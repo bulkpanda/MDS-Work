@@ -19,7 +19,7 @@ colClinicTypeText = 'Clinic Type_3_TEXT'
 colFinished = 'Finished'
 colResponseId= 'ResponseId'
 colComments = 'Supervisor comments'
-
+colComments2 = 'Further comments'
 colClinicChoice = 'Sim or Clinic'
 colClinicOther = 'Sim or Clinic_999_TEXT'
 
@@ -84,17 +84,17 @@ rubricQues = ['PS', 'CS', 'TS',	'ES']
 newRubricQuesPatterns = ['PS-', 'CS-', 'TS-', 'ES-']
 
 beforeCols = [colId, colNameG, colNameF, colDate]
-afterCols = [colCohort, colSubject, colClinicChoice, colClinicOther, colCE, colCEReason, colPatient, colComplex, colAge, colCohort, colSubject, colRole, colClinicType, colClinicTypeText, colFinished, colSupervisor, colComments, colResponseId]+ serviceCols
+afterCols = [colCohort, colSubject, colClinicChoice, colClinicOther, colCE, colCEReason, colPatient, colComplex, colAge, colCohort, colSubject, colRole, colClinicType, colClinicTypeText, colFinished, colSupervisor, colComments, colResponseId, colComments2]+ serviceCols
 
-columnRenameFile = 'Column Rename Dictionary.json'
+columnRenameFile = 'data/Column Rename Dictionary.json'
 
 VALID_TAGS= ['SIM', 'Sim', 'CLINIC', 'Clinic', 'Infiltration', 'Block', 'Relining insert', 'Relining partial', 'Relining full',
                  'Review', 'Finish', 'Try-in', 'Occlusal', 'Secondary', 'Primary']
 
 invalidIDs = [111111, 1111111, 1, 12, 123, 1234, 12345, 123456, 1234567, 12345678, 12321321, 0, 111, 12344]
 
-mcReferenceFile = "MC Reference Dictionary.json"
-othermcReferenceFile = 'MC Reference Other Dictionary.json'
+mcReferenceFile = "data/MC Reference Dictionary.json"
+othermcReferenceFile = 'data/MC Reference Other Dictionary.json'
 
 notReviewedW = 0.5
 mcScoreW = 0.8
@@ -118,10 +118,12 @@ styles.add(ParagraphStyle(name='Center', alignment=1))  # Center alignment
 headingStyle = ParagraphStyle('Heading1', parent=styles['Heading1'], fontSize=32, alignment=1)  # Centered
 heading2Style = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=28, alignment=1)  # Centered
 subheadingStyle = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=24, alignment=1)  # Centered
-subsubheadingStyle = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=1, leading=40)  # Centered
+subsubheadingStyle = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=1)  # Centered
+subsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=0)  # Centered
 normalLargeStyleLeft = ParagraphStyle('NormalLarge', parent=styles['Normal'], fontSize=18, alignment=0)  # Left aligned
 normalLargeStyleCenter = ParagraphStyle('NormalLarge2', parent=styles['Normal'], fontSize=18, alignment=1)  # Center aligned
 tableTextStyle = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=1)
+tableTextStyleL = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=0)
 tableTextStyleSmall= ParagraphStyle('SmallFont', parent=styles['Normal'], fontSize=11, alignment=1)
 tableTextStyleLarge = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=15, alignment=1, leading=20)
 Checklistcolors = {'Yes': 'blue', 'No': 'orange', 'Not Reviewed': 'lightgrey'}

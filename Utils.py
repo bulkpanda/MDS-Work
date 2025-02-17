@@ -81,7 +81,7 @@ def loadWorkbook(filePath: str):
     pprint(f"Workbook sheets: {workbook.sheetnames}")
     return workbook, folderPath, name
 
-def getStudentList(listFile1 = 'Student ID for Kunal.xlsx', listFile2 = '2024 MDS Student List_v10.xlsx', **kwargs):
+def getStudentList(listFile1 = 'data/Student ID for Kunal.xlsx', listFile2 = 'data/2024 MDS Student List_v10.xlsx', **kwargs):
     # Load the Excel file containing the student IDs
     # listDf1 = pd.read_excel(listFile1)
     # get cohort from kwargs
@@ -581,7 +581,7 @@ def extractCodes(service_str: str, location: str):
                 if tag not in ['SIM', 'CLINIC']:
                     tag = 'SIM' if 'Simulation' in str(location) else 'CLINIC'
             except:
-                print('No tag found in:', string)
+                # print('No tag found in:', string)
                 tag = 'SIM' if 'Simulation' in str(location) else 'CLINIC'
         code = re.findall(r'\b(\d+)\b', string)
         for c in code:
@@ -595,8 +595,11 @@ def extractCodes(service_str: str, location: str):
             elif c=='012':
                 tag = 'POE'
             elif c=='013':
+                if 'Paeds Specific' in string:
+                    tag = 'PAEDS SPECIFIC'
                 tag = 'LIMITED OE'
             # WORRY ABOUT  Paeds Specific as well
+
             elif c== '014':
                 tag = 'CONSULTATION'
             elif c == '022':
@@ -1331,7 +1334,7 @@ def autopct(pct, total):
     """
     
     val = int(round(pct * total / 100.0))
-    return '{:.0f}%\n({v:d})'.format(pct, v=val) if pct > 0 else ''
+    return '{:.0f}% ({v:d})'.format(pct, v=val) if pct > 0 else ''
 
 
 
@@ -1444,7 +1447,7 @@ def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [],
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),  # Center align all cells
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),  # Center align all cells
             ('GRID', (0, 0), (-1, -1), 1, colors.black),  # Add border around cells
-            ('ALIGN', (3, 1), (3, -1), 'LEFT'),  # Left align Reason column cells
+            # ('ALIGN', (3, 1), (3, -1), 'LEFT'),  # Left align Reason column cells
             ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),  # Change font to bold
             ('FONTSIZE', (0, 0), (-1, -1), 14),  # Increase font size
             ('BOTTOMPADDING', (0, 0), (-1, -1), bottomPadding),  # Increase bottom padding
@@ -1452,10 +1455,12 @@ def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [],
         ])
         table.setStyle(table_style)
 
-    mergedElement = KeepTogether([Paragraph(title, variableUtils.subsubheadingStyle), Spacer(1, 12), table, Spacer(1, 12)])
+    mergedElement = KeepTogether([Paragraph(title, variableUtils.subsubheadingStyle), Spacer(1, 6), table, Spacer(1, 12)])
 
     # Add red colour where cell values are No
     if not cellHighlight:
+        return mergedElement
+    if df.empty:
         return mergedElement
     for i in range(1, len(data)):
         for j in range(len(data[i])):
