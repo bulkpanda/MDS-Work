@@ -81,7 +81,7 @@ def loadWorkbook(filePath: str):
     pprint(f"Workbook sheets: {workbook.sheetnames}")
     return workbook, folderPath, name
 
-def getStudentList(listFile1 = 'data/Student ID for Kunal.xlsx', listFile2 = 'data/2024 MDS Student List_v10.xlsx', **kwargs):
+def getStudentList(listFile1 = 'data/Student ID for Kunal.xlsx', listFile2 = '2024/data/2024 MDS Student List_v10.xlsx', **kwargs):
     # Load the Excel file containing the student IDs
     # listDf1 = pd.read_excel(listFile1)
     # get cohort from kwargs
@@ -355,7 +355,7 @@ def renameColumns(df):
 # This is the second way of renaming columns
 def notValidMCPrint(parts, col):
     if len(parts) < 2:
-        print('No a valid MC column:', col)
+        print('No a valid MC column:', col, len(parts), parts)
         return True
 
 def getMCColumnParts(col):

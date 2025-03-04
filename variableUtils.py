@@ -77,7 +77,9 @@ checklistMap = {
 'Positioning': 'PEC',
 'Infection control': 'ICC',
 'Record keeping': 'RKC',
-'Consent': 'CC'
+'Consent': 'CC',
+'Anatomy': 'ANATOMY',
+'Additional items': 'ADD_ITEMS',
 }
 # Get list of column names based on the type
 rubricQues = ['PS', 'CS', 'TS',	'ES']
@@ -86,15 +88,15 @@ newRubricQuesPatterns = ['PS-', 'CS-', 'TS-', 'ES-']
 beforeCols = [colId, colNameG, colNameF, colDate]
 afterCols = [colCohort, colSubject, colClinicChoice, colClinicOther, colCE, colCEReason, colPatient, colComplex, colAge, colCohort, colSubject, colRole, colClinicType, colClinicTypeText, colFinished, colSupervisor, colComments, colResponseId, colComments2]+ serviceCols
 
-columnRenameFile = 'data/Column Rename Dictionary.json'
+columnRenameFile = '2024/data/Column Rename Dictionary.json'
 
 VALID_TAGS= ['SIM', 'Sim', 'CLINIC', 'Clinic', 'Infiltration', 'Block', 'Relining insert', 'Relining partial', 'Relining full',
-                 'Review', 'Finish', 'Try-in', 'Occlusal', 'Secondary', 'Primary']
+                 'Review', 'Finish', 'Try-in', 'Occlusal', 'Secondary', 'Primary', 'Anatomy', 'Additional items']
 
 invalidIDs = [111111, 1111111, 1, 12, 123, 1234, 12345, 123456, 1234567, 12345678, 12321321, 0, 111, 12344]
 
-mcReferenceFile = "data/MC Reference Dictionary.json"
-othermcReferenceFile = 'data/MC Reference Other Dictionary.json'
+mcReferenceFile = "2024/data/MC Reference Dictionary.json"
+othermcReferenceFile = '2024/data/MC Reference Other Dictionary.json'
 
 notReviewedW = 0.5
 mcScoreW = 0.8
@@ -119,7 +121,8 @@ headingStyle = ParagraphStyle('Heading1', parent=styles['Heading1'], fontSize=32
 heading2Style = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=28, alignment=1)  # Centered
 subheadingStyle = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=24, alignment=1)  # Centered
 subsubheadingStyle = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=1)  # Centered
-subsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=0)  # Centered
+subsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=0)  # left aligned
+smallsubsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=13, alignment=0)  # Centered
 normalLargeStyleLeft = ParagraphStyle('NormalLarge', parent=styles['Normal'], fontSize=18, alignment=0)  # Left aligned
 normalLargeStyleCenter = ParagraphStyle('NormalLarge2', parent=styles['Normal'], fontSize=18, alignment=1)  # Center aligned
 tableTextStyle = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=1)

@@ -1,0 +1,5 @@
+CriticalWeight,ModerateWeight,MinorWeight,Cutoff,PassCount,CriticalConditionPass,FailWhenMissingCritical
+25,3,1,0.9,9,TRUE,TRUE
+30,3,1,0.9,9,TRUE,TRUE
+30,3,2,0.9,9,TRUE,TRUE
+30,4,1,0.9,9,TRUE,TRUE
