@@ -1,0 +1,4 @@
+group1,group2,meandiff,p-adj,lower,upper,reject
+Keira Venables,Stephanie Chang,14.0313,0.0,7.173,20.8895,True
+Keira Venables,Yvonne Zhang,11.2681,0.0008,4.3067,18.2295,True
+Stephanie Chang,Yvonne Zhang,-2.7631,0.5957,-9.6214,4.0951,False

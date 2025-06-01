@@ -1422,7 +1422,7 @@ def aggregator(dfGuttman, mcCols, colCE=None, colCEReason=None, colComments: lis
 
 
 def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [], 
-            tableTextStyle = variableUtils.tableTextStyle, topPadding = 12, bottomPadding = 12, cellHighlight = False, headerColor = '#9C27B0'):
+            tableTextStyle = variableUtils.tableTextStyle, topPadding = 12, bottomPadding = 12, cellHighlight = False, headerColor = '#9C27B0', titleStyle = variableUtils.subsubheadingStyle):
     print(f'Creating table for {title}')
     if df.empty:
         table = Paragraph("No data found", variableUtils.subsubheadingStyle)
@@ -1455,7 +1455,7 @@ def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [],
         ])
         table.setStyle(table_style)
 
-    mergedElement = KeepTogether([Paragraph(title, variableUtils.subsubheadingStyle), Spacer(1, 6), table, Spacer(1, 12)])
+    mergedElement = KeepTogether([Paragraph(title, titleStyle), Spacer(1, 6), table, Spacer(1, 12)])
 
     # Add red colour where cell values are No
     if not cellHighlight:
@@ -1469,6 +1469,90 @@ def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [],
             if data[i][j] == 'Yes':
                 table.setStyle(TableStyle([('TEXTCOLOR', (j, i), (j, i), colors.green)]))
     return mergedElement
+
+def createSplitTable(df, title, colRatio:list, tableWidth=0.9, customTextCols=[], 
+                     tableTextStyle=variableUtils.tableTextStyle, topPadding=12, bottomPadding=12, 
+                     cellHighlight=False, headerColor='#9C27B0', titleStyle=variableUtils.subsubheadingStyle):
+    
+    print(f'Creating split table for {title}')
+    
+    if df.empty:
+        table = Paragraph("No data found", variableUtils.subsubheadingStyle)
+        mergedElement = KeepTogether([Paragraph(title, titleStyle), Spacer(1, 6), table, Spacer(1, 12)])
+        return mergedElement
+
+    else:
+        data = [df.columns.to_list()] + df.values.tolist()
+
+        # Convert custom text columns to Paragraphs
+        for i in range(1, len(data)):
+            for j in customTextCols:
+                data[i][j] = Paragraph(str(data[i][j]), tableTextStyle)
+
+        if colRatio is not None:
+            colWidths = [ratio/sum(colRatio) * variableUtils.pageSize[0] * tableWidth/2 for ratio in colRatio]
+        else:
+            colWidths = [1 for _ in range(len(df.columns))]
+
+        # Split rows
+        headerRow = data[0]
+        bodyRows = data[1:]
+        splitPoint = (len(bodyRows) + 1) // 2  # +1 for safe split if odd number
+
+        leftData = [headerRow] + bodyRows[:splitPoint]
+        rightData = [headerRow] + bodyRows[splitPoint:]
+
+        # Create left and right tables
+        leftTable = Table(leftData, colWidths=colWidths)
+        rightTable = Table(rightData, colWidths=colWidths)
+
+        tableStyle = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(headerColor)),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#FFFFFF')),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 14),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), bottomPadding),
+            ('TOPPADDING', (0, 0), (-1, -1), topPadding),
+        ])
+
+        leftTable.setStyle(tableStyle)
+        rightTable.setStyle(tableStyle)
+
+        # Now combine left and right tables into one row with two columns
+        combinedTable = Table(
+            [[leftTable, rightTable]],
+            colWidths=[variableUtils.pageSize[0]*tableWidth/2]*2,
+            hAlign='CENTER',
+                style=[
+        ('VALIGN', (0, 0), (-1, -1), 'TOP')  # This line is critical
+    ]
+        )
+
+    mergedElement = KeepTogether([Paragraph(title, titleStyle), Spacer(1, 6), combinedTable, Spacer(1, 12)])
+
+    # Add cellHighlight if needed
+    if not cellHighlight:
+        return mergedElement
+
+    # Coloring Yes/No
+    for i in range(1, len(leftData)):
+        for j in range(len(leftData[i])):
+            if isinstance(leftData[i][j], str) and leftData[i][j] == 'No':
+                leftTable.setStyle(TableStyle([('TEXTCOLOR', (j, i), (j, i), colors.red)]))
+            if isinstance(leftData[i][j], str) and leftData[i][j] == 'Yes':
+                leftTable.setStyle(TableStyle([('TEXTCOLOR', (j, i), (j, i), colors.green)]))
+    for i in range(1, len(rightData)):
+        for j in range(len(rightData[i])):
+            if isinstance(rightData[i][j], str) and rightData[i][j] == 'No':
+                rightTable.setStyle(TableStyle([('TEXTCOLOR', (j, i), (j, i), colors.red)]))
+            if isinstance(rightData[i][j], str) and rightData[i][j] == 'Yes':
+                rightTable.setStyle(TableStyle([('TEXTCOLOR', (j, i), (j, i), colors.green)]))
+
+    return mergedElement
+
 
 def createPlotImage(fig):
         buf = BytesIO()
@@ -1501,3 +1585,33 @@ def addPlotImage(fig, ratio = None):
         #self.elements.append(PageBreak())
         plt.close(fig)
         return(image)
+
+def cleanEntry(codeList):
+    validCodes = []
+    for entry in codeList:
+        if isinstance(entry, str) and 'LA' in entry.upper():
+            validCodes.append('LA')
+        
+        matches = re.findall(r'(\d+)(?:\s*[xX]\s*(\d+))?', str(entry))
+
+        first = True
+        for code, multiplier in matches:
+            if len(code) == 1:
+                continue
+
+            if len(code) > 3:
+                if len(code) % 3 != 0:
+                    code = '0' + code
+                splitCodes = [code[i:i+3] for i in range(0, len(code), 3)]
+            else:
+                if first and len(code) == 2:
+                    code = '0' + code
+                splitCodes = [code] if len(code) == 3 else []
+
+            count = int(multiplier) if multiplier else 1
+            for splitCode in splitCodes:
+                if len(splitCode) == 3:
+                    validCodes.extend([splitCode] * count)
+            
+            first = False
+    return validCodes

@@ -97,6 +97,7 @@ invalidIDs = [111111, 1111111, 1, 12, 123, 1234, 12345, 123456, 1234567, 1234567
 
 mcReferenceFile = "2024/data/MC Reference Dictionary.json"
 othermcReferenceFile = '2024/data/MC Reference Other Dictionary.json'
+studentEmailFile = '2025/RE_ Student List.xlsx'
 
 notReviewedW = 0.5
 mcScoreW = 0.8
@@ -122,11 +123,13 @@ heading2Style = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=2
 subheadingStyle = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=24, alignment=1)  # Centered
 subsubheadingStyle = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=1)  # Centered
 subsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=0)  # left aligned
-smallsubsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=13, alignment=0)  # Centered
+smallsubsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=13, alignment=0)  # Left aligned
+smallsubsubheadingStyleC = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=13, alignment=1)  # Centered
 normalLargeStyleLeft = ParagraphStyle('NormalLarge', parent=styles['Normal'], fontSize=18, alignment=0)  # Left aligned
 normalLargeStyleCenter = ParagraphStyle('NormalLarge2', parent=styles['Normal'], fontSize=18, alignment=1)  # Center aligned
 tableTextStyle = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=1)
 tableTextStyleL = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=0)
+tableTextStyleLSmall = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=11, alignment=0)
 tableTextStyleSmall= ParagraphStyle('SmallFont', parent=styles['Normal'], fontSize=11, alignment=1)
 tableTextStyleLarge = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=15, alignment=1, leading=20)
 Checklistcolors = {'Yes': 'blue', 'No': 'orange', 'Not Reviewed': 'lightgrey'}

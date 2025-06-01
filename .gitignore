@@ -12,3 +12,6 @@ data
 .env
 2024
 MDS
+**/*.xlsx
+**/*.xls
+**/*.json

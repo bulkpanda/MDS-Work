@@ -1,1 +1,615 @@
-{"success": true, "type": "sim", "result": [{"id": 17, "key": "114-hs", "name": "Removal of Calculus - First Appointment (Hand scaling)", "group": "Preventive, Prophylactic and Bleaching Services", "fields": {"MC1": "Selects the curette for the specific area", "MC2": "Checks instrument sharpness", "MC3": "Maintains a modified pen grasp during debridement", "MC4": "Adapts the instrument to the tooth surface", "MC5": "Debrides with continuous, overlapping and controlled strokes away from the base of the pocket.", "MC6": "Uses stable finger rest in the same quadrant throughout the procedure", "MC7": "Applies lateral pressure during debridement without applying excessive force: such as no loss of instrument control", "MC8": "Ensures all surfaces are debrided", "MC9": "Uses a systematic approach to debridement", "MC10": "Minimises damage to soft tissues"}}, {"id": 19, "key": "114-us", "name": "Removal of Calculus - First Appointment (Ultrasonic scaling)", "group": "Preventive, Prophylactic and Bleaching Services", "fields": {"MC1": "Checks setup of u/s including water flow", "MC2": "Stable finger rest in same quadrant during the procedure", "MC3": "Uses continuous overlapping strokes", "MC4": "Moves the tip to prevent burning of soft tissue", "MC5": "Uses a range of stroke directions to adapt tip to the tooth", "MC6": "The entire tooth surface is debrided", "MC7": "Prevents damage of tooth structure", "MC8": "Prevents damage of soft tissue, lips and cheeks"}}, {"id": 20, "key": "522", "name": "Adhesive restoration - two surfaces - anterior tooth - direct", "group": "Restorative Services", "fields": {"MC1": "Isolates the tooth/teeth according to the patient and material choice", "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure", "MC3": "Applies selective caries removal: avoids proximity to pulp", "MC4": "Applies selective caries removal: clears DEJ of caries", "MC5": "Creates smooth cavity preparation", "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation", "MC7": "Follows bonding protocol specific to material selected", "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.", "MC9": "Recreates original occlusal and buccal/lingual morphology", "MC10": "Recreates original marginal ridge morphology", "MC11": "Establishes contact area(s)", "MC12": "Ensures restoration is free of overhangs", "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable", "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth", "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation", "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues", "MC17": "Demonstrates safe management and disposal of sharps"}}, {"id": 15, "key": "524", "name": "Adhesive restoration - four surfaces - anterior tooth - direct", "group": "Restorative Services", "fields": {"MC1": "Isolates the tooth/teeth according to the patient and material choice", "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure", "MC3": "Applies selective caries removal: avoids proximity to pulp", "MC4": "Applies selective caries removal: clears DEJ of caries", "MC5": "Creates smooth cavity preparation", "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation", "MC7": "Follows bonding protocol specific to material selected", "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.", "MC9": "Recreates original occlusal and buccal/lingual morphology", "MC10": "Recreates original marginal ridge morphology", "MC11": "Establishes contact area(s)", "MC12": "Ensures restoration is free of overhangs", "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable", "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth", "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation", "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues", "MC17": "Demonstrates safe management and disposal of sharps"}}, {"id": 18, "key": "532", "name": "Adhesive restoration - two surfaces - posterior tooth - direct", "group": "Restorative Services", "fields": {"MC1": "Isolates the tooth/teeth according to the patient and material choice", "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure", "MC3": "Applies selective caries removal: avoids proximity to pulp", "MC4": "Applies selective caries removal: clears DEJ of caries", "MC5": "Creates smooth cavity preparation", "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation", "MC7": "Follows bonding protocol specific to material selected", "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.", "MC9": "Recreates original occlusal and buccal/lingual morphology", "MC10": "Recreates original marginal ridge morphology", "MC11": "Establishes contact area(s)", "MC12": "Ensures restoration is free of overhangs", "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable", "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth", "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation", "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues", "MC17": "Demonstrates safe management and disposal of sharps"}}, {"id": 13, "key": "533", "name": "Adhesive restoration - three surfaces - posterior tooth - direct", "group": "Restorative Services", "fields": {"MC1": "Isolates the tooth/teeth according to the patient and material choice", "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure", "MC3": "Applies selective caries removal: avoids proximity to pulp", "MC4": "Applies selective caries removal: clears DEJ of caries", "MC5": "Creates smooth cavity preparation", "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation", "MC7": "Follows bonding protocol specific to material selected", "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.", "MC9": "Recreates original occlusal and buccal/lingual morphology", "MC10": "Recreates original marginal ridge morphology", "MC11": "Establishes contact area(s)", "MC12": "Ensures restoration is free of overhangs", "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable", "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth", "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation", "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues", "MC17": "Demonstrates safe management and disposal of sharps"}}, {"id": 14, "key": "577", "name": "Cusp Capping per Cusp", "group": "Restorative Services", "fields": {"MC1": "Reduces cusp/wall anatomically to allow full thickness of restorative material selected without excessive reduction", "MC2": "Creates smooth surface and line angles", "MC3": "Restores anatomy to correct anatomical contour", "MC4": "Finishes and polishes restoration smoothly and free of porosities"}}, {"id": 16, "key": "578", "name": "Restoration of an incisal corner", "group": "Restorative Services", "fields": {"MC1": "Reduces incisal edge and angle(s) leaving smooth surface", "MC2": "Places bevel on labial surface only, 1-1.5mm wide", "MC3": "Restores incisal edge to anatomical proportions", "MC4": "Restores incisal angle position and contour to anatomical proportions", "MC5": "Maintains anatomical thickness of restored incisal angle(s) after finishing and polishing"}}]}
+{
+  "success": true,
+  "type": "sim",
+  "result": [
+    {
+      "id": 32,
+      "key": "111",
+      "name": "Removal of Plaque",
+      "group": "Preventive, Prophylactic and Bleaching Services",
+      "fields": {
+        "MC1": "Correctly assembles and applies the cup/brush when polishing",
+        "MC2": "Uses flat end of the cup/brush when polishing",
+        "MC3": "Uses gentle pressure when using cup/brush to polish surface",
+        "MC4": "Moves the cup continuously and does not hold it in one position",
+        "MC5": "Works systematically to ensure all surfaces as covered",
+        "MC6": "Holds stable fulcrum throughout procedure"
+      }
+    },
+    {
+      "id": 33,
+      "key": "11-12",
+      "name": "Explorer SIM",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Uses a relaxed modified pen grasp",
+        "MC2": "Selects correct working end to explore the specified area.",
+        "MC3": "Inserts instrument with the terminal shank parallel to the long axis of the tooth.",
+        "MC4": "Minimal pressure or displacement of gingiva at the cervical margin.",
+        "MC5": "Adapts the tip to the tooth surface.",
+        "MC6": "Applies controlled small V-shaped strokes to the cervical area of the tooth surface.",
+        "MC7": "Covers the entire eara/surface of the sextant in a systematic manner",
+        "MC8": "Posteriorly, strokes cover distal 1/3 of the tooth and the mesial 2/3 of the tooth",
+        "MC9": "Anteriorly, strokes cover from midline to the interproximal for both mesial and distal directions",
+        "MC10": "Does not slip when probing"
+      }
+    },
+    {
+      "id": 45,
+      "key": "113",
+      "name": "Recontouring and Polishing of Pre-existing Restoration(s)",
+      "group": "Preventive, Prophylactic and Bleaching Services",
+      "fields": {
+        "MC1": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable)",
+        "MC2": "Preserves hard and soft tissues during preparation and polishing (i.e. no gingival lacerations, does not cut adjacent tooth)",
+        "MC3": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 17,
+      "key": "114-hs",
+      "name": "Removal of Calculus - First Appointment (Hand scaling)",
+      "group": "Preventive, Prophylactic and Bleaching Services",
+      "fields": {
+        "MC1": "Selects the curette for the specific area",
+        "MC2": "Checks instrument sharpness",
+        "MC3": "Maintains a modified pen grasp during debridement",
+        "MC4": "Adapts the instrument to the tooth surface",
+        "MC5": "Debrides with continuous, overlapping and controlled strokes away from the base of the pocket.",
+        "MC6": "Uses stable finger rest in the same quadrant throughout the procedure",
+        "MC7": "Applies lateral pressure during debridement without applying excessive force: such as no loss of instrument control",
+        "MC8": "Ensures all surfaces are debrided",
+        "MC9": "Uses a systematic approach to debridement",
+        "MC10": "Minimises damage to soft tissues"
+      }
+    },
+    {
+      "id": 19,
+      "key": "114-us",
+      "name": "Removal of Calculus - First Appointment (Ultrasonic scaling)",
+      "group": "Preventive, Prophylactic and Bleaching Services",
+      "fields": {
+        "MC1": "Checks setup of u/s including water flow",
+        "MC2": "Stable finger rest in same quadrant during the procedure",
+        "MC3": "Uses continuous overlapping strokes",
+        "MC4": "Moves the tip to prevent burning of soft tissue",
+        "MC5": "Uses a range of stroke directions to adapt tip to the tooth",
+        "MC6": "The entire tooth surface is debrided",
+        "MC7": "Prevents damage of tooth structure",
+        "MC8": "Prevents damage of soft tissue, lips and cheeks"
+      }
+    },
+    {
+      "id": 26,
+      "key": "161",
+      "name": "Fissure and / or Tooth Surface Sealing",
+      "group": "Preventive, Prophylactic and Bleaching Services",
+      "fields": {
+        "MC1": "Identifies material based on patient history and tooth factors.",
+        "MC2": "Isolates the tooth/teeth according to the patient and material choice to obtain moisture control",
+        "MC3": "Prepares tooth surface specific to material selected",
+        "MC4": "Applies sealant to all required pits and fissures and material is retained on the tooth surface.",
+        "MC5": "The sealant is finished (no overextension and overfilling, material is free of bubbles and voids the surface is smooth, the margins are undetected and is not interfering with occlusion)"
+      }
+    },
+    {
+      "id": 23,
+      "key": "221",
+      "name": "(Archived) Periodontal Analysis and Recording",
+      "group": "Periodontics",
+      "fields": {
+        "MC1": "Maintains ergonomic position of operator and patient",
+        "MC2": "Uses non-WHO probe with stable finger rest",
+        "MC3": "Inserts probe gently parallel to tooth surface to base of sulcus of pocket at 6 points for each tooth",
+        "MC4": "Records probing depths using taught technique (expected to be within 2mm of educator’s measurements)"
+      }
+    },
+    {
+      "id": 44,
+      "key": "221-BOH",
+      "name": "Periodontal Analysis and Recording",
+      "group": "Periodontics",
+      "fields": {
+        "MC1": "Maintains a relaxed modified pen grasp",
+        "MC2": "Uses periodontal probe with stable finger rest",
+        "MC3": "Inserts probe parallel to tooth surface",
+        "MC4": "Adapts the tip of the probe to the tooth surface",
+        "MC5": "Walks the probes systematically around the tooth",
+        "MC6": "Measures interproximal areas"
+      }
+    },
+    {
+      "id": 24,
+      "key": "222",
+      "name": "Periodontal Debridment - Per Tooth",
+      "group": "Periodontics",
+      "fields": {
+        "MC1": "Maintains ergonomic  position of operator and patient",
+        "MC2": "Selects scaler or curette for the specific area",
+        "MC3": "Checks Instrument sharpness with a test stick",
+        "MC4": "Uses sharp instrument",
+        "MC5": "Maintains a  modified pen grasp during debridement",
+        "MC6": "Uses correct working-end",
+        "MC7": "Inserts the face of the curette against the tooth surface as closely as possible",
+        "MC8": "Opens face  so that the terminal shank is parallel to the long access of the tooth",
+        "MC9": "Debrides with continuous, overlapping and controlled strokes away from the base of the pocket",
+        "MC10": "Applies  lateral pressure during debridement without applying excessive force: shown by no loss of instrument control",
+        "MC11": "Uses a range of strokes depending on surface being debrided (vertical, horizontal, oblique)",
+        "MC12": "Ensures all surfaces are debrided",
+        "MC13": "Uses a systematic approach to debridement",
+        "MC14": "Minimises damage to soft tissues"
+      }
+    },
+    {
+      "id": 21,
+      "key": "411",
+      "name": "Direct Pulp Cap",
+      "group": "Endodontics",
+      "fields": {
+        "MC1": "Rinses exposure with sodium hypochlorite or saline",
+        "MC2": "Observes for healthy bleeding response",
+        "MC3": "Obtains haemostasis with pressure",
+        "MC4": "Places medicament over exposure",
+        "MC5": "Places liner"
+      }
+    },
+    {
+      "id": 34,
+      "key": "513",
+      "name": "Three surface amalgam",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares tooth based on extent of caries or fracture, minimum 2mm deep throughout, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Develops retention/resistance form through convergence/undercuts on most internal cavity walls",
+        "MC6": "Prepares approximately 90 degree cavo-surface angles for most cavo-surface margins",
+        "MC7": "Creates smooth cavity preparation",
+        "MC8": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC9": "Places liner/base on cavity floor/axial walls (towards pulp) where indicated by cavity depth",
+        "MC10": "Condenses material generally free of voids, porosities or marginal deficiencies prior to carving, according to manufacturer instructions",
+        "MC11": "Recreates original occlusal and buccal/lingual morphology",
+        "MC12": "Recreates original marginal ridge morphology",
+        "MC13": "Establishes contact area(s)",
+        "MC14": "Ensures restoration is free of overhangs",
+        "MC15": "Carves amalgam, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC17": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC18": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC19": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 35,
+      "key": "514",
+      "name": "Four surface amalgam",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares tooth based on extent of caries or fracture, minimum 2mm deep throughout, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Develops retention/resistance form through convergence/undercuts on most internal cavity walls",
+        "MC6": "Prepares approximately 90 degree cavo-surface angles for most cavo-surface margins",
+        "MC7": "Creates smooth cavity preparation",
+        "MC8": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC9": "Places liner/base on cavity floor/axial walls (towards pulp) where indicated by cavity depth",
+        "MC10": "Condenses material generally free of voids, porosities or marginal deficiencies prior to carving, according to manufacturer instructions",
+        "MC11": "Recreates original occlusal and buccal/lingual morphology",
+        "MC12": "Recreates original marginal ridge morphology",
+        "MC13": "Establishes contact area(s)",
+        "MC14": "Ensures restoration is free of overhangs",
+        "MC15": "Carves amalgam, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC17": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC18": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC19": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 20,
+      "key": "522",
+      "name": "Adhesive restoration - two surfaces - anterior tooth - direct",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC7": "Follows bonding protocol specific to material selected",
+        "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC9": "Recreates original occlusal and buccal/lingual morphology",
+        "MC10": "Recreates original marginal ridge morphology",
+        "MC11": "Establishes contact area(s)",
+        "MC12": "Ensures restoration is free of overhangs",
+        "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC17": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 15,
+      "key": "524",
+      "name": "Adhesive restoration - four surfaces - anterior tooth - direct",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC7": "Follows bonding protocol specific to material selected",
+        "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC9": "Recreates original occlusal and buccal/lingual morphology",
+        "MC10": "Recreates original marginal ridge morphology",
+        "MC11": "Establishes contact area(s)",
+        "MC12": "Ensures restoration is free of overhangs",
+        "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC17": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 36,
+      "key": "531",
+      "name": "Adhesive restoration - one surface - posterior tooth - direct",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Follows bonding protocol specific to material selected",
+        "MC7": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC8": "Recreates original occlusal and buccal/lingual morphology",
+        "MC9": "Ensures restoration is free of overhangs",
+        "MC10": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC11": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC12": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC13": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC14": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 18,
+      "key": "532",
+      "name": "Adhesive restoration - two surfaces - posterior tooth - direct",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC7": "Follows bonding protocol specific to material selected",
+        "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC9": "Recreates original occlusal and buccal/lingual morphology",
+        "MC10": "Recreates original marginal ridge morphology",
+        "MC11": "Establishes contact area(s)",
+        "MC12": "Ensures restoration is free of overhangs",
+        "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC17": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 13,
+      "key": "533",
+      "name": "Adhesive restoration - three surfaces - posterior tooth - direct",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC7": "Follows bonding protocol specific to material selected",
+        "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC9": "Recreates original occlusal and buccal/lingual morphology",
+        "MC10": "Recreates original marginal ridge morphology",
+        "MC11": "Establishes contact area(s)",
+        "MC12": "Ensures restoration is free of overhangs",
+        "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC17": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 22,
+      "key": "534",
+      "name": "Adhesive restoration - four surfaces - posterior tooth - direct",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC7": "Follows bonding protocol specific to material selected",
+        "MC8": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC9": "Recreates original occlusal and buccal/lingual morphology",
+        "MC10": "Recreates original marginal ridge morphology ",
+        "MC11": "Establishes contact area(s)",
+        "MC12": "Ensures restoration is free of overhangs",
+        "MC13": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC14": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC15": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC16": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC17": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 38,
+      "key": "575",
+      "name": "Pin retention",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Determines location for pin placement, at least 1mm from DEJ and avoiding pulp.",
+        "MC2": "Aligns pin with external surface of tooth and places pin slowly and with control.",
+        "MC3": "Trims pin if extending beyond anatomical form occlusally."
+      }
+    },
+    {
+      "id": 14,
+      "key": "577",
+      "name": "Cusp Capping per Cusp",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Reduces cusp/wall anatomically to allow full thickness of restorative material selected without excessive reduction",
+        "MC2": "Creates smooth surface and line angles",
+        "MC3": "Restores anatomy to correct anatomical contour",
+        "MC4": "Finishes and polishes restoration smoothly and free of porosities"
+      }
+    },
+    {
+      "id": 37,
+      "key": "577-2",
+      "name": "Cusp Capping per Cusp",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Reduces cusp/wall anatomically to allow full thickness of restorative material selected without excessive reduction",
+        "MC2": "Creates smooth surface and line angles",
+        "MC3": "Restores anatomy to correct anatomical contour",
+        "MC4": "Finishes and polishes restoration smoothly and free of porosities"
+      }
+    },
+    {
+      "id": 16,
+      "key": "578",
+      "name": "Restoration of an incisal corner",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Reduces incisal edge and angle(s) leaving smooth surface",
+        "MC2": "Places bevel on labial surface only, 1-1.5mm wide",
+        "MC3": "Restores incisal edge to anatomical proportions",
+        "MC4": "Restores incisal angle position and contour to anatomical proportions",
+        "MC5": "Maintains anatomical thickness of restored incisal angle(s) after finishing and polishing"
+      }
+    },
+    {
+      "id": 46,
+      "key": "CAA-DDS",
+      "name": "DDS2 Cons Amalgam Assessment 2",
+      "group": "Restorative Services",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares tooth based on extent of caries or fracture, minimum 2mm deep throughout, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Develops retention/resistance form through convergence/undercuts on most internal cavity walls",
+        "MC6": "Prepares approximately 90 degree cavo-surface angles for most cavo-surface margins",
+        "MC7": "Creates smooth cavity preparation",
+        "MC8": "Reduces cusp/wall anatomically to allow full thickness of restorative material selected without excessive reduction",
+        "MC9": "Creates smooth surface and line angles",
+        "MC10": "This procedure was completed in timeframe expected for this timepoint in DDS2",
+        "MC11": "Able to complete this procedure with indirect supervision",
+        "MC12": "Condenses material generally free of voids, porosities or marginal deficiencies prior to carving, according to manufacturer instructions",
+        "MC13": "Recreates original occlusal and buccal/lingual morphology",
+        "MC14": "Recreates original marginal ridge morphology",
+        "MC15": "Establishes contact area(s)",
+        "MC16": "Ensures restoration is free of overhangs",
+        "MC17": "Carves amalgam, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC18": "Restores anatomy to correct anatomical contour",
+        "MC19": "Finishes and polishes restoration smoothly and free of porosities",
+        "MC20": "This procedure was completed in timeframe expected for this timepoint in DDS2",
+        "MC21": "Able to complete this procedure with indirect supervision",
+        "MC22": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC23": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC24": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC25": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 25,
+      "key": "DDI-BOH",
+      "name": "Dental Dam Isolation (BOH)",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Clamp selected fits tightly around tooth",
+        "MC2": "Stable Clamp",
+        "MC3": "Clamp secured with dental floss",
+        "MC4": "Hole size and spacing correlates to the area being isolated",
+        "MC5": "Dam flossed through interproximal spaces",
+        "MC6": "Dam inverted in operative area",
+        "MC7": "Frame oriented comfortably around patient's chin",
+        "MC8": "Patient's airway not restricted",
+        "MC9": "Opposing arch covered",
+        "MC10": "No tears or defects in the dam that could compromise treatment"
+      }
+    },
+    {
+      "id": 27,
+      "key": "DDI-DDS",
+      "name": "Dental Dam Isolation (DDS)",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Nasal airway open and oral cavity covered",
+        "MC2": "Chosen clamp fits securely around tooth",
+        "MC3": "Clamp correctly secured with floss, floss is secured and contained",
+        "MC4": "Clamp handling: wings and beaks exposed, no floss caught in beaks",
+        "MC5": "Accessory retention appropriately placed (if applicable)",
+        "MC6": "Dam secured to frame, frame correctly oriented",
+        "MC7": "Appropriate number of teeth isolated",
+        "MC8": "Dam flossed interproximally, including distal to the clamp",
+        "MC9": "Dam inverted around all teeth",
+        "MC10": "No large tears"
+      }
+    },
+    {
+      "id": 28,
+      "key": "FS-DDS",
+      "name": "DDS1 FS",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Correct surface preparation prior to placement",
+        "MC2": "Neat placement in fissure system"
+      }
+    },
+    {
+      "id": 42,
+      "key": "LOP-DDS",
+      "name": "Anterior Approximal Cavity Preparation",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Selective caries removal demonstrated: pulpal",
+        "MC2": "Selective caries removal demonstrated: peripheral surfaces",
+        "MC3": "Selective caries removal demonstrated: DEJ is caries-free",
+        "MC4": "Cavity outline reflects caries",
+        "MC5": "Cavity depth reflects caries",
+        "MC6": "Cavosurface enamel margins supported",
+        "MC7": "Internal surfaces smooth",
+        "MC8": "Adjacent teeth/surfaces: No iatrogenic damage"
+      }
+    },
+    {
+      "id": 43,
+      "key": "LOR-DDS",
+      "name": "Anterior Approximal Restoration",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Composite handling: Homogenous",
+        "MC2": "Surface finish smooth",
+        "MC3": "Margins: No deficiency",
+        "MC4": "Margins: No Excess",
+        "MC5": "No overhang",
+        "MC6": "Contact area recreated",
+        "MC7": "Tooth morphology resembles anatomy",
+        "MC8": "Adjacent teeth/surfaces: No iatrogenic damage"
+      }
+    },
+    {
+      "id": 31,
+      "key": "MAR-31-DDS",
+      "name": "DDS2 31 Mar Sim",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Isolates the tooth/teeth according to the patient and material choice",
+        "MC2": "Prepares cavity based on extent of caries or fracture, avoiding excessive loss or weakening of tooth structure",
+        "MC3": "Applies selective caries removal: avoids proximity to pulp",
+        "MC4": "Applies selective caries removal: clears DEJ of caries",
+        "MC5": "Creates smooth cavity preparation",
+        "MC6": "Reduces cusp/wall anatomically to allow full thickness of restorative material selected without excessive reduction",
+        "MC7": "Creates smooth surface and line angles",
+        "MC8": "This procedure was completed in timeframe expected for this timepoint in DDS2",
+        "MC9": "Able to complete this procedure with indirect supervision",
+        "MC10": "Places a stable matrix, according to tooth and patient factors, ensuring contact formation",
+        "MC11": "Follows bonding protocol specific to material selected",
+        "MC12": "Places restorative material generally free of voids, porosities or marginal deficiencies prior to polishing, according to manufacturer instructions.",
+        "MC13": "Recreates original occlusal and buccal/lingual morphology",
+        "MC14": "Recreates original marginal ridge morphology",
+        "MC15": "Establishes contact area(s)",
+        "MC16": "Ensures restoration is free of overhangs",
+        "MC17": "Finishes and polishes, ensuring restoration is free of bubbles and voids, surface is smooth & margins not detectable",
+        "MC18": "Restores incisal edge to anatomical proportions",
+        "MC19": "Restores incisal angle position and contour to anatomical proportions",
+        "MC20": "Maintains anatomical thickness of restored incisal angle(s) after finishing and polishing",
+        "MC21": "This procedure was completed in timeframe expected for this timepoint in DDS2",
+        "MC22": "Able to complete this procedure with indirect supervision",
+        "MC23": "Preserves hard and soft tissues: Avoids damage to adjacent tooth/teeth",
+        "MC24": "Preserves hard and soft tissues: Avoids damage to working tooth beyond preparation",
+        "MC25": "Preserves hard and soft tissues: Avoids damage to soft tissues",
+        "MC26": "Demonstrates safe management and disposal of sharps"
+      }
+    },
+    {
+      "id": 39,
+      "key": "SD-DDS",
+      "name": "DDS1 SS Direct",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Calcium hydroxide cement covers pulp exposure",
+        "MC2": "No material on enamel margins",
+        "MC3": "Calcium hydroxide completely covered by liner or base",
+        "MC4": "Neat and uniform application of liner or base covering pulpal caries (dye)",
+        "MC5": "Sufficient space for restorative material thickness"
+      }
+    },
+    {
+      "id": 41,
+      "key": "SGB-DDS",
+      "name": "DDS1 SS GIC Base",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "No material on enamel margins",
+        "MC2": "Thin and neat application covering caries (dye)",
+        "MC3": "Sufficient space for restorative material thickness"
+      }
+    },
+    {
+      "id": 40,
+      "key": "SGL-DDS",
+      "name": "DDS1 SS GIC Liner",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "No material on enamel margins",
+        "MC2": "Neat and uniform application covering pulpal caries (dye)"
+      }
+    },
+    {
+      "id": 29,
+      "key": "SOP-DDS",
+      "name": "DDS1 SmOcc Prep",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Selective caries removal demonstrated: pulpal",
+        "MC2": "Selective caries removal demonstrated: peripheral surfaces",
+        "MC3": "DEJ is caries free",
+        "MC4": "Cavity outline reflects extent of caries",
+        "MC5": "Cavity depth reflects extent of caries",
+        "MC6": "Cavosurface margins supported?",
+        "MC7": "Internal surfaces smooth",
+        "MC8": "Adjacent teeth/surfaces: no iatrogenic damage"
+      }
+    },
+    {
+      "id": 30,
+      "key": "SOR-DDS",
+      "name": "DDS1 SmOcc Resto",
+      "group": "Miscellaneous",
+      "fields": {
+        "MC1": "Composite handling: Homogenous",
+        "MC2": "Surface finish smooth",
+        "MC3": "Margins: No deficiency",
+        "MC4": "Margins: No excess",
+        "MC5": "Tooth morphology and contour resembles anatomy",
+        "MC6": "Adjacent teeth/surfaces: No iatrogenic damage"
+      }
+    }
+  ]
+}
