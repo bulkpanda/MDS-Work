@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Consensus-based Standard-Setting Poster</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;0,700;1,400;1,600&family=Source+Sans+3:ital,wght@0,300;0,400;0,600;1,300&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #f4f1eb;
+  font-family: 'Source Sans 3', sans-serif;
+  font-weight: 300;
+  color: #1a1a1a;
+  width: 1189px;
+  margin: 0 auto;
+}
+.poster {
+  width: 1189px;
+  min-height: 841px;
+  background: #faf8f4;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #d0ccc2;
+}
+
+/* HEADER */
+.header {
+  background: #085041;
+  color: #faf8f4;
+  padding: 24px 36px 20px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  border-bottom: 5px solid #1D9E75;
+}
+.title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 29px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: #faf8f4;
+  margin-bottom: 10px;
+}
+.title em { font-style: italic; font-weight: 600; }
+.authors { font-size: 13px; font-weight: 400; color: #9FE1CB; letter-spacing: 0.3px; margin-bottom: 3px; }
+.institution { font-size: 12px; font-weight: 300; color: #5DCAA5; }
+.header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; min-width: 150px; }
+.logo-box {
+  width: 76px; height: 76px;
+  border: 1.5px solid #5DCAA5; border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: #5DCAA5; text-align: center; line-height: 1.4;
+}
+.conference-tag {
+  background: #1D9E75; color: #faf8f4;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 1px;
+  text-transform: uppercase; padding: 4px 10px; border-radius: 2px;
+}
+
+/* BODY GRID */
+.body {
+  display: grid;
+  grid-template-columns: 310px 1fr 1fr;
+  flex: 1;
+}
+.col {
+  padding: 18px 18px 16px;
+  border-right: 1px solid #ddd9d0;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+.col:last-child { border-right: none; }
+
+/* SECTION */
+.section { display: flex; flex-direction: column; gap: 7px; }
+.section-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 14.5px; font-weight: 700;
+  color: #085041;
+  text-transform: uppercase; letter-spacing: 1.3px;
+  padding-bottom: 5px;
+  border-bottom: 2px solid #1D9E75;
+  display: flex; align-items: center; gap: 7px;
+}
+.section-num {
+  background: #085041; color: #faf8f4;
+  font-family: 'Source Sans 3', sans-serif;
+  font-size: 10.5px; font-weight: 600;
+  width: 20px; height: 20px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+.section p { font-size: 12px; line-height: 1.65; color: #2a2a2a; }
+.section p + p { margin-top: 5px; }
+
+/* AIM BOX */
+.aim-box {
+  background: #E1F5EE; border-left: 3px solid #1D9E75;
+  border-radius: 0 3px 3px 0; padding: 9px 11px;
+}
+.aim-box .aim-label {
+  font-size: 10px; font-weight: 600; color: #085041;
+  letter-spacing: 0.8px; text-transform: uppercase; margin-bottom: 3px;
+}
+.aim-box p { font-size: 11.5px; color: #0F6E56; line-height: 1.5; }
+
+/* STATS ROW */
+.stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; }
+.stat-card {
+  background: #f0ede7; border-radius: 3px;
+  padding: 9px 6px; text-align: center;
+  border: 1px solid #ddd9d0;
+}
+.stat-number {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 23px; font-weight: 700; color: #085041;
+  line-height: 1; margin-bottom: 3px;
+}
+.stat-label { font-size: 9.5px; color: #5F5E5A; line-height: 1.3; }
+
+/* METHODS STEPS */
+.method-step { display: flex; gap: 9px; align-items: flex-start; }
+.step-num {
+  background: #085041; color: #faf8f4;
+  font-size: 10px; font-weight: 600;
+  width: 18px; height: 18px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  margin-top: 1px;
+}
+.method-step p { font-size: 12px; line-height: 1.6; }
+
+/* SPECIMEN VISUAL */
+.specimen-visual {
+  background: #f0ede7; border-radius: 3px;
+  padding: 11px 14px;
+  display: flex; align-items: center; justify-content: space-around;
+  border: 1px solid #ddd9d0;
+}
+.tooth { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.tooth-count { font-size: 18px; font-family: 'Cormorant Garamond', serif; font-weight: 700; color: #085041; }
+.tooth-label { font-size: 10px; color: #5F5E5A; text-align: center; line-height: 1.3; }
+.specimen-divider { width: 1px; height: 46px; background: #ddd9d0; }
+
+/* CHARTS */
+.chart-wrap { background: #f7f5f1; border: 1px solid #ddd9d0; border-radius: 3px; padding: 12px 14px; }
+.chart-label {
+  font-size: 10px; font-weight: 600; color: #085041;
+  letter-spacing: 0.7px; text-transform: uppercase; margin-bottom: 8px;
+}
+.charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+/* RESULT ITEMS */
+.result-highlight {
+  background: #085041; color: #faf8f4;
+  border-radius: 3px; padding: 11px 14px;
+}
+.result-highlight .rh-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.8px;
+  text-transform: uppercase; color: #9FE1CB; margin-bottom: 5px;
+}
+.result-highlight p { font-size: 12px; color: #E1F5EE; line-height: 1.6; }
+
+.result-item {
+  display: flex; gap: 9px; align-items: flex-start;
+  padding: 7px 0; border-bottom: 1px solid #ddd9d0;
+}
+.result-item:last-child { border-bottom: none; }
+.result-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #1D9E75; flex-shrink: 0; margin-top: 5px;
+}
+.result-item p { font-size: 12px; line-height: 1.6; }
+
+/* PULL QUOTE */
+.pull-quote {
+  border-left: 3px solid #1D9E75; padding: 9px 12px;
+  background: #f0ede7; border-radius: 0 3px 3px 0;
+}
+.pull-quote p {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 13.5px; font-style: italic; font-weight: 600;
+  color: #085041; line-height: 1.5;
+}
+
+/* ACKNOWLEDGEMENTS */
+.acknowledgements {
+  background: #f0ede7; border-radius: 3px; padding: 9px 11px;
+  border-left: 3px solid #085041;
+}
+.acknowledgements p { font-size: 11px; line-height: 1.6; color: #4a4a4a; font-style: italic; }
+
+/* FOOTER */
+.footer {
+  background: #085041; padding: 9px 36px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-top: 3px solid #1D9E75;
+}
+.footer-text { font-size: 10.5px; color: #9FE1CB; }
+.footer-tags { display: flex; gap: 18px; }
+.footer-tag { font-size: 10px; font-weight: 600; color: #5DCAA5; letter-spacing: 0.4px; }
+
+/* DATA NOTE */
+.data-note {
+  font-size: 9.5px; color: #888780; font-style: italic;
+  margin-top: 4px; line-height: 1.4;
+}
+</style>
+</head>
+<body>
+<div class="poster">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div>
+      <div class="title">Consensus-based Standard-Setting in<br><em>Conservative Dentistry</em> Simulation</div>
+      <div class="authors">McNally · Wylie · Gupta · Patel</div>
+      <div class="institution">Melbourne Dental School &nbsp;|&nbsp; DDS2 Conservative Dentistry Program</div>
+    </div>
+    <div class="header-right">
+      <div class="logo-box">MDS<br>Logo</div>
+      <div class="conference-tag">Pilot Study · 2026</div>
+    </div>
+  </div>
+
+  <!-- THREE COLUMNS -->
+  <div class="body">
+
+    <!-- COL 1: Background + Aims -->
+    <div class="col">
+      <div class="section">
+        <div class="section-title"><span class="section-num">1</span>Background</div>
+        <p>Clinical educator interpretation and assessment of student work is known to differ widely. A shift to <strong style="font-weight:600;">programmatic assessment</strong> has heightened the impact of individual professional judgment on student progress.</p>
+        <p>This pilot applied an <strong style="font-weight:600;">assessment literacy and alignment process</strong> within the DDS2 Cons Dent simulation component to reduce the influence individual assessors have on student outcomes.</p>
+      </div>
+
+      <div class="section">
+        <div class="section-title"><span class="section-num">2</span>Aims &amp; Objectives</div>
+        <div class="aim-box">
+          <div class="aim-label">Primary Aim</div>
+          <p>Identify areas of difference among Cons Dent simulation educators and facilitate discussion to develop a <em>shared understanding of the expected standard.</em></p>
+        </div>
+        <div class="aim-box" style="margin-top:6px">
+          <div class="aim-label">Secondary Aim</div>
+          <p>Help clinical educators understand how their own professional interpretation of the checklist could influence student progress, supporting shared standard-setting.</p>
+        </div>
+      </div>
+
+      <!-- Key study stats -->
+      <div class="stats-row" style="grid-template-columns:repeat(2,1fr);">
+        <div class="stat-card">
+          <div class="stat-number">11</div>
+          <div class="stat-label">Clinical<br>educators</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number">10</div>
+          <div class="stat-label">Typodent<br>stations</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number">21</div>
+          <div class="stat-label">Checklist<br>items</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number">DDS2</div>
+          <div class="stat-label">Student<br>cohort</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- COL 2: Methods -->
+    <div class="col">
+      <div class="section">
+        <div class="section-title"><span class="section-num">3</span>Methods</div>
+
+        <div class="specimen-visual">
+          <div class="tooth">
+            <svg width="32" height="38" viewBox="0 0 34 40" fill="none">
+              <rect x="6" y="2" width="22" height="18" rx="3" fill="#1D9E75" opacity="0.25" stroke="#085041" stroke-width="1.5"/>
+              <rect x="9" y="20" width="7" height="17" rx="2" fill="#9FE1CB" stroke="#085041" stroke-width="1.2"/>
+              <rect x="18" y="20" width="7" height="17" rx="2" fill="#9FE1CB" stroke="#085041" stroke-width="1.2"/>
+            </svg>
+            <div class="tooth-count">10</div>
+            <div class="tooth-label">Posterior carious<br>teeth (Nissin)</div>
+          </div>
+          <div class="specimen-divider"></div>
+          <div class="tooth">
+            <svg width="32" height="38" viewBox="0 0 34 40" fill="none">
+              <path d="M17 3 C8 3 4 12 6 22 C8 30 12 37 17 37 C22 37 26 30 28 22 C30 12 26 3 17 3Z" fill="#1D9E75" opacity="0.25" stroke="#085041" stroke-width="1.5"/>
+              <circle cx="22" cy="8" r="4" fill="#9FE1CB" stroke="#085041" stroke-width="1.2"/>
+            </svg>
+            <div class="tooth-count">10</div>
+            <div class="tooth-label">Anterior + incisal<br>angle composite</div>
+          </div>
+          <div class="specimen-divider"></div>
+          <div class="tooth">
+            <svg width="32" height="38" viewBox="0 0 34 40" fill="none">
+              <rect x="4" y="8" width="26" height="24" rx="2" fill="#9FE1CB" opacity="0.4" stroke="#085041" stroke-width="1.3"/>
+              <rect x="8" y="12" width="7" height="7" rx="1" fill="#085041" opacity="0.3"/>
+              <rect x="19" y="12" width="7" height="7" rx="1" fill="#085041" opacity="0.3"/>
+              <rect x="8" y="22" width="7" height="7" rx="1" fill="#085041" opacity="0.3"/>
+              <rect x="19" y="22" width="7" height="7" rx="1" fill="#085041" opacity="0.3"/>
+            </svg>
+            <div class="tooth-count">11</div>
+            <div class="tooth-label">Assessors<br>per station</div>
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:9px;">
+          <div class="method-step">
+            <div class="step-num">1</div>
+            <p>Ten Nissin typodents assembled with adjacent teeth (11, 13, 15) from the same anonymous examination submissions to highlight iatrogenic damage, anatomy and contact points.</p>
+          </div>
+          <div class="method-step">
+            <div class="step-num">2</div>
+            <p>Each assessor pair's scores were compared item-by-item within each station. Pairs differing by <strong style="font-weight:600;">≥2 levels</strong> on a 5-point scale (0–4) were flagged as a disagreement.</p>
+          </div>
+          <div class="method-step">
+            <div class="step-num">3</div>
+            <p>Flagged items were <strong style="font-weight:600;">discussed in real time</strong> as a structured standard-setting process, surfacing underlying lenient and strict tendencies.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Disagreement severity chart + donut side by side -->
+      <div class="section">
+        <div class="section-title"><span class="section-num">4</span>Disagreement Analysis</div>
+        <div class="charts-row">
+          <div class="chart-wrap">
+            <div class="chart-label">Top items · flagged pairs</div>
+            <svg viewBox="0 0 307 260" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:307px">
+<style>.bl{font-size:10px;font-family:sans-serif;fill:#1a1a1a}.bv{font-size:9.5px;font-family:sans-serif;fill:#085041;font-weight:600}</style>
+<text x="38" y="23" text-anchor="end" class="bl">MC20</text>
+<rect x="42" y="10" width="215" height="17" rx="2" fill="#1D9E75" opacity="1.00"/>
+<text x="261" y="23" class="bv">251</text>
+<text x="38" y="47" text-anchor="end" class="bl">MC6</text>
+<rect x="42" y="34" width="167" height="17" rx="2" fill="#1D9E75" opacity="0.94"/>
+<text x="213" y="47" class="bv">195</text>
+<text x="38" y="71" text-anchor="end" class="bl">MC19</text>
+<rect x="42" y="58" width="164" height="17" rx="2" fill="#1D9E75" opacity="0.88"/>
+<text x="210" y="71" class="bv">192</text>
+<text x="38" y="95" text-anchor="end" class="bl">MC3</text>
+<rect x="42" y="82" width="157" height="17" rx="2" fill="#1D9E75" opacity="0.82"/>
+<text x="203" y="95" class="bv">184</text>
+<text x="38" y="119" text-anchor="end" class="bl">MC17</text>
+<rect x="42" y="106" width="148" height="17" rx="2" fill="#1D9E75" opacity="0.76"/>
+<text x="194" y="119" class="bv">173</text>
+<text x="38" y="143" text-anchor="end" class="bl">MC12</text>
+<rect x="42" y="130" width="128" height="17" rx="2" fill="#1D9E75" opacity="0.70"/>
+<text x="174" y="143" class="bv">150</text>
+<text x="38" y="167" text-anchor="end" class="bl">MC10</text>
+<rect x="42" y="154" width="125" height="17" rx="2" fill="#1D9E75" opacity="0.64"/>
+<text x="171" y="167" class="bv">146</text>
+<text x="38" y="191" text-anchor="end" class="bl">MC13</text>
+<rect x="42" y="178" width="118" height="17" rx="2" fill="#1D9E75" opacity="0.58"/>
+<text x="164" y="191" class="bv">138</text>
+<text x="38" y="215" text-anchor="end" class="bl">MC16</text>
+<rect x="42" y="202" width="116" height="17" rx="2" fill="#1D9E75" opacity="0.52"/>
+<text x="162" y="215" class="bv">136</text>
+<text x="38" y="239" text-anchor="end" class="bl">MC15</text>
+<rect x="42" y="226" width="114" height="17" rx="2" fill="#1D9E75" opacity="0.46"/>
+<text x="160" y="239" class="bv">134</text>
+</svg>
+            <p class="data-note">Flagged = assessor pair differs ≥2 levels (0–4 scale), within-station only</p>
+          </div>
+
+          <div class="chart-wrap">
+            <div class="chart-label">Disagreement severity</div>
+            <svg viewBox="0 0 230 140" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:230px">
+<path d="M 68.00 10.00 A 58 58 0 1 1 12.13 83.56 L 35.25 77.12 A 34 34 0 1 0 68.00 34.00 Z" fill="#1D9E75"/>
+<path d="M 11.99 83.08 A 58 58 0 0 1 45.60 14.50 L 54.87 36.64 A 34 34 0 0 0 35.17 76.84 Z" fill="#085041"/>
+<path d="M 46.07 14.31 A 58 58 0 0 1 67.49 10.00 L 67.70 34.00 A 34 34 0 0 0 55.14 36.52 Z" fill="#9FE1CB"/>
+<rect x="138" y="28" width="10" height="10" rx="2" fill="#1D9E75"/>
+<text x="152" y="37" style="font-size:10px;font-family:sans-serif;fill:#1a1a1a">2-level diff: 71%</text>
+<rect x="138" y="48" width="10" height="10" rx="2" fill="#085041"/>
+<text x="152" y="57" style="font-size:10px;font-family:sans-serif;fill:#1a1a1a">3-level diff: 23%</text>
+<rect x="138" y="68" width="10" height="10" rx="2" fill="#9FE1CB"/>
+<text x="152" y="77" style="font-size:10px;font-family:sans-serif;fill:#1a1a1a">4-level diff: 6%</text>
+<text x="68" y="62" text-anchor="middle" style="font-size:11px;font-family:sans-serif;fill:#085041;font-weight:700">2,933</text>
+<text x="68" y="75" text-anchor="middle" style="font-size:8px;font-family:sans-serif;fill:#5F5E5A">flagged pairs</text>
+</svg>
+            <p class="data-note">MC19 showed highest avg diff (2.67). MC20 was present across all 10 stations.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- COL 3: Results + Discussion -->
+    <div class="col">
+      <div class="section">
+        <div class="section-title"><span class="section-num">5</span>Results</div>
+
+        <div class="result-highlight">
+          <div class="rh-label">Key Discrepancies Identified</div>
+          <p>Across 10 typodent stations and 11 educators, <strong style="font-weight:600;color:#faf8f4;">2,933 flagged assessor-pair disagreements</strong> were recorded. All 21 checklist items generated disagreements at ≥2 levels.</p>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:0;">
+          <div class="result-item">
+            <div class="result-dot"></div>
+            <p><strong style="font-weight:600;">Excessively deep preparations</strong> — educators held divergent views on severity. MC20 generated the highest total (251 flagged pairs across all 10 stations), indicating a systemically contested item.</p>
+          </div>
+          <div class="result-item">
+            <div class="result-dot"></div>
+            <p><strong style="font-weight:600;">Residual caries near the dentinoenamel junction (DEJ)</strong> — MC19 showed the highest average score difference (2.67), reflecting wide individual variation in threshold expectations.</p>
+          </div>
+          <div class="result-item">
+            <div class="result-dot"></div>
+            <p><strong style="font-weight:600;">29% of disagreements spanned ≥3 levels</strong> (3- or 4-level difference), indicating not merely marginal but substantive divergence between some educator pairs.</p>
+          </div>
+          <div class="result-item">
+            <div class="result-dot"></div>
+            <p>Structured discussion promoted open exploration of individual standards, leading to a <strong style="font-weight:600;">softening of overly lenient or overly critical judgements</strong> and convergence toward a shared benchmark.</p>
+          </div>
+        </div>
+
+        <div class="pull-quote">
+          <p>"Preliminary data reveals an improvement in alignment and consistency in grading across all stations."</p>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title"><span class="section-num">6</span>Discussion</div>
+        <p>This pilot with <strong style="font-weight:600;">11 educators</strong> across 10 stations demonstrates that structured standard-setting exercises can surface and reduce significant inter-rater variability before it impacts student outcomes. The breadth of disagreements — spanning all 21 items — underscores that variance is not confined to a few ambiguous criteria.</p>
+        <p>Formal evaluation will be completed at the end of the component in <strong style="font-weight:600;">mid-June 2026.</strong> The approach will be expanded to incorporate the <strong style="font-weight:600;">whole simulation program</strong> at Melbourne Dental School.</p>
+      </div>
+
+      <div class="section">
+        <div class="section-title"><span class="section-num">7</span>Acknowledgements</div>
+        <div class="acknowledgements">
+          <p>The Cons Dent teaching team for engaging in this process and continuing to work towards a shared understanding of the MDS standard and the student experience.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <div class="footer-text">DDS2 Conservative Dentistry · Simulation Program · Melbourne Dental School · 2026</div>
+    <div class="footer-tags">
+      <span class="footer-tag">Assessment Literacy</span>
+      <span class="footer-tag">Standard Setting</span>
+      <span class="footer-tag">Programmatic Assessment</span>
+      <span class="footer-tag">Inter-Rater Reliability</span>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

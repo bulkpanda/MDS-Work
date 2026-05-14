@@ -23,8 +23,11 @@ from reportlab.platypus import Paragraph, Spacer, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from PyPDF2 import PdfReader, PdfWriter
+from reportlab.lib.enums import TA_CENTER
 import datetime
 from dateutil import parser
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase import pdfmetrics
 from itertools import combinations
 # For data cleaning and preprocessing
 
@@ -1422,7 +1425,8 @@ def aggregator(dfGuttman, mcCols, colCE=None, colCEReason=None, colComments: lis
 
 
 def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [], 
-            tableTextStyle = variableUtils.tableTextStyle, topPadding = 12, bottomPadding = 12, cellHighlight = False, headerColor = '#9C27B0', titleStyle = variableUtils.subsubheadingStyle):
+            tableTextStyle = variableUtils.tableTextStyle, topPadding = 12, bottomPadding = 12, cellHighlight = False, headerColor = '#9C27B0', titleStyle = variableUtils.subsubheadingStyle,
+            headerTextColor = '#FFFFFF', pageSize = variableUtils.pageSize):
     print(f'Creating table for {title}')
     if df.empty:
         table = Paragraph("No data found", variableUtils.subsubheadingStyle)
@@ -1435,7 +1439,7 @@ def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [],
                 data[i][j] = Paragraph(str(data[i][j]), tableTextStyle)
         
         if colRatio is not None:
-            colWidths = [ratio/sum(colRatio) * variableUtils.pageSize[0] * tableWidth for ratio in colRatio]
+            colWidths = [ratio/sum(colRatio) * pageSize[0] * tableWidth for ratio in colRatio]
         else:
             colWidths = [1 for i in range(len(df.columns))] # Equal column widths
         # print(f'Column widths: {colWidths}')
@@ -1443,7 +1447,7 @@ def createTable(df, title, colRatio:list, tableWidth = 0.9, customTextCols = [],
         # print(data)
         table_style = TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(headerColor)),  # Header row
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#FFFFFF')),  # Header text
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor(headerTextColor)),  # Header text
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),  # Center align all cells
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),  # Center align all cells
             ('GRID', (0, 0), (-1, -1), 1, colors.black),  # Add border around cells
@@ -1560,9 +1564,8 @@ def createPlotImage(fig):
         buf.seek(0)
         return buf
 
-def addPlotImage(fig, ratio = None):
+def addPlotImage(fig, ratio = None, pageSize = variableUtils.pageSize):
         plotImage = createPlotImage(fig)
-        pageSize = variableUtils.pageSize
         topMargin = variableUtils.topMargin
         bottomMargin = variableUtils.bottomMargin
         leftMargin = variableUtils.leftMargin
@@ -1615,3 +1618,101 @@ def cleanEntry(codeList):
             
             first = False
     return validCodes
+
+
+pdfmetrics.registerFont(TTFont('Arial', 'arial.ttf'))
+
+
+pdfmetrics.registerFont(TTFont('Calibri-Bold', 'calibrib.ttf'))  # Bold version
+
+class BannerDrawer:
+    def __init__(self, firstLine, secondLine, bannerWidth = None, bannerHeight=132, bgColor = '#010d44', topOffset=72, lineSpacing=36, leftMargin=36):
+        self.firstLine = firstLine
+        self.secondLine = secondLine
+        self.bannerWidth = bannerWidth
+        self.bannerHeight = bannerHeight
+        self.bgColor = bgColor
+        self.topOffset = topOffset
+        self.lineSpacing = lineSpacing
+        self.leftMargin = leftMargin  # can replace variableUtils.leftMargin
+
+    def __call__(self, canvas, doc):
+        canvas.saveState()
+
+        pageWidth, pageHeight = doc.pagesize
+        if self.bannerWidth is None:
+            self.bannerWidth = pageWidth
+        canvas.setFillColor(colors.HexColor(self.bgColor))
+        # calculate x and y pos to make it centered
+        x = (pageWidth - self.bannerWidth) / 2
+        y = pageHeight - self.bannerHeight
+        canvas.rect(x, y, self.bannerWidth, self.bannerHeight, fill=1, stroke=0)
+
+        # Draw text
+        canvas.setFillColor(colors.white)
+        try:
+            canvas.setFont("Calibri-Bold", 30)
+        except:
+            canvas.setFont("Helvetica-Bold", 30)
+        canvas.drawString(self.leftMargin, pageHeight - self.topOffset, self.firstLine)
+
+        try:
+            canvas.setFont("Calibri-Bold", 24)
+        except:
+            canvas.setFont("Helvetica-Bold", 24)
+        canvas.drawString(self.leftMargin, pageHeight - self.topOffset - self.lineSpacing, self.secondLine)
+
+        canvas.restoreState()
+
+def getBannerDrawer( firstline, secondline):
+    def drawBanner(canvas, doc):
+        canvas.saveState()
+
+        # Banner layout
+        pageWidth, pageHeight = doc.pagesize
+        bannerHeight = 132
+        canvas.setFillColor(colors.HexColor("#010d44"))
+        canvas.rect(0, pageHeight - bannerHeight, pageWidth, bannerHeight, fill=1, stroke=0)
+
+        # Text: internal margin from left and top
+        textLeftMargin = variableUtils.leftMargin
+        topOffset = 72  # Distance from top of banner to first text line
+        lineSpacing = 36
+
+        try:
+            canvas.setFont("Calibri-Bold", 30)
+        except:
+            canvas.setFont("Helvetica-Bold", 30)  # Fallback
+
+        canvas.setFillColor(colors.white)
+        canvas.drawString(textLeftMargin, pageHeight - topOffset, f"{firstline}")
+        try:
+            canvas.setFont("Calibri-Bold", 24)
+        except:
+            canvas.setFont("Helvetica-Bold", 24)  # Fallback        
+        
+        canvas.drawString(textLeftMargin, pageHeight - topOffset - lineSpacing, f"{secondline}")
+
+        canvas.restoreState()
+
+    return drawBanner
+
+
+def getmodeArgs(filepath):
+        if os.path.exists(filepath):
+            mode = 'a'  # append mode for existing files
+            if_sheet_exists = 'replace'
+        else:
+            mode = 'w'  # write mode for new files
+            if_sheet_exists = None  # Don't specify if_sheet_exists for new files
+
+        # Create ExcelWriter with appropriate parameters
+        writer_kwargs = {
+            'engine': 'openpyxl',
+            'mode': mode
+        }
+        
+        # Only add if_sheet_exists for append mode
+        if mode == 'a':
+            writer_kwargs['if_sheet_exists'] = if_sheet_exists
+        return writer_kwargs

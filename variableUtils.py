@@ -113,7 +113,7 @@ figSize = (pageSize[0] / 100, pageSize[1] / 100)
 leftMargin = 0.5* inch
 rightMargin = 0.5 * inch
 topMargin = 1 * inch
-bottomMargin = 0 * inch
+bottomMargin = 1 * inch
 
 # Define the styles for the headings
 styles = getSampleStyleSheet()
@@ -121,6 +121,7 @@ styles.add(ParagraphStyle(name='Center', alignment=1))  # Center alignment
 headingStyle = ParagraphStyle('Heading1', parent=styles['Heading1'], fontSize=32, alignment=1)  # Centered
 heading2Style = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=28, alignment=1)  # Centered
 subheadingStyle = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=24, alignment=1)  # Centered
+subheadingStyleL = ParagraphStyle('Heading2', parent=styles['Heading2'], fontSize=24, alignment=0)  # Left aligned
 subsubheadingStyle = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=1)  # Centered
 subsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=20, alignment=0)  # left aligned
 smallsubsubheadingStyleL = ParagraphStyle('Heading3', parent=styles['Heading3'], fontSize=13, alignment=0)  # Left aligned
@@ -134,3 +135,15 @@ tableTextStyleSmall= ParagraphStyle('SmallFont', parent=styles['Normal'], fontSi
 tableTextStyleLarge = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=15, alignment=1, leading=20)
 Checklistcolors = {'Yes': 'blue', 'No': 'orange', 'Not Reviewed': 'lightgrey'}
 # Set the colorblind-friendly palette
+
+
+bannerHeadingStyle = ParagraphStyle(
+    name='BannerHeading',
+    fontName='Helvetica-Bold',  # ensures actual bold
+    fontSize=18,
+    textColor='white',
+    alignment=0,
+    leading=22,
+    spaceAfter=0,
+    spaceBefore=0
+)

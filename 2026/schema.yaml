@@ -1,0 +1,498 @@
+# schema.yaml
+# Source-of-truth for table/column names + types + JSONB structures.
+# Uses YAML anchors so common columns are defined once.
+
+types:
+  bigint: &bigint BIGINT
+  text: &text TEXT
+  bool: &bool BOOLEAN
+  timestamptz: &timestamptz TIMESTAMPTZ
+  int: &int INT
+  jsonb: &jsonb JSONB
+
+commonColumns: &commonColumns
+  assessmentId: { name: assessmentid, sqlType: *bigint }
+  formCode: { name: form_code, sqlType: *text }
+  cohort: { name: cohort, sqlType: *text }
+  subject: { name: subject, sqlType: *text }
+  type_: { name: type, sqlType: *text }
+  completed: { name: completed, sqlType: *bool, nullable: true }
+  datetimeUtc: { name: datetimeutc, sqlType: *timestamptz }
+
+  studentNumber: { name: student_number, sqlType: *bigint }
+  studentName: { name: student_name, sqlType: *text }
+  studentEmail: { name: student_email, sqlType: *text }
+
+  version: { name: version, sqlType: *int, nullable: true }
+  clinic: { name: clinic, sqlType: *text, nullable: true }
+
+  assessorId: { name: assessorid, sqlType: *bigint, nullable: true }
+  assessorName: { name: assessor_name, sqlType: *text, nullable: true }
+
+  submittedByStudent: { name: submitted_by_student, sqlType: *bool, nullable: true }
+  submittedByAssessor: { name: submitted_by_assessor, sqlType: *bool, nullable: true }
+
+  insertedAt: { name: insertedat, sqlType: *timestamptz, nullable: true }
+
+
+tables:
+  dds4_boh3_forms:
+    description: "Combined DDS4 + BOH3 forms (CAF) flattened + JSONB payloads"
+    columns:
+      <<: *commonColumns
+      createdAt: { name: createdat, sqlType: *timestamptz, nullable: true }
+      updatedAt: { name: updatedat, sqlType: *timestamptz, nullable: true }
+      externalClinic: { name: external_clinic, sqlType: *text, nullable: true }
+      additionalConcerns: { name: additional_concerns, sqlType: *text, nullable: true }
+      rotation: { name: rotation, sqlType: *text, nullable: true }
+      
+      patientData:
+        name: patient_data
+        sqlType: *jsonb
+        nullable: true
+        kind: list
+        items:
+          kind: object
+          keys:
+            id: { type: text }
+            itemCodes:
+              kind: list
+              items:
+                kind: object
+                keys:
+                  code: { type: text }
+                  category: { type: text }
+                  quantity: { type: int }
+                  description: { type: text }
+            patientAge: { type: text }
+            visitNumber: { type: text }
+            priorityGroup: { type: text }
+            priorityGroupOptions:
+              kind: list
+              items: { type: text }
+      
+      studentData:
+        name: student_data
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+        keys:
+          texts:
+            kind: object
+            keys:
+              reflection: { type: text }
+          scales:
+            kind: object
+            keys:
+              scale-practice-readiness:
+                kind: object
+                keys:
+                  scale: { type: text }
+          checklists:
+            kind: object
+            keys:
+              checklist-caf-final-eval:
+                kind: object
+                keys:
+                  MC1: { type: text }
+                  MC2: { type: text }
+                  MC3: { type: text }
+                  MC4: { type: text }
+                  MC5: { type: text }
+                  MC6: { type: text }
+                  MC7: { type: text }
+          multi-select:
+            kind: object
+            keys: {}
+      
+      assessorData:
+        name: assessor_data
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+        keys:
+          texts: { kind: object, keys: {} }
+          scales:
+            kind: object
+            keys:
+              scale-entrustment:
+                kind: object
+                keys:
+                  scale: { type: text }
+          checklists: { kind: object, keys: {} }
+          multi-select:
+            kind: object
+            keys:
+              strengths:
+                kind: list
+                items:
+                  kind: object
+                  keys:
+                    name: { type: text }
+                    value: { type: text }
+              weakness-other:
+                kind: list
+                items:
+                  kind: object
+                  keys:
+                    name: { type: text }
+                    value: { type: text }
+              weakness-timeliness:
+                kind: list
+                items:
+                  kind: object
+                  keys:
+                    name: { type: text }
+                    value: { type: text }
+              weakness-knowledge-clinical-reasoning:
+                kind: list
+                items:
+                  kind: object
+                  keys:
+                    name: { type: text }
+                    value: { type: text }
+
+      studentConfig:
+        name: student_config
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+        keys:
+          scales:
+            kind: object
+            keys:
+              scale-practice-readiness:
+                kind: object
+                keys:
+                  name: { type: text } # Readiness to Practice
+                  fields: { kind: object, keys: {} } # S1: <full name>, S2: <full name> etc
+                  description: { type: text }
+          checklists:
+            kind: object
+            keys:
+              checklist-caf-final-eval:
+                kind: object
+                keys:
+                  name: { type: text } # Student Evaluation
+                  fields: { kind: object, keys: {} } # MC1: <full name>, MC2: <full name> etc
+                  extra_config: 
+                    kind: object
+                    keys: 
+                      headers:
+                        kind: object
+                        keys: {} # MC1: <header name>, MC2: <header name> etc 
+
+      # assessorConfig (for dds4_boh3_forms.assessor_config)
+
+      assessorConfig:
+        name: assessor_config
+        sqlType: JSONB
+        nullable: true
+        kind: object
+        keys:
+          multi:
+            kind: object
+            keys:
+              strengths:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. STR1..STR7
+                        title: { type: text }    # domain header
+                        value: { type: text }    # description text
+
+              clinical-incident:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. CI1..CI17
+                        value: { type: text }    # label
+
+              weakness-timeliness:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. TL1..TL3
+                        value: { type: text }
+
+              weakness-communication:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. CM1..CM3
+                        value: { type: text }
+
+              weakness-risk-management:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. RM1..RM7
+                        value: { type: text }
+
+              weakness-technical-skills:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. TS1..TS5
+                        value: { type: text }
+
+              weakness-person-centered-care:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. PC1..PC4
+                        value: { type: text }
+
+              weakness-professional-behaviour:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. PB1..PB5
+                        value: { type: text }
+
+              weakness-knowledge-clinical-reasoning:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: list
+                    items:
+                      kind: object
+                      keys:
+                        name: { type: text }     # e.g. KC1..KC5
+                        value: { type: text }
+
+          scales:
+            kind: object
+            keys:
+              scale-entrustment:
+                kind: object
+                keys:
+                  name: { type: text }
+                  fields:
+                    kind: object
+                    keys:
+                      S1: { type: text }
+                      S2: { type: text }
+                      S3: { type: text }
+                      S4: { type: text }
+                  description: { type: text }
+
+
+  raw_form_forms:
+    description: "Flattened form-level rows with student/assessor JSONB payloads and reflections"
+    columns:
+      <<: *commonColumns
+
+      formCode: { name: form_code, sqlType: *text, nullable: true }
+
+      studentData:
+        name: student_data
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+        # dynamic form instance keys like:
+        # "2026-Week-1", "DDS2-PIP", etc.
+        patternKeys:
+          ".*":
+            kind: object
+            patternProperties:
+              "^MC\\d+$":
+                type: text
+                nullable: true
+
+      assessorData:
+        name: assessor_data
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+        patternKeys:
+          ".*":
+            kind: object
+            patternProperties:
+              "^MC\\d+$":
+                type: text
+                nullable: true
+        keys:
+          scale-time-mgmt:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-communication:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-global-rating:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-professionalism:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-practice-readiness:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-position-ergonomics:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-consent:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-record-keeping:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-infection-control:
+            kind: object
+            keys:
+              scale: { type: text }
+          scale-patient-complexity:
+            kind: object
+            keys:
+              scale: { type: text }
+
+      studentReflection: { name: student_reflection, sqlType: *text, nullable: true }
+      assessorReflection: { name: assessor_reflection, sqlType: *text, nullable: true }
+      clinicalIncident: { name: clinical_incident, sqlType: *text, nullable: true }
+
+      patientComplexity: { name: patient_complexity, sqlType: *text, nullable: true }
+      role: { name: role, sqlType: *text, nullable: true }
+
+      # raw_form_forms.columns.scales
+      scales:
+        name: scales
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+
+        # dynamic keys like "scale-consent", "scale-time-mgmt", etc.
+        patternKeys:
+          "^scale-.*$":
+            kind: object
+            keys:
+              name: { type: text, nullable: true }
+
+              # fields is a dict: keys can be "1","2","3","4","5" OR "complex"/"non-complex", etc.
+              fields:
+                kind: object
+                patternKeys:
+                  ".*":
+                    type: text
+                    nullable: true
+
+              # not always present, but common in some configs
+              description: { type: text, nullable: true }
+
+        # raw_form_forms.columns.checklists
+        checklists:
+          name: checklists
+          sqlType: *jsonb
+          nullable: true
+          kind: object
+
+          # dynamic checklist codes like "015", "799-DPI", "2026-Week-1", etc.
+          patternKeys:
+            ".*":
+              kind: object
+              keys:
+                name: { type: text, nullable: true }
+
+                # MC keys are dynamic (MC1..MCN)
+                fields:
+                  kind: object
+                  patternProperties:
+                    "^MC\\d+$":
+                      type: text
+                      nullable: true
+
+                extra_config:
+                  kind: object
+                  nullable: true
+                  keys:
+                    headers:
+                      kind: object
+                      nullable: true
+                      # keys like "MC1", "MC6" etc; values are list of objects with {title}
+                      patternKeys:
+                        "^MC\\d+$":
+                          kind: list
+                          items:
+                            kind: object
+                            keys:
+                              title: { type: text, nullable: true }
+
+                    options:
+                      kind: object
+                      nullable: true
+                      keys:
+                        student:
+                          kind: object
+                          nullable: true
+                          patternKeys:
+                            "^O\\d+$":
+                              type: text
+                              nullable: true
+                        assessor:
+                          kind: object
+                          nullable: true
+                          patternKeys:
+                            "^O\\d+$":
+                              type: text
+                              nullable: true
+
+      additionalChecklists:
+        name: additional_checklists
+        sqlType: *jsonb
+        nullable: true
+        kind: object
+        keys: {}
+
+      version: { name: version, sqlType: *int, nullable: true }
+      patientAge: { name: patient_age, sqlType: *int, nullable: true }
+      patientDrn: { name: patient_drn, sqlType: *text, nullable: true }
+      patientDetails: { name: patient_details, sqlType: *text, nullable: true }
+      patientInterpreter: { name: patient_interpreter, sqlType: *bool, nullable: true }

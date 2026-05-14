@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Consensus-based Standard-Setting – MDS Poster</title>
+<link href="https://fonts.googleapis.com/css2?family=Merriweather:ital,wght@0,400;0,700;1,400&family=Source+Sans+3:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+
+/* ── UoM palette ─────────────────────────────────────────── */
+:root{
+  --blue:    #033F85;
+  --blue-dk: #022660;
+  --blue-md: #1A5BA8;
+  --blue-lt: #5B8EC4;
+  --blue-pl: #C4D8F0;
+  --blue-xs: #EBF2FA;
+  --dkgrey:  #9BA2AB;
+  --ltgrey:  #E3E6E6;
+  --offwhite:#F7F9FC;
+  --text:    #1A1A2E;
+}
+
+body{
+  font-family:'Source Sans 3',sans-serif;
+  font-weight:300;
+  color:var(--text);
+  width:1189px;
+  margin:0 auto;
+  background:#dde4ed;
+}
+
+.poster{
+  width:1189px;
+  background:var(--offwhite);
+  display:flex;
+  flex-direction:column;
+}
+
+/* ── HEADER ─────────────────────────────────────────────── */
+.header{
+  background:var(--blue);
+  padding:0;
+  display:flex;
+  position:relative;
+  overflow:hidden;
+  min-height:118px;
+}
+.header-deco{
+  position:absolute;inset:0;
+  pointer-events:none;
+}
+.header-content{
+  position:relative;z-index:2;
+  flex:1;
+  display:flex;align-items:flex-start;justify-content:space-between;
+  padding:22px 36px 18px;
+  gap:24px;
+}
+.header-left{flex:1}
+.title{
+  font-family:'Merriweather',serif;
+  font-size:26px;font-weight:700;
+  line-height:1.25;color:#fff;
+  margin-bottom:10px;letter-spacing:-0.2px;
+}
+.title em{font-style:italic;color:var(--blue-pl)}
+.authors{font-size:13px;font-weight:400;color:var(--blue-pl);margin-bottom:3px;}
+.institution{font-size:12px;font-weight:300;color:var(--blue-lt)}
+.header-right{
+  display:flex;flex-direction:column;align-items:flex-end;gap:9px;min-width:140px;
+}
+.logo-box{
+  width:74px;height:74px;
+  border:1.5px solid var(--blue-lt);border-radius:3px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:10px;color:var(--blue-pl);text-align:center;line-height:1.4;
+}
+.conf-tag{
+  background:var(--blue-md);color:#fff;
+  font-size:10px;font-weight:600;letter-spacing:1px;
+  text-transform:uppercase;padding:3px 10px;border-radius:2px;
+}
+
+/* ── BODY ─────────────────────────────────────────────── */
+.body{
+  display:grid;
+  grid-template-columns:290px 1fr 1fr;
+  flex:1;
+}
+.col{
+  padding:16px 17px;
+  border-right:1px solid var(--ltgrey);
+  display:flex;flex-direction:column;gap:14px;
+}
+.col:last-child{border-right:none}
+
+/* ── SECTION ─────────────────────────────────────────── */
+.section{display:flex;flex-direction:column;gap:7px}
+.sec-head{
+  font-family:'Merriweather',serif;
+  font-size:13px;font-weight:700;
+  color:var(--blue);text-transform:uppercase;letter-spacing:1.2px;
+  padding-bottom:5px;
+  border-bottom:2px solid var(--blue);
+  display:flex;align-items:center;gap:7px;
+}
+.sec-num{
+  background:var(--blue);color:#fff;
+  font-family:'Source Sans 3',sans-serif;
+  font-size:10px;font-weight:600;
+  width:19px;height:19px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.section p{font-size:11.5px;line-height:1.65;color:#2a2a2e}
+.section p+p{margin-top:5px}
+
+/* ── AIM BOX ─────────────────────────────────────────── */
+.aim-box{
+  background:var(--blue-xs);
+  border-left:3px solid var(--blue);
+  border-radius:0 3px 3px 0;
+  padding:8px 11px;
+}
+.aim-label{
+  font-size:9.5px;font-weight:600;color:var(--blue);
+  letter-spacing:0.8px;text-transform:uppercase;margin-bottom:3px;
+}
+.aim-box p{font-size:11px;color:var(--blue-md);line-height:1.5}
+
+/* ── STAT CARDS ──────────────────────────────────────── */
+.stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px}
+.stat-card{
+  background:#fff;border:1px solid var(--ltgrey);border-radius:4px;
+  padding:9px 8px;text-align:center;
+  border-top:3px solid var(--blue);
+}
+.stat-num{
+  font-family:'Merriweather',serif;
+  font-size:22px;font-weight:700;color:var(--blue);line-height:1;margin-bottom:3px;
+}
+.stat-lbl{font-size:9.5px;color:var(--dkgrey);line-height:1.3}
+
+/* ── CHART CARD ──────────────────────────────────────── */
+.chart-card{
+  background:#fff;border:1px solid var(--ltgrey);border-radius:4px;padding:11px 13px;
+}
+.chart-title{
+  font-size:9.5px;font-weight:600;color:var(--blue);
+  letter-spacing:0.6px;text-transform:uppercase;margin-bottom:8px;
+}
+.chart-note{font-size:9px;color:var(--dkgrey);font-style:italic;margin-top:5px;line-height:1.4}
+.charts-row{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+
+/* ── RESULT ITEMS ────────────────────────────────────── */
+.result-banner{
+  background:var(--blue);color:#fff;
+  border-radius:4px;padding:10px 14px;
+}
+.result-banner .rb-label{
+  font-size:9px;font-weight:600;letter-spacing:0.8px;
+  text-transform:uppercase;color:var(--blue-pl);margin-bottom:4px;
+}
+.result-banner p{font-size:11.5px;color:var(--blue-xs);line-height:1.6}
+
+.result-item{
+  display:flex;gap:8px;align-items:flex-start;
+  padding:6px 0;border-bottom:1px solid var(--ltgrey);
+}
+.result-item:last-child{border-bottom:none}
+.dot{
+  width:6px;height:6px;border-radius:50%;
+  background:var(--blue);flex-shrink:0;margin-top:5px;
+}
+.result-item p{font-size:11.5px;line-height:1.6}
+
+/* ── PULL QUOTE ──────────────────────────────────────── */
+.pull-quote{
+  border-left:3px solid var(--blue-md);padding:8px 12px;
+  background:var(--blue-xs);border-radius:0 3px 3px 0;
+}
+.pull-quote p{
+  font-family:'Merriweather',serif;
+  font-size:12.5px;font-style:italic;font-weight:400;
+  color:var(--blue);line-height:1.5;
+}
+
+/* ── ACKS ─────────────────────────────────────────────── */
+.acks{
+  background:#fff;border-radius:3px;padding:8px 11px;
+  border-left:3px solid var(--dkgrey);
+}
+.acks p{font-size:10.5px;line-height:1.6;color:#4a4a5a;font-style:italic}
+
+/* ── PROCESS FLOW ────────────────────────────────────── */
+.process-flow{
+  background:#fff;border:1px solid var(--ltgrey);border-radius:4px;
+  padding:10px 12px 8px;
+}
+
+/* ── FOOTER ──────────────────────────────────────────── */
+.footer{
+  background:var(--blue-dk);
+  padding:8px 36px;
+  display:flex;align-items:center;justify-content:space-between;
+  border-top:3px solid var(--blue-md);
+}
+.footer-text{font-size:10px;color:var(--blue-pl)}
+.footer-tags{display:flex;gap:16px}
+.footer-tag{font-size:9.5px;font-weight:600;color:var(--blue-lt);letter-spacing:0.4px}
+
+/* ── DIVIDER BAR ─────────────────────────────────────── */
+.divbar{height:3px;background:linear-gradient(90deg,var(--blue) 0%,var(--blue-lt) 60%,var(--blue-pl) 100%)}
+</style>
+</head>
+<body>
+<div class="poster">
+
+<!-- ══ HEADER ══════════════════════════════════════════════════════════════ -->
+<div class="header">
+  <!-- Decorative diagonal geometry -->
+  <svg class="header-deco" viewBox="0 0 1189 118" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+    <polygon points="0,0 340,0 260,118 0,118" fill="#022660" opacity="0.5"/>
+    <polygon points="1189,0 900,0 980,118 1189,118" fill="#022660" opacity="0.35"/>
+    <line x1="0" y1="118" x2="1189" y2="118" stroke="#1A5BA8" stroke-width="0.5" opacity="0.6"/>
+    <!-- subtle grid lines -->
+    <line x1="0" y1="30" x2="1189" y2="30" stroke="#1A5BA8" stroke-width="0.3" opacity="0.15"/>
+    <line x1="0" y1="60" x2="1189" y2="60" stroke="#1A5BA8" stroke-width="0.3" opacity="0.15"/>
+    <line x1="0" y1="90" x2="1189" y2="90" stroke="#1A5BA8" stroke-width="0.3" opacity="0.15"/>
+    <line x1="200" y1="0" x2="200" y2="118" stroke="#1A5BA8" stroke-width="0.3" opacity="0.12"/>
+    <line x1="400" y1="0" x2="400" y2="118" stroke="#1A5BA8" stroke-width="0.3" opacity="0.12"/>
+    <line x1="600" y1="0" x2="600" y2="118" stroke="#1A5BA8" stroke-width="0.3" opacity="0.12"/>
+    <line x1="800" y1="0" x2="800" y2="118" stroke="#1A5BA8" stroke-width="0.3" opacity="0.12"/>
+    <line x1="1000" y1="0" x2="1000" y2="118" stroke="#1A5BA8" stroke-width="0.3" opacity="0.12"/>
+    <!-- accent bar behind title -->
+    <rect x="36" y="20" width="4" height="68" rx="2" fill="#5B8EC4" opacity="0.7"/>
+  </svg>
+
+  <div class="header-content">
+    <div class="header-left">
+      <div class="title">Consensus-based Standard-Setting in<br><em>Conservative Dentistry</em> Simulation</div>
+      <div class="authors">McNally &nbsp;·&nbsp; Wylie &nbsp;·&nbsp; Gupta &nbsp;·&nbsp; Patel</div>
+      <div class="institution">Melbourne Dental School &nbsp;|&nbsp; DDS2 Conservative Dentistry Simulation Program</div>
+    </div>
+    <div class="header-right">
+      <div class="logo-box">MDS<br>Logo</div>
+      <div class="conf-tag">Pilot Study · 2026</div>
+    </div>
+  </div>
+</div>
+
+<!-- colour accent strip -->
+<div class="divbar"></div>
+
+<!-- ══ THREE COLUMNS ════════════════════════════════════════════════════════ -->
+<div class="body">
+
+  <!-- ── COL 1: Background + Aims ──────────────────────────────────── -->
+  <div class="col">
+
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">1</span>Background</div>
+      <p>Clinical educator interpretation and assessment of student work is known to <strong style="font-weight:600">differ widely</strong> across individuals. A shift to <strong style="font-weight:600">programmatic assessment</strong> has heightened the impact of individual professional judgment on student progress.</p>
+      <p>This pilot applied an <strong style="font-weight:600">assessment literacy and alignment process</strong> within the DDS2 Cons Dent simulation component to reduce the influence individual assessors have on student outcomes.</p>
+    </div>
+
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">2</span>Aims &amp; Objectives</div>
+      <div class="aim-box">
+        <div class="aim-label">Primary Aim</div>
+        <p>Identify areas of difference among Cons Dent educators and facilitate discussion to develop a <em>shared understanding of the expected standard.</em></p>
+      </div>
+      <div class="aim-box" style="margin-top:6px">
+        <div class="aim-label">Secondary Aim</div>
+        <p>Help educators understand how their professional interpretation of the assessment checklist influences student progress, supporting shared standard-setting.</p>
+      </div>
+    </div>
+
+    <!-- Key study stats with icons -->
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">3</span>Study Overview</div>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <!-- assessors icon -->
+          <svg width="28" height="22" viewBox="0 0 28 22" style="margin-bottom:4px" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="9" cy="8" r="5" fill="#C4D8F0"/>
+            <circle cx="19" cy="8" r="5" fill="#1A5BA8" opacity="0.6"/>
+            <ellipse cx="9" cy="19" rx="7" ry="4" fill="#C4D8F0"/>
+            <ellipse cx="19" cy="19" rx="7" ry="4" fill="#1A5BA8" opacity="0.6"/>
+          </svg>
+          <div class="stat-num">11</div>
+          <div class="stat-lbl">Educators</div>
+        </div>
+        <div class="stat-card">
+          <!-- tooth icon -->
+          <svg width="22" height="22" viewBox="0 0 22 22" style="margin-bottom:4px" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="2" width="16" height="10" rx="3" fill="#C4D8F0" stroke="#033F85" stroke-width="1.2"/>
+            <rect x="5" y="12" width="5" height="8" rx="2" fill="#1A5BA8" opacity="0.5"/>
+            <rect x="12" y="12" width="5" height="8" rx="2" fill="#1A5BA8" opacity="0.5"/>
+          </svg>
+          <div class="stat-num">10</div>
+          <div class="stat-lbl">Typodent stations</div>
+        </div>
+        <div class="stat-card">
+          <!-- checklist icon -->
+          <svg width="22" height="22" viewBox="0 0 22 22" style="margin-bottom:4px" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="2" width="16" height="18" rx="2" fill="#EBF2FA" stroke="#033F85" stroke-width="1.2"/>
+            <line x1="7" y1="7" x2="15" y2="7" stroke="#1A5BA8" stroke-width="1.3"/>
+            <line x1="7" y1="11" x2="15" y2="11" stroke="#1A5BA8" stroke-width="1.3"/>
+            <line x1="7" y1="15" x2="12" y2="15" stroke="#9BA2AB" stroke-width="1.3"/>
+            <circle cx="6" cy="7" r="1.2" fill="#033F85"/>
+            <circle cx="6" cy="11" r="1.2" fill="#033F85"/>
+            <circle cx="6" cy="15" r="1.2" fill="#9BA2AB"/>
+          </svg>
+          <div class="stat-num">21</div>
+          <div class="stat-lbl">Checklist items</div>
+        </div>
+        <div class="stat-card">
+          <!-- flag icon -->
+          <svg width="22" height="22" viewBox="0 0 22 22" style="margin-bottom:4px" xmlns="http://www.w3.org/2000/svg">
+            <line x1="5" y1="2" x2="5" y2="20" stroke="#033F85" stroke-width="1.8" stroke-linecap="round"/>
+            <polygon points="5,3 18,8 5,13" fill="#C4D8F0" stroke="#033F85" stroke-width="1"/>
+          </svg>
+          <div class="stat-num">2,933</div>
+          <div class="stat-lbl">Flagged pairs</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── COL 2: Methods + Analysis ─────────────────────────────────── -->
+  <div class="col">
+
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">4</span>Methods</div>
+
+      <!-- Process flow -->
+      <div class="process-flow">
+        <div class="chart-title">Standard-setting process</div>
+        <svg viewBox="0 0 390 62" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+          <style>.pf{font-family:'Source Sans 3',sans-serif}.pft{font-size:9.5px;font-weight:600;fill:#033F85}.pfs{font-size:8px;fill:#9BA2AB}</style>
+          <!-- Step boxes -->
+          <!-- Step 1 -->
+          <rect x="0" y="8" width="110" height="46" rx="4" fill="#EBF2FA" stroke="#033F85" stroke-width="1.3"/>
+          <circle cx="14" cy="20" r="8" fill="#033F85"/>
+          <text x="14" y="24" text-anchor="middle" font-size="9" fill="#fff" font-family="sans-serif" font-weight="700">1</text>
+          <text x="58" y="25" text-anchor="middle" class="pf pft">Assemble</text>
+          <text x="58" y="36" text-anchor="middle" class="pf pft">Specimens</text>
+          <text x="58" y="47" text-anchor="middle" class="pf pfs">10 typodents</text>
+          <!-- arrow 1→2 -->
+          <line x1="112" y1="31" x2="128" y2="31" stroke="#1A5BA8" stroke-width="1.5"/>
+          <polygon points="128,27 136,31 128,35" fill="#1A5BA8"/>
+          <!-- Step 2 -->
+          <rect x="138" y="8" width="110" height="46" rx="4" fill="#EBF2FA" stroke="#033F85" stroke-width="1.3"/>
+          <circle cx="152" cy="20" r="8" fill="#033F85"/>
+          <text x="152" y="24" text-anchor="middle" font-size="9" fill="#fff" font-family="sans-serif" font-weight="700">2</text>
+          <text x="196" y="25" text-anchor="middle" class="pf pft">Pair-wise</text>
+          <text x="196" y="36" text-anchor="middle" class="pf pft">Assessment</text>
+          <text x="196" y="47" text-anchor="middle" class="pf pfs">11 educators</text>
+          <!-- arrow 2→3 -->
+          <line x1="250" y1="31" x2="266" y2="31" stroke="#1A5BA8" stroke-width="1.5"/>
+          <polygon points="266,27 274,31 266,35" fill="#1A5BA8"/>
+          <!-- Step 3 -->
+          <rect x="276" y="8" width="112" height="46" rx="4" fill="#033F85"/>
+          <circle cx="291" cy="20" r="8" fill="#EBF2FA"/>
+          <text x="291" y="24" text-anchor="middle" font-size="9" fill="#033F85" font-family="sans-serif" font-weight="700">3</text>
+          <text x="336" y="25" text-anchor="middle" font-size="9.5" font-weight="600" fill="#fff" font-family="sans-serif">Flag &amp; Discuss</text>
+          <text x="336" y="36" text-anchor="middle" font-size="9.5" font-weight="600" fill="#fff" font-family="sans-serif">≥2-level diff</text>
+          <text x="336" y="47" text-anchor="middle" font-size="8" fill="#C4D8F0" font-family="sans-serif">real-time analysis</text>
+        </svg>
+      </div>
+
+      <!-- Specimen visual -->
+      <div style="background:#fff;border:1px solid var(--ltgrey);border-radius:4px;padding:10px 14px;display:flex;align-items:center;justify-content:space-around;gap:10px">
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
+          <svg width="34" height="40" viewBox="0 0 34 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="5" y="2" width="24" height="16" rx="3" fill="#C4D8F0" stroke="#033F85" stroke-width="1.3"/>
+            <rect x="8" y="18" width="7" height="18" rx="2" fill="#EBF2FA" stroke="#033F85" stroke-width="1.2"/>
+            <rect x="19" y="18" width="7" height="18" rx="2" fill="#EBF2FA" stroke="#033F85" stroke-width="1.2"/>
+            <circle cx="12" cy="10" r="3" fill="#1A5BA8" opacity="0.4"/>
+          </svg>
+          <span style="font-size:18px;font-family:'Merriweather',serif;font-weight:700;color:var(--blue)">10</span>
+          <span style="font-size:9.5px;color:var(--dkgrey);text-align:center;line-height:1.3">Posterior carious<br>teeth (Nissin)</span>
+        </div>
+        <div style="width:1px;height:50px;background:var(--ltgrey)"></div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
+          <svg width="34" height="40" viewBox="0 0 34 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M17 3C8 3 4 12 6 22C8 30 12 37 17 37C22 37 26 30 28 22C30 12 26 3 17 3Z" fill="#C4D8F0" stroke="#033F85" stroke-width="1.3"/>
+            <circle cx="21" cy="8" r="4" fill="#EBF2FA" stroke="#033F85" stroke-width="1.2"/>
+            <circle cx="21" cy="8" r="2" fill="#1A5BA8" opacity="0.5"/>
+          </svg>
+          <span style="font-size:18px;font-family:'Merriweather',serif;font-weight:700;color:var(--blue)">10</span>
+          <span style="font-size:9.5px;color:var(--dkgrey);text-align:center;line-height:1.3">Anterior + incisal<br>angle composite</span>
+        </div>
+        <div style="width:1px;height:50px;background:var(--ltgrey)"></div>
+        <!-- Scale icon for assessment -->
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
+          <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <line x1="20" y1="5" x2="20" y2="35" stroke="#033F85" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="8" y1="10" x2="32" y2="10" stroke="#033F85" stroke-width="1.5" stroke-linecap="round"/>
+            <circle cx="8" cy="10" r="2" fill="#1A5BA8"/>
+            <circle cx="32" cy="10" r="2" fill="#1A5BA8"/>
+            <!-- left pan (lower = lenient) -->
+            <line x1="8" y1="10" x2="5" y2="22" stroke="#9BA2AB" stroke-width="1"/>
+            <line x1="8" y1="10" x2="11" y2="22" stroke="#9BA2AB" stroke-width="1"/>
+            <ellipse cx="8" cy="22" rx="7" ry="2.5" fill="#EBF2FA" stroke="#033F85" stroke-width="1"/>
+            <!-- right pan (higher = strict) -->
+            <line x1="32" y1="10" x2="29" y2="17" stroke="#9BA2AB" stroke-width="1"/>
+            <line x1="32" y1="10" x2="35" y2="17" stroke="#9BA2AB" stroke-width="1"/>
+            <ellipse cx="32" cy="17" rx="7" ry="2.5" fill="#C4D8F0" stroke="#033F85" stroke-width="1"/>
+            <line x1="10" y1="35" x2="30" y2="35" stroke="#033F85" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span style="font-size:18px;font-family:'Merriweather',serif;font-weight:700;color:var(--blue)">0–4</span>
+          <span style="font-size:9.5px;color:var(--dkgrey);text-align:center;line-height:1.3">Scale levels<br>per checklist item</span>
+        </div>
+        <div style="width:1px;height:50px;background:var(--ltgrey)"></div>
+        <!-- anonymous badge -->
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
+          <svg width="34" height="40" viewBox="0 0 34 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="4" y="5" width="26" height="30" rx="3" fill="#EBF2FA" stroke="#033F85" stroke-width="1.3"/>
+            <circle cx="17" cy="16" r="6" fill="#C4D8F0" stroke="#033F85" stroke-width="1"/>
+            <!-- eye-slash (anonymous) -->
+            <line x1="10" y1="22" x2="24" y2="10" stroke="#033F85" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="8" y1="26" x2="26" y2="26" stroke="#9BA2AB" stroke-width="0.8"/>
+            <line x1="11" y1="30" x2="23" y2="30" stroke="#9BA2AB" stroke-width="0.8"/>
+          </svg>
+          <span style="font-size:9.5px;color:var(--blue);font-weight:600;text-align:center;line-height:1.3">Anonymised<br>submissions</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts row -->
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">5</span>Disagreement Analysis</div>
+      <div class="charts-row">
+        <div class="chart-card">
+          <div class="chart-title">Top items · flagged pairs</div>
+          <svg viewBox="0 0 268 246" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+<style>.bl2{font-family:sans-serif}</style>
+<text x="38" y="21" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC20</text>
+<rect x="42" y="8" width="190" height="16" rx="2" fill="#033F85"/>
+<text x="236" y="21" font-size="9" fill="#033F85" font-weight="600" class="bl2">251</text>
+<text x="38" y="44" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC6</text>
+<rect x="42" y="31" width="147" height="16" rx="2" fill="#10498C"/>
+<text x="193" y="44" font-size="9" fill="#033F85" font-weight="600" class="bl2">195</text>
+<text x="38" y="67" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC19</text>
+<rect x="42" y="54" width="145" height="16" rx="2" fill="#1E5493"/>
+<text x="191" y="67" font-size="9" fill="#033F85" font-weight="600" class="bl2">192</text>
+<text x="38" y="90" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC3</text>
+<rect x="42" y="77" width="139" height="16" rx="2" fill="#2B5F9B"/>
+<text x="185" y="90" font-size="9" fill="#033F85" font-weight="600" class="bl2">184</text>
+<text x="38" y="113" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC17</text>
+<rect x="42" y="100" width="130" height="16" rx="2" fill="#3969A2"/>
+<text x="176" y="113" font-size="9" fill="#033F85" font-weight="600" class="bl2">173</text>
+<text x="38" y="136" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC12</text>
+<rect x="42" y="123" width="113" height="16" rx="2" fill="#4674AA"/>
+<text x="159" y="136" font-size="9" fill="#033F85" font-weight="600" class="bl2">150</text>
+<text x="38" y="159" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC10</text>
+<rect x="42" y="146" width="110" height="16" rx="2" fill="#547FB1"/>
+<text x="156" y="159" font-size="9" fill="#033F85" font-weight="600" class="bl2">146</text>
+<text x="38" y="182" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC13</text>
+<rect x="42" y="169" width="104" height="16" rx="2" fill="#6189B9"/>
+<text x="150" y="182" font-size="9" fill="#033F85" font-weight="600" class="bl2">138</text>
+<text x="38" y="205" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC16</text>
+<rect x="42" y="192" width="102" height="16" rx="2" fill="#6F94C0"/>
+<text x="148" y="205" font-size="9" fill="#033F85" font-weight="600" class="bl2">136</text>
+<text x="38" y="228" text-anchor="end" font-size="9.5" fill="#1A1A2E" class="bl2">MC15</text>
+<rect x="42" y="215" width="101" height="16" rx="2" fill="#7C9FC8"/>
+<text x="147" y="228" font-size="9" fill="#033F85" font-weight="600" class="bl2">134</text>
+</svg>
+          <p class="chart-note">Flagged = ≥2-level difference (0–4 scale), within-station pairs only</p>
+        </div>
+
+        <div class="chart-card">
+          <div class="chart-title">Disagreement severity</div>
+          <svg viewBox="0 0 200 130" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+<style>.dt{font-family:sans-serif}</style>
+<path d="M58.0,6.0 A52,52,0,1,1,7.9,72.0 L29.1,66.1 A30,30,0,1,0,58.0,28.0Z" fill="#1A5BA8"/>
+<path d="M7.8,71.5 A52,52,0,0,1,37.9,10.0 L46.4,30.3 A30,30,0,0,0,29.0,65.8Z" fill="#033F85"/>
+<path d="M38.3,9.9 A52,52,0,0,1,57.5,6.0 L57.7,28.0 A30,30,0,0,0,46.7,30.2Z" fill="#C4D8F0"/>
+<text x="58" y="53" text-anchor="middle" font-size="10.5" fill="#033F85" font-weight="700" class="dt">2,933</text>
+<text x="58" y="66" text-anchor="middle" font-size="7.5" fill="#9BA2AB" class="dt">flagged pairs</text>
+<rect x="122" y="20" width="9" height="9" rx="1" fill="#1A5BA8" stroke="#9BA2AB" stroke-width="0.5"/>
+<text x="135" y="28" font-size="9" fill="#1A1A2E" class="dt">2-level: <tspan font-weight="700" fill="#1A5BA8">71%</tspan></text>
+<rect x="122" y="40" width="9" height="9" rx="1" fill="#033F85" stroke="#9BA2AB" stroke-width="0.5"/>
+<text x="135" y="48" font-size="9" fill="#1A1A2E" class="dt">3-level: <tspan font-weight="700" fill="#033F85">23%</tspan></text>
+<rect x="122" y="60" width="9" height="9" rx="1" fill="#C4D8F0" stroke="#9BA2AB" stroke-width="0.5"/>
+<text x="135" y="68" font-size="9" fill="#1A1A2E" class="dt">4-level: <tspan font-weight="700" fill="#1A1A2E">6%</tspan></text>
+</svg>
+          <p class="chart-note">MC19 showed highest avg diff (2.67). MC20 present across all 10 stations.</p>
+
+          <!-- Convergence illustration -->
+          <div class="chart-title" style="margin-top:10px">Assessor alignment · before vs after</div>
+          <svg viewBox="0 0 200 80" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+<style>.cv{font-family:sans-serif}</style>
+<!-- Before panel -->
+<rect x="0" y="0" width="88" height="80" rx="3" fill="#EBF2FA"/>
+<text x="44" y="10" text-anchor="middle" font-size="7.5" fill="#9BA2AB" class="cv">Before</text>
+<!-- diverging lines = spread assessor ratings -->
+<line x1="12" y1="40" x2="76" y2="18" stroke="#033F85" stroke-width="1.2" opacity="0.9"/>
+<line x1="12" y1="40" x2="76" y2="27" stroke="#1A5BA8" stroke-width="1.2" opacity="0.8"/>
+<line x1="12" y1="40" x2="76" y2="38" stroke="#5B8EC4" stroke-width="1.2" opacity="0.7"/>
+<line x1="12" y1="40" x2="76" y2="50" stroke="#9BA2AB" stroke-width="1.2" opacity="0.7"/>
+<line x1="12" y1="40" x2="76" y2="62" stroke="#C4D8F0" stroke-width="1.2" opacity="0.9" stroke-dasharray="3,2"/>
+<!-- dots at right end -->
+<circle cx="76" cy="18" r="2.5" fill="#033F85"/>
+<circle cx="76" cy="27" r="2.5" fill="#1A5BA8"/>
+<circle cx="76" cy="38" r="2.5" fill="#5B8EC4"/>
+<circle cx="76" cy="50" r="2.5" fill="#9BA2AB"/>
+<circle cx="76" cy="62" r="2.5" fill="#C4D8F0"/>
+<!-- labels -->
+<text x="6" y="43" font-size="7" fill="#033F85" class="cv">A</text>
+<text x="79" y="21" font-size="6.5" fill="#033F85" class="cv">4</text>
+<text x="79" y="30" font-size="6.5" fill="#1A5BA8" class="cv">3</text>
+<text x="79" y="41" font-size="6.5" fill="#5B8EC4" class="cv">2</text>
+<text x="79" y="53" font-size="6.5" fill="#9BA2AB" class="cv">1</text>
+<text x="79" y="65" font-size="6.5" fill="#C4D8F0" class="cv">0</text>
+<text x="44" y="76" text-anchor="middle" font-size="6.5" fill="#9BA2AB" class="cv">spread ± 4 levels</text>
+
+<!-- Arrow between panels -->
+<polygon points="97,36 104,40 97,44" fill="#033F85"/>
+<line x1="88" y1="40" x2="104" y2="40" stroke="#033F85" stroke-width="1.2"/>
+
+<!-- After panel -->
+<rect x="108" y="0" width="88" height="80" rx="3" fill="#EBF2FA"/>
+<text x="152" y="10" text-anchor="middle" font-size="7.5" fill="#9BA2AB" class="cv">After</text>
+<!-- converging lines -->
+<line x1="120" y1="18" x2="184" y2="40" stroke="#033F85" stroke-width="1.2" opacity="0.9"/>
+<line x1="120" y1="27" x2="184" y2="40" stroke="#1A5BA8" stroke-width="1.2" opacity="0.8"/>
+<line x1="120" y1="38" x2="184" y2="40" stroke="#5B8EC4" stroke-width="1.2" opacity="0.7"/>
+<line x1="120" y1="50" x2="184" y2="40" stroke="#9BA2AB" stroke-width="1.2" opacity="0.7"/>
+<line x1="120" y1="62" x2="184" y2="40" stroke="#033F85" stroke-width="1.2" opacity="0.5" stroke-dasharray="3,2"/>
+<!-- converged dot -->
+<circle cx="184" cy="40" r="5" fill="#033F85"/>
+<circle cx="184" cy="40" r="2.5" fill="#fff"/>
+<text x="152" y="76" text-anchor="middle" font-size="6.5" fill="#033F85" class="cv" font-weight="600">shared standard</text>
+</svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── COL 3: Results + Discussion ───────────────────────────────── -->
+  <div class="col">
+
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">6</span>Results</div>
+
+      <div class="result-banner">
+        <div class="rb-label">Key Finding</div>
+        <p>Across 10 typodent stations and 11 educators, <strong style="font-weight:600;color:#fff">2,933 flagged assessor-pair disagreements</strong> were recorded. All 21 checklist items generated disagreements. 29% spanned ≥3 levels — substantive, not marginal divergence.</p>
+      </div>
+
+      <!-- Heatmap -->
+      <div class="chart-card">
+        <div class="chart-title">Flagged pairs · checklist item × station (top 10 items)</div>
+        <svg viewBox="0 0 326 242" xmlns="http://www.w3.org/2000/svg" style="width:100%">
+<style>text{font-family:sans-serif}</style>
+<text x="56" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M1</text>
+<text x="84" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M2</text>
+<text x="112" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M3</text>
+<text x="140" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M4</text>
+<text x="168" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M5</text>
+<text x="196" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M6</text>
+<text x="224" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M7</text>
+<text x="252" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M8</text>
+<text x="280" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M9</text>
+<text x="308" y="15" text-anchor="middle" font-size="8" fill="#9BA2AB">M10</text>
+<text x="39" y="43" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC20</text>
+<rect x="42" y="28" width="27" height="19" rx="1" fill="#5E84B1"/><text x="56" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">21</text>
+<rect x="70" y="28" width="27" height="19" rx="1" fill="#295C97"/><text x="84" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">28</text>
+<rect x="98" y="28" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="112" y="43" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<rect x="126" y="28" width="27" height="19" rx="1" fill="#4773A6"/><text x="140" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<rect x="154" y="28" width="27" height="19" rx="1" fill="#295C97"/><text x="168" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">28</text>
+<rect x="182" y="28" width="27" height="19" rx="1" fill="#215693"/><text x="196" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">29</text>
+<rect x="210" y="28" width="27" height="19" rx="1" fill="#38679E"/><text x="224" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="238" y="28" width="27" height="19" rx="1" fill="#295C97"/><text x="252" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">28</text>
+<rect x="266" y="28" width="27" height="19" rx="1" fill="#033F85"/><text x="280" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">33</text>
+<rect x="294" y="28" width="27" height="19" rx="1" fill="#6D90B8"/><text x="308" y="43" text-anchor="middle" font-size="7.5" fill="#FFFFFF">19</text>
+<text x="39" y="63" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC6</text>
+<rect x="42" y="48" width="27" height="19" rx="1" fill="#38679E"/><text x="56" y="63" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="70" y="48" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="84" y="63" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="98" y="48" width="27" height="19" rx="1" fill="#38679E"/><text x="112" y="63" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="126" y="48" width="27" height="19" rx="1" fill="#94ADCB"/><text x="140" y="63" text-anchor="middle" font-size="7.5" fill="#033F85">14</text>
+<rect x="154" y="48" width="27" height="19" rx="1" fill="#38679E"/><text x="168" y="63" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="182" y="48" width="27" height="19" rx="1" fill="#577FAD"/><text x="196" y="63" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="210" y="48" width="27" height="19" rx="1" fill="#124A8C"/><text x="224" y="63" text-anchor="middle" font-size="7.5" fill="#FFFFFF">31</text>
+<rect x="238" y="48" width="27" height="19" rx="1" fill="#7596BC"/><text x="252" y="63" text-anchor="middle" font-size="7.5" fill="#033F85">18</text>
+<rect x="266" y="48" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="280" y="63" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="294" y="48" width="27" height="19" rx="1" fill="#A3B9D2"/><text x="308" y="63" text-anchor="middle" font-size="7.5" fill="#033F85">12</text>
+<text x="39" y="83" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC19</text>
+<rect x="42" y="68" width="27" height="19" rx="1" fill="#195090"/><text x="56" y="83" text-anchor="middle" font-size="7.5" fill="#FFFFFF">30</text>
+<rect x="70" y="68" width="27" height="19" rx="1" fill="#C9D6E5"/><text x="84" y="83" text-anchor="middle" font-size="7.5" fill="#033F85">7</text>
+<rect x="98" y="68" width="27" height="19" rx="1" fill="#6D90B8"/><text x="112" y="83" text-anchor="middle" font-size="7.5" fill="#FFFFFF">19</text>
+<rect x="126" y="68" width="27" height="19" rx="1" fill="#577FAD"/><text x="140" y="83" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="154" y="68" width="27" height="19" rx="1" fill="#4773A6"/><text x="168" y="83" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<rect x="182" y="68" width="27" height="19" rx="1" fill="#84A1C3"/><text x="196" y="83" text-anchor="middle" font-size="7.5" fill="#033F85">16</text>
+<rect x="210" y="68" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="224" y="83" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="238" y="68" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="252" y="83" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<rect x="266" y="68" width="27" height="19" rx="1" fill="#4773A6"/><text x="280" y="83" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<rect x="294" y="68" width="27" height="19" rx="1" fill="#406DA2"/><text x="308" y="83" text-anchor="middle" font-size="7.5" fill="#FFFFFF">25</text>
+<text x="39" y="103" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC3</text>
+<rect x="42" y="88" width="27" height="19" rx="1" fill="#C9D6E5"/><text x="56" y="103" text-anchor="middle" font-size="7.5" fill="#033F85">7</text>
+<rect x="70" y="88" width="27" height="19" rx="1" fill="#4773A6"/><text x="84" y="103" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<rect x="98" y="88" width="27" height="19" rx="1" fill="#4773A6"/><text x="112" y="103" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<rect x="126" y="88" width="27" height="19" rx="1" fill="#577FAD"/><text x="140" y="103" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="154" y="88" width="27" height="19" rx="1" fill="#C1D0E1"/><text x="168" y="103" text-anchor="middle" font-size="7.5" fill="#033F85">8</text>
+<rect x="182" y="88" width="27" height="19" rx="1" fill="#38679E"/><text x="196" y="103" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="210" y="88" width="27" height="19" rx="1" fill="#295C97"/><text x="224" y="103" text-anchor="middle" font-size="7.5" fill="#FFFFFF">28</text>
+<rect x="238" y="88" width="27" height="19" rx="1" fill="#C1D0E1"/><text x="252" y="103" text-anchor="middle" font-size="7.5" fill="#033F85">8</text>
+<rect x="266" y="88" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="280" y="103" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<rect x="294" y="88" width="27" height="19" rx="1" fill="#577FAD"/><text x="308" y="103" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<text x="39" y="123" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC17</text>
+<rect x="42" y="108" width="27" height="19" rx="1" fill="#577FAD"/><text x="56" y="123" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="70" y="108" width="27" height="19" rx="1" fill="#A3B9D2"/><text x="84" y="123" text-anchor="middle" font-size="7.5" fill="#033F85">12</text>
+<rect x="98" y="108" width="27" height="19" rx="1" fill="#38679E"/><text x="112" y="123" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="126" y="108" width="27" height="19" rx="1" fill="#38679E"/><text x="140" y="123" text-anchor="middle" font-size="7.5" fill="#FFFFFF">26</text>
+<rect x="154" y="108" width="27" height="19" rx="1" fill="#577FAD"/><text x="168" y="123" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="182" y="108" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="196" y="123" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="210" y="108" width="27" height="19" rx="1" fill="#94ADCB"/><text x="224" y="123" text-anchor="middle" font-size="7.5" fill="#033F85">14</text>
+<rect x="238" y="108" width="27" height="19" rx="1" fill="#D1DCE8"/><text x="252" y="123" text-anchor="middle" font-size="7.5" fill="#033F85">6</text>
+<rect x="266" y="108" width="27" height="19" rx="1" fill="#668AB5"/><text x="280" y="123" text-anchor="middle" font-size="7.5" fill="#FFFFFF">20</text>
+<rect x="294" y="108" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="308" y="123" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<text x="39" y="143" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC12</text>
+<rect x="42" y="128" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="56" y="143" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="70" y="128" width="27" height="19" rx="1" fill="#7596BC"/><text x="84" y="143" text-anchor="middle" font-size="7.5" fill="#033F85">18</text>
+<rect x="98" y="128" width="27" height="19" rx="1" fill="#E0E7F0"/><text x="112" y="143" text-anchor="middle" font-size="7.5" fill="#033F85">4</text>
+<rect x="126" y="128" width="27" height="19" rx="1" fill="#FFFFFF"/>
+<rect x="154" y="128" width="27" height="19" rx="1" fill="#4F79A9"/><text x="168" y="143" text-anchor="middle" font-size="7.5" fill="#FFFFFF">23</text>
+<rect x="182" y="128" width="27" height="19" rx="1" fill="#195090"/><text x="196" y="143" text-anchor="middle" font-size="7.5" fill="#FFFFFF">30</text>
+<rect x="210" y="128" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="224" y="143" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<rect x="238" y="128" width="27" height="19" rx="1" fill="#4F79A9"/><text x="252" y="143" text-anchor="middle" font-size="7.5" fill="#FFFFFF">23</text>
+<rect x="266" y="128" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="280" y="143" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<rect x="294" y="128" width="27" height="19" rx="1" fill="#A3B9D2"/><text x="308" y="143" text-anchor="middle" font-size="7.5" fill="#033F85">12</text>
+<text x="39" y="163" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC10</text>
+<rect x="42" y="148" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="56" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="70" y="148" width="27" height="19" rx="1" fill="#E0E7F0"/><text x="84" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">4</text>
+<rect x="98" y="148" width="27" height="19" rx="1" fill="#94ADCB"/><text x="112" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">14</text>
+<rect x="126" y="148" width="27" height="19" rx="1" fill="#E8EDF3"/><text x="140" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">3</text>
+<rect x="154" y="148" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="168" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="182" y="148" width="27" height="19" rx="1" fill="#195090"/><text x="196" y="163" text-anchor="middle" font-size="7.5" fill="#FFFFFF">30</text>
+<rect x="210" y="148" width="27" height="19" rx="1" fill="#7D9CC0"/><text x="224" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">17</text>
+<rect x="238" y="148" width="27" height="19" rx="1" fill="#A3B9D2"/><text x="252" y="163" text-anchor="middle" font-size="7.5" fill="#033F85">12</text>
+<rect x="266" y="148" width="27" height="19" rx="1" fill="#577FAD"/><text x="280" y="163" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="294" y="148" width="27" height="19" rx="1" fill="#4773A6"/><text x="308" y="163" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<text x="39" y="183" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC13</text>
+<rect x="42" y="168" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="56" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="70" y="168" width="27" height="19" rx="1" fill="#BACADD"/><text x="84" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">9</text>
+<rect x="98" y="168" width="27" height="19" rx="1" fill="#577FAD"/><text x="112" y="183" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="126" y="168" width="27" height="19" rx="1" fill="#B2C4DA"/><text x="140" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">10</text>
+<rect x="154" y="168" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="168" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<rect x="182" y="168" width="27" height="19" rx="1" fill="#406DA2"/><text x="196" y="183" text-anchor="middle" font-size="7.5" fill="#FFFFFF">25</text>
+<rect x="210" y="168" width="27" height="19" rx="1" fill="#577FAD"/><text x="224" y="183" text-anchor="middle" font-size="7.5" fill="#FFFFFF">22</text>
+<rect x="238" y="168" width="27" height="19" rx="1" fill="#D8E1EC"/><text x="252" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">5</text>
+<rect x="266" y="168" width="27" height="19" rx="1" fill="#94ADCB"/><text x="280" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">14</text>
+<rect x="294" y="168" width="27" height="19" rx="1" fill="#D1DCE8"/><text x="308" y="183" text-anchor="middle" font-size="7.5" fill="#033F85">6</text>
+<text x="39" y="203" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC16</text>
+<rect x="42" y="188" width="27" height="19" rx="1" fill="#295C97"/><text x="56" y="203" text-anchor="middle" font-size="7.5" fill="#FFFFFF">28</text>
+<rect x="70" y="188" width="27" height="19" rx="1" fill="#E0E7F0"/><text x="84" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">4</text>
+<rect x="98" y="188" width="27" height="19" rx="1" fill="#7596BC"/><text x="112" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">18</text>
+<rect x="126" y="188" width="27" height="19" rx="1" fill="#E8EDF3"/><text x="140" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">3</text>
+<rect x="154" y="188" width="27" height="19" rx="1" fill="#6D90B8"/><text x="168" y="203" text-anchor="middle" font-size="7.5" fill="#FFFFFF">19</text>
+<rect x="182" y="188" width="27" height="19" rx="1" fill="#7596BC"/><text x="196" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">18</text>
+<rect x="210" y="188" width="27" height="19" rx="1" fill="#9BB3CE"/><text x="224" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">13</text>
+<rect x="238" y="188" width="27" height="19" rx="1" fill="#FFFFFF"/>
+<rect x="266" y="188" width="27" height="19" rx="1" fill="#7596BC"/><text x="280" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">18</text>
+<rect x="294" y="188" width="27" height="19" rx="1" fill="#8CA7C7"/><text x="308" y="203" text-anchor="middle" font-size="7.5" fill="#033F85">15</text>
+<text x="39" y="223" text-anchor="end" font-size="9" fill="#1A1A2E" font-weight="600">MC15</text>
+<rect x="42" y="208" width="27" height="19" rx="1" fill="#C1D0E1"/><text x="56" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">8</text>
+<rect x="70" y="208" width="27" height="19" rx="1" fill="#D1DCE8"/><text x="84" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">6</text>
+<rect x="98" y="208" width="27" height="19" rx="1" fill="#C1D0E1"/><text x="112" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">8</text>
+<rect x="126" y="208" width="27" height="19" rx="1" fill="#E0E7F0"/><text x="140" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">4</text>
+<rect x="154" y="208" width="27" height="19" rx="1" fill="#668AB5"/><text x="168" y="223" text-anchor="middle" font-size="7.5" fill="#FFFFFF">20</text>
+<rect x="182" y="208" width="27" height="19" rx="1" fill="#9BB3CE"/><text x="196" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">13</text>
+<rect x="210" y="208" width="27" height="19" rx="1" fill="#6D90B8"/><text x="224" y="223" text-anchor="middle" font-size="7.5" fill="#FFFFFF">19</text>
+<rect x="238" y="208" width="27" height="19" rx="1" fill="#7596BC"/><text x="252" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">18</text>
+<rect x="266" y="208" width="27" height="19" rx="1" fill="#94ADCB"/><text x="280" y="223" text-anchor="middle" font-size="7.5" fill="#033F85">14</text>
+<rect x="294" y="208" width="27" height="19" rx="1" fill="#4773A6"/><text x="308" y="223" text-anchor="middle" font-size="7.5" fill="#FFFFFF">24</text>
+<!-- legend -->
+<text x="42" y="240" font-size="7.5" fill="#9BA2AB">Low</text>
+<rect x="66" y="232" width="7" height="7" fill="#FFFFFF" stroke="#E3E6E6" stroke-width="0.5"/>
+<rect x="73" y="232" width="7" height="7" fill="#D7E0EB"/>
+<rect x="80" y="232" width="7" height="7" fill="#C9D6E5"/>
+<rect x="87" y="232" width="7" height="7" fill="#BCCCDE"/>
+<rect x="94" y="232" width="7" height="7" fill="#AFC2D8"/>
+<rect x="101" y="232" width="7" height="7" fill="#94AECB"/>
+<rect x="108" y="232" width="7" height="7" fill="#7A99BE"/>
+<rect x="115" y="232" width="7" height="7" fill="#6085B1"/>
+<rect x="122" y="232" width="7" height="7" fill="#4571A5"/>
+<rect x="129" y="232" width="7" height="7" fill="#2A5D98"/>
+<rect x="136" y="232" width="7" height="7" fill="#10498B"/>
+<rect x="143" y="232" width="7" height="7" fill="#033F85"/>
+<text x="152" y="240" font-size="7.5" fill="#033F85">High (33)</text>
+</svg>
+        <p class="chart-note">Darker cells = more flagged assessor pairs. White = no disagreements recorded for that station.</p>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:0">
+        <div class="result-item">
+          <div class="dot"></div>
+          <p><strong style="font-weight:600">MC20</strong> generated the most disagreements (251 pairs, present across all 10 stations), indicating a systemically contested checklist item.</p>
+        </div>
+        <div class="result-item">
+          <div class="dot"></div>
+          <p><strong style="font-weight:600">MC19</strong> showed the highest average score difference (2.67), with a peak of 30 flagged pairs in Station 1 alone.</p>
+        </div>
+        <div class="result-item">
+          <div class="dot"></div>
+          <p>Structured discussion led to a <strong style="font-weight:600">softening of overly lenient or strict judgements</strong>, with preliminary data showing improved grading consistency.</p>
+        </div>
+      </div>
+
+      <div class="pull-quote">
+        <p>"The critical discussion of these items identified underlying lenient and strict tendencies, promoting open debate and exploration of their own standards."</p>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">7</span>Discussion &amp; Future Directions</div>
+      <p>This pilot with <strong style="font-weight:600">11 educators</strong> across 10 stations demonstrates that structured standard-setting exercises can surface and reduce significant inter-rater variability before it impacts student outcomes. Formal evaluation will conclude in <strong style="font-weight:600">mid-June 2026</strong>, with expansion to the whole MDS simulation program planned.</p>
+    </div>
+
+    <div class="section">
+      <div class="sec-head"><span class="sec-num">8</span>Acknowledgements</div>
+      <div class="acks">
+        <p>The Cons Dent teaching team for engaging in this process and continuing to work towards a shared understanding of the MDS standard and the student experience.</p>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══ FOOTER ═══════════════════════════════════════════════════════════════ -->
+<div class="footer">
+  <div class="footer-text">DDS2 Conservative Dentistry · Simulation Program · Melbourne Dental School · 2026</div>
+  <div class="footer-tags">
+    <span class="footer-tag">Assessment Literacy</span>
+    <span class="footer-tag">Standard Setting</span>
+    <span class="footer-tag">Inter-Rater Reliability</span>
+    <span class="footer-tag">Programmatic Assessment</span>
+  </div>
+</div>
+
+</div><!-- /poster -->
+</body>
+</html>
