@@ -23,7 +23,7 @@ from openpyxl.styles import Font, Alignment
 
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
-    SimpleDocTemplate, PageBreak, Paragraph, Spacer,
+    SimpleDocTemplate, PageBreak, Paragraph, Spacer, Flowable
 )
 from reportlab.lib.units import inch
 import matplotlib.dates as mdates
@@ -75,6 +75,7 @@ def _writeTable(ws, df, startRow, startCol=1, title=None):
         r += 1
     return r + 2
 
+itemSectionDf = pd.read_excel(variableUtils.itemSectionMappingFile) # Item Code, Section and Sub-section columns
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. Data processing — DDL, upsert, clinic standardisation
 # ═══════════════════════════════════════════════════════════════════════════
@@ -499,17 +500,26 @@ def getAdditionalConcerns(engine, cohort, formsTable="dds4_boh3_forms", filters=
     return df
 
 
-def getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms", filters=None, extractValue='clinical-incident', colName='Clinical Incidents'):
+def getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms", filters=None,
+                               extractValue='clinical-incident', colName='Clinical Incidents'):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT
       f.cohort AS "Cohort", date_trunc('day', f.datetimeutc) AS "Date",
       f.assessor_name AS "Assessor Name", f.student_name AS "Student Name",
-      STRING_AGG(ci->>'value', '; ' ORDER BY ci->>'name') AS "{colName}" 
+      STRING_AGG(DISTINCT codes_agg.codes, '; ') AS "Item Codes",
+      STRING_AGG(ci->>'value', '; ' ORDER BY ci->>'name') AS "{colName}"
+      
     FROM {formsTable} f
     LEFT JOIN LATERAL jsonb_array_elements(
       f.assessor_data->'multi-select'->'{extractValue}'
     ) AS ci ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT STRING_AGG(DISTINCT ic->>'code', ', ' ORDER BY ic->>'code') AS codes
+      FROM jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+      WHERE ic ? 'code'
+    ) codes_agg ON TRUE
     WHERE {whereClause} AND ci IS NOT NULL
     GROUP BY f.cohort, date_trunc('day', f.datetimeutc), f.assessor_name, f.student_name
     ORDER BY date_trunc('day', f.datetimeutc), f.assessor_name;
@@ -795,7 +805,7 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     elements.append(PageBreak())
 
     # Per-rotation summaries
-    for rotation in ["Rotation 1", "Rotation 2", "Rotation 3", "Rotation 4"]:
+    for rotation in ["Rotation 1", "Rotation 2", "Rotation 3", "Rotation 4", "Rotation 5"]:
         elements.append(Paragraph(f"{rotation} Summary", subheadingStyle))
         buildFrontPage(engine, cohort, filters={"rotation": rotation}, elements=elements,
                        subheadingColor=subheadingColor, subheadingStyle=subheadingStyle,
@@ -817,6 +827,7 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
             elements.append(concernsTable)
             elements.append(Spacer(1, 24))
         if hasIncidents:
+            incidentsDf.drop(columns=["Cohort"], inplace=True, errors="ignore")
             incidentsTable = createTable(
                 incidentsDf, colRatio=[1, 1, 1, 1, 3],
                 customTextCols=list(range(incidentsDf.shape[1])),
@@ -908,18 +919,39 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
 
 def getStudentTopItemCodes(engine, cohort, studentNumber, limit=10, formsTable="dds4_boh3_forms"):
     sql = f"""
-    SELECT
-      ic->>'code' AS itemCode,
-      MAX(ic->>'description') AS description,
-      SUM(COALESCE(NULLIF((ic->>'quantity')::int, NULL), 1))::int AS totalQty
-    FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
-    WHERE f.cohort = :cohort
-      AND f.student_number = :studentNumber
-      AND ic ? 'code'
-    GROUP BY 1
-    ORDER BY totalQty DESC, itemCode
+    WITH student_codes AS (
+      SELECT
+        ic->>'code' AS itemCode,
+        MAX(ic->>'description') AS description,
+        SUM(COALESCE(NULLIF((ic->>'quantity')::int, NULL), 1))::int AS totalQty
+      FROM {formsTable} f
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+      WHERE f.cohort = :cohort AND f.student_number = :studentNumber AND ic ? 'code'
+      GROUP BY 1
+    ),
+    cohort_codes AS (
+      SELECT
+        ic->>'code' AS itemCode,
+        SUM(COALESCE(NULLIF((ic->>'quantity')::int, NULL), 1))::numeric AS cohortTotal
+      FROM {formsTable} f
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
+      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+      WHERE f.cohort = :cohort AND ic ? 'code'
+      GROUP BY 1
+    ),
+    n_students AS (
+      SELECT COUNT(DISTINCT student_number)::numeric AS n
+      FROM {formsTable}
+      WHERE cohort = :cohort
+        AND student_name IS NOT NULL AND student_name <> '' AND student_name <> 'Test Student'
+    )
+    SELECT s.itemCode, s.description, s.totalQty,
+           ROUND(c.cohortTotal / ns.n, 1) AS cohortAvg
+    FROM student_codes s
+    LEFT JOIN cohort_codes c ON c.itemCode = s.itemCode
+    CROSS JOIN n_students ns
+    ORDER BY s.totalQty DESC, s.itemCode
     LIMIT :limit;
     """
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber, "limit": int(limit)})
@@ -1246,6 +1278,7 @@ def weaknessPiePlot(weaknessCounts, totalWeaknesses, uniColor):
     img = addPlotImage(fig, 0.8)
     return img
 
+
 def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, styles,
                                   formsTable="dds4_boh3_forms",
                                   subheadingStyle=None, uniColor=None, tableTextStyleSmall=None):
@@ -1260,11 +1293,11 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
     topWeaknessOther = getTopMultiSelectValues(engine, cohort, studentNumber, "weakness-other", 30, formsTable)
     # topIncidents = getTopMultiSelectValues(engine, cohort, studentNumber, "clinical-incident", 6, formsTable)
     clinicalIncidents = getClinicalIncidentSummary(engine, cohort, filters={"student_number": studentNumber}, formsTable=formsTable)
-    clinicalIncidents.drop(columns=["Cohort", 'Student Name'], inplace=True)
+    clinicalIncidents.drop(columns=["Cohort", 'Student Name', 'Item Codes'], inplace=True)
 
     weaknessOther = getClinicalIncidentSummary(engine, cohort, filters={"student_number": studentNumber}, 
                                                formsTable=formsTable, extractValue='weakness-other', colName = 'Weakness/Strength')
-    weaknessOther.drop(columns=["Cohort", 'Student Name'], inplace=True)
+    weaknessOther.drop(columns=["Cohort", 'Student Name', 'Assessor Name'], inplace=True)
     elements.append(PageBreak())
 
     # Practice readiness distribution
@@ -1390,7 +1423,7 @@ def plotEntrustmentReadinessTimeSeries(df, title, uniColor=None, useDateAxis=Fal
         entDf['date'] = entDf['date'].dt.strftime('%Y-%m-%d')
         prDf['date'] = prDf['date'].dt.strftime('%Y-%m-%d')
 
-    fig, ax = plt.subplots(figsize=(variableUtils.figSize[0], variableUtils.figSize[1] / 3), dpi = 200)
+    fig, ax = plt.subplots(figsize=(variableUtils.figSize[0], variableUtils.figSize[1] / 4), dpi = 200)
 
     offset = 0.05
 
@@ -1457,14 +1490,14 @@ def buildStudentPdf(engine, cohort, studentNumber, studentName, outputPath,
         elements.append(Spacer(1, 24))
         elements.append(addPlotImage(fig, 0.9))
 
-    topItemsDf = getStudentTopItemCodes(engine, cohort, studentNumber, limit = 30, formsTable=formsTable)
+    topItemsDf = getStudentTopItemCodes(engine, cohort, studentNumber, limit = 55, formsTable=formsTable)
     if not topItemsDf.empty:
-        elements.append(Spacer(1, 18))
+        # elements.append(Spacer(1, 18))
         topItemsDf2 = topItemsDf.copy()
-        topItemsDf2.columns = ["Item Code", "Description", "Total Qty"]
+        topItemsDf2.columns = ["Item Code", "Description", "Total Qty", "Cohort Avg"]
         elements.append(createTable(
-            topItemsDf2, colRatio=[1, 4, 1], customTextCols=[0, 1, 2], bottomPadding=6, topPadding=6,
-            title="Top Procedures", titleStyle=subheadingStyle, headerColor=uniColor,
+            topItemsDf2, colRatio=[1, 4, 1, 1], customTextCols=[0, 1, 2, 3], bottomPadding=3, topPadding=3,
+            title="Top Procedures", titleStyle=subheadingStyle, headerColor=uniColor, tableTextStyle=tableTextStyleSmall,
         ))
 
 
@@ -1541,6 +1574,8 @@ def buildEntrustmentTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
         elements.append(Spacer(1, 36))
 
     doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, ""))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. Excel textual report (one sheet per student)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1743,10 +1778,131 @@ LATERAL jsonb_each_text(b.student_data->'checklists'->'checklist-caf-final-eval'
 WHERE b.assessmentid = :assessmentId;
 """
 
+STUDENT_ENTRIES_SQL = """
+WITH b AS (
+  SELECT * FROM dds4_boh3_forms WHERE student_number = :studentNumber
+),
+student AS (
+  SELECT
+    b.assessmentid, b.form_code, b.cohort, b.subject, b.type,
+    b.createdat::date AS created_date, b.updatedat::date AS updated_date,
+    b.clinic, b.rotation,
+    b.student_number, b.student_name, b.student_email,
+    b.assessorid, b.assessor_name, b.submitted_by_assessor, b.submitted_by_student,
+    NULLIF(b.student_data->'texts'->>'reflection','') AS student_reflection,
+    b.student_data->'scales'->'scale-practice-readiness'->>'scale' AS practice_readiness_code,
+    b.student_config->'scales'->'scale-practice-readiness'->'fields'
+      -> (b.student_data->'scales'->'scale-practice-readiness'->>'scale') AS practice_readiness_text,
+    b.assessor_data->'scales'->'scale-entrustment'->>'scale' AS entrustment_code,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC1' AS mc1,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC2' AS mc2,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC3' AS mc3,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC4' AS mc4,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC5' AS mc5,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC6' AS mc6,
+    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC7' AS mc7,
+    CASE b.assessor_data->'scales'->'scale-entrustment'->>'scale'
+      WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4 ELSE NULL
+    END AS entrustment_num,
+    b.assessor_config->'scales'->'scale-entrustment'->'fields'
+      -> (b.assessor_data->'scales'->'scale-entrustment'->>'scale') AS entrustment_text,
+    NULLIF(b.assessor_data->'texts'->>'additional_comments','') AS assessor_comments,
+    NULLIF(b.additional_concerns,'') AS additional_concerns,
+    b.patient_data, b.assessor_data
+  FROM b
+),
+agg AS (
+  SELECT s.*,
+    (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
+     WHERE COALESCE(e->>'name','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths,
+    (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
+     WHERE COALESCE(e->>'name','') = 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths_other,
+    (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
+     FROM jsonb_each(COALESCE(s.assessor_data->'multi-select','{}'::jsonb)) kv(key, arr)
+     JOIN LATERAL jsonb_array_elements(COALESCE(kv.arr,'[]'::jsonb)) e ON TRUE
+     WHERE kv.key LIKE 'weakness-%%%%' AND kv.key <> 'weakness-other'
+       AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS weaknesses,
+    (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'weakness-other','[]'::jsonb)) e
+     WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS weaknesses_other,
+    (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) e
+     WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS clinical_incidents
+  FROM student s
+)
+SELECT
+  assessmentid, form_code, cohort, subject, type, created_date, updated_date, clinic, rotation,
+  student_number, student_name, student_email,
+  assessorid, assessor_name, practice_readiness_text,
+  entrustment_num, entrustment_text,
+  student_reflection, assessor_comments,
+  strengths, strengths_other, weaknesses, weaknesses_other,
+  clinical_incidents, additional_concerns, patient_data, submitted_by_assessor, submitted_by_student
+FROM agg
+ORDER BY created_date;
+"""
+
+STUDENT_MC_SQL = """
+SELECT b.assessmentid, b.student_name, kv.key AS "MC Code",
+  b.student_config->'checklists'->'checklist-caf-final-eval'->'fields'->> kv.key AS "Full MC Text",
+  kv.value AS "MC Rating",
+  CASE kv.value
+    WHEN 'Done well' THEN 1.0 WHEN 'Done' THEN 0.8 WHEN 'Mostly done' THEN 0.6
+    WHEN 'Sometimes done' THEN 0.4 WHEN 'Not done' THEN 0.0 ELSE NULL
+  END AS "MC Score"
+FROM dds4_boh3_forms b,
+LATERAL jsonb_each_text(b.student_data->'checklists'->'checklist-caf-final-eval') kv
+WHERE b.student_number = :studentNumber;
+"""
+
+class _EntryMarker(Flowable):
+    """Zero-size sentinel that updates page_state at draw time."""
+    def __init__(self, label, page_state):
+        super().__init__()
+        self.label = label
+        self._page_state = page_state
+        self.width = self.height = 0
+
+    def draw(self):
+        self._page_state["label"] = self.label
+
+class TrackedStudentDoc(SimpleDocTemplate):
+    """SimpleDocTemplate that updates page_state whenever an _EntryMarker is placed."""
+    def __init__(self, *args, page_state, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._page_state = page_state
+
+    def afterFlowable(self, flowable):
+        if isinstance(flowable, _EntryMarker):
+            self._page_state["label"] = flowable.label
+
+class _BannerMarker(Flowable):
+    """Updates page_state label at draw time. Place BEFORE PageBreak."""
+    def __init__(self, label, page_state):
+        super().__init__()
+        self.label = label
+        self._page_state = page_state
+        self.width = self.height = 0
+
+    def draw(self):
+        self._page_state["label"] = self.label
+
+
+class _BookmarkAnchor(Flowable):
+    """Creates a named PDF destination. Place AFTER PageBreak."""
+    def __init__(self, anchor):
+        super().__init__()
+        self.anchor = anchor
+        self.width = self.height = 0
+
+    def draw(self):
+        self.canv.bookmarkPage(self.anchor)
 
 def buildIndividualEntryPage(elements, row, mcDf,
                              uniColor=None, subheadingStyle=None,
-                             tableTextStyleSmall=None):
+                             tableTextStyleSmall=None, i=None):
     """Build reportlab elements for a single assessment entry."""
     infoData = [
         ("Creation Date", row["created_date"]),
@@ -1754,7 +1910,14 @@ def buildIndividualEntryPage(elements, row, mcDf,
         ("Assessor", row["assessor_name"]),
         ("Clinic", row["clinic"]),
         ("Rotation", row["rotation"]),
+        ("Submitted by Assessor", row["submitted_by_assessor"] if "submitted_by_assessor" in row else "N/A"),
+        ("Submitted by Student", row["submitted_by_student"] if "submitted_by_student" in row else "N/A"),
     ]
+    print(row.index)
+    if i is not None:
+        elements.append(Paragraph(f"Form: {i + 1}", variableUtils.subheadingStyleL))
+        elements.append(Spacer(1, 12))
+
     infoTable = createTable(
         pd.DataFrame(infoData, columns=["Field", "Value"]),
         colRatio=[1, 2], customTextCols=[0, 1], bottomPadding=4, topPadding=4,

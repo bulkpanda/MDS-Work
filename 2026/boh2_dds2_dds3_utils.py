@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from xml.sax.saxutils import escape
 from sqlalchemy import text
 
@@ -25,7 +25,7 @@ from openpyxl.styles import Font, Alignment
 
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
-    SimpleDocTemplate, PageBreak, Paragraph, Spacer,
+    KeepTogether, SimpleDocTemplate, PageBreak, Paragraph, Spacer,
 )
 from reportlab.lib.units import inch
 from matplotlib.patches import Rectangle
@@ -33,6 +33,7 @@ from matplotlib.lines import Line2D
 
 from Utils import createTable, addPlotImage, getBannerDrawer, getmodeArgs, readDf, runDdl, toInt, autoFitColumns
 import variableUtils
+from IPython.display import display
 
 # Default score map used across BOH2/DDS2/DDS3
 SCORE_MAP = {
@@ -44,6 +45,10 @@ SCORE_MAP = {
     "Yes": 1.00,
     "No": 0.00,
 }
+
+BOH2_REMOVED_STUDENTS = [1352051, 1606158, 1605793, 1617958, 1605538]
+DDS2_REMOVED_STUDENTS = [1270152, 1155940, 914405]
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,7 +113,7 @@ def _loadSectionMapping(mappingFile=None):
     return mappingDf
 
 
-def _mergeSection(df, mappingDf, codeCol="Item Code"):
+def _mergeSection(df, mappingDf = _loadSectionMapping(), codeCol="Item Code"):
     """
     Merge a DataFrame that has an item-code column with the section mapping.
 
@@ -118,8 +123,14 @@ def _mergeSection(df, mappingDf, codeCol="Item Code"):
     Always adds both "Section" and "Sub-section" columns.
     """
     merged = df.copy()
-    merged["_MappingCode"] = merged[codeCol].astype(str).str.split("/").str[0].str.split("-").str[0].str.strip()
-
+    if len(merged) == 0:
+        # If the input DataFrame is empty, just add the Section/Sub-section columns and return
+        merged["Section"] = pd.NA
+        merged["Sub-section"] = pd.NA
+        return merged
+    # SPLIT by - also only if first part is a number otherwise keep as it is (for codes like "BOH-DD" that should be matched as a whole)
+    merged["_MappingCode"] = merged[codeCol].astype(str).str.split("/").str[0].str.strip()
+    merged["_MappingCode"] = merged["_MappingCode"].apply(lambda code: code.split("-")[0] if code.split("-")[0].isdigit() else code)
     mergeCols = ["Item Code", "Section"]
     if "Sub-section" in mappingDf.columns:
         mergeCols.append("Sub-section")
@@ -137,6 +148,15 @@ def _mergeSection(df, mappingDf, codeCol="Item Code"):
     if "Sub-section" in merged.columns:
         merged["Sub-section"] = merged["Sub-section"].fillna("Unmapped")
     return merged
+
+def _naturalKey(s: str) -> tuple:
+    """Split into (str, int) parts for correct natural sort: '011-RPP' → ('', 11, '-rpp')."""
+    return tuple(int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(s)))
+
+def _mcNum(s: str) -> int:
+    """Extract trailing number from MC key: 'MC10' → 10."""
+    m = re.search(r'\d+$', str(s))
+    return int(m.group()) if m else 0
 
 def saveToExcel(filepath, sheets: dict, index=False, **writerKwargs):
     """
@@ -164,6 +184,96 @@ def saveToExcel(filepath, sheets: dict, index=False, **writerKwargs):
         for ws in writer.sheets.values():
             autoFitColumns(ws)
 
+
+def getChecklistMcTexts(
+    engine,
+    itemCodes: list,
+    formsTable: str = "rawform_forms",
+) -> pd.DataFrame:
+    """
+    Return the MC text descriptions for the given item codes.
+
+    Pulls DISTINCT (item_code, item_name, MC, MC Text) from the checklists
+    JSONB column — one row per MC per item code.
+
+    Parameters
+    ----------
+    engine      : SQLAlchemy engine
+    itemCodes   : list of item code strings, e.g. ["578", "579"]
+    formsTable  : defaults to "rawform_forms"
+
+    Returns
+    -------
+    DataFrame with columns: item_code, item_name, MC, MC Text
+    """
+    sql = f"""
+    SELECT DISTINCT ON (item.item_code, mc.mc_key)
+        item.item_code,
+        item.item_data ->> 'name'                              AS item_name,
+        mc.mc_key                                              AS "MC",
+        mc.mc_text                                             AS "MC Text"
+    FROM {formsTable} f
+    CROSS JOIN LATERAL jsonb_each(f.checklists)
+        AS item(item_code, item_data)
+    CROSS JOIN LATERAL jsonb_each_text(
+        COALESCE(item.item_data -> 'fields', '{{}}'::jsonb)
+    ) AS mc(mc_key, mc_text)
+    WHERE item.item_code = ANY(:itemCodes)
+    AND f.datetimeutc >= '2026-01-01'
+      AND mc.mc_key LIKE 'MC%'
+      AND mc.mc_key ~ '^MC[0-9]+'
+    ORDER BY item.item_code, mc.mc_key;
+    """
+    df = readDf(engine, sql, {"itemCodes": itemCodes})
+
+    df["_item_sort"] = df["item_code"].apply(_naturalKey)
+    df["_mc_sort"]   = df["MC"].apply(_mcNum)
+    df = (df.sort_values(["_item_sort", "_mc_sort"])
+            .drop(columns=["_item_sort", "_mc_sort"])
+            .reset_index(drop=True))
+    return df
+
+
+def getChecklistItems(
+    engine,
+    cohort: str,
+    formsTable: str = "rawform_forms",
+    filters: dict = None,
+) -> pd.DataFrame:
+    """
+    Return distinct checklist item codes and names for a cohort.
+
+    Parameters
+    ----------
+    engine     : SQLAlchemy engine
+    cohort     : e.g. "DDS2", "DDS3", "BOH1"
+    formsTable : defaults to "rawform_forms"
+    filters    : e.g. {"type": "Clinic"} or {"type": ["Clinic", "Simulation"]}
+
+    Returns
+    -------
+    DataFrame with columns: item_code, item_name, mc_count
+    """
+    whereClause, params = _where(cohort, filters)
+
+    sql = f"""
+    SELECT DISTINCT ON (item.item_code)
+        item.item_code,
+        item.item_data ->> 'name'                          AS item_name,
+        (SELECT COUNT(*)
+         FROM jsonb_object_keys(
+             COALESCE(item.item_data -> 'fields', '{{}}'::jsonb)
+         ) k
+         WHERE k ~ '^MC[0-9]+'
+        )::int                                             AS mc_count
+    FROM {formsTable} f
+    CROSS JOIN LATERAL jsonb_each(f.checklists)
+        AS item(item_code, item_data)
+    WHERE {whereClause}
+      AND NULLIF(item.item_data ->> 'name', '') IS NOT NULL
+    ORDER BY item.item_code, LENGTH(item.item_data ->> 'name') DESC;
+    """
+    return readDf(engine, sql, params)
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. Cohort-level query functions
 # ═══════════════════════════════════════════════════════════════════════════
@@ -350,6 +460,33 @@ def getStudentItemCodeDf(engine, cohort, formsTable="rawform_forms", filters=Non
     WHERE {whereClause}
     """
     return readDf(engine, sql, params)
+
+
+def getCohortItemCodeAverages(engine, cohort, formType="Simulation",
+                              formsTable="rawform_forms", filters=None):
+    """
+    Mean count of each item code performed per student in the given cohort/type.
+ 
+    For each (student, item_code) the number of forms is counted, then averaged
+    across all students that have at least one form in scope.  Useful as a
+    class-average comparison baseline for individual student reports.
+ 
+    Returns dict {item_code: avg_count}.
+    """
+    effectiveFilters = {"type": formType}
+    if filters:
+        effectiveFilters.update(filters)
+ 
+    df = getStudentItemCodeDf(
+        engine, cohort, formsTable=formsTable, filters=effectiveFilters,
+    )
+    if df.empty:
+        return {}
+ 
+    perStudent = (
+        df.groupby(["Student ID", "Item Code"]).size().unstack(fill_value=0)
+    )
+    return perStudent.mean(axis=0).to_dict()
 
 
 def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms", filters=None,
@@ -737,6 +874,20 @@ def getStudentData(engine, cohort, studentNumber, formsTable="rawform_forms", fi
                 NULLIF(f.assessor_data->'entrustment'->>'scale', '')::int,
                 NULLIF(f.assessor_data->'practice-readiness'->>'scale', '')::int
             ) AS entrustment,
+        COALESCE(
+                NULLIF(f.assessor_data->'scale-professionalism'->>'scale', '')::int,
+                NULLIF(f.assessor_data->'professionalism'->>'scale', '')::int
+    )
+        AS professionalism,
+    COALESCE(
+                NULLIF(f.assessor_data->'scale-communication'->>'scale', '')::int,
+                NULLIF(f.assessor_data->'communication'->>'scale', '')::int
+        )
+        AS communication,
+    COALESCE(
+                NULLIF(f.assessor_data->'scale-time-mgmt'->>'scale', '')::int,
+                NULLIF(f.assessor_data->'time_mgmt'->>'scale', '')::int
+        ) AS time_management,        
       f.assessor_data->'scale-global-rating'->>'scale' AS global_rating,
       ic.item_codes AS item_codes
         FROM {formsTable} f
@@ -795,14 +946,37 @@ def _getColor(row):
     return "blue"
 
 
+def explodeScoresToLong(df):
+    """
+    Explode the per-form ``scores`` dict into a long DataFrame with one row
+    per (form, item_code).
+ 
+    Expects *df* to already have a ``scores`` column (output of ``calcScore``).
+ 
+    Returns a DataFrame with columns:
+        datetimeutc, item_code, score, entrustment, global_rating
+    """
+    records = []
+    for _, row in df.iterrows():
+        scores = row.get("scores")
+        if not isinstance(scores, dict) or not scores:
+            continue
+        for code, sd in scores.items():
+            records.append({
+                "datetimeutc": row["datetimeutc"],
+                "Item Code": code,
+                "Score": sd.get("score") if isinstance(sd, dict) else None,
+                "Entrustment": row["entrustment"],
+                "Global Rating": row["global_rating"],
+                "Type": row["type"],
+            })
+    return pd.DataFrame(records)
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Plotting helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores",
-                                scoreKey="score", fallbackKey=None,
-                                title="Student Performance Over Time",
-                                pageSize=None):
+def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores", scoreKey="score", 
+                                fallbackKey=None, title="Student Performance Over Time", pageSize=None):
     """Scatter plot of item-code scores over time."""
     if pageSize is None:
         pageSize = variableUtils.pageSize
@@ -838,6 +1012,7 @@ def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores",
                 "Assessor Name": row["assessor_name"],
                 "NA_Flag": naFlag,
                 "Patient Complexity": complexity,
+                "Clinic": row.get("clinic", "Unknown"),
             })
 
     expandedDf = pd.DataFrame(expandedRows)
@@ -857,7 +1032,7 @@ def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores",
         offset = offsetCounter[key] * 5
         offsetCounter[key] += 1
         ax.annotate(
-            f"{row['Item']}",
+            f"{row['Item']} SS" if row["Clinic"] == "Smile Squad" else f"{row['Item']}",
             (row["Date"], row["Score"]),
             textcoords="offset points", xytext=(10, 3 + 2 * offset),
             ha="center", fontsize=8,
@@ -880,6 +1055,7 @@ def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores",
     return fig
 
 
+
 def rubricPlot(ax, studentDf, label, color, xLabelRotation=45, maxY=None):
     """Single-axis time series of a scale value."""
     studentDf = studentDf.dropna(subset=[label])
@@ -899,6 +1075,8 @@ def rubricPlot(ax, studentDf, label, color, xLabelRotation=45, maxY=None):
         ax.set_yticks(range(0, int(maxY) + 1, 1))
     ax.tick_params(axis="x", rotation=xLabelRotation, labelsize=8)
     ax.grid(True, linestyle="--", alpha=0.5)
+    # add space b/w plots
+    plt.subplots_adjust(hspace=0.3)
 
 
 def makeSafeParagraph(value):
@@ -910,6 +1088,586 @@ def makeSafeParagraph(value):
     return textValue
 
 
+def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
+    """
+    Compute summary metrics from a student DataFrame (optionally pre-filtered
+    by form type).
+ 
+    Expects datetimeutc already converted.  The ``submitted_by_assessor``
+    filter is applied internally so that total form counts reflect the
+    unfiltered set while scale/item metrics use assessor-submitted forms only.
+ 
+    When ``isSimulation`` is True, patient-age fields are left blank since
+    simulation forms have no real patient.
+ 
+    Returns an OrderedDict  {metricName: displayValue}  (empty if *df* is empty).
+    """
+    if df.empty:
+        return OrderedDict()
+ 
+    nForms = len(df)
+    nAssessorSubmitted = int(df["submitted_by_assessor"].sum())
+    nStudentSubmitted = int(df["submitted_by_student"].sum())
+ 
+    # assessor-filtered subset for remaining metrics
+    adf = df[df["submitted_by_assessor"]].copy()
+ 
+    if adf.empty:
+        return OrderedDict([
+            ("# Forms", nForms),
+            ("# Assessor Submitted", nAssessorSubmitted),
+            ("# Student Submitted", nStudentSubmitted),
+            # ("Entrustment Counts", "N/A"),
+            ("Avg Global Rating", "N/A"),
+            ("Critical Incidents", "0"),
+        ])
+ 
+    entrustmentCounts = adf["entrustment"].dropna().value_counts().to_dict()
+    esCountsText = "<br/> ".join(
+        f"Lvl {int(k)}: {v}" for k, v in sorted(entrustmentCounts.items())
+    )
+ 
+    avgGR = adf["global_rating"].dropna().astype(float).mean()
+ 
+    ciCount = adf[adf["clinical_incident"].notna()].shape[0]
+ 
+    metrics = OrderedDict([
+        ("# Forms", nForms),
+        ("# Assessor Submitted", nAssessorSubmitted),
+        ("# Student Submitted", nStudentSubmitted),
+        # ("Entrustment Counts", esCountsText),
+        ("Avg Global Rating", f"{avgGR:.2f}/5" if not np.isnan(avgGR) else "N/A"),
+        ("Critical Incidents", str(ciCount)),
+    ])
+ 
+    if patientInfo:
+        if isSimulation:
+            metrics["Mean Patient Age"] = ""
+            metrics["Patient Age Dist."] = ""
+            roleCounts = adf["role"].value_counts().to_dict()
+            roleCountsText = "<br/> ".join(f"{k}: {v}" for k, v in roleCounts.items())
+            patientDetails = adf["patient_details"].value_counts().to_dict()
+            patientDetailsText = "<br/> ".join(f"{k}: {v}" for k, v in patientDetails.items())
+            metrics["Role Counts"] = roleCountsText
+            metrics["Patient Details"] = patientDetailsText
+        else:
+            patientAge = adf["patient_age"].clip(lower=0, upper=120)
+            meanAge = patientAge.dropna().mean()
+            ageBuckets = OrderedDict([
+                ("0-6", adf[(adf["patient_age"] >= 0) & (adf["patient_age"] <= 6)].shape[0]),
+                ("7-17", adf[(adf["patient_age"] >= 7) & (adf["patient_age"] <= 17)].shape[0]),
+                ("18+", adf[adf["patient_age"] >= 18].shape[0]),
+            ])
+            ageCountsText = "<br/> ".join(f"{k}: {v}" for k, v in ageBuckets.items())
+            roleCounts = adf["role"].value_counts().to_dict()
+            roleCountsText = "<br/> ".join(f"{k}: {v}" for k, v in roleCounts.items())
+            patientDetails = adf["patient_details"].value_counts().to_dict()
+            patientDetailsText = "<br/> ".join(f"{k}: {v}" for k, v in patientDetails.items())
+ 
+            metrics["Mean Patient Age"] = f"{meanAge:.2f}" if not np.isnan(meanAge) else "N/A"
+            metrics["Patient Age Dist."] = ageCountsText
+            metrics["Role Counts"] = roleCountsText
+            metrics["Patient Details"] = patientDetailsText
+ 
+    return metrics
+
+# ── Pie-chart colour maps (red → green tier) ──
+ENTRUSTMENT_COLORS = {
+    1: "#d73027",   # red
+    2: "#fc8d59",   # orange
+    3: "#91cf60",   # light green
+    4: "#1a9850",   # dark green
+}
+ 
+GR_COLORS = {
+    1: "#d73027",   # red
+    2: "#fc8d59",   # orange
+    3: "#fee08b",   # yellow
+    4: "#91cf60",   # light green
+    5: "#1a9850",   # dark green
+}
+ 
+ 
+def _makeCountPctAutopct(counts):
+    """Return an autopct callable that renders slices as 'count (pct%)'."""
+    total = sum(counts)
+    def autopct(pct):
+        val = int(round(pct * total / 100.0))
+        return f"{val} ({pct:.0f}%)"
+    return autopct
+ 
+ 
+def _plotEntrustmentPie(ax, df, title):
+    """Plot entrustment-level pie chart on the given axis."""
+    counts = df["entrustment"].dropna().astype(int).value_counts().sort_index()
+    if counts.empty:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.axis("off")
+        return
+    labels = [f"Lvl {lvl}" for lvl in counts.index]
+    colors = [ENTRUSTMENT_COLORS.get(lvl, "#999999") for lvl in counts.index]
+    ax.pie(
+        counts.values, labels=labels, colors=colors,
+        autopct=_makeCountPctAutopct(counts.values),
+        startangle=90,
+        labeldistance=1.1,
+        pctdistance=0.7,
+        textprops={"fontsize": 9},
+    )
+    ax.set_title(title, fontsize=11, fontweight="bold")
+ 
+ 
+def _plotGlobalRatingPie(ax, df, title):
+    """Plot global-rating pie chart with average shown in the title."""
+    grNumeric = df["global_rating"].dropna().astype(float)
+    counts = grNumeric.round().astype(int).value_counts().sort_index()
+    avgGR = grNumeric.mean()
+    avgText = f"  (Avg: {avgGR:.2f}/5)" if not np.isnan(avgGR) else ""
+    if counts.empty:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(f"{title}{avgText}", fontsize=11, fontweight="bold")
+        ax.axis("off")
+        return
+    labels = [f"GR {gr}" for gr in counts.index]
+    colors = [GR_COLORS.get(gr, "#999999") for gr in counts.index]
+    ax.pie(
+        counts.values, labels=labels, colors=colors,
+        autopct=_makeCountPctAutopct(counts.values),
+        startangle=90,
+        labeldistance=1.1,
+        pctdistance=0.7,
+        textprops={"fontsize": 9},
+    )
+    ax.set_title(f"{title}{avgText}", fontsize=11, fontweight="bold")
+ 
+ 
+def _makeRatingsFigure(simDf, clinicDf, hasSim, hasClinic):
+    """
+    Build a matplotlib figure with entrustment + global-rating pie charts.
+ 
+    Layout: columns = type (Simulation first, then Clinic),
+            rows = metric (Entrustment on top, Global Rating below).
+    Returns the figure, or None if neither type has data.
+    """
+    nRows = int(hasSim) + int(hasClinic)
+    if nRows == 0:
+        return None
+ 
+    fig, axes = plt.subplots(nRows, 2, figsize=(10, 4.2 * nRows))
+    # Normalise to 2D shape (nRows, 2)
+    if nRows == 1:
+        axes = np.array([axes])
+ 
+    rowIdx = 0
+    if hasSim:
+        simAdf = simDf[simDf["submitted_by_assessor"]]
+        _plotEntrustmentPie(axes[rowIdx, 0], simAdf, "Simulation — Entrustment")
+        _plotGlobalRatingPie(axes[rowIdx, 1], simAdf, "Simulation — Global Rating")
+        rowIdx += 1
+    if hasClinic:
+        clinicAdf = clinicDf[clinicDf["submitted_by_assessor"]]
+        _plotEntrustmentPie(axes[rowIdx, 0], clinicAdf, "Clinic — Entrustment")
+        _plotGlobalRatingPie(axes[rowIdx, 1], clinicAdf, "Clinic — Global Rating")
+ 
+    plt.tight_layout()
+    return fig
+
+
+def _addTimeSeriesPage(elements, df, typeLabel, subheadingStyle):
+    """
+    Append the time-series scatter + entrustment/GR rubric plots for a single
+    form type ('Simulation' or 'Clinic') to *elements*.
+ 
+    Caller is responsible for adding the PageBreak afterwards.
+    *df* is expected to be assessor-submitted, type-filtered, sorted by date.
+    """
+    if df.empty:
+        return
+ 
+    elements.append(Spacer(1, 24))
+    heading = Paragraph(f"{typeLabel} — Performance Over Time", subheadingStyle)
+ 
+    # Item-score scatter plot
+    timeSeriesDf = df[[
+        "datetimeutc", "entrustment", "global_rating", "item_codes",
+        "scores", "assessor_data", "assessor_name",
+    ]].copy()
+    timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
+    fig = plotStudentScoresTimeSeries(
+        timeSeriesDf, dateCol="Date", scoreDictCol="scores",
+        scoreKey="score", fallbackKey=None,
+        title=f"{typeLabel} — Performance on Assessed Items Over Time",
+    )
+    timeSeriesImg = addPlotImage(fig) if fig is not None else None
+    # if fig is not None:
+        # elements.append(KeepTogether([heading, Spacer(1, 12), addPlotImage(fig)]))
+        # plt.close(fig)
+ 
+    # Entrustment + GR rubric panels
+    fig, axes = plt.subplots(2, 1, figsize=(14, 6))
+    rubricPlotDf = df[["datetimeutc", "entrustment", "global_rating"]].copy()
+    rubricPlotDf.rename(columns={
+        "datetimeutc": "Date",
+        "entrustment": "Entrustment",
+        "global_rating": "Global Rating",
+    }, inplace=True)
+    rubricPlotDf.sort_values("Date", inplace=True)
+    rubricPlotDf["Date"] = rubricPlotDf["Date"].dt.strftime("%Y-%m-%d")
+    rubricPlotDf["Entrustment"] = rubricPlotDf["Entrustment"].astype("Int64")
+    rubricPlotDf["Global Rating"] = rubricPlotDf["Global Rating"].astype("Int64")
+    rubricPlot(axes[0], rubricPlotDf, "Entrustment", "blue", maxY=4.5)
+    rubricPlot(axes[1], rubricPlotDf, "Global Rating", "green", maxY=5.5)
+    plt.subplots_adjust(hspace=0.5)
+    rubricImg = addPlotImage(fig)
+    plt.close(fig)
+ 
+    elements.append(Spacer(1, 18))
+    # elements.append(Paragraph(f"{typeLabel} — Entrustment and Global Rating Over Time", subheadingStyle,))
+    elements.append(KeepTogether([heading, Spacer(1, 12), timeSeriesImg, rubricImg]))
+
+
+def _addReflectionsTable(elements, df, typeLabel, subheadingStyle,
+                         tableTextStyleSmall, uniColor):
+    """
+    Append a reflections table for a single form type to *elements*.
+ 
+    Caller is responsible for adding a PageBreak afterwards.
+    *df* is expected to be assessor-submitted and type-filtered.
+    """
+    if df.empty:
+        return
+ 
+    reflectionsDf = df[
+        ["datetimeutc", "item_codes", "student_reflection", "assessor_reflection"]
+    ].copy()
+    reflectionsDf["item_codes"] = reflectionsDf["item_codes"].apply(
+        lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) and len(v) > 0 else ""
+    )
+    reflectionsDf["student_reflection"] = (
+        reflectionsDf["student_reflection"].apply(truncateText).str.replace("\n", "<br/>")
+    )
+    reflectionsDf["assessor_reflection"] = (
+        reflectionsDf["assessor_reflection"].apply(truncateText).str.replace("\n", "<br/>")
+    )
+    reflectionsDf.columns = ["Date", "Item Codes", "Student Reflection", "Assessor Reflection"]
+    reflectionsDf = reflectionsDf.sort_values("Date")
+    reflectionsDf["Date"] = reflectionsDf["Date"].dt.strftime("%Y-%m-%d")
+ 
+    reflectionsTable = createTable(
+        reflectionsDf,
+        title=f"{typeLabel} — Reflections",
+        colRatio=[1.2, 1.8, 4.5, 4.5],
+        customTextCols=[0, 1, 2, 3],
+        titleStyle=subheadingStyle,
+        tableTextStyle=tableTextStyleSmall,
+        headerColor=uniColor,
+        bottomPadding=6, topPadding=6,
+    )
+    elements.append(reflectionsTable)
+
+
+def _addItemCodeCountsBarChart(elements, df, classAvgItemCounts,
+                               typeLabel, subheadingStyle,
+                               maxCodesPerSubplot=25):
+    """
+    Append item-code counts bar chart(s) for *df* (already type-filtered and
+    assessor-submitted).
+ 
+    Codes are filtered: any code where the student's count is 0 *and* the
+    class average (if present) is less than 1 is dropped.
+ 
+    If more than *maxCodesPerSubplot* codes remain after filtering, the chart
+    is split into stacked subplots with codes divided as evenly as possible
+    across them (so 60 codes become 20+20+20, not 25+25+10).
+ 
+    If *classAvgItemCounts* is a non-empty dict, a side-by-side class-average
+    series is included; otherwise only the student's counts are shown.
+ 
+    Caller is responsible for adding a PageBreak afterwards.
+    """
+    if df.empty:
+        return
+ 
+    studentCounts = (
+        df["item_codes"].dropna().explode().value_counts().to_dict()
+    )
+    if not studentCounts:
+        return
+    # sort by count values
+    
+    hasAvg = bool(classAvgItemCounts)
+    if hasAvg:
+        allCodes = sorted(
+            set(studentCounts.keys()) | set(classAvgItemCounts.keys()),
+            key=lambda c: (-studentCounts.get(c, 0), c),
+        )
+    else:
+        allCodes = sorted(
+            studentCounts.keys(),
+            key=lambda c: (-studentCounts[c], c),
+        )
+ 
+    # Drop codes where student count == 0 AND (no avg or avg < 1)
+    filteredCodes = []
+    for c in allCodes:
+        sv = studentCounts.get(c, 0)
+        av = classAvgItemCounts.get(c, 0.0) if hasAvg else 0.0
+        if sv == 0 and av < 1:
+            continue
+        filteredCodes.append(c)
+ 
+    if not filteredCodes:
+        return
+ 
+    # Split into roughly equal chunks (≤ maxCodesPerSubplot per chunk)
+    n = len(filteredCodes)
+    nSubplots = (n + maxCodesPerSubplot - 1) // maxCodesPerSubplot
+    base = n // nSubplots
+    remainder = n % nSubplots
+ 
+    chunks = []
+    start = 0
+    for i in range(nSubplots):
+        size = base + (1 if i < remainder else 0)
+        chunks.append(filteredCodes[start:start + size])
+        start += size
+ 
+    # Shared y-axis ceiling so subplots are visually comparable
+    studentMax = max(studentCounts.get(c, 0) for c in filteredCodes)
+    if hasAvg:
+        avgMax = max(classAvgItemCounts.get(c, 0.0) for c in filteredCodes)
+        maxY = max(studentMax, avgMax)
+    else:
+        maxY = studentMax
+    yLim = maxY * 1.15 + 1  # headroom for value labels above bars
+ 
+    fig, axes = plt.subplots(
+        nSubplots, 1,
+        figsize=(14, 5 * nSubplots),
+        sharey=True,
+    )
+    if nSubplots == 1:
+        axes = [axes]
+ 
+    for axIdx, (ax, chunk) in enumerate(zip(axes, chunks)):
+        x = np.arange(len(chunk))
+        studentVals = [studentCounts.get(c, 0) for c in chunk]
+ 
+        if hasAvg:
+            width = 0.4
+            avgVals = [classAvgItemCounts.get(c, 0.0) for c in chunk]
+            ax.bar(x - width / 2, studentVals, width,
+                   label="Your count" if axIdx == 0 else None,
+                   color="#1f77b4")
+            ax.bar(x + width / 2, avgVals, width,
+                   label="Class average" if axIdx == 0 else None,
+                   color="#fc8d59")
+            for xi, v in zip(x - width / 2, studentVals):
+                if v > 0:
+                    ax.text(xi, v + 0.1, str(int(v)),
+                            ha="center", va="bottom", fontsize=8)
+            for xi, v in zip(x + width / 2, avgVals):
+                if v > 0:
+                    ax.text(xi, v + 0.1, f"{v:.1f}",
+                            ha="center", va="bottom", fontsize=8)
+        else:
+            width = 0.65
+            ax.bar(x, studentVals, width, color="#1f77b4")
+            for xi, v in zip(x, studentVals):
+                if v > 0:
+                    ax.text(xi, v + 0.1, str(int(v)),
+                            ha="center", va="bottom", fontsize=8)
+ 
+        ax.set_xticks(x)
+        ax.set_xticklabels(chunk, rotation=45, ha="right", fontsize=8)
+        ax.set_ylim(0, yLim)
+        ax.set_ylabel("Count")
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+ 
+    if hasAvg:
+        axes[0].legend(loc="upper right")
+ 
+    titleSuffix = " vs Class Average" if hasAvg else ""
+    fig.suptitle(
+        f"{typeLabel} — Item Code Counts{titleSuffix}",
+        fontsize=13, fontweight="bold", y=1.0,
+    )
+    plt.tight_layout()
+ 
+    img = addPlotImage(fig, 0.9)
+    plt.close(fig)
+ 
+    elements.append(Spacer(1, 18))
+    elements.append(Paragraph(
+        f"{typeLabel} — Procedures Performed",
+        subheadingStyle,
+    ))
+    elements.append(img)
+
+SECTION_DISPLAY_NAMES = {
+    "Preventive, Prophylactic and Bleaching Services": "PPB",
+}
+ 
+ 
+def _sectionLabel(name):
+    """Return shortened display label for a section name."""
+    return SECTION_DISPLAY_NAMES.get(name, name)
+
+def _addSectionPerformance(elements, longDf, typePages, subheadingStyle,
+                           tableTextStyle, uniColor, minSectionsForSpider=3):
+    """
+    Append section-level performance for all form types present.
+ 
+    When both Simulation and Clinic have ≥ *minSectionsForSpider* sections,
+    their spider charts are rendered side-by-side in a single figure.
+    When only one qualifies, a single smaller spider is shown.
+    When fewer than *minSectionsForSpider* sections exist for a type, only
+    a summary table is shown for that type.
+ 
+    *longDf* must already contain columns:
+        Item Code, Score, Entrustment, Global Rating, Type, Section
+    """
+    if longDf.empty or "Section" not in longDf.columns:
+        return
+ 
+    # ── Compute per-type section aggregates ──
+    typeAggs = {}
+    for typeLabel, _ in typePages:
+        typeLongDf = longDf[
+            (longDf["Type"] == typeLabel) & (longDf["Section"] != "Unmapped")
+        ]
+        if typeLongDf.empty:
+            continue
+        agg = (
+            typeLongDf.groupby("Section")
+            .agg(
+                count=("Score", "size"),
+                mean_score=("Score", "mean"),
+                mean_gr=("Global Rating",
+                         lambda s: s.dropna().astype(float).mean()),
+                mean_es=("Entrustment",
+                         lambda s: s.dropna().astype(float).mean()),
+            )
+            .sort_values("count", ascending=False)
+        )
+        agg = agg[agg["count"] > 0]
+        if not agg.empty:
+            typeAggs[typeLabel] = agg
+ 
+    if not typeAggs:
+        return
+ 
+    # ── Spider chart(s): Score (left) and GR + ES overlay (right) ──
+    spiderTypes = {
+        t: a for t, a in typeAggs.items()
+        if len(a) >= minSectionsForSpider
+    }
+    nSpiders = len(spiderTypes)
+ 
+    if nSpiders > 0:
+        fig, axes = plt.subplots(nSpiders, 2, figsize=(11, 5.2 * nSpiders), subplot_kw=dict(polar=True),)
+        
+        if nSpiders == 1:
+            axes = axes.reshape(1, 2)
+ 
+        for rowIdx, (typeLabel, agg) in enumerate(spiderTypes.items()):
+            sections = agg.index.tolist()
+            N = len(sections)
+            angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+            angles_closed = angles + [angles[0]]
+ 
+            spokeLabels = [_sectionLabel(s) + f"\n(n={int(agg.loc[s, 'count'])})" for s in sections]
+ 
+            # ── Left spider: Mean Score (0–1) ──
+            axScore = axes[rowIdx, 0]
+            scoreVals = agg["mean_score"].tolist()
+            scoreVals_c = scoreVals + [scoreVals[0]]
+ 
+            axScore.fill(angles_closed, scoreVals_c, alpha=0.25, color="#1f77b4")
+            axScore.plot(angles_closed, scoreVals_c, "o-", color="#1f77b4", linewidth=2, markersize=5)
+            axScore.set_xticks(angles)
+            axScore.set_xticklabels(spokeLabels, fontsize=8)
+            axScore.set_ylim(0, 1)
+            axScore.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+            axScore.set_yticklabels(["20%", "40%", "60%", "80%", "100%"], fontsize=7)
+            axScore.set_title(f"{typeLabel} — Mean Score", fontsize=11, fontweight="bold", pad=30)
+ 
+            # ── Right spider: GR (/5) and ES (/4) normalised to 0–1 ──
+            axGrEs = axes[rowIdx, 1]
+ 
+            grVals = [agg.loc[s, "mean_gr"] / 5 if not np.isnan(agg.loc[s, "mean_gr"]) else 0
+                      for s in sections]
+            esVals = [agg.loc[s, "mean_es"] / 4 if not np.isnan(agg.loc[s, "mean_es"]) else 0
+                      for s in sections]
+            grVals_c = grVals + [grVals[0]]
+            esVals_c = esVals + [esVals[0]]
+ 
+            axGrEs.fill(angles_closed, grVals_c, alpha=0.15, color="#2ca02c")
+            axGrEs.plot(angles_closed, grVals_c, "o-", color="#2ca02c",
+                        linewidth=2, markersize=5, label="Global Rating (/5)")
+            axGrEs.fill(angles_closed, esVals_c, alpha=0.15, color="#ff7f0e")
+            axGrEs.plot(angles_closed, esVals_c, "o-", color="#ff7f0e",
+                        linewidth=2, markersize=5, label="Entrustment (/4)")
+ 
+            axGrEs.set_xticks(angles)
+            axGrEs.set_xticklabels(spokeLabels, fontsize=8)
+            axGrEs.set_ylim(0, 1)
+            axGrEs.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+            axGrEs.set_yticklabels(["20%", "40%", "60%", "80%", "100%"],
+                                    fontsize=7)
+            axGrEs.set_title(f"{typeLabel} — GR & Entrustment",
+                             fontsize=11, fontweight="bold", pad=30)
+            axGrEs.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1),
+                          fontsize=8)
+ 
+        # fig.suptitle("Section Performance", fontsize=13, fontweight="bold", y=1.02)
+        plt.subplots_adjust(wspace=0.4, hspace=1)
+        plt.tight_layout()
+
+ 
+        spiderImg = addPlotImage(fig, 0.9)
+        plt.close(fig)
+ 
+        elements.append(Spacer(1, 18))
+        elements.append(KeepTogether([Paragraph("Performance by Section", subheadingStyle), Spacer(1, 12), spiderImg]))
+ 
+    # ── Summary table(s) — only for types without a spider chart ──
+    tableOnlyTypes = {
+        t: a for t, a in typeAggs.items() if t not in spiderTypes
+    }
+    for typeLabel, agg in tableOnlyTypes.items():
+        sections = agg.index.tolist()
+        tableDf = pd.DataFrame({
+            "Section": [_sectionLabel(s) for s in sections],
+            "# Items": [int(agg.loc[s, "count"]) for s in sections],
+            "Mean Score": [f"{agg.loc[s, 'mean_score']:.0%}" for s in sections],
+            "Mean GR": [
+                f"{agg.loc[s, 'mean_gr']:.1f}/5"
+                if not np.isnan(agg.loc[s, 'mean_gr']) else "N/A"
+                for s in sections
+            ],
+            "Mean ES": [
+                f"{agg.loc[s, 'mean_es']:.1f}/4"
+                if not np.isnan(agg.loc[s, 'mean_es']) else "N/A"
+                for s in sections
+            ],
+        })
+ 
+        sectionTable = createTable(
+            tableDf,
+            title=f"{typeLabel} — Section Summary",
+            colRatio=[3, 1, 1, 1, 1],
+            customTextCols=list(range(tableDf.shape[1])),
+            titleStyle=subheadingStyle,
+            tableTextStyle=tableTextStyle,
+            headerColor=uniColor,
+            bottomPadding=6, topPadding=6,
+        )
+        elements.append(Spacer(1, 12))
+        elements.append(sectionTable)
 # ═══════════════════════════════════════════════════════════════════════════
 # 6. Student PDF report builder
 # ═══════════════════════════════════════════════════════════════════════════
@@ -947,6 +1705,10 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
     for _, sRow in studentsDf.iterrows():
         studentName = sRow["student_name"]
         studentNumber = sRow["student_number"]
+        if cohort == 'BOH2' and studentNumber in BOH2_REMOVED_STUDENTS:
+            continue
+        if cohort == 'DDS2' and studentNumber in DDS2_REMOVED_STUDENTS:
+            continue
         # studentIds = ['1678748', '1684643', '1362959', '1309866', '1362803', '1346824']
         # if str(studentNumber) not in studentIds:
         #     continue
@@ -959,6 +1721,15 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
             pd.to_datetime(studentDataDf["datetimeutc"], utc=True)
             .dt.tz_convert("Australia/Melbourne")
         )
+        if cohort == 'BOH2' and formType == 'Clinic':
+            # filter out Smile Squad clinic, in these student_data is to be treated as assessor_data, to be filtered out by submitted_by_student
+            smileSquadDf = studentDataDf[studentDataDf["clinic"] == "Smile Squad"]
+            # display(smileSquadDf[["clinic", "student_data", "assessor_data", "submitted_by_student"]])
+            # exchange the columns student_data and assessor_data for these rows
+            studentDataDf.loc[smileSquadDf.index, ["student_data", "assessor_data"]] = studentDataDf.loc[smileSquadDf.index, ["assessor_data", "student_data"]].values
+            studentDataDf.loc[smileSquadDf.index, ["submitted_by_student", "submitted_by_assessor"]] = studentDataDf.loc[smileSquadDf.index, ["submitted_by_assessor", "submitted_by_student"]].values
+            # display(studentDataDf[["clinic", "student_data", "assessor_data", "submitted_by_student"]][studentDataDf["clinic"] == "Smile Squad"])
+        
         studentDataDf = studentDataDf[studentDataDf["submitted_by_assessor"]].copy()
         if studentDataDf.empty:
             continue
@@ -973,8 +1744,8 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
 
         # ── 1. Item-code score scatter ──
         timeSeriesDf = studentDataDf[
-            ["datetimeutc", "entrustment", "global_rating",
-             "item_codes", "scores", "assessor_data", "assessor_name"]
+            ["datetimeutc", "entrustment", "global_rating", "communication", "professionalism", "time_management",
+             "item_codes", "scores", "assessor_data", "assessor_name", 'clinic']
         ].copy()
         timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
         scoreFig = plotStudentScoresTimeSeries(
@@ -987,14 +1758,17 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
             elements.append(Spacer(1, 12))
 
         # ── 2. Rubric lines (entrustment + global rating) ──
-        rubricDf = studentDataDf[["datetimeutc", "entrustment", "global_rating"]].copy()
+        rubricDf = studentDataDf[["datetimeutc", "entrustment", "global_rating", "communication", "professionalism", "time_management"]].copy()
         rubricDf["entrustment"] = pd.to_numeric(rubricDf["entrustment"], errors="coerce")
         rubricDf["global_rating"] = pd.to_numeric(rubricDf["global_rating"], errors="coerce")
+        rubricDf["communication"] = pd.to_numeric(rubricDf["communication"], errors="coerce")
+        rubricDf["professionalism"] = pd.to_numeric(rubricDf["professionalism"], errors="coerce")
+        rubricDf["time_management"] = pd.to_numeric(rubricDf["time_management"], errors="coerce")
         rubricDf["date"] = rubricDf["datetimeutc"].dt.strftime("%Y-%m-%d")
 
         # Average when multiple forms on the same day
         rubricDf = (
-            rubricDf.groupby("date", sort=True)[["entrustment", "global_rating"]]
+            rubricDf.groupby("date", sort=True)[["entrustment", "global_rating", "communication", "professionalism", "time_management"]]
             .mean()
             .reset_index()
         )
@@ -1002,28 +1776,36 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
             "date": "Date",
             "entrustment": "Entrustment",
             "global_rating": "Global Rating",
+            "communication": "Communication",
+            "professionalism": "Professionalism",
+            "time_management": "Time Management",
         }, inplace=True)
 
-        fig, axes = plt.subplots(2, 1, figsize=(14, 5))
+        fig, axes = plt.subplots(5, 1, figsize=(14, 10))
         rubricPlot(axes[0], rubricDf, "Entrustment", "steelblue", maxY=4.5)
         axes[0].tick_params(axis="x", labelbottom=False)
         rubricPlot(axes[1], rubricDf, "Global Rating", "darkorange", maxY=5.5)
+        axes[1].tick_params(axis="x", labelbottom=False)
+        rubricPlot(axes[2], rubricDf, "Communication", "green", maxY=3.0)
+        axes[2].tick_params(axis="x", labelbottom=False)
+        rubricPlot(axes[3], rubricDf, "Professionalism", "purple", maxY=3.0)
+        axes[3].tick_params(axis="x", labelbottom=False)
+        rubricPlot(axes[4], rubricDf, "Time Management", "red", maxY=5.0)
         plt.subplots_adjust(hspace=0.5)
         plt.close(fig)
         elements.append(addPlotImage(fig, 0.9))
 
         elements.append(PageBreak())
+        # break  # TEMP: only first student for now
 
     doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, ""))
 
 
-def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None,
-                       subheadingStyle=None, subsubheadingStyleL=None,
-                       tableTextStyle=None, tableTextStyleSmall=None,
-                       uniColor=None):
+def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadingStyle=None, subsubheadingStyleL=None,
+                       tableTextStyle=None, tableTextStyleSmall=None, uniColor=None, cohort=None, classAvgItemCounts:dict=None):
     """
     Build reportlab elements for a single student's PDF report.
-
+ 
     Returns a list of reportlab flowable elements.
     """
     if scoreMap is None:
@@ -1034,80 +1816,65 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None,
         subheadingStyle = variableUtils.subheadingStyle
     if tableTextStyle is None:
         tableTextStyle = variableUtils.tableTextStyle
-
+ 
     elements = []
     elements.append(Spacer(1, 72))
-
-    nForms = len(studentDataDf)
-    nAssessorSubmittedForms = studentDataDf["submitted_by_assessor"].sum()
-    nStudentSubmittedForms = studentDataDf["submitted_by_student"].sum()
-
+ 
     studentDataDf["datetimeutc"] = (
         pd.to_datetime(studentDataDf["datetimeutc"], utc=True)
         .dt.tz_convert("Australia/Melbourne")
     )
-    studentDataDf = studentDataDf[studentDataDf["submitted_by_assessor"]].copy()
-    studentDataDf["scores"] = studentDataDf.apply(lambda row: calcScore(row, scoreMap), axis=1)
-    studentDataDf.sort_values("datetimeutc", inplace=True)
 
-    roleCounts = studentDataDf["role"].value_counts().to_dict()
-    roleCountsText = "<br/> ".join(f"{k}: {v}" for k, v in roleCounts.items())
-    entrustmentCounts = studentDataDf["entrustment"].value_counts().to_dict()
-    esCountsText = "<br/> ".join(f"Lvl {int(k)}: {v}" for k, v in sorted(entrustmentCounts.items()))
-    avgGlobalRating = studentDataDf["global_rating"].dropna().astype(float).mean()
-    ciDf = studentDataDf[studentDataDf["clinical_incident"].notna()][
-        ["datetimeutc", "clinical_incident", "assessor_name", "clinic"]
-    ]
-    ciCounts = ciDf.shape[0]
-    allItemCodes = studentDataDf["item_codes"].dropna().explode().value_counts().to_dict()
-    topItemCodes = dict(sorted(allItemCodes.items(), key=lambda x: x[1], reverse=True)[:5])
-    topItemCodesText = ", ".join(f"{k}: {v}" for k, v in topItemCodes.items())
+    # ── Summary table: split by form type (Simulation / Clinic) ──
+    simDf = studentDataDf[studentDataDf["type"] == "Simulation"]
+    clinicDf = studentDataDf[studentDataDf["type"] == "Clinic"]
+ 
+    simMetrics = _computeSummaryMetrics(simDf, patientInfo=patientInfo, isSimulation=True)
+    clinicMetrics = _computeSummaryMetrics(clinicDf, patientInfo=patientInfo)
+ 
+    # Union of metric keys in insertion order
+    allKeys = list(OrderedDict.fromkeys(
+        list(simMetrics.keys()) + list(clinicMetrics.keys())
+    ))
+ 
+    hasSim = bool(simMetrics)
+    hasClinic = bool(clinicMetrics)
+    
+    if cohort == 'DDS3':
+        hasSim = False
+    if cohort == 'BOH1':
+        hasClinic = False
 
-    summaryDf = pd.DataFrame({
-        "Metric": [
-            "# Forms", "# Forms Submitted by Assessor", "# Forms Submitted by Student",
-            "Entrustment Counts", "Average Global Rating", "Critical Incidents", "Top Item Codes",
-        ],
-        "": [
-            nForms, nAssessorSubmittedForms, nStudentSubmittedForms, esCountsText,
-            f"{avgGlobalRating:.2f}/5" if not np.isnan(avgGlobalRating) else "N/A",
-            f"{ciCounts}", topItemCodesText,
-        ],
-    })
-
-    if patientInfo:
-        # patient details clip 0 to 120 
-        patientAge = studentDataDf["patient_age"].clip(lower=0, upper=120)
-        meanAge = patientAge.dropna().mean()
-        patientDetails = studentDataDf["patient_details"].value_counts().to_dict()
-        patientDetailsText = "<br/> ".join(f"{k}: {v}" for k, v in patientDetails.items())
-        ageBuckets = {
-            "0-6": studentDataDf[
-                (studentDataDf["patient_age"] >= 0) & (studentDataDf["patient_age"] <= 6)
-            ].shape[0],
-            "7-17": studentDataDf[
-                (studentDataDf["patient_age"] >= 7) & (studentDataDf["patient_age"] <= 17)
-            ].shape[0],
-            "18+": studentDataDf[studentDataDf["patient_age"] >= 18].shape[0],
-        }
-        ageCountsText = "<br/> ".join(f"{k}: {v}" for k, v in ageBuckets.items())
-        summaryDf = pd.concat([
-            summaryDf,
-            pd.DataFrame({
-                "Metric": ["Mean Patient Age", " Patient age distribution", "Role Counts", "Patient Details"],
-                "": [
-                    f"{meanAge:.2f}" if not np.isnan(meanAge) else "N/A",
-                    ageCountsText, roleCountsText, patientDetailsText,
-                ],
-            }),
-        ], ignore_index=True)
-
+    if hasSim and hasClinic:
+        summaryDf = pd.DataFrame({
+            "Metric": allKeys,
+            "Simulation": [simMetrics.get(k, "") for k in allKeys],
+            "Clinic": [clinicMetrics.get(k, "") for k in allKeys],
+        })
+        colRatio = [2, 1, 1]
+        customTextCols = [0, 1, 2]
+    elif hasSim:
+        summaryDf = pd.DataFrame({
+            "Metric": allKeys,
+            "Simulation": [simMetrics.get(k, "") for k in allKeys],
+        })
+        colRatio = [2, 1]
+        customTextCols = [0, 1]
+    else:
+        summaryDf = pd.DataFrame({
+            "Metric": allKeys,
+            "Clinic": [clinicMetrics.get(k, "") for k in allKeys],
+        })
+        colRatio = [2, 1]
+        customTextCols = [0, 1]
+ 
     summaryTable = createTable(
-        summaryDf, title="Summary", colRatio=[2, 1], customTextCols=[0, 1],
+        summaryDf, title="Summary", colRatio=colRatio,
+        customTextCols=customTextCols,
         titleStyle=subheadingStyle, tableTextStyle=tableTextStyle,
         headerColor=uniColor, bottomPadding=6, topPadding=6,
     )
-
+ 
     if subsubheadingStyleL is not None:
         elements.append(Paragraph(
             "This is a summary report of your activity so far in 2026. "
@@ -1116,60 +1883,90 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None,
             subsubheadingStyleL,
         ))
     elements.append(summaryTable)
+    elements.append(Spacer(1, 16))
+ 
+    # ── Rating Distribution: entrustment + global-rating pies per type ──
+    ratingsFig = _makeRatingsFigure(simDf, clinicDf, hasSim, hasClinic)
+    if ratingsFig is not None:
+        ratingElements = [
+            Paragraph("Rating Distribution", subheadingStyle),
+            Spacer(1, 6),
+            addPlotImage(ratingsFig, ratio=0.75),
+        ]
+        elements.append(KeepTogether(ratingElements))
+    elements.append(PageBreak())
+    
+
+
+    # ── Filter to assessor-submitted for plots & reflections ──
+    studentDataDf = studentDataDf[studentDataDf["submitted_by_assessor"]].copy()
+    studentDataDf["scores"] = studentDataDf.apply(lambda row: calcScore(row, scoreMap), axis=1)
+    studentDataDf.sort_values("datetimeutc", inplace=True)
+    # display(studentDataDf.head())
+
+    # -- explode to longDf for item-code-level analyses and add sections
+    longDf = explodeScoresToLong(studentDataDf)
+    longDf = _mergeSection(longDf)
+    # replace Unmapped section with Miscellaneous
+    longDf["Section"] = longDf["Section"].replace("Unmapped", "Miscellaneous")
+    # display(longDf.head(15))
+    allSections = _loadSectionMapping()["Section"].dropna().unique().tolist()
+    # print(f"Sections in mapping: {allSections}")
+
+    # ── Per-type time series pages (Simulation, then Clinic) and Item Code counts ──
+    simAdf = studentDataDf[studentDataDf["type"] == "Simulation"]
+    clinicAdf = studentDataDf[studentDataDf["type"] == "Clinic"]
+ 
+    typePages = []
+    if not simAdf.empty and hasSim:
+        typePages.append(("Simulation", simAdf))
+    if not clinicAdf.empty and hasClinic:
+        typePages.append(("Clinic", clinicAdf))
+    
+    if classAvgItemCounts['Simulation'] and not simAdf.empty and cohort not in ['DDS3', 'DDS2']:
+        _addItemCodeCountsBarChart(
+            elements, simAdf, classAvgItemCounts['Simulation'],
+            "Simulation", subheadingStyle,
+        )
+    elements.append(Spacer(1, 18))
+
+    if classAvgItemCounts['Clinic'] and not clinicAdf.empty and cohort not in ['BOH1']:
+        _addItemCodeCountsBarChart(
+            elements, clinicAdf, classAvgItemCounts["Clinic"],
+            "Clinic", subheadingStyle)
+    
+    
+    # Section performance (spider charts side-by-side + per-type tables)
+    if not longDf.empty:
+        _addSectionPerformance(
+            elements, longDf, typePages,
+            subheadingStyle=subheadingStyle,
+            tableTextStyle=tableTextStyle,
+            uniColor=uniColor,
+        )   
     elements.append(PageBreak())
 
-    # Time series plot of scores
-    timeSeriesDf = studentDataDf[
-        ["datetimeutc", "entrustment", "global_rating", "item_codes", "scores", "assessor_data", "assessor_name"]
-    ].copy()
-    timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
-    fig = plotStudentScoresTimeSeries(timeSeriesDf, dateCol="Date", scoreDictCol="scores",
-                                      scoreKey="score", fallbackKey=None,
-                                      title="Performance on Assessed Items Over Time")
-    if fig is not None:
-        timeSeriesImg = addPlotImage(fig)
-        elements.append(Spacer(1, 24))
-        elements.append(Paragraph("Performance Over Time", subheadingStyle))
-        elements.append(timeSeriesImg)
+    # Time series pages (scatter + rubric lines) for each type, with PageBreak after each
+    for idx, (typeLabel, typeDf) in enumerate(typePages):
+        _addTimeSeriesPage(
+            elements, typeDf, typeLabel,
+            subheadingStyle=subheadingStyle,
+        )
+        elements.append(PageBreak())
 
-    # Rubric plots for entrustment and global rating
-    fig, axes = plt.subplots(2, 1, figsize=(14, 6))
-    rubricPlotDf = studentDataDf[["datetimeutc", "entrustment", "global_rating"]].copy()
-    rubricPlotDf.rename(columns={
-        "datetimeutc": "Date", "entrustment": "Entrustment", "global_rating": "Global Rating",
-    }, inplace=True)
-    rubricPlotDf.sort_values("Date", inplace=True)
-    rubricPlotDf["Date"] = rubricPlotDf["Date"].dt.strftime("%Y-%m-%d")
-    rubricPlotDf["Entrustment"] = rubricPlotDf["Entrustment"].astype("Int64")
-    rubricPlotDf["Global Rating"] = rubricPlotDf["Global Rating"].astype("Int64")
-    rubricPlot(axes[0], rubricPlotDf, "Entrustment", "blue", maxY=4.5)
-    rubricPlot(axes[1], rubricPlotDf, "Global Rating", "green", maxY=5.5)
-    plt.subplots_adjust(hspace=0.5)
-    rubricImg = addPlotImage(fig)
-    plt.close(fig)
-    elements.append(Spacer(1, 24))
-    elements.append(Paragraph("Entrustment and Global Rating Over Time", subheadingStyle))
-    elements.append(rubricImg)
-
-    # Reflections table
-    reflectionsDf = studentDataDf[
-        ["datetimeutc", "role", "student_reflection", "assessor_reflection"]
-    ].copy()
-    reflectionsDf["student_reflection"] = reflectionsDf["student_reflection"].apply(truncateText).str.replace("\n", "<br/>")
-    reflectionsDf["assessor_reflection"] = reflectionsDf["assessor_reflection"].apply(truncateText).str.replace("\n", "<br/>")
-    reflectionsDf.columns = ["Date", "Role", "Student Reflection", "Assessor Reflection"]
-    reflectionsDf = reflectionsDf.sort_values("Date")
-    reflectionsDf["Date"] = reflectionsDf["Date"].dt.strftime("%Y-%m-%d")
-    reflectionsTable = createTable(
-        reflectionsDf, title="Reflections", colRatio=[1.2, 1, 5, 5],
-        customTextCols=[0, 1, 2, 3], titleStyle=subheadingStyle,
-        tableTextStyle=tableTextStyleSmall, headerColor=uniColor,
-        bottomPadding=6, topPadding=6,
-    )
-    elements.append(reflectionsTable)
-    elements.append(PageBreak())
+    # ── Per-type reflections (Simulation, then Clinic) ──
+    for typeLabel, typeDf in typePages:
+        _addReflectionsTable(
+            elements, typeDf, typeLabel,
+            subheadingStyle=subheadingStyle,
+            tableTextStyleSmall=tableTextStyleSmall,
+            uniColor=uniColor,
+        )
+        elements.append(PageBreak())
+ 
 
     return elements
+
 
 
 def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
@@ -1195,9 +1992,31 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
     studentIds = studentInfoDf.index.tolist()
     savefolder = f"{cohort}/Individual Student Reports"
     os.makedirs(savefolder, exist_ok=True)
+    # Cohort-level class averages for Simulation item-code counts (DDS2 only).
+    # Computed once outside the loop and passed into each student report.
+    classAvgItemCountsSim = None
+    classAvgItemCountsClinic = None
+    if cohort not in ["DDS2", "DDS3"]:
+        classAvgItemCountsSim = getCohortItemCodeAverages(
+            engine, cohort, formType="Simulation", formsTable=formsTable,
+        )
+        print(f"Computed class averages over {len(classAvgItemCountsSim)} item codes for {cohort} Simulation")
+    if cohort not in ["BOH1"]:
+        classAvgItemCountsClinic = getCohortItemCodeAverages(
+            engine, cohort, formType="Clinic", formsTable=formsTable,
+        )
+        print(f"Computed class averages over {len(classAvgItemCountsClinic)} item codes for {cohort} Clinic")
+    classAvgItemCounts = {
+        "Simulation": classAvgItemCountsSim,
+        "Clinic": classAvgItemCountsClinic,
+    }
     # studentIds = ['1678748', '1684643', '1362959', '1309866', '1362803', '1346824']
     # studentIds = [int(id) for id in studentIds]
     for studentNumber in studentIds:
+        if cohort == 'DDS2' and studentNumber in DDS2_REMOVED_STUDENTS:
+            continue
+        if cohort == 'BOH2' and studentNumber in BOH2_REMOVED_STUDENTS:
+            continue
         studentName = studentInfoDf.loc[studentNumber, "student_name"]
         print(f"Building report for student {studentNumber} - {studentName}")
         studentDataDf = getStudentData(engine, cohort, studentNumber, formsTable)
@@ -1212,7 +2031,7 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
             studentDataDf, patientInfo=patientInfo, scoreMap=scoreMap,
             subheadingStyle=subheadingStyle, subsubheadingStyleL=subsubheadingStyleL,
             tableTextStyle=tableTextStyle, tableTextStyleSmall=tableTextStyleSmall,
-            uniColor=uniColor,
+            uniColor=uniColor, cohort=cohort, classAvgItemCounts=classAvgItemCounts
         )
         doc.build(
             elements,
@@ -1220,3 +2039,4 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
                                          f"{studentName} ({studentNumber})"),
         )
         print(f"Report saved to {filename}\n")
+        # break  # TEMP - remove this to build for all students

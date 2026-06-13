@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DASH · SCBD Monitor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f8fafc;color:#1e293b;min-height:100vh;}
+.hdr{background:#010d44;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:12px 24px;position:sticky;top:0;z-index:10;}
+.hdr-brand{font-size:16px;font-weight:600;letter-spacing:1px;}
+.hdr-sub{font-size:11px;color:#c7d2fe;margin-top:2px;}
+.hdr-r{display:flex;align-items:center;gap:10px;}
+#last-upd{font-size:11px;color:#94a3b8;}
+.mode-badge{font-size:10px;font-weight:600;padding:2px 7px;border-radius:4px;letter-spacing:.3px;}
+.mode-proxy{background:#15803d33;color:#86efac;}
+.mode-direct{background:#f9731633;color:#fdba74;}
+.hbtn{background:transparent;border:1px solid #4f5fb2;color:#c7d2fe;border-radius:7px;padding:6px 14px;cursor:pointer;font-size:12px;font-family:inherit;}
+.hbtn:hover{background:#0d1f6b;}
+.hbtn.pri{background:#4f5fb2;border-color:#4f5fb2;color:#fff;font-weight:600;}
+.hbtn.pri:hover{background:#3d4d9e;}
+.hbtn.pri:disabled{background:#374151;border-color:#374151;cursor:default;}
+.cfg{background:#f1f5f9;border-bottom:1px solid #e2e8f0;padding:14px 24px;}
+.cfg-grid{display:grid;grid-template-columns:90px 1fr 70px 1fr;gap:8px 18px;align-items:center;font-size:12px;color:#64748b;}
+input[type=password],input[type=text],select{border:1px solid #cbd5e1;border-radius:6px;padding:6px 10px;font-size:12px;font-family:inherit;width:100%;background:#fff;color:#1e293b;}
+.cbs{display:flex;flex-wrap:wrap;gap:6px;grid-column:2/5;}
+.cbl{display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;color:#1e293b;}
+.err{background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:11px 16px;margin:12px 24px;font-size:13px;color:#dc2626;display:none;}
+.proxy-hint{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 16px;margin:0 24px;font-size:12px;color:#1d4ed8;display:none;line-height:1.6;}
+.proxy-hint code{background:#dbeafe;padding:1px 5px;border-radius:3px;font-size:11px;}
+.stats{display:none;gap:12px;padding:18px 24px 0;flex-wrap:wrap;}
+.sc{flex:1;min-width:100px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px 16px;}
+.sc-lbl{font-size:10px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.6px;margin-bottom:5px;}
+.sc-val{font-size:26px;font-weight:600;color:#0f172a;}
+.sc-val.g{color:#15803d;}.sc-val.a{color:#4f5fb2;}
+.charts{display:none;gap:14px;padding:16px 24px 0;}
+.cc{flex:1;background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px;}
+.cc-t{font-size:12px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;}
+.tbl-wrap{display:none;margin:16px 24px 28px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;}
+.tbl-hdr{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #e2e8f0;}
+.tbl-hdr span{font-size:13px;font-weight:600;color:#0f172a;}
+#search{border:1px solid #cbd5e1;border-radius:7px;padding:6px 12px;font-size:12px;width:270px;font-family:inherit;}
+table.rt{width:100%;border-collapse:collapse;font-size:12px;}
+table.rt th{background:#010d44;color:#c7d2fe;padding:9px 13px;text-align:left;cursor:pointer;font-weight:500;white-space:nowrap;user-select:none;}
+table.rt th:hover{background:#0d1f6b;}
+table.rt td{padding:8px 13px;border-bottom:1px solid #f1f5f9;color:#334155;}
+table.rt tr:last-child td{border-bottom:none;}
+table.rt tr:hover td{background:#f8fafc;}
+.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600;}
+.empty{text-align:center;padding:70px 0;color:#94a3b8;}
+.empty-icon{font-size:32px;display:block;margin-bottom:12px;color:#cbd5e1;}
+@media(prefers-color-scheme:dark){
+  body{background:#0f172a;color:#e2e8f0;}
+  .cfg{background:#1e293b;border-color:#334155;}
+  .cfg-grid{color:#94a3b8;}
+  input[type=password],input[type=text],select,#search{background:#1e293b;border-color:#334155;color:#e2e8f0;}
+  .sc,.cc,.tbl-wrap{background:#1e293b;border-color:#334155;}
+  .sc-val{color:#f1f5f9;}.tbl-hdr span{color:#f1f5f9;}
+  .tbl-hdr,table.rt td{border-color:#334155;}
+  table.rt tr:hover td{background:#0f172a;}
+  .proxy-hint{background:#172554;border-color:#1e40af;color:#93c5fd;}
+  .proxy-hint code{background:#1e3a8a;}
+  .cbl{color:#e2e8f0;}
+}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div>
+    <div class="hdr-brand">DASH</div>
+    <div class="hdr-sub">SCBD Live Monitor</div>
+  </div>
+  <div class="hdr-r">
+    <span id="mode-badge" class="mode-badge"></span>
+    <span id="last-upd"></span>
+    <button class="hbtn" onclick="toggleCfg()">⚙ Config</button>
+    <button class="hbtn pri" id="rbtn" onclick="loadData()">↻ Refresh</button>
+  </div>
+</div>
+
+<div class="cfg" id="cfg">
+  <div class="cfg-grid">
+    <span>Token</span>
+    <input type="password" id="tok" placeholder="Paste raw token (no 'Token ' prefix)…" />
+    <span>Year</span>
+    <select id="yr"><option>2026</option><option>2025</option><option>2024</option></select>
+    <span>Cohorts</span>
+    <div class="cbs" id="cbs"></div>
+    <span>Auto-refresh</span>
+    <select id="rsel" onchange="setRefresh(+this.value)">
+      <option value="0">Manual only</option>
+      <option value="60">Every 1 min</option>
+      <option value="300">Every 5 min</option>
+      <option value="600">Every 10 min</option>
+    </select>
+    <span></span>
+    <label class="cbl"><input type="checkbox" id="subonly" onchange="rerender()"> Submitted assessments only</label>
+  </div>
+</div>
+
+<div class="proxy-hint" id="proxy-hint">
+  <strong>CORS blocked.</strong> The API doesn't allow direct browser requests.
+  Run the proxy server instead:<br>
+  <code>python scbd_proxy.py</code> then open <code>http://localhost:8765/</code>
+</div>
+<div class="err" id="err"></div>
+
+<div class="stats" id="stats">
+  <div class="sc"><div class="sc-lbl">Total records</div><div class="sc-val" id="sv-tot">—</div></div>
+  <div class="sc"><div class="sc-lbl">Submitted</div><div class="sc-val g" id="sv-sub">—</div></div>
+  <div class="sc"><div class="sc-lbl">Avg global rating</div><div class="sc-val a" id="sv-gr">—</div></div>
+  <div class="sc"><div class="sc-lbl">Unique students</div><div class="sc-val" id="sv-stu">—</div></div>
+  <div class="sc"><div class="sc-lbl">Assessors active</div><div class="sc-val" id="sv-ass">—</div></div>
+</div>
+
+<div class="charts" id="charts">
+  <div class="cc">
+    <div class="cc-t">Global rating distribution</div>
+    <div style="position:relative;height:210px">
+      <canvas id="grc" role="img" aria-label="Bar chart of assessment counts by global rating GR 1 to GR 5">No data</canvas>
+    </div>
+  </div>
+  <div class="cc">
+    <div class="cc-t">Cohort breakdown — total vs submitted</div>
+    <div style="position:relative;height:210px">
+      <canvas id="coc" role="img" aria-label="Grouped bar chart of total and submitted assessment counts per cohort">No data</canvas>
+    </div>
+  </div>
+</div>
+
+<div class="tbl-wrap" id="tbl-wrap">
+  <div class="tbl-hdr">
+    <span id="rcnt">Records</span>
+    <input id="search" placeholder="Search students, assessors, cohort, subject…" oninput="rerender()" />
+  </div>
+  <div style="overflow-x:auto">
+    <table class="rt">
+      <thead><tr>
+        <th data-k="datetimeUtc" onclick="doSort('datetimeUtc')">Date</th>
+        <th data-k="studentName" onclick="doSort('studentName')">Student</th>
+        <th data-k="assessorName" onclick="doSort('assessorName')">Assessor</th>
+        <th data-k="cohort" onclick="doSort('cohort')">Cohort</th>
+        <th data-k="subject" onclick="doSort('subject')">Subject</th>
+        <th data-k="globalRating" onclick="doSort('globalRating')">GR</th>
+        <th data-k="submitted" onclick="doSort('submitted')">Submitted</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="empty" id="empty">
+  <span class="empty-icon">▦</span>
+  Enter your bearer token above and click Refresh to load SCBD data
+</div>
+
+<script>
+// ── Mode detection ──────────────────────────────────────────────────────────
+const IS_PROXY = ['localhost','127.0.0.1'].includes(location.hostname);
+const API_BASE = IS_PROXY ? '/api' : 'https://api.unimelb-dash.com';
+
+const badge = document.getElementById('mode-badge');
+if (IS_PROXY) {
+  badge.textContent = 'Proxy'; badge.className = 'mode-badge mode-proxy';
+} else {
+  badge.textContent = 'Direct'; badge.className = 'mode-badge mode-direct';
+}
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const NAVY='#010d44', ACCENT='#4f5fb2';
+const ALL_C=['DDS1','DDS2','DDS3','DDS4','BOH1','BOH2','BOH3'];
+const GR_C=['','#ef4444','#f97316','#eab308','#22c55e','#10b981'];
+const COH_C={DDS1:'#818cf8',DDS2:'#a78bfa',DDS3:'#c084fc',DDS4:'#e879f9',BOH1:'#38bdf8',BOH2:'#22d3ee',BOH3:'#2dd4bf'};
+const EXCL=new Set(['kunal patel','suhrid gupta']);
+let recs=[], prev=null, gC=null, cC=null, sk='datetimeUtc', sa=false, rt=null;
+
+// ── Init: restore session state ──────────────────────────────────────────────
+(()=>{
+  const saved=JSON.parse(sessionStorage.getItem('dash_cohorts')||'["DDS3","BOH3", "DDS4"]');
+  const g=document.getElementById('cbs');
+  ALL_C.forEach(c=>{
+    const l=document.createElement('label');
+    l.className='cbl';
+    l.innerHTML=`<input type="checkbox" class="ccb" value="${c}" ${saved.includes(c)?'checked':''}> ${c}`;
+    g.appendChild(l);
+  });
+  const t=sessionStorage.getItem('dash_tok'); if(t) document.getElementById('tok').value=t;
+  const y=sessionStorage.getItem('dash_yr');  if(y) document.getElementById('yr').value=y;
+})();
+
+function isDark(){ return matchMedia('(prefers-color-scheme:dark)').matches; }
+function tc(){ return isDark()?'#94a3b8':'#64748b'; }
+function gc(){ return isDark()?'rgba(255,255,255,0.06)':'rgba(0,0,0,0.05)'; }
+
+// ── Fetch (with pagination) ───────────────────────────────────────────────────
+async function fetchAll(rawTok, cohorts, yr){
+  // Strip accidental "Bearer " prefix — user may have copied the full header value
+  const tok = rawTok.replace(/^(bearer|token)\s+/i, '').trim();
+  const ct=cohorts.join(',');
+  let url=`${API_BASE}/assessment/scbd/get?page_size=max&page=1&cohort=${encodeURIComponent(ct)}&year=${yr}&ordering=id`;
+  const all=[];
+  while(url){
+    const r=await fetch(url,{headers:{Authorization:`Token ${tok}`}});
+    if(!r.ok){
+      if(r.status===401) throw new Error(
+        'Unauthorized (401). Verify the token is correct — paste only the raw token, not the full "Bearer <token>" string.');
+      if(r.status===403) throw new Error('Forbidden — check cohort permissions for this token');
+      throw new Error(`HTTP ${r.status} from API`);
+    }
+    const d=await r.json();
+    all.push(...(Array.isArray(d.results)?d.results:[]));
+    url=d.next||null;
+  }
+  return all;
+}
+
+// ── Parse (mirrors toRowsScbd) ────────────────────────────────────────────────
+function parse(raw){
+  return raw.map(r=>{
+    const s=r.student;
+    if(!s||typeof s!=='string'||EXCL.has(s.toLowerCase())) return null;
+    const ad=(r.form?.data?.assessor)||{};
+    const grRaw=ad['scale-global-rating']?.scale;
+    let ck=null;
+    for(const[k,v]of Object.entries(ad)){
+      if(k!=='comments'&&k!=='scale-global-rating'&&v&&typeof v==='object'){ck=k;break;}
+    }
+    return{
+      id:r.id, studentName:s, assessorName:r.assessor||'—',
+      datetimeUtc:r.datetime, cohort:r.cohort||'—', subject:r.subject||'—',
+      submitted:!!r.submitted, version:r.version,
+      globalRating:grRaw!=null?parseInt(grRaw):null,
+      assessorComments:ad.comments||null, checklistKey:ck
+    };
+  }).filter(Boolean);
+}
+
+function fmt(s){
+  if(!s) return'—';
+  const d=new Date(s);
+  return`${d.getDate()} ${d.toLocaleString('default',{month:'short'})} ${d.getFullYear()} `+
+    `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+function grBadge(g){
+  if(g==null) return'<span style="color:#94a3b8">—</span>';
+  const c=GR_C[g]||'#94a3b8';
+  return`<span class="badge" style="background:${c}33;color:${c}">${g}</span>`;
+}
+
+// ── Load data ─────────────────────────────────────────────────────────────────
+async function loadData(){
+  const tok=document.getElementById('tok').value.trim();
+  const yr=document.getElementById('yr').value;
+  const cohorts=[...document.querySelectorAll('.ccb:checked')].map(c=>c.value);
+  if(!tok){showErr('Please enter a bearer token.');return;}
+  if(!cohorts.length){showErr('Select at least one cohort.');return;}
+  // Store stripped token
+  const strippedTok=tok.replace(/^bearer\s+/i,'').trim();
+  document.getElementById('tok').value=strippedTok;
+  sessionStorage.setItem('dash_tok',strippedTok);
+  sessionStorage.setItem('dash_yr',yr);
+  sessionStorage.setItem('dash_cohorts',JSON.stringify(cohorts));
+  const btn=document.getElementById('rbtn');
+  btn.textContent='↻ Loading…'; btn.disabled=true;
+  hideErr(); document.getElementById('proxy-hint').style.display='none';
+  try{
+    const raw=await fetchAll(tok,cohorts,yr);
+    prev=recs.length||null;
+    recs=parse(raw);
+    renderStats(); renderCharts(); rerender();
+    document.getElementById('stats').style.display='flex';
+    document.getElementById('charts').style.display='flex';
+    document.getElementById('tbl-wrap').style.display='block';
+    document.getElementById('empty').style.display='none';
+    document.getElementById('last-upd').textContent='Updated '+new Date().toLocaleTimeString();
+  }catch(e){
+    let m=e.message||'Unknown error';
+    const isCors=/failed to fetch|network|cors/i.test(m);
+    showErr(m);
+    if(isCors) document.getElementById('proxy-hint').style.display='block';
+  }finally{
+    btn.textContent='↻ Refresh'; btn.disabled=false;
+  }
+}
+
+// ── Render stat cards ─────────────────────────────────────────────────────────
+function renderStats(){
+  const sub=recs.filter(r=>r.submitted);
+  const wgr=sub.filter(r=>r.globalRating!=null);
+  const avg=wgr.length?(wgr.reduce((s,r)=>s+r.globalRating,0)/wgr.length).toFixed(2):'—';
+  const stu=new Set(recs.map(r=>r.studentName)).size;
+  const ass=new Set(recs.map(r=>r.assessorName).filter(a=>a!=='—')).size;
+  const pct=recs.length?Math.round(sub.length/recs.length*100):0;
+  const nb=(prev!=null&&recs.length>prev)
+    ?` <span class="badge" style="background:#dcfce7;color:#15803d;font-size:10px">+${recs.length-prev} new</span>`:'';
+  document.getElementById('sv-tot').innerHTML=recs.length+nb;
+  document.getElementById('sv-sub').textContent=`${sub.length} (${pct}%)`;
+  document.getElementById('sv-gr').textContent=avg;
+  document.getElementById('sv-stu').textContent=stu;
+  document.getElementById('sv-ass').textContent=ass;
+}
+
+// ── Render charts ─────────────────────────────────────────────────────────────
+function renderCharts(){
+  const sub=recs.filter(r=>r.submitted);
+  const grD=[1,2,3,4,5].map(g=>recs.filter(r=>r.globalRating===g).length);
+  if(gC)gC.destroy();
+  gC=new Chart(document.getElementById('grc'),{
+    type:'bar',
+    data:{labels:['GR 1','GR 2','GR 3','GR 4','GR 5'],
+      datasets:[{data:grD,backgroundColor:GR_C.slice(1),borderRadius:5,borderSkipped:false}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:tc(),autoSkip:false},grid:{color:gc()}},
+        y:{beginAtZero:true,ticks:{stepSize:1,color:tc()},grid:{color:gc()}}}}
+  });
+  const ac=ALL_C.filter(c=>recs.some(r=>r.cohort===c));
+  if(cC)cC.destroy();
+  cC=new Chart(document.getElementById('coc'),{
+    type:'bar',
+    data:{labels:ac,datasets:[
+      {label:'Total',data:ac.map(c=>recs.filter(r=>r.cohort===c).length),backgroundColor:NAVY+'bb',borderRadius:5,borderSkipped:false},
+      {label:'Submitted',data:ac.map(c=>sub.filter(r=>r.cohort===c).length),backgroundColor:ACCENT+'bb',borderRadius:5,borderSkipped:false}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{labels:{color:tc(),boxWidth:11,font:{size:11}}}},
+      scales:{x:{ticks:{color:tc(),autoSkip:false},grid:{color:gc()}},
+        y:{beginAtZero:true,ticks:{stepSize:1,color:tc()},grid:{color:gc()}}}}
+  });
+}
+
+// ── Records table ─────────────────────────────────────────────────────────────
+function rerender(){
+  if(!recs.length) return;
+  const q=(document.getElementById('search')?.value||'').toLowerCase();
+  const so=document.getElementById('subonly').checked;
+  const dk=isDark();
+  let f=recs.filter(r=>{
+    if(so&&!r.submitted) return false;
+    if(!q) return true;
+    return r.studentName.toLowerCase().includes(q)||r.assessorName.toLowerCase().includes(q)||
+      r.cohort.toLowerCase().includes(q)||r.subject.toLowerCase().includes(q);
+  });
+  f.sort((a,b)=>{
+    let va=a[sk],vb=b[sk];
+    if(va==null)va='';if(vb==null)vb='';
+    if(typeof va==='string') return sa?va.localeCompare(vb):vb.localeCompare(va);
+    return sa?va-vb:vb-va;
+  });
+  document.getElementById('rcnt').textContent=`Records (${f.length})`;
+  const MAX=500;
+  document.getElementById('tbody').innerHTML=f.slice(0,MAX).map((r,i)=>{
+    const cc=COH_C[r.cohort]||'#64748b';
+    const bg=i%2?(dk?'#0f172a':'#f8fafc'):(dk?'#1e293b':'#fff');
+    return`<tr style="background:${bg}">
+      <td style="white-space:nowrap;color:${dk?'#64748b':'#94a3b8'}">${fmt(r.datetimeUtc)}</td>
+      <td style="font-weight:500">${r.studentName}</td>
+      <td>${r.assessorName}</td>
+      <td><span class="badge" style="background:${cc}22;color:${cc}">${r.cohort}</span></td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.subject}">${r.subject}</td>
+      <td>${grBadge(r.globalRating)}</td>
+      <td style="color:${r.submitted?'#15803d':'#94a3b8'};font-weight:500">${r.submitted?'✓ Yes':'✗ No'}</td>
+    </tr>`;
+  }).join('')+(f.length>MAX?`<tr><td colspan="7" style="padding:9px 13px;color:#94a3b8;font-size:11px">Showing ${MAX} of ${f.length} — use search to filter further</td></tr>`:'');
+}
+
+function doSort(k){
+  if(sk===k)sa=!sa;else{sk=k;sa=false;}
+  document.querySelectorAll('.rt th').forEach(th=>{
+    const dk2=th.dataset.k;
+    const base=th.dataset.label||(th.dataset.label=th.textContent.replace(/ [↑↓]/,'').trim());
+    th.textContent=base+(dk2===k?(sa?' ↑':' ↓'):'');
+  });
+  rerender();
+}
+function toggleCfg(){const p=document.getElementById('cfg');p.style.display=p.style.display==='none'?'block':'none';}
+function setRefresh(s){if(rt)clearInterval(rt);if(s>0)rt=setInterval(loadData,s*1000);}
+function showErr(m){const e=document.getElementById('err');e.textContent=m;e.style.display='block';}
+function hideErr(){document.getElementById('err').style.display='none';}
+</script>
+</body>
+</html>

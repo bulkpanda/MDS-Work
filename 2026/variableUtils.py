@@ -37,6 +37,7 @@ print(pageSize)
 figSize = (pageSize[0] / 100, pageSize[1] / 100)
 uniColor = '#010d44'
 textcolor = "#4f5fb2"
+whitecolor = 'white'
 # Define the margins
 leftMargin = 0.5* inch
 rightMargin = 0.5 * inch
@@ -57,9 +58,11 @@ smallsubsubheadingStyleC = ParagraphStyle('Heading3', parent=styles['Heading3'],
 normalLargeStyleLeft = ParagraphStyle('NormalLarge', parent=styles['Normal'], fontSize=18, alignment=0)  # Left aligned
 normalLargeStyleCenter = ParagraphStyle('NormalLarge2', parent=styles['Normal'], fontSize=18, alignment=1)  # Center aligned
 tableTextStyle = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=1)
+tableTextStyleWhite = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=1, textColor=whitecolor)
 tableTextStyleL = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=13, alignment=0)
 tableTextStyleLSmall = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=11, alignment=0)
 tableTextStyleSmall= ParagraphStyle('SmallFont', parent=styles['Normal'], fontSize=11, alignment=1)
+tableTextStyleSmallWhite = ParagraphStyle('SmallFont', parent=styles['Normal'], fontSize=11, alignment=1, textColor=whitecolor)
 tableTextStyleLarge = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=15, alignment=1, leading=20)
 Checklistcolors = {'Yes': 'blue', 'No': 'orange', 'Not Reviewed': 'lightgrey'}
 

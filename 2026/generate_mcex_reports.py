@@ -216,6 +216,7 @@ def generate_pdf(row, styles, out_path):
     pct   = float(row["%Score"])
     score = int(row["Score"])
     comments = str(row["comments"]).strip() if pd.notna(row["comments"]) else ""
+    result = row["Result"] if pd.notna(row.get("Result")) else ""
 
     story = []
     story.append(Spacer(1, BANNER_SPACER))
@@ -247,10 +248,16 @@ def generate_pdf(row, styles, out_path):
     if comments:
         story.append(Paragraph("Assessor Comments", styles["subheading_l"]))
         story.append(Paragraph(f'"{comments}"', styles["comment"]))
-
+    story.append(Spacer(1, 10))
+    # add result at end
+    if result:
+        story.append(Paragraph("Result", styles["subheading_l"]))
+        story.append(Paragraph(f'{result}', styles["comment"]))
     story.append(Spacer(1, 10))
     story.append(HRFlowable(width="100%", thickness=1, color=C_UNI, spaceAfter=6))
     # story.append(Paragraph("This report is intended for the individual student only.", styles["footer"]))
+    # add result
+    
 
     doc.build(story, onFirstPage=getBannerDrawer(
         "DENT90148 Oral Medicine Clinical Examination",
