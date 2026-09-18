@@ -5,6 +5,8 @@ from pprint import pprint
 import warnings
 import openpyxl
 import os
+
+import win32com
 import variableUtils
 import json
 from openpyxl.utils import get_column_letter
@@ -31,6 +33,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 from itertools import combinations
 from sqlalchemy import create_engine, text
+
 # For data cleaning and preprocessing
 
 pdfmetrics.registerFont(TTFont('Arial', 'arial.ttf'))
@@ -522,14 +525,20 @@ def addPlotImage(fig, ratio = None, pageSize = variableUtils.pageSize):
         plt.close(fig)
         return(image)
 
-# New year functions
+# New year functions ------------------------------------------------------------------------------------------------------------
 
-def getBannerDrawer( firstline, secondline):
+def getBannerDrawer( firstline, secondline, bannerHeight=132):
     """
     Returns a function that draws a banner with the specified first and second lines of text.
     The returned function can be used as a callback for the onPage event in ReportLab's SimpleDocTemplate.
     Args:        firstline (str): The text to display on the first line of the banner.
-        secondline (str): The text to display on the second line of the banner. 
+        secondline (str): The text to display on the second line of the banner.
+        bannerHeight (float): Height of the coloured banner rectangle in points.
+            Defaults to 132 (the original hardcoded value), so existing two-arg
+            callers are unchanged. NOTE: the text offsets below (topOffset=72,
+            lineSpacing=36) stay fixed and are tuned for 132 — on a shorter
+            banner the first line sits low and a non-empty second line can fall
+            outside the rectangle, so pass a height that suits your text.
     Returns: function: A function that takes a canvas and a document as arguments and draws the banner on the canvas.
     """
     def drawBanner(canvas, doc):
@@ -537,7 +546,6 @@ def getBannerDrawer( firstline, secondline):
 
         # Banner layout
         pageWidth, pageHeight = doc.pagesize
-        bannerHeight = 132
         canvas.setFillColor(colors.HexColor(variableUtils.uniColor))
         canvas.rect(0, pageHeight - bannerHeight, pageWidth, bannerHeight, fill=1, stroke=0)
 
@@ -628,4 +636,73 @@ def autoFitColumns(ws, minWidth=5, maxWidth=30, padding=2):
         headerLen = len(str(headerCell.value or ""))
         ws.column_dimensions[colLetter].width = max(minWidth, min(maxWidth, headerLen + padding))
 
+def _loadSectionMapping(mappingFile=None):
+    """
+    Load the item-code → section mapping and return a DataFrame
+    with columns ["Item Code", "Section", "Sub-section"].
+    """
+    if mappingFile is None:
+        mappingFile = variableUtils.itemSectionMappingFile
+    mappingDf = pd.read_excel(mappingFile)
+    mappingDf["Item Code"] = mappingDf["Item Code"].astype(str).str.strip()
+    return mappingDf
 
+def _mergeSection(df, mappingDf = _loadSectionMapping(), codeCol="Item Code", sectionCol="Section", subSectionCol="Sub-section"):
+    """
+    Merge a DataFrame that has an item-code column with the section mapping.
+
+    Handles compound codes like "022/024" by splitting on "/" and matching
+    the first component.  Unmatched codes get Section/Sub-section = "Unmapped".
+
+    Always adds both "Section" and "Sub-section" columns.
+    """
+    merged = df.copy()
+    if len(merged) == 0:
+        # If the input DataFrame is empty, just add the Section/Sub-section columns and return
+        merged[sectionCol] = pd.NA
+        merged[subSectionCol] = pd.NA
+        return merged
+    # SPLIT by - also only if first part is a number otherwise keep as it is (for codes like "BOH-DD" that should be matched as a whole)
+    merged["_MappingCode"] = merged[codeCol].astype(str).str.split("/").str[0].str.strip()
+    merged["_MappingCode"] = merged["_MappingCode"].apply(lambda code: code.split("-")[0] if code.split("-")[0].isdigit() else code)
+    mergeCols = ['Item Code', 'Section']
+    # mappingDf = mappingDf.rename({"Item Code": codeCol, "Section": sectionCol})
+    print(mergeCols, mappingDf.columns)
+    if subSectionCol in mappingDf.columns:
+        mergeCols.append(subSectionCol)
+
+    merged = merged.merge(
+        mappingDf[mergeCols],
+        left_on="_MappingCode", right_on='Item Code',
+        how="left", suffixes=("", "_map"),
+    )
+    # Clean up helper columns
+    if "Item Code_map" in merged.columns:
+        merged.drop(columns=["Item Code_map"], inplace=True)
+    merged.drop(columns=["_MappingCode"], inplace=True)
+    merged[sectionCol] = merged[sectionCol].fillna("Unmapped")
+    if subSectionCol in merged.columns:
+        merged[subSectionCol] = merged[subSectionCol].fillna("Unmapped")
+    return merged
+
+def send_email(recipient_email: str, filename: str, subject: str = "Report", 
+               body: str = "Please find the attached report.", savefolder: str = ".") -> None:
+        """
+        Send an email with the report attachment.
+        :param recipient_email: The email of the recipient.
+        :param filename: The report file to attach.
+        """
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.To = recipient_email
+        mail.Subject = subject
+        mail.Body = body
+        fullpath = os.path.abspath(os.path.join(savefolder, filename))
+        if not os.path.isfile(fullpath):
+            print(f"Attachment file does not exist: {fullpath}")
+            return False
+        mail.Attachments.Add(fullpath)
+        mail.Send()
+        outlook.Session.SendAndReceive(False)
+        print(f"Email sent to {recipient_email} with attachment {fullpath}\n")
+        return True

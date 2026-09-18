@@ -24,15 +24,19 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
 from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
 from reportlab.platypus import (
-    KeepTogether, SimpleDocTemplate, PageBreak, Paragraph, Spacer,
+    KeepTogether, SimpleDocTemplate, PageBreak, Paragraph, Spacer, Table, TableStyle, Flowable,
 )
+from reportlab.platypus.tableofcontents import TableOfContents
 from reportlab.lib.units import inch
 from matplotlib.patches import Rectangle
 from matplotlib.lines import Line2D
 
-from Utils import createTable, addPlotImage, getBannerDrawer, getmodeArgs, readDf, runDdl, toInt, autoFitColumns
+from Utils import createTable, addPlotImage, getBannerDrawer, getmodeArgs, readDf, runDdl, toInt, autoFitColumns, _loadSectionMapping, _mergeSection
 import variableUtils
+from variableUtils import *
 from IPython.display import display
 
 # Default score map used across BOH2/DDS2/DDS3
@@ -42,12 +46,28 @@ SCORE_MAP = {
     "O3": 0.60,
     "O4": 0.40,
     "O5": 0.00,
+    "O6": np.nan,  # "Not observed" - exclude from averages
     "Yes": 1.00,
     "No": 0.00,
 }
 
-BOH2_REMOVED_STUDENTS = [1352051, 1606158, 1605793, 1617958, 1605538]
-DDS2_REMOVED_STUDENTS = [1270152, 1155940, 914405]
+# Default layout for buildCohortTimeSeriesPdf's per-student page:
+#   False -> two separate figures (score scatter, then the 5 rubric panels) with
+#            matched widths so their equidistant date ticks line up vertically.
+#   True  -> one combined figure with the scatter + 5 rubric panels sharing a
+#            single x-axis (guaranteed alignment).
+# Flip this here to change the default globally, or pass `combined=` per call.
+COMBINE_TIMESERIES_PANELS = False
+
+# ── Time-series FHY/SHY split + interactive-embed config (2026-09-16, additive) ──
+# FHY = forms before TS_SPLIT_DATE, SHY = on/after. Split happens only when BOTH
+# halves have rows. INTERACTIVE_TS_COHORTS get the embedded-interactive chart by
+# default (a self-contained HTML embedded in the PDF + an in-page paperclip); all
+# other cohorts keep the static matplotlib charts. Both behaviours are switchable
+# per call via `tsSplit=` / `interactiveTimeSeries=` on the V2 builders.
+TS_SPLIT_DATE = pd.Timestamp("2026-06-15", tz="Australia/Melbourne")
+INTERACTIVE_TS_COHORTS = ("DDS3",)
+
 
 
 
@@ -96,58 +116,193 @@ def getWhereStatement(cohort, filters: dict = None, dateFrom="2026-01-01"):
 
     return " AND ".join(whereClauses), params
 
-
 def _where(cohort, filters, dateFrom="2026-01-01"):
     """Shorthand: returns (whereClause, params)."""
     return getWhereStatement(cohort, filters, dateFrom=dateFrom)
 
-def _loadSectionMapping(mappingFile=None):
+
+# Cohorts whose graded data can live in student_data instead of assessor_data:
+#   BOH1 – some checklists are filled by students only (see Config.xlsx)
+#   BOH2 – Smile Squad clinic forms carry only student_data
+STUDENT_FALLBACK_COHORTS = ("BOH1", "BOH2")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BOH2 Smile Squad — student-completed clinic forms
+# ═══════════════════════════════════════════════════════════════════════════
+# Smile Squad clinic sessions have no separate DASH assessor account: the student
+# fills in the assessor side of the form themselves. The result is that ALL the
+# graded content (scales, checklists and the flattened item codes) lands in
+# ``student_data`` while ``assessor_data`` holds only empty buckets, and
+# ``submitted_by_assessor`` is False. Every downstream report filters on
+# ``submitted_by_assessor``, so without the swap below these forms vanish from
+# the scatter, rubric panels, item-code counts, section performance and
+# reflections.
+#
+# IMPORTANT — v3 stores the clinic as a CODE, not a label. ``rawform_forms_v3.clinic``
+# is populated from ``form_context->>'clinic_type'`` (see
+# ``general_utils.getInsertSqlRawform_forms_v3``), so the value is "SS"; the v2
+# label "Smile Squad" never appears. Comparing against the label alone silently
+# matched zero rows. ``isSmileSquadClinic`` accepts both spellings.
+SMILE_SQUAD_CLINIC_VALUES = {"ss", "smile squad", "smilesquad"}
+SMILE_SQUAD_COHORTS = ("BOH2",)
+
+# Standard (non item-code) buckets that live alongside the flattened item codes
+# at the top level of student_data / assessor_data in v3.
+DATA_BUCKET_KEYS = ("radio", "texts", "scales", "checklists", "multi-select")
+
+# Scalar columns getDataDf derives IN SQL from ``assessor_data->'scales'``.
+# Because the swap happens in Python (after the query) they have to be
+# re-derived for the swapped rows, or the rubric panels stay empty.
+SMILE_SQUAD_SCALE_COLUMNS = {
+    "entrustment": "scale-practice-readiness",
+    "professionalism": "scale-professionalism",
+    "communication": "scale-communication",
+    "time_management": "scale-time-mgmt",
+    "global_rating": "scale-global-rating",
+    "patient_complexity": "scale-patient-complexity",
+}
+# Of those, the ones getDataDf casts to int.
+SMILE_SQUAD_INT_SCALE_COLUMNS = (
+    "entrustment", "professionalism", "communication", "time_management",
+)
+
+
+def isSmileSquadClinic(value) -> bool:
+    """True when a ``clinic`` value is Smile Squad.
+
+    Accepts the v3 code ("SS") and the legacy v2 label ("Smile Squad"), so the
+    same test works against either pipeline.
     """
-    Load the item-code → section mapping and return a DataFrame
-    with columns ["Item Code", "Section", "Sub-section"].
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().lower() in SMILE_SQUAD_CLINIC_VALUES
+
+
+def _scaleKeyFromData(data, scaleName):
+    """Extract ``*_data->'scales'->scaleName->>'key'`` from a parsed JSONB dict.
+
+    Mirrors the SQL in ``getDataDf``. Returns None for missing/blank values.
     """
-    if mappingFile is None:
-        mappingFile = variableUtils.itemSectionMappingFile
-    mappingDf = pd.read_excel(mappingFile)
-    mappingDf["Item Code"] = mappingDf["Item Code"].astype(str).str.strip()
-    return mappingDf
+    if not isinstance(data, dict):
+        return None
+    scales = data.get("scales") or {}
+    if not isinstance(scales, dict):
+        return None
+    entry = scales.get(scaleName)
+    key = entry.get("key") if isinstance(entry, dict) else entry
+    if key is None:
+        return None
+    if isinstance(key, str) and not key.strip():
+        return None
+    return key
 
 
-def _mergeSection(df, mappingDf = _loadSectionMapping(), codeCol="Item Code"):
+def _itemCodesFromData(data):
+    """Top-level item codes of a ``*_data`` dict.
+
+    Mirrors the LATERAL join in ``getDataDf``: the standard buckets and the
+    ``scale-*`` entries are excluded, everything else is a real item code.
     """
-    Merge a DataFrame that has an item-code column with the section mapping.
-
-    Handles compound codes like "022/024" by splitting on "/" and matching
-    the first component.  Unmatched codes get Section/Sub-section = "Unmapped".
-
-    Always adds both "Section" and "Sub-section" columns.
-    """
-    merged = df.copy()
-    if len(merged) == 0:
-        # If the input DataFrame is empty, just add the Section/Sub-section columns and return
-        merged["Section"] = pd.NA
-        merged["Sub-section"] = pd.NA
-        return merged
-    # SPLIT by - also only if first part is a number otherwise keep as it is (for codes like "BOH-DD" that should be matched as a whole)
-    merged["_MappingCode"] = merged[codeCol].astype(str).str.split("/").str[0].str.strip()
-    merged["_MappingCode"] = merged["_MappingCode"].apply(lambda code: code.split("-")[0] if code.split("-")[0].isdigit() else code)
-    mergeCols = ["Item Code", "Section"]
-    if "Sub-section" in mappingDf.columns:
-        mergeCols.append("Sub-section")
-
-    merged = merged.merge(
-        mappingDf[mergeCols],
-        left_on="_MappingCode", right_on="Item Code",
-        how="left", suffixes=("", "_map"),
+    if not isinstance(data, dict):
+        return []
+    return sorted(
+        k for k in data.keys()
+        if k not in DATA_BUCKET_KEYS and not str(k).startswith("scale-")
     )
-    # Clean up helper columns
-    if "Item Code_map" in merged.columns:
-        merged.drop(columns=["Item Code_map"], inplace=True)
-    merged.drop(columns=["_MappingCode"], inplace=True)
-    merged["Section"] = merged["Section"].fillna("Unmapped")
-    if "Sub-section" in merged.columns:
-        merged["Sub-section"] = merged["Sub-section"].fillna("Unmapped")
-    return merged
+
+
+def applySmileSquadSwap(df, cohort):
+    """Treat BOH2 Smile Squad ``student_data`` as ``assessor_data``.
+
+    For every Smile Squad row this swaps ``student_data`` <-> ``assessor_data``
+    and ``submitted_by_student`` <-> ``submitted_by_assessor``, then re-derives
+    the scale columns and ``item_codes`` from the new assessor side (they were
+    computed in SQL from the pre-swap ``assessor_data`` and would otherwise stay
+    NULL/empty, leaving every rubric panel blank).
+
+    The reflection columns are deliberately NOT swapped: on a Smile Squad form
+    the single reflection text is written by the student, so it belongs in the
+    "Student Reflection" column of the reflections table.
+
+    Returns a new DataFrame; the input is left untouched. A no-op for other
+    cohorts, empty frames, or frames with no Smile Squad rows.
+    """
+    if df is None or len(df) == 0:
+        return df
+    if str(cohort).upper() not in SMILE_SQUAD_COHORTS:
+        return df
+    if "clinic" not in df.columns:
+        return df
+
+    mask = df["clinic"].apply(isSmileSquadClinic)
+    if not mask.any():
+        return df
+
+    df = df.copy()
+    idx = df.index[mask]
+
+    for colA, colB in (("student_data", "assessor_data"),
+                       ("submitted_by_student", "submitted_by_assessor")):
+        if colA in df.columns and colB in df.columns:
+            df.loc[idx, [colA, colB]] = df.loc[idx, [colB, colA]].values
+
+    if "assessor_data" not in df.columns:
+        return df
+
+    for col, scaleName in SMILE_SQUAD_SCALE_COLUMNS.items():
+        if col not in df.columns:
+            continue
+        values = df.loc[idx, "assessor_data"].apply(
+            lambda d, s=scaleName: _scaleKeyFromData(d, s)
+        )
+        if col in SMILE_SQUAD_INT_SCALE_COLUMNS:
+            values = pd.to_numeric(values, errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+        else:
+            df[col] = df[col].astype(object)
+        df.loc[idx, col] = values
+
+    if "item_codes" in df.columns:
+        # Assigned one cell at a time: .loc broadcasting mangles list values.
+        df["item_codes"] = df["item_codes"].astype(object)
+        for i in idx:
+            df.at[i, "item_codes"] = _itemCodesFromData(df.at[i, "assessor_data"])
+
+    return df
+
+
+def _effScalesSrc(cohort, prefix=""):
+    """SQL expr for the effective nested-scales object.
+
+    For fallback cohorts, use assessor_data->'scales' but fall back to
+    student_data->'scales' when the assessor side is empty. Otherwise just
+    assessor_data->'scales'. ``prefix`` is an optional table alias like 'f.'.
+    """
+    a = f"{prefix}assessor_data->'scales'"
+    if str(cohort).upper() in STUDENT_FALLBACK_COHORTS:
+        s = f"{prefix}student_data->'scales'"
+        return f"COALESCE(NULLIF({a}, '{{}}'::jsonb), {s}, '{{}}'::jsonb)"
+    return a
+
+
+def _effChecklistsSrc(cohort, prefix=""):
+    """SQL expr for the effective nested-checklists object (item_code -> mcs).
+
+    For fallback cohorts, UNION student + assessor checklists (assessor wins on
+    key conflict) so student-only item codes are included. Otherwise just the
+    assessor checklists column.
+    """
+    a = f"COALESCE({prefix}checklists, '{{}}'::jsonb)"
+    if str(cohort).upper() in STUDENT_FALLBACK_COHORTS:
+        s = f"COALESCE({prefix}student_data->'checklists', '{{}}'::jsonb)"
+        return f"({s} || {a})"
+    return a
 
 def _naturalKey(s: str) -> tuple:
     """Split into (str, int) parts for correct natural sort: '011-RPP' → ('', 11, '-rpp')."""
@@ -184,11 +339,10 @@ def saveToExcel(filepath, sheets: dict, index=False, **writerKwargs):
         for ws in writer.sheets.values():
             autoFitColumns(ws)
 
-
 def getChecklistMcTexts(
     engine,
     itemCodes: list,
-    formsTable: str = "rawform_forms",
+    formsTable: str = "rawform_forms_v3",
 ) -> pd.DataFrame:
     """
     Return the MC text descriptions for the given item codes.
@@ -213,8 +367,12 @@ def getChecklistMcTexts(
         mc.mc_key                                              AS "MC",
         mc.mc_text                                             AS "MC Text"
     FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_each(f.checklists)
-        AS item(item_code, item_data)
+    -- v3: definitions (name + fields) live in *_config, not the data column
+    CROSS JOIN LATERAL jsonb_each(
+        COALESCE(f.assessor_config->'checklists'->'selected',
+                 f.student_config->'checklists'->'selected',
+                 '{{}}'::jsonb)
+    ) AS item(item_code, item_data)
     CROSS JOIN LATERAL jsonb_each_text(
         COALESCE(item.item_data -> 'fields', '{{}}'::jsonb)
     ) AS mc(mc_key, mc_text)
@@ -233,11 +391,10 @@ def getChecklistMcTexts(
             .reset_index(drop=True))
     return df
 
-
 def getChecklistItems(
     engine,
     cohort: str,
-    formsTable: str = "rawform_forms",
+    formsTable: str = "rawform_forms_v3",
     filters: dict = None,
 ) -> pd.DataFrame:
     """
@@ -267,24 +424,29 @@ def getChecklistItems(
          WHERE k ~ '^MC[0-9]+'
         )::int                                             AS mc_count
     FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_each(f.checklists)
-        AS item(item_code, item_data)
+    -- v3: definitions (name + fields) live in *_config, not the data column
+    CROSS JOIN LATERAL jsonb_each(
+        COALESCE(f.assessor_config->'checklists'->'selected',
+                 f.student_config->'checklists'->'selected',
+                 '{{}}'::jsonb)
+    ) AS item(item_code, item_data)
     WHERE {whereClause}
       AND NULLIF(item.item_data ->> 'name', '') IS NOT NULL
     ORDER BY item.item_code, LENGTH(item.item_data ->> 'name') DESC;
     """
     return readDf(engine, sql, params)
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. Cohort-level query functions
 # ═══════════════════════════════════════════════════════════════════════════
 
-def getFullDf(engine, cohort, formsTable="rawform_forms", filters=None):
+def getFullDf(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"SELECT * FROM {formsTable} WHERE {whereClause};"
     return readDf(engine, sql, params)
 
 
-def getStudentScaleSummary(engine, cohort, formsTable="rawform_forms", filters=None):
+def getStudentScaleSummary(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     """
     Scale summary per student (entrustment, professionalism, communication,
     time management) with level counts and averages.
@@ -293,6 +455,12 @@ def getStudentScaleSummary(engine, cohort, formsTable="rawform_forms", filters=N
     """
     whereClause, params = _where(cohort, filters)
 
+    # v3: scales nested under assessor_data->'scales' (prefixed keys, level under
+    # 'key'). BOH1 (student-only checklists) and BOH2 (Smile Squad) forms can
+    # carry the graded data in student_data instead of assessor_data, so for
+    # those cohorts fall back to student_data->'scales' when assessor is empty.
+    scalesSrc = _effScalesSrc(cohort)
+
     sql = f"""
     WITH base AS (
         SELECT
@@ -300,26 +468,13 @@ def getStudentScaleSummary(engine, cohort, formsTable="rawform_forms", filters=N
             student_name AS "Student Name",
             type,
 
-            COALESCE(
-                NULLIF(assessor_data->'scale-practice-readiness'->>'scale', '')::int,
-                NULLIF(assessor_data->'entrustment'->>'scale', '')::int,
-                NULLIF(assessor_data->'practice-readiness'->>'scale', '')::int
-            ) AS entrustment,
+            NULLIF({scalesSrc}->'scale-practice-readiness'->>'key', '')::int AS entrustment,
 
-            COALESCE(
-                NULLIF(assessor_data->'scale-professionalism'->>'scale', '')::int,
-                NULLIF(assessor_data->'professionalism'->>'scale', '')::int
-            ) AS professionalism,
+            NULLIF({scalesSrc}->'scale-professionalism'->>'key', '')::int AS professionalism,
 
-            COALESCE(
-                NULLIF(assessor_data->'scale-communication'->>'scale', '')::int,
-                NULLIF(assessor_data->'communication'->>'scale', '')::int
-            ) AS communication,
+            NULLIF({scalesSrc}->'scale-communication'->>'key', '')::int AS communication,
 
-            COALESCE(
-                NULLIF(assessor_data->'scale-time-mgmt'->>'scale', '')::int,
-                NULLIF(assessor_data->'time_mgmt'->>'scale', '')::int
-            ) AS timeManagement
+            NULLIF({scalesSrc}->'scale-time-mgmt'->>'key', '')::int AS timeManagement
 
         FROM {formsTable}
         WHERE {whereClause}
@@ -388,24 +543,28 @@ def convertToMultiLevel(df):
     return df
 
 
-def getCriticalIncidentDf(engine, cohort, formsTable="rawform_forms", filters=None):
+def getCriticalIncidentDf(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
+
+    # Reads every clinical-incident storage shape, not just the stored column —
+    # the radio+text templates left that column NULL. See clinicalIncidentSqlExpr.
+    incidentExpr = clinicalIncidentSqlExpr("")
 
     sql = f"""
     SELECT
         student_number AS "Student ID",
         student_name AS "Student Name",
         datetimeutc::date AS "Date",
-        clinical_incident AS "Critical Incident"
+        {incidentExpr} AS "Critical Incident"
     FROM {formsTable}
     WHERE {whereClause}
-      AND NULLIF(TRIM(clinical_incident), '') IS NOT NULL
+      AND NULLIF(TRIM({incidentExpr}), '') IS NOT NULL
     ORDER BY student_name, datetimeutc;
     """
     return readDf(engine, sql, params)
 
 
-def getStudentFormCountDf(engine, cohort, formsTable="rawform_forms", filters=None):
+def getStudentFormCountDf(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
 
     sql = f"""
@@ -421,7 +580,7 @@ def getStudentFormCountDf(engine, cohort, formsTable="rawform_forms", filters=No
     return readDf(engine, sql, params)
 
 
-def getStudentItemCodeDf(engine, cohort, formsTable="rawform_forms", filters=None):
+def getStudentItemCodeDf(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     """
     Flat DataFrame of item codes per student with all scale values attached.
 
@@ -431,39 +590,32 @@ def getStudentItemCodeDf(engine, cohort, formsTable="rawform_forms", filters=Non
     """
     whereClause, params = _where(cohort, filters)
 
+    # v3: scales nested under assessor_data->'scales' (prefixed keys, level under
+    # 'key'); item codes from the nested checklists. BOH1/BOH2 fall back to /
+    # union student_data (see _effScalesSrc / _effChecklistsSrc).
+    scalesSrc = _effScalesSrc(cohort, "f.")
+    checklistsSrc = _effChecklistsSrc(cohort, "f.")
+
     sql = f"""
     SELECT
         f.student_number AS "Student ID",
         f.student_name   AS "Student Name",
         cl.key           AS "Item Code",
         cl.value->>'name' AS "Description",
-        NULLIF(f.assessor_data->'scale-global-rating'->>'scale','')::int      AS "Global Rating",
-        COALESCE(
-            NULLIF(f.assessor_data->'scale-practice-readiness'->>'scale','')::int,
-            NULLIF(f.assessor_data->'entrustment'->>'scale','')::int,
-            NULLIF(f.assessor_data->'practice-readiness'->>'scale','')::int
-        ) AS "Entrustment",
-        COALESCE(
-            NULLIF(f.assessor_data->'scale-professionalism'->>'scale','')::int,
-            NULLIF(f.assessor_data->'professionalism'->>'scale','')::int
-        ) AS "Professionalism",
-        COALESCE(
-            NULLIF(f.assessor_data->'scale-communication'->>'scale','')::int,
-            NULLIF(f.assessor_data->'communication'->>'scale','')::int
-        ) AS "Communication",
-        COALESCE(
-            NULLIF(f.assessor_data->'scale-time-mgmt'->>'scale','')::int,
-            NULLIF(f.assessor_data->'time_mgmt'->>'scale','')::int
-        ) AS "Time Management"
+        NULLIF({scalesSrc}->'scale-global-rating'->>'key','')::int      AS "Global Rating",
+        NULLIF({scalesSrc}->'scale-practice-readiness'->>'key','')::int AS "Entrustment",
+        NULLIF({scalesSrc}->'scale-professionalism'->>'key','')::int    AS "Professionalism",
+        NULLIF({scalesSrc}->'scale-communication'->>'key','')::int      AS "Communication",
+        NULLIF({scalesSrc}->'scale-time-mgmt'->>'key','')::int          AS "Time Management"
     FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_each(COALESCE(f.checklists, '{{}}'::jsonb)) cl
+    CROSS JOIN LATERAL jsonb_each({checklistsSrc}) cl
     WHERE {whereClause}
     """
     return readDf(engine, sql, params)
 
 
 def getCohortItemCodeAverages(engine, cohort, formType="Simulation",
-                              formsTable="rawform_forms", filters=None):
+                              formsTable="rawform_forms_v3", filters=None):
     """
     Mean count of each item code performed per student in the given cohort/type.
  
@@ -489,7 +641,7 @@ def getCohortItemCodeAverages(engine, cohort, formType="Simulation",
     return perStudent.mean(axis=0).to_dict()
 
 
-def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms", filters=None,
+def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms_v3", filters=None,
                           globalRatingThresholds=(1,), entrustmentThresholds=(1,),
                           includeEmptyComments=False):
     """
@@ -508,22 +660,22 @@ def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms", filters=No
 
     if globalRatingList:
         triggerConditions.append(
-            f"NULLIF(assessor_data->'scale-global-rating'->>'scale', '')::int IN ({globalRatingList})"
+            f"NULLIF(assessor_data->'scales'->'scale-global-rating'->>'key', '')::int IN ({globalRatingList})"
         )
         triggerLabels.append(
             f"""CASE
-                    WHEN NULLIF(assessor_data->'scale-global-rating'->>'scale', '')::int IN ({globalRatingList})
+                    WHEN NULLIF(assessor_data->'scales'->'scale-global-rating'->>'key', '')::int IN ({globalRatingList})
                     THEN 'Global Rating'
                 END"""
         )
 
     if entrustmentList:
         triggerConditions.append(
-            f"NULLIF(assessor_data->'scale-practice-readiness'->>'scale', '')::int IN ({entrustmentList})"
+            f"NULLIF(assessor_data->'scales'->'scale-practice-readiness'->>'key', '')::int IN ({entrustmentList})"
         )
         triggerLabels.append(
             f"""CASE
-                    WHEN NULLIF(assessor_data->'scale-practice-readiness'->>'scale', '')::int IN ({entrustmentList})
+                    WHEN NULLIF(assessor_data->'scales'->'scale-practice-readiness'->>'key', '')::int IN ({entrustmentList})
                     THEN 'Entrustment'
                 END"""
         )
@@ -531,12 +683,18 @@ def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms", filters=No
     if not triggerConditions:
         raise ValueError("At least one threshold list must be provided.")
 
+    # Flagged forms export to Excel → plain-text labels (no <b> markup).
+    studentComposite = _reflectionCompositeSqlExpr("student_data->'texts'", STUDENT_REFLECTION_TEXT_KEYS, bold=False)
+    assessorComposite = _reflectionCompositeSqlExpr("assessor_data->'texts'", ASSESSOR_REFLECTION_TEXT_KEYS, bold=False)
+
     commentFilter = ""
     if not includeEmptyComments:
-        commentFilter = """
+        # Check the FULL composite (all comment keys), not just texts->>'reflection',
+        # so a flagged form whose only comment is in a structured key isn't dropped.
+        commentFilter = f"""
         AND (
-            NULLIF(TRIM(COALESCE(student_reflection, '')), '') IS NOT NULL
-            OR NULLIF(TRIM(COALESCE(assessor_reflection, '')), '') IS NOT NULL
+            {studentComposite} IS NOT NULL
+            OR {assessorComposite} IS NOT NULL
             OR NULLIF(TRIM(COALESCE(clinical_incident, '')), '') IS NOT NULL
         )
         """
@@ -557,11 +715,11 @@ def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms", filters=No
         clinic AS "Clinic",
         assessor_name AS "Assessor Name",
 
-        NULLIF(assessor_data->'scale-global-rating'->>'scale', '')::int AS "Global Rating",
-        NULLIF(assessor_data->'scale-practice-readiness'->>'scale', '')::int AS "Entrustment",
+        NULLIF(assessor_data->'scales'->'scale-global-rating'->>'key', '')::int AS "Global Rating",
+        NULLIF(assessor_data->'scales'->'scale-practice-readiness'->>'key', '')::int AS "Entrustment",
 
-        student_reflection AS "Student Reflection",
-        assessor_reflection AS "Assessor Reflection",
+        {studentComposite} AS "Student Reflection",
+        {assessorComposite} AS "Assessor Reflection",
         clinical_incident AS "Critical Incident",
 
         student_data AS "Student Checklist Responses",
@@ -581,7 +739,7 @@ def getFlaggedFormDetails(engine, cohort, formsTable="rawform_forms", filters=No
     return readDf(engine, sql, params)
 
 
-def getClinicList(engine, cohort, formsTable="rawform_forms", filters=None):
+def getClinicList(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
 
     sql = f"""
@@ -595,7 +753,7 @@ def getClinicList(engine, cohort, formsTable="rawform_forms", filters=None):
     return df["clinic"].dropna().tolist()
 
 
-def getSubmissionInfo(engine, cohort, formsTable="rawform_forms", filters=None):
+def getSubmissionInfo(engine, cohort, formsTable="rawform_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
 
     sql = f"""
@@ -616,7 +774,7 @@ def getSubmissionInfo(engine, cohort, formsTable="rawform_forms", filters=None):
     return readDf(engine, sql, params)
 
 
-def getStudentsInCohort(engine, cohort, formsTable="rawform_forms", dateFrom="2026-01-01"):
+def getStudentsInCohort(engine, cohort, formsTable="rawform_forms_v3", dateFrom="2026-01-01"):
     """Return distinct student_number / student_name / student_email for a cohort."""
     whereClause, params = _where(cohort, filters=None, dateFrom=dateFrom)
     sql = f"""
@@ -706,14 +864,14 @@ def pivotItemCodes(df, groupBy="item_code", valueCol=None, aggfunc=None,
     return pivotDf, df
 
 
-def getStudentItemCodePivot(engine, cohort, formsTable="rawform_forms", filters=None,
+def getStudentItemCodePivot(engine, cohort, formsTable="rawform_forms_v3", filters=None,
                             groupBy="item_code", mappingFile=None, valueCol=None, aggfunc=None):
     """Fetch item codes from checklists and pivot by item_code / section / sub_section."""
     df = getStudentItemCodeDf(engine, cohort, formsTable, filters)
     return pivotItemCodes(df, groupBy=groupBy, mappingFile=mappingFile, valueCol=valueCol, aggfunc=aggfunc)
 
 
-def getCohortReports(engine, cohort, today, formsTable="rawform_forms",
+def getCohortReports(engine, cohort, today, formsTable="rawform_forms_v3",
                      subject=None, type_=("Simulation", "Clinic")):
     """
     Generate cohort-level Excel reports (scales, item-code pivots, submission info).
@@ -743,16 +901,23 @@ def getCohortReports(engine, cohort, today, formsTable="rawform_forms",
     # Simulation and Clinic filters are built separately
     simFilters = _filters("Simulation")
     clinicFilters = _filters("Clinic")
-
+    removeStudents = REMOVE_STUDENTS_DICT.get(cohort, [])
     simScaleSummary = getStudentScaleSummary(engine, cohort, formsTable, filters=simFilters)
+    simScaleSummary = simScaleSummary[~simScaleSummary["Student ID"].isin(removeStudents)]
     simScaleSummary = convertToMultiLevel(simScaleSummary)
+
     clinicScaleSummary = getStudentScaleSummary(engine, cohort, formsTable, filters=clinicFilters)
+    clinicScaleSummary = clinicScaleSummary[~clinicScaleSummary["Student ID"].isin(removeStudents)]
     clinicScaleSummary = convertToMultiLevel(clinicScaleSummary)
 
     simCIDf = getCriticalIncidentDf(engine, cohort, formsTable, filters=simFilters)
+    simCIDf = simCIDf[~simCIDf["Student ID"].isin(removeStudents)]
     clinicCIDf = getCriticalIncidentDf(engine, cohort, formsTable, filters=clinicFilters)
+    clinicCIDf = clinicCIDf[~clinicCIDf["Student ID"].isin(removeStudents)]
     simFormCountDf = getStudentFormCountDf(engine, cohort, formsTable, filters=simFilters)
+    simFormCountDf = simFormCountDf[~simFormCountDf["Student ID"].isin(removeStudents)]
     clinicFormCountDf = getStudentFormCountDf(engine, cohort, formsTable, filters=clinicFilters)
+    clinicFormCountDf = clinicFormCountDf[~clinicFormCountDf["Student ID"].isin(removeStudents)]
 
     simPivot, _ = getStudentItemCodePivot(engine, cohort, formsTable, filters=_filters("Simulation"), groupBy="item_code")
     clinicPivot, mergedDf = getStudentItemCodePivot(engine, cohort, formsTable, filters=_filters("Clinic"), groupBy="section",
@@ -765,8 +930,18 @@ def getCohortReports(engine, cohort, today, formsTable="rawform_forms",
                                             valueCol="Global Rating", groupBy="section", mappingFile=variableUtils.itemSectionMappingFile)
     clinicEntrustmentPivot, _ = getStudentItemCodePivot(engine, cohort, formsTable, filters=_filters("Clinic"),
                                             valueCol="Entrustment", groupBy="section", mappingFile=variableUtils.itemSectionMappingFile)
+    
+    # from pivots also remove students
+    clinicPivot = clinicPivot[~clinicPivot["Student ID"].isin(removeStudents)]
+    simGlobalRatingPivot = simGlobalRatingPivot[~simGlobalRatingPivot["Student ID"].isin(removeStudents)]
+    simEntrustmentPivot = simEntrustmentPivot[~simEntrustmentPivot["Student ID"].isin(removeStudents)]
+    clinicGlobalRatingPivot = clinicGlobalRatingPivot[~clinicGlobalRatingPivot["Student ID"].isin(removeStudents)]
+    clinicEntrustmentPivot = clinicEntrustmentPivot[~clinicEntrustmentPivot["Student ID"].isin(removeStudents)]
+
     simSubmissionInfoDf = getSubmissionInfo(engine, cohort, formsTable, filters=simFilters)
+    simSubmissionInfoDf = simSubmissionInfoDf[~simSubmissionInfoDf["Student ID"].isin(removeStudents)]
     clinicSubmissionInfoDf = getSubmissionInfo(engine, cohort, formsTable, filters=clinicFilters)
+    clinicSubmissionInfoDf = clinicSubmissionInfoDf[~clinicSubmissionInfoDf["Student ID"].isin(removeStudents)]
 
     os.makedirs(cohort, exist_ok=True)
     sheetDataScales = {}
@@ -812,7 +987,7 @@ def getCohortReports(engine, cohort, today, formsTable="rawform_forms",
     return flaggedSimDf, flaggedClinicDf
 
 
-def getCohortReportsPerClinic(engine, cohort, today, formsTable="rawform_forms",
+def getCohortReportsPerClinic(engine, cohort, today, formsTable="rawform_forms_v3",
                               subject=None, type_=("Clinic",)):
     """Generate per-clinic breakdowns of scales, pivots, and submission info."""
     clinics = getClinicList(engine, cohort, formsTable,
@@ -862,46 +1037,245 @@ def getCohortReportsPerClinic(engine, cohort, today, formsTable="rawform_forms",
 # 4. Student-level query & report functions
 # ═══════════════════════════════════════════════════════════════════════════
 
-def getStudentData(engine, cohort, studentNumber, formsTable="rawform_forms", filters=None):
-    """Fetch all form data for a single student with item codes extracted."""
+# ── Reflection / comment composition ────────────────────────────────────────
+# v3 forms store free-text under *_data->'texts' with several keys (not just
+# 'reflection'): DDS2 splits the student reflection into structured prompts and
+# gives the assessor did-well/to-improve fields; DDS1 uses 'additional-comments';
+# second-operator (SO) forms use so-(assessor-)reflection. The report previously
+# surfaced ONLY texts->>'reflection', silently dropping the rest. These maps
+# gather every comment key, in display order, with a bold label, into one cell.
+# (clinical-incident keys are excluded here — handled by the clinical_incident
+#  column / Critical Incident elsewhere.)
+STUDENT_REFLECTION_TEXT_KEYS = [
+    ("reflection",                "Reflection"),
+    ("reflection-how-prepare",    "How I Prepared"),
+    ("reflection-what-did-well",  "What Went Well"),
+    ("reflection-what-differently", "What I'd Do Differently"),
+    ("so-reflection",             "Second Operator Reflection"),
+    ("procedures-observed",       "Procedures Observed"),
+]
+ASSESSOR_REFLECTION_TEXT_KEYS = [
+    ("reflection",                 "Feedback"),
+    ("reflection-student-did-well", "Did Well"),
+    ("reflection-student-improve",  "To Improve"),
+    ("additional-comments",        "Additional Comments"),
+    ("so-assessor-reflection",     "Second Operator Feedback"),
+    ("needs-additional-support",   "Needs Additional Support"),
+]
+
+
+# ── Dynamic reflection composite (future-proof: captures every comment key) ──
+# The two *_REFLECTION_TEXT_KEYS lists give nice labels + a preferred order for
+# the keys we know. Any OTHER key under *_data->'texts' is a comment we have not
+# named yet: include it with a humanised label so a new DASH field is captured
+# automatically, with no code change. The keys below are NOT comments — the
+# clinical incident is handled by clinicalIncidentSqlExpr and signatures are
+# noise — so they are skipped.
+REFLECTION_TEXT_DENY = {"clinical-incident", "clinical-incident-additional-details",
+                        "clinical-incident-occurred"}
+
+
+def _isReflectionTextKey(key):
+    """True when a *_data->'texts' key is a free-text comment (not a signature,
+    clinical-incident field, or other non-comment key)."""
+    k = str(key).strip().lower()
+    if not k:
+        return False
+    if "signature" in k:
+        return False
+    if k.startswith("clinical-incident") or k in REFLECTION_TEXT_DENY:
+        return False
+    return True
+
+
+def _humanizeTextKey(key):
+    """Fallback label for an unknown/new text key:
+    'reflection-what-did-well' -> 'Reflection What Did Well'."""
+    s = re.sub(r"[-_]+", " ", str(key)).strip()
+    return s[:1].upper() + s[1:] if s else str(key)
+
+
+def _buildReflectionComposite(textsDict, knownPairs, bold=True):
+    """Concatenate every non-empty comment text key in *textsDict*, each prefixed
+    with a 'Label: ' heading, segments separated by a blank line. Known keys use
+    their label from *knownPairs* and come first in that order; any other comment
+    key follows alphabetically with a humanised label. Data-driven equivalent of
+    the old SQL composite. Returns None when nothing substantive is present.
+      bold=True  -> '<b>Label: </b>value' for the reportlab Paragraph.
+      bold=False -> 'Label: value' for plain Excel/CSV output.
+    """
+    if not isinstance(textsDict, dict):
+        return None
+    known = {k: lbl for k, lbl in knownPairs}
+    order = {k: i for i, (k, _lbl) in enumerate(knownPairs)}
+    keys = [k for k in textsDict.keys() if _isReflectionTextKey(k)]
+    keys.sort(key=lambda k: (0, order[k]) if k in order else (1, str(k).lower()))
+    segments = []
+    for k in keys:
+        v = textsDict.get(k)
+        if not (isinstance(v, str) and v.strip()):
+            continue
+        label = known.get(k) or _humanizeTextKey(k)
+        if bold:
+            # reportlab Paragraph parses this as mini-XML — escape the free text
+            # (a student wrote "a < b" or "&"), keep only our own <b> markup, or
+            # the parser dies with "unclosed tags".
+            segments.append(f"<b>{escape(label)}: </b>{escape(v.strip())}")
+        else:
+            segments.append(f"{label}: {v.strip()}")
+    return "\n\n".join(segments) if segments else None
+
+
+def _applyDynamicReflectionComposites(df):
+    """Overwrite student_reflection_full / assessor_reflection_full with the
+    dynamic composite built from every comment key in *_data->'texts'. Call in
+    getDataDf BEFORE the Smile Squad swap, so reflections are read from the
+    pre-swap student_data / assessor_data (SS reflections are the student's own
+    and are deliberately not swapped)."""
+    if df is None or len(df) == 0:
+        return df
+    def _txts(d):
+        return d.get("texts") if isinstance(d, dict) else None
+    if "student_data" in df.columns:
+        df["student_reflection_full"] = df["student_data"].apply(
+            lambda d: _buildReflectionComposite(_txts(d), STUDENT_REFLECTION_TEXT_KEYS))
+    if "assessor_data" in df.columns:
+        df["assessor_reflection_full"] = df["assessor_data"].apply(
+            lambda d: _buildReflectionComposite(_txts(d), ASSESSOR_REFLECTION_TEXT_KEYS))
+    return df
+
+
+# ── Clinical incident: three storage shapes, one expression  (2026-08-18) ────
+# DASH records a clinical incident in TWO different ways depending on the form
+# template, and the v3 loader only ever read one of them:
+#
+#   1. multi-select  assessor_data->'multi-select'->'clinical-incident'  (array)
+#        — the only shape the loader's `clinical_incident` column was built from
+#   2. radio + text  assessor_data->'radio'->>'clinical-incident-occurred' = 'yes'
+#                    assessor_data->'texts'->>'clinical-incident'          (detail)
+#        — what the DDS2/BOH2/BOH1 2026 templates actually use
+#
+# Shape 2 was dropped on the floor: the stored column came back NULL, so every
+# downstream consumer (flagging ci_count / Clinical Incidents sheet, the cohort
+# report's Critical Incident sheet) showed zero incidents. Counted in the 2026
+# CAF payload: 159 forms with "yes" — DDS2 Clinic 35, DDS2 Sim 40, BOH2 Clinic 32,
+# BOH1 Sim 23, DDS1 Sim 20, BOH2 Sim 9 — against 87 rows carrying the array shape.
+#
+# ~66 of those 159 are "yes" with no detail text typed. The assessor still
+# explicitly ticked yes, so they count, and carry CLINICAL_INCIDENT_NO_DETAILS as
+# their detail so a blank cell is never mistaken for "no incident".
+#
+# This expression reads the stored column first (so a correctly-loaded row is
+# untouched), then shape 2, then shape 1 straight from assessor_data — meaning it
+# also repairs tables loaded BEFORE the loader fix in general_utils, with no
+# reload needed.
+CLINICAL_INCIDENT_NO_DETAILS = "Yes (no details recorded)"
+
+
+def clinicalIncidentSqlExpr(alias="f"):
+    """SQL scalar expression resolving a form's clinical incident from any of the
+    three storage shapes. *alias* is the forms-table alias ('f'), or '' / None
+    when the query has no alias."""
+    p = f"{alias}." if alias else ""
+    noDetails = CLINICAL_INCIDENT_NO_DETAILS.replace("'", "''")
+    return f"""COALESCE(
+        NULLIF(TRIM(COALESCE({p}clinical_incident, '')), ''),
+        CASE WHEN lower(COALESCE({p}assessor_data->'radio'->>'clinical-incident-occurred', '')) = 'yes'
+             THEN COALESCE(
+                    NULLIF(TRIM(COALESCE({p}assessor_data->'texts'->>'clinical-incident', '')), ''),
+                    '{noDetails}')
+        END,
+        (SELECT string_agg(x->>'value', '; ' ORDER BY x->>'value')
+           FROM jsonb_array_elements(
+                COALESCE({p}assessor_data->'multi-select'->'clinical-incident', '[]'::jsonb)) x)
+    )"""
+
+
+def _reflectionCompositeSqlExpr(textsExpr, pairs, bold=True):
+    """Build a SQL scalar expression that concatenates every non-empty text key
+    in *pairs* (list of (json_key, label)) from the jsonb *textsExpr*, each
+    prefixed with a ``Label: `` heading, segments separated by a blank line.
+    Missing/empty keys are skipped (concat_ws drops NULLs); returns NULL when
+    nothing is present.
+      * bold=True  → wrap the label in ``<b>…</b>`` for reportlab Paragraph
+                     (used by the PDF reflections table).
+      * bold=False → plain ``Label: value`` for Excel/CSV output
+                     (used by the flagged-forms export)."""
+    segments = []
+    for key, label in pairs:
+        keyLit = key.replace("'", "''")
+        labelLit = label.replace("'", "''")
+        prefix = f"<b>{labelLit}: </b>" if bold else f"{labelLit}: "
+        segments.append(
+            f"CASE WHEN NULLIF(TRIM(COALESCE({textsExpr}->>'{keyLit}', '')), '') IS NOT NULL "
+            f"THEN '{prefix}' || ({textsExpr}->>'{keyLit}') END"
+        )
+    joined = ",\n            ".join(segments)
+    return f"NULLIF(concat_ws(E'\\n\\n',\n            {joined}\n        ), '')"
+
+
+def getDataDf(engine, cohort, formsTable="rawform_forms_v3", filters=None, smileSquadSwap=True):
+    """Fetch all form data for a single student with item codes extracted. Filters contain the student number.
+
+    ``smileSquadSwap`` (BOH2 only) treats Smile Squad ``student_data`` as
+    ``assessor_data`` — see ``applySmileSquadSwap``. Applied here so EVERY caller
+    (cohort time-series PDF, individual student reports, ad-hoc notebook pulls)
+    gets the same view; pass False for the raw, unswapped rows.
+    """
     whereClause, params = _where(cohort, filters=filters)
-    params["studentNumber"] = studentNumber
 
     sql = f"""
       SELECT f.*,
-      COALESCE(
-                NULLIF(f.assessor_data->'scale-practice-readiness'->>'scale', '')::int,
-                NULLIF(f.assessor_data->'entrustment'->>'scale', '')::int,
-                NULLIF(f.assessor_data->'practice-readiness'->>'scale', '')::int
-            ) AS entrustment,
-        COALESCE(
-                NULLIF(f.assessor_data->'scale-professionalism'->>'scale', '')::int,
-                NULLIF(f.assessor_data->'professionalism'->>'scale', '')::int
-    )
-        AS professionalism,
-    COALESCE(
-                NULLIF(f.assessor_data->'scale-communication'->>'scale', '')::int,
-                NULLIF(f.assessor_data->'communication'->>'scale', '')::int
-        )
-        AS communication,
-    COALESCE(
-                NULLIF(f.assessor_data->'scale-time-mgmt'->>'scale', '')::int,
-                NULLIF(f.assessor_data->'time_mgmt'->>'scale', '')::int
-        ) AS time_management,        
-      f.assessor_data->'scale-global-rating'->>'scale' AS global_rating,
+      -- v3: scales nested under assessor_data->'scales' (prefixed keys, level under 'key')
+      NULLIF(f.assessor_data->'scales'->'scale-practice-readiness'->>'key', '')::int AS entrustment,
+      NULLIF(f.assessor_data->'scales'->'scale-professionalism'->>'key', '')::int    AS professionalism,
+      NULLIF(f.assessor_data->'scales'->'scale-communication'->>'key', '')::int      AS communication,
+      NULLIF(f.assessor_data->'scales'->'scale-time-mgmt'->>'key', '')::int          AS time_management,
+      f.assessor_data->'scales'->'scale-global-rating'->>'key' AS global_rating,
+      -- v3: patient fields collapsed into patient_data JSONB; derive the old columns
+      NULLIF(regexp_replace(f.patient_data->>'age', '[^0-9]', '', 'g'), '')::int AS patient_age,
+      f.patient_data->>'details'                                    AS patient_details,
+      f.patient_data->>'drn'                                        AS patient_drn,
+      f.patient_data->>'interpreter'                                AS patient_interpreter,
+      -- v3: gather ALL comment text keys (not just 'reflection') into one
+      -- bold-labelled cell so DDS1 additional-comments / DDS2 structured &
+      -- second-operator reflections are no longer dropped. See the *_TEXT_KEYS maps.
+      {_reflectionCompositeSqlExpr("f.student_data->'texts'", STUDENT_REFLECTION_TEXT_KEYS)}  AS student_reflection_full,
+      {_reflectionCompositeSqlExpr("f.assessor_data->'texts'", ASSESSOR_REFLECTION_TEXT_KEYS)} AS assessor_reflection_full,
+      -- Clinical incident resolved from every storage shape — the stored column
+      -- is NULL for the radio+text templates (see clinicalIncidentSqlExpr).
+      -- Swapped over the raw column in Python below.
+      {clinicalIncidentSqlExpr("f")} AS clinical_incident_resolved,
       ic.item_codes AS item_codes
         FROM {formsTable} f
         LEFT JOIN LATERAL (
+            -- v3: assessor_data top level now also holds the standard buckets
+            -- (radio/texts/scales/checklists/multi-select) alongside the
+            -- flattened item-code entries; exclude the buckets so only real
+            -- item codes remain.
             SELECT array_agg(DISTINCT ic.key) AS item_codes
             FROM jsonb_each(COALESCE(f.assessor_data,'{{}}'::jsonb)) ic
             WHERE ic.key NOT LIKE 'scale-%%'
+              AND ic.key NOT IN ('radio','texts','scales','checklists','multi-select')
         ) ic ON true
       WHERE {whereClause}
-        AND student_number = :studentNumber
     """
     if filters:
         params.update(filters)
-    return readDf(engine, sql, params)
+    df = readDf(engine, sql, params)
+    # The SELECT is `f.*` plus derived columns, so the raw clinical_incident
+    # column comes back too. Overwrite it with the resolved one so every caller
+    # keeps reading the same column name and nothing downstream has to change.
+    if "clinical_incident_resolved" in df.columns:
+        df["clinical_incident"] = df.pop("clinical_incident_resolved")
+    # Rebuild the reflection composites dynamically from EVERY comment key present
+    # (future-proof — see _buildReflectionComposite). Done BEFORE the Smile Squad
+    # swap so the SS reflection, which lives in student_data and is not swapped,
+    # stays correct.
+    df = _applyDynamicReflectionComposites(df)
+    if smileSquadSwap:
+        df = applySmileSquadSwap(df, cohort)
+    return df
 
 
 def calcScore(row, scoreMap=None):
@@ -909,11 +1283,24 @@ def calcScore(row, scoreMap=None):
     if scoreMap is None:
         scoreMap = SCORE_MAP
     assessorData = row["assessor_data"]
-    if assessorData is None or (row.get("role") not in (None, "Operator")):
+    # Role gate: score the operator's own forms only, excluding observer ("OB")
+    # and second-operator ("SO") forms. The old `role not in (None, "Operator")`
+    # test was broken — DASH stores role as "O" (operator), "OB"/"SO", or None on
+    # the newer form template and never the string "Operator", so it silently
+    # dropped every role="O" form (most of Feb–June, which is why the scatter only
+    # showed July). Excluding just OB/SO keeps operator + unspecified forms.
+    # Item scores that come out null/Not-Observed are ignored downstream
+    # (see _drawScoresScatter).
+    if assessorData is None or (row.get("role") in ("OB", "SO")):
         return {}
     scores = {}
     for itemCode, itemData in assessorData.items():
         if "scale" in itemCode:
+            continue
+        # v3: assessor_data top level also carries the standard buckets
+        # (radio/texts/scales/checklists/multi-select) alongside the flattened
+        # item-code entries — skip the buckets, keep only real item codes.
+        if itemCode in ("radio", "texts", "scales", "checklists", "multi-select"):
             continue
         if not isinstance(itemData, dict):
             continue
@@ -921,6 +1308,8 @@ def calcScore(row, scoreMap=None):
         validLength = 0
         for k, v in itemData.items():
             if v in scoreMap:
+                if pd.isna(scoreMap[v]):
+                    continue
                 itemScore += scoreMap[v]
                 validLength += 1
         itemScore = itemScore / validLength if validLength > 0 else np.nan
@@ -938,12 +1327,46 @@ def truncateText(textValue, maxLength=2000):
     return textValue[:maxLength] + "..."
 
 
+def _safeHtmlTruncate(value, maxLength=2000):
+    """Like truncateText but safe for the reportlab mini-XML the reflection
+    composite carries: never end inside a ``<...>`` tag, an ``&entity;`` or an
+    unclosed ``<b>`` — any of which crashes the Paragraph parser with
+    "parse ended with N unclosed tags". Only ``<b>``/``</b>`` exist at call time
+    (``<br/>`` is substituted afterwards)."""
+    if value is None:
+        return ""
+    s = str(value)
+    if len(s) <= maxLength:
+        return s
+    cut = s[:maxLength]
+    lt, gt = cut.rfind("<"), cut.rfind(">")
+    if lt > gt:                      # ends inside a partial tag ("<", "<b")
+        cut = cut[:lt]
+    amp, semi = cut.rfind("&"), cut.rfind(";")
+    if amp > semi:                   # ends inside a partial &entity;
+        cut = cut[:amp]
+    lo, lc = cut.rfind("<b>"), cut.rfind("</b>")
+    if lo > lc:                      # an opened <b> whose </b> was cut off
+        cut = cut[:lo]
+    return cut.rstrip() + "\u2026"
+
+
 def _getColor(row):
+    """Marker colour for one scatter point.
+
+    Smile Squad wins over patient complexity: those sessions are run and
+    assessed differently (the student fills the assessor side — see
+    ``applySmileSquadSwap``) and the whole point of colouring them is that a
+    reader can pick them out at a glance. The " SS" text suffix on the point
+    label stays, so nothing is lost when the two rules collide.
+    """
     if row["NA_Flag"]:
         return "gray"
+    if isSmileSquadClinic(row.get("Clinic")):
+        return SMILE_SQUAD_COLOR
     elif row["Patient Complexity"] == "complex":
-        return "red"
-    return "blue"
+        return COMPLEX_PATIENT_COLOR
+    return DEFAULT_POINT_COLOR
 
 
 def explodeScoresToLong(df):
@@ -975,12 +1398,396 @@ def explodeScoresToLong(df):
 # 5. Plotting helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores", scoreKey="score", 
-                                fallbackKey=None, title="Student Performance Over Time", pageSize=None):
-    """Scatter plot of item-code scores over time."""
-    if pageSize is None:
-        pageSize = variableUtils.pageSize
+def _shortItemCode(item):
+    """Reduce a full item label to just its 3-digit item code(s), for readable graphs.
 
+    Pulls every standalone 3-digit code out of the label (inside parentheses or
+    not), de-duplicated in order. Falls back to the full label when there is no
+    3-digit code.
+
+    '36MO (532)'                     -> '532'
+    '14MODB (534 577) (preparation)' -> '534, 577'
+    '26O (531) & 64DO 65MO (532)'    -> '531, 532'
+    'BOH2 S2 531'                    -> '531'
+    'pe-scaling'                     -> 'pe-scaling' (fallback: no 3-digit code)
+    """
+    codes = []
+    for c in re.findall(r"\b\d{3}\b", str(item)):
+        if c not in codes:
+            codes.append(c)
+    return ", ".join(codes) if codes else str(item)
+
+
+# ── Weekly-sim stream labelling for the score scatter (DDS2) ─────────────────
+# On a weekly-sim cohort the Simulation "item code" is the session name
+# ("2026-Week-15", "Paeds 2026-Week-1", "FP-Week-04", "Week-03"). Spelled out on
+# the scatter they overlap into a wall of text, so when a streamCohort is passed
+# each is shortened to <abbrev><week-no> and the point is coloured by its stream
+# (a Sim point carries no complexity / Smile-Squad colour, so the channel is
+# free). Colours are Okabe-Ito (colour-blind safe). Both maps key on the
+# SIM_STREAMS stream key; an unknown stream falls back.
+SIM_STREAM_ABBREV = {"SEM1": "CD", "PAEDS": "P", "FP": "FP", "ENDO": "E"}
+SIM_STREAM_COLORS = {
+    "SEM1": "#0072B2",   # blue      — Semester 1 (Cons Dent)
+    "PAEDS": "#009E73",  # green     — Paediatrics
+    "FP": "#D55E00",     # vermilion — Fixed Prosthodontics
+    "ENDO": "#CC79A7",   # purple    — Endodontics
+}
+SIM_STREAM_OTHER_COLOR = "#555555"   # a session name that matches no stream
+
+
+def _streamForCode(itemCode, cohort):
+    """Stream key for an item code on *cohort*, or None. Local import keeps
+    general_utils optional — the scatter still draws if it is unavailable."""
+    try:
+        from general_utils import streamForItemCode
+        return streamForItemCode(itemCode, cohort=cohort)
+    except Exception:
+        return None
+
+
+def _shortStreamItemCode(item, cohort):
+    """(shortLabel, streamKey) for a weekly-sim session name:
+    '2026-Week-15'->('CD15','SEM1'); 'Paeds 2026-Week-1'->('P1','PAEDS');
+    'FP-Week-04'->('FP4','FP'); 'Week-03'->('E3','ENDO'). Falls back to
+    (_shortItemCode(item), None) when the code matches no stream."""
+    key = _streamForCode(item, cohort)
+    if not key:
+        return _shortItemCode(item), None
+    abbr = SIM_STREAM_ABBREV.get(key) or (re.sub(r"[^A-Za-z]", "", str(key))[:2].upper() or str(key))
+    m = re.search(r"(\d+)\s*$", str(item))
+    num = str(int(m.group(1))) if m else ""
+    return f"{abbr}{num}", key
+
+
+def _cohortStreamsSafe(cohort):
+    """SIM_STREAMS mapping for *cohort* ({} if general_utils is unavailable)."""
+    try:
+        from general_utils import cohortStreams
+        return cohortStreams(cohort)
+    except Exception:
+        return {}
+
+
+def _cohortStreamOrder(cohort):
+    """Stream keys for *cohort* in their defined order."""
+    return list(_cohortStreamsSafe(cohort))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session schedule / roster / scale-level helpers  (added 2026-08-18)
+#
+# Three separate lookups, all OPTIONAL: every one of them degrades to the
+# previous behaviour when its source file or field is missing, because a cohort
+# without a roster or a published timetable must still produce a PDF.
+#
+#   MISSING_SESSION_COLOR  purple dot at y=0 on a scheduled date with no form
+#   SMILE_SQUAD_COLOR      orange scatter point for a Smile Squad clinic form
+# ─────────────────────────────────────────────────────────────────────────────
+
+MISSING_SESSION_COLOR = "purple"
+SMILE_SQUAD_COLOR = "darkorange"
+# Text appended to a Smile Squad point label. Empty since 2026-08-18: the orange
+# marker + legend key already identify them, and the suffix only crowded the
+# scatter. Set to " SS" to restore the old labels.
+SMILE_SQUAD_LABEL_SUFFIX = ""
+COMPLEX_PATIENT_COLOR = "red"
+DEFAULT_POINT_COLOR = "blue"
+
+# The session timetable is a Simulation concept — the file is "<COHORT> Sim
+# Sessions <year>.xlsx" and clinic attendance is not timetabled — so only these
+# form types consult it. Clinic keeps purely observed dates.
+SCHEDULED_FORM_TYPES = ("Simulation",)
+
+
+def _scheduleFrame(cohort, year=2026, path=None):
+    """The cohort's planned session schedule, or an EMPTY frame.
+
+    Prefers ``general_utils.loadSessionSchedule`` (single source of truth, also
+    used by the weekly-sim workbooks) and falls back to reading the Excel file
+    directly if that module is not importable. A missing file is NOT an error:
+    the timetable is an enhancement, and a cohort without one keeps the original
+    observed-dates-only behaviour.
+    """
+    try:
+        from general_utils import loadSessionSchedule
+        return loadSessionSchedule(cohort, year=year, path=path)
+    except Exception:
+        pass
+    path = path or os.path.join(str(cohort), f"{cohort} Sim Sessions {year}.xlsx")
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["date"])
+    try:
+        df = pd.read_excel(path, sheet_name=0)
+    except Exception:
+        return pd.DataFrame(columns=["date"])
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return df
+
+
+def getScheduledSessionDates(cohort, formType=None, year=2026, path=None,
+                             maxDate=None, minDate=None):
+    """Planned session dates as sorted "%Y-%m-%d" strings, or [] when unknown.
+
+    BREAK rows (blank ``date``) drop out automatically. Only Simulation-type
+    calls consult the file — see ``SCHEDULED_FORM_TYPES``; pass ``formType=None``
+    to read it regardless.
+
+    ``maxDate`` caps the list (default: today). Without the cap every student's
+    chart would carry a run of empty columns for sessions that have not happened
+    yet, which reads as a wall of absences rather than a timetable.
+    """
+    if formType is not None and formType not in SCHEDULED_FORM_TYPES:
+        return []
+    df = _scheduleFrame(cohort, year=year, path=path)
+    if df is None or df.empty or "date" not in df.columns:
+        return []
+    dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+    dates = sorted({d.strftime("%Y-%m-%d") for d in dates})
+    if maxDate is None:
+        maxDate = pd.Timestamp.today().strftime("%Y-%m-%d")
+    if maxDate:
+        dates = [d for d in dates if d <= str(maxDate)]
+    if minDate:
+        dates = [d for d in dates if d >= str(minDate)]
+    return dates
+
+
+def formatDateRange(dates, fmt="%d %b %Y", sep=" – "):
+    """"10 Feb 2026 – 18 Aug 2026" from any iterable of dates/date strings.
+
+    Returns "" for an empty input and a single date (no separator) when the
+    range collapses, so the banner never reads "X – X".
+    """
+    parsed = pd.to_datetime(pd.Series(list(dates or [])), errors="coerce").dropna()
+    if parsed.empty:
+        return ""
+    lo, hi = parsed.min(), parsed.max()
+    if lo == hi:
+        return lo.strftime(fmt)
+    return f"{lo.strftime(fmt)}{sep}{hi.strftime(fmt)}"
+
+
+def typeLabelFor(formType):
+    """'Simulation' / 'Clinic' / 'All Forms' — for headings when formType is None."""
+    return str(formType) if formType else "All Forms"
+
+
+def _rosterNameMap(cohort, year=2026, path=None):
+    """{student_number(str): (last_name, first_name)} from the cohort roster.
+
+    Empty dict when there is no roster file — callers then fall back to parsing
+    the display name, which is why this never raises.
+    """
+    try:
+        from general_utils import loadRoster
+        df = loadRoster(cohort, year=year, path=path)
+    except Exception:
+        path = path or os.path.join(str(cohort), f"{cohort} Roster {year}.xlsx")
+        if not os.path.exists(path):
+            return {}
+        try:
+            df = pd.read_excel(path, sheet_name=0)
+        except Exception:
+            return {}
+    if df is None or df.empty:
+        return {}
+    if not {"student_number", "last_name"}.issubset(df.columns):
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        num = str(r["student_number"]).strip()
+        out[num] = (str(r.get("last_name") or "").strip(),
+                    str(r.get("first_name") or "").strip())
+    return out
+
+
+def _surnameKey(studentName, studentNumber, rosterMap=None):
+    """Sort key that puts students in SURNAME order.
+
+    The roster is authoritative because a display name cannot be split
+    reliably — "Lexy Mhaye San Pablo Huang" is first name "Lexy Mhaye San
+    Pablo", surname "Huang", while "Kate Mclennan Arnott" is surname "Mclennan
+    Arnott". With no roster entry we fall back to the LAST whitespace-separated
+    token, which is right for the common two-part name and the best guess
+    otherwise. Roster and fallback keys sort together in one alphabetical list
+    rather than in two blocks, so the PDF reads as a single A-Z sequence.
+    """
+    num = str(studentNumber).strip()
+    if rosterMap and num in rosterMap:
+        last, first = rosterMap[num]
+        if last:
+            return (last.casefold(), first.casefold(), num)
+    parts = str(studentName or "").strip().split()
+    if not parts:
+        return ("", "", num)
+    return (parts[-1].casefold(), " ".join(parts[:-1]).casefold(), num)
+
+
+def orderStudentsBySurname(studentsDf, cohort=None, year=2026, rosterMap=None,
+                           nameCol="student_name", idCol="student_number"):
+    """Return *studentsDf* sorted alphabetically by SURNAME (see ``_surnameKey``)."""
+    if studentsDf is None or studentsDf.empty:
+        return studentsDf
+    if rosterMap is None:
+        rosterMap = _rosterNameMap(cohort, year=year) if cohort else {}
+    keys = studentsDf.apply(
+        lambda r: _surnameKey(r.get(nameCol), r.get(idCol), rosterMap), axis=1,
+    )
+    out = studentsDf.assign(_surnameKey=keys).sort_values("_surnameKey", kind="stable")
+    return out.drop(columns=["_surnameKey"]).reset_index(drop=True)
+
+
+# Snapshot keys a scale can be published under. The forms have changed key
+# spelling before (see the v3 migration), so each lookup tries every alias
+# rather than assuming one.
+SCALE_SNAPSHOT_KEYS = {
+    "time_management": ("scale-time-mgmt", "scale-time-management", "time-mgmt",
+                        "time_management"),
+    "entrustment": ("scale-practice-readiness", "scale-entrustment"),
+    "global_rating": ("scale-global-rating",),
+    "communication": ("scale-communication",),
+    "professionalism": ("scale-professionalism",),
+}
+
+
+def _scaleMaxFromSnapshots(snapshots, scaleKeys):
+    """Highest numeric level a scale offers, read from context_schema_snapshot.
+
+    ``scaleKeys`` is a key or an iterable of aliases. Returns None when no
+    snapshot publishes the scale (or its options are not numeric), which is the
+    signal for callers to fall back to the observed data. Only levels that parse
+    as integers count, so a snapshot carrying an "N/A" option cannot inflate the
+    axis.
+    """
+    if isinstance(scaleKeys, str):
+        scaleKeys = (scaleKeys,)
+    wanted = {str(k) for k in scaleKeys}
+    best = None
+    for snap in (snapshots if snapshots is not None else []):
+        if snap is None:
+            continue
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(snap, list):
+            continue
+        for field in snap:
+            if not isinstance(field, dict) or str(field.get("key")) not in wanted:
+                continue
+            opts = field.get("options")
+            if not isinstance(opts, dict):
+                continue
+            for code in opts:
+                try:
+                    level = int(str(code).strip())
+                except (ValueError, TypeError):
+                    continue
+                if best is None or level > best:
+                    best = level
+    return best
+
+
+def rubricAxisMax(label, series=None, snapshots=None, default=None, headroom=0.5):
+    """Y-axis maximum for one rubric panel.
+
+    Time Management is published with a different number of levels on different
+    form templates — usually 5, sometimes just 2 — so a hardcoded 5 squashes a
+    2-level scale into the bottom of the panel. Resolution order:
+
+      1. the scale definition in the form's own ``context_schema_snapshot``
+         (authoritative: it says how many levels the student could have been
+         given, not how many they scored);
+      2. the highest value actually observed, rounded up;
+      3. *default* (the historical fixed value).
+
+    ``headroom`` is added so the top marker is not drawn on the frame. Returns
+    None when nothing resolves, which ``rubricPlot`` reads as "auto-scale".
+    """
+    # accepts either the display label ("Time Management") or the column name
+    lookup = str(label).strip().casefold().replace(" ", "_")
+    level = _scaleMaxFromSnapshots(snapshots, SCALE_SNAPSHOT_KEYS.get(lookup, (label,)))
+    if level is None and series is not None:
+        try:
+            observed = pd.to_numeric(pd.Series(series), errors="coerce").max()
+        except (TypeError, ValueError):
+            observed = None
+        if observed is not None and pd.notna(observed):
+            level = int(np.ceil(float(observed)))
+    if level is None:
+        return default
+    if level <= 0:
+        return default
+    return level + headroom
+
+
+# Dotted vertical divider between first-half and second-half of the academic
+# year, drawn on every time-series panel (student reports + cohort timeseries PDF).
+HALF_YEAR_DIVIDER_DATE = "2026-06-15"
+
+
+def _addHalfYearDivider(ax, xCategories=None, boundary=HALF_YEAR_DIVIDER_DATE):
+    """Draw a dotted vertical line splitting first-half vs second-half year at
+    *boundary* (default 15 Jun 2026).
+
+    On the shared CATEGORICAL x-axis (``xCategories`` = ordered "%Y-%m-%d"
+    strings) the line sits at the boundary between the last form date on/before
+    *boundary* and the first one after it, so it lands identically on the scatter
+    and every rubric panel. Skipped when all forms fall on one side (nothing to
+    separate). Falls back to a real-date line when no categories are supplied.
+    """
+    if xCategories is not None:
+        firstHalf = sum(1 for d in xCategories if str(d) <= boundary)
+        if firstHalf == 0 or firstHalf == len(xCategories):
+            return
+        xPos = firstHalf - 0.5
+    else:
+        xPos = pd.Timestamp(boundary)
+    ax.axvline(xPos, linestyle=":", color="#555555", linewidth=1.3, alpha=0.8, zorder=0)
+
+
+def _missingSessionMarks(ax, missingDates, xCategories, y=0, size=45, zorder=5):
+    """Purple dot at *y* on every scheduled date the student has no form for.
+
+    Shared by the scatter and all five rubric panels so an absence reads as one
+    vertical run of purple across the whole page. Dates not in *xCategories* are
+    ignored rather than silently shifting the axis. Returns True if anything was
+    drawn, which is what tells the caller to add the legend entry.
+    """
+    if not missingDates or not xCategories:
+        return False
+    catToIdx = {d: i for i, d in enumerate(xCategories)}
+    xs = [catToIdx[d] for d in missingDates if d in catToIdx]
+    if not xs:
+        return False
+    ax.scatter(xs, [y] * len(xs), color=MISSING_SESSION_COLOR, marker="o",
+               s=size, zorder=zorder, clip_on=False)
+    return True
+
+
+def _drawScoresScatter(ax, df, dateCol="Date", scoreDictCol="scores", scoreKey="score",
+                       fallbackKey=None, xCategories=None, showXTickLabels=True,
+                       missingDates=None, showLegend=True,
+                       smileSquadSuffix=SMILE_SQUAD_LABEL_SUFFIX, streamCohort=None):
+    """Draw the item-code score scatter onto an existing Axes ``ax``.
+
+    Dates are treated as CATEGORIES (strings), so ticks are equidistant. Returns
+    True if any marker was drawn. Item scores that are null / Not-Observed are
+    ignored (no marker). Point labels show only the numeric item code (see
+    _shortItemCode). ``xCategories`` (ordered "%Y-%m-%d" strings) pins the ticks so
+    the scatter lines up column-for-column with the rubric panels.
+
+    ``missingDates``: scheduled session dates with no form for this student —
+    drawn as a purple dot at y=0 (see ``_missingSessionMarks``).
+
+    The legend is built from what was ACTUALLY drawn rather than from a fixed
+    list. That is what removes the "Complex" key from Simulation charts, where
+    patient complexity does not exist, without needing a form-type flag: no red
+    point, no red legend entry.
+    """
     pecCodes = [
         "Consent", "Record_keeping", "infection_control", "positioning",
         "Record keeping", "Positioning", "Infection control",
@@ -991,89 +1798,231 @@ def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores", score
         if not isinstance(row[scoreDictCol], dict):
             continue
         complexity = (
-            row["assessor_data"].get("scale-patient-complexity", {}).get("scale", None)
+            # v3: scales nested under 'scales', prefixed key, level under 'key'
+            (row["assessor_data"].get("scales", {}) or {}).get("scale-patient-complexity", {}).get("key", None)
             if isinstance(row["assessor_data"], dict) else None
         )
         for itemCode, scoreDict in row[scoreDictCol].items():
-            naFlag = False
             if itemCode in pecCodes:
                 continue
             score = scoreDict.get(scoreKey)
             if score is None or pd.isna(score):
                 if fallbackKey is not None:
                     score = scoreDict.get(fallbackKey)
+                # Null / Not-Observed scores are ignored (no marker).
                 if score is None or pd.isna(score):
-                    score = -5
-                    naFlag = True
+                    continue
             expandedRows.append({
                 "Date": row[dateCol],
                 "Item": itemCode,
                 "Score": score * 100,
                 "Assessor Name": row["assessor_name"],
-                "NA_Flag": naFlag,
+                "NA_Flag": False,
                 "Patient Complexity": complexity,
                 "Clinic": row.get("clinic", "Unknown"),
             })
 
     expandedDf = pd.DataFrame(expandedRows)
-    if expandedDf.empty:
-        return None
+    drewAny = not expandedDf.empty
+    drewComplex = drewSmileSquad = False
 
-    expandedDf.sort_values("Date", inplace=True)
-    expandedDf["Date"] = expandedDf["Date"].dt.strftime("%Y-%m-%d")
-    expandedDf["Color"] = expandedDf.apply(_getColor, axis=1)
+    if drewAny:
+        expandedDf.sort_values("Date", inplace=True)
+        expandedDf["DateStr"] = expandedDf["Date"].dt.strftime("%Y-%m-%d")
+        if xCategories is None:
+            xCategories = sorted(expandedDf["DateStr"].unique())
+        catToIdx = {d: i for i, d in enumerate(xCategories)}
+        expandedDf = expandedDf[expandedDf["DateStr"].isin(catToIdx)].copy()
+        expandedDf["X"] = expandedDf["DateStr"].map(catToIdx)
+        # Colour: a matched weekly-sim session gets its stream colour; everything
+        # else keeps the normal _getColor (blue default / red Complex / orange
+        # Smile Squad) — never the grey fallback, so a cohort whose Sim streams
+        # declare no code patterns (e.g. BOH2) stays plain blue, not all-grey.
+        if streamCohort:
+            expandedDf["StreamKey"] = expandedDf["Item"].apply(
+                lambda it: _streamForCode(it, streamCohort))
+        else:
+            expandedDf["StreamKey"] = None
+        expandedDf["Color"] = expandedDf.apply(
+            lambda r: SIM_STREAM_COLORS[r["StreamKey"]]
+            if r["StreamKey"] in SIM_STREAM_COLORS else _getColor(r), axis=1)
+        drewComplex = bool((expandedDf["Color"] == COMPLEX_PATIENT_COLOR).any())
+        drewSmileSquad = bool((expandedDf["Color"] == SMILE_SQUAD_COLOR).any())
+        matchedStreamKeys = ([k for k in _cohortStreamOrder(streamCohort)
+                              if (expandedDf["StreamKey"] == k).any()]
+                             if streamCohort else [])
+        hasPlainPoints = bool(expandedDf["StreamKey"].apply(
+            lambda k: k not in SIM_STREAM_COLORS).any())
 
-    fig, ax = plt.subplots(figsize=(14, 8))
-    ax.scatter(expandedDf["Date"], expandedDf["Score"], color=expandedDf["Color"], label="Scores")
+        # Real points carry the generic "Scores" key only when no stream owns
+        # their colour; matched streams get their own keys via proxies below.
+        ax.scatter(expandedDf["X"], expandedDf["Score"], color=expandedDf["Color"],
+                   label=("_nolegend_" if matchedStreamKeys else "Scores"))
 
-    offsetCounter = defaultdict(int)
-    for _, row in expandedDf.iterrows():
-        key = (row["Date"], row["Score"])
-        offset = offsetCounter[key] * 5
-        offsetCounter[key] += 1
-        ax.annotate(
-            f"{row['Item']} SS" if row["Clinic"] == "Smile Squad" else f"{row['Item']}",
-            (row["Date"], row["Score"]),
-            textcoords="offset points", xytext=(10, 3 + 2 * offset),
-            ha="center", fontsize=8,
-        )
+        # Invisible labelled proxies so the legend (auto-rebuilt by the V2 caller
+        # after it adds the rolling-avg line) keys every colour on the scatter.
+        if matchedStreamKeys:
+            _streams = _cohortStreamsSafe(streamCohort)
+            for k in matchedStreamKeys:
+                _name = _streams.get(k, {}).get("name", k)
+                _abbr = SIM_STREAM_ABBREV.get(k, str(k))
+                ax.scatter([], [], color=SIM_STREAM_COLORS.get(k, DEFAULT_POINT_COLOR),
+                           label=f"{_abbr} \u2014 {_name}", s=40)
+            if hasPlainPoints:
+                ax.scatter([], [], color=DEFAULT_POINT_COLOR, label="Scores", s=40)
+        if drewComplex:
+            ax.scatter([], [], color=COMPLEX_PATIENT_COLOR, label="Complex", s=40)
+        if drewSmileSquad:
+            ax.scatter([], [], color=SMILE_SQUAD_COLOR, label="Smile Squad", s=40)
 
-    ax.set_xlabel("Date")
+        offsetCounter = defaultdict(int)
+        for _, row in expandedDf.iterrows():
+            key = (row["X"], row["Score"])
+            offset = offsetCounter[key] * 5
+            offsetCounter[key] += 1
+            if streamCohort:
+                label = _shortStreamItemCode(row["Item"], streamCohort)[0]
+            else:
+                label = _shortItemCode(row["Item"])
+                # Smile Squad used to carry an " SS" suffix here — redundant now the
+                # points are coloured + keyed in the legend (SMILE_SQUAD_LABEL_SUFFIX
+                # is "" by default; set it / pass smileSquadSuffix=" SS" to restore).
+                if smileSquadSuffix and isSmileSquadClinic(row["Clinic"]):
+                    label = f"{label}{smileSquadSuffix}"
+            ax.annotate(
+                label, (row["X"], row["Score"]),
+                textcoords="offset points", xytext=(10, 3 + 2 * offset),
+                ha="center", fontsize=8,
+            )
+
+    drewMissing = _missingSessionMarks(ax, missingDates, xCategories, y=0, size=55)
+    drewAny = drewAny or drewMissing
+
     ax.set_ylabel("Score (% Yes or Weighted)")
     ax.grid(True, linestyle="--", alpha=0.5)
-    ax.tick_params(axis="x", rotation=45)
+    # Categorical (equidistant) ticks pinned to the shared category list.
+    if xCategories is not None:
+        ax.set_xticks(range(len(xCategories)))
+        if showXTickLabels:
+            ax.set_xticklabels(xCategories, rotation=45, ha="right", fontsize=8)
+        ax.set_xlim(-0.5, len(xCategories) - 0.5)
+    else:
+        ax.tick_params(axis="x", rotation=45)
+    _addHalfYearDivider(ax, xCategories)
     maxScore = 100
     ax.set_ylim(-10, 1.2 * maxScore)
     step = int(max(maxScore // 10, 1))
     ax.set_yticks(range(0, int(maxScore + 1), step))
-    legendElems = [
-        Line2D([0], [0], marker="o", color="w", label="Complex", markerfacecolor="red", markersize=8),
-        Line2D([0], [0], marker="o", color="w", label="All NA", markerfacecolor="gray", markersize=8),
-    ]
-    ax.legend(handles=legendElems, bbox_to_anchor=(0.9, 0.97), loc="upper left")
-    fig.tight_layout()
+    # Legend built from what was drawn — see the docstring. Simulation charts
+    # therefore carry no "Complex" key.
+    if drewMissing:
+        ax.scatter([], [], color=MISSING_SESSION_COLOR,
+                   label="No form for scheduled session", s=40)
+    # One auto-collected legend keying every colour actually drawn (Scores /
+    # stream / Complex / Smile Squad / missing). The V2 page re-runs ax.legend()
+    # after adding the rolling-avg line, re-collecting these same handles, so the
+    # keys survive there too (this is what restores Complex / Smile Squad on the
+    # Clinic page). Non-Sim charts drop the "Complex" key when none was drawn,
+    # exactly as before, because the proxy is only added when it was drawn.
+    if showLegend and drewAny:
+        if streamCohort:
+            ax.legend(loc="upper left", fontsize=7.5, ncol=2, framealpha=0.9)
+        else:
+            ax.legend(loc="upper left", bbox_to_anchor=(0.9, 0.97), fontsize=8,
+                      framealpha=0.9)
+    return drewAny
+
+
+def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores", scoreKey="score",
+                                fallbackKey=None, title="Student Performance Over Time", pageSize=None,
+                                xCategories=None, marginFractions=None, missingDates=None, streamCohort=None):
+    """Standalone item-code score scatter figure (used by the per-student reports).
+
+    Thin wrapper over ``_drawScoresScatter``; returns a Figure, or ``None`` when
+    there is nothing to plot. See ``_drawScoresScatter`` for the axis/label rules.
+    """
+    if pageSize is None:
+        pageSize = variableUtils.pageSize
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    drewAny = _drawScoresScatter(
+        ax, df, dateCol=dateCol, scoreDictCol=scoreDictCol, scoreKey=scoreKey,
+        fallbackKey=fallbackKey, xCategories=xCategories,
+        missingDates=missingDates, streamCohort=streamCohort,
+    )
+    if not drewAny:
+        plt.close(fig)
+        return None
+    ax.set_xlabel("Date")
+    if marginFractions is not None:
+        fig.subplots_adjust(**marginFractions)
+    else:
+        fig.tight_layout()
     return fig
 
 
 
-def rubricPlot(ax, studentDf, label, color, xLabelRotation=45, maxY=None):
-    """Single-axis time series of a scale value."""
+def rubricPlot(ax, studentDf, label, color, xLabelRotation=45, maxY=None, xCategories=None,
+               missingDates=None):
+    """Single-axis time series of a scale value on a CATEGORICAL (equidistant) x-axis.
+
+    ``xCategories`` (optional): an ordered list of "%Y-%m-%d" date strings (the same
+    list passed to the scatter), so this rubric line lands at the same x position as
+    the matching scatter column. Ticks/limits are applied even when this scale has no
+    data, so all five rubric panels and the scatter stay aligned.
+
+    ``missingDates``: scheduled sessions the student has no form for, drawn as a
+    purple dot at y=0 — the same marker the scatter uses, so an absence reads as
+    one vertical run of purple down the page. The panel floor drops slightly
+    below zero when any are drawn so the marker is not bisected by the frame.
+
+    ``maxY``: the axis ceiling. Pass ``rubricAxisMax(...)`` rather than a
+    constant for scales whose level count varies between form templates (Time
+    Management is published with 5 levels on some forms and 2 on others).
+    """
+    def _applySharedAxis(top):
+        if xCategories is not None:
+            ax.set_xticks(range(len(xCategories)))
+            ax.set_xticklabels(xCategories, rotation=xLabelRotation, ha="right", fontsize=8)
+            ax.set_xlim(-0.5, len(xCategories) - 0.5)
+        else:
+            ax.tick_params(axis="x", rotation=xLabelRotation, labelsize=8)
+        # Drop the floor a little so a y=0 purple dot is fully visible.
+        drewMissing = _missingSessionMarks(ax, missingDates, xCategories, y=0)
+        if drewMissing and top:
+            ax.set_ylim(-0.06 * float(top), float(top))
+        _addHalfYearDivider(ax, xCategories)
+
     studentDf = studentDf.dropna(subset=[label])
     if studentDf.empty:
         ax.text(0.5, 0.5, "No data available", horizontalalignment="center",
                 verticalalignment="center", transform=ax.transAxes)
+        ax.set_title(label)
+        if maxY:
+            ax.set_ylim(0, maxY)
+            ax.set_yticks(range(0, int(maxY) + 1, 1))
+        _applySharedAxis(maxY)
+        ax.grid(True, linestyle="--", alpha=0.5)
         return
     # studentDf agg by Date to average multiple forms in a day
     studentDf = (studentDf.groupby("Date", sort=True)[label].mean().reset_index())
-    ax.plot(studentDf["Date"], studentDf[label], label=label, color=color, marker="o")
+    if xCategories is not None:
+        catToIdx = {d: i for i, d in enumerate(xCategories)}
+        studentDf = studentDf[studentDf["Date"].isin(catToIdx)]
+        xVals = studentDf["Date"].map(catToIdx)
+    else:
+        xVals = studentDf["Date"]
+    ax.plot(xVals, studentDf[label], label=label, color=color, marker="o")
     ax.set_title(label)
     if maxY is None:
-        ax.set_ylim(0, studentDf[label].max() + 0.5)
+        top = studentDf[label].max() + 0.5
+        ax.set_ylim(0, top)
         ax.set_yticks(range(0, int(studentDf[label].max() + 1), 1))
     else:
+        top = maxY
         ax.set_ylim(0, maxY)
         ax.set_yticks(range(0, int(maxY) + 1, 1))
-    ax.tick_params(axis="x", rotation=xLabelRotation, labelsize=8)
+    _applySharedAxis(top)
     ax.grid(True, linestyle="--", alpha=0.5)
     # add space b/w plots
     plt.subplots_adjust(hspace=0.3)
@@ -1086,6 +2035,63 @@ def makeSafeParagraph(value):
         textValue = str(value)
     textValue = escape(textValue).replace("\n", "<br/>")
     return textValue
+
+
+# ── Code → full-name maps ────────────────────────────────────────────────────
+# The authoritative source is each form's context_schema_snapshot (field
+# 'role' / 'patient.details' options: {code: label}); these are read DYNAMICALLY
+# at render time via _labelMapFromSnapshots so future form changes flow through
+# automatically. The constants below are ONLY a fallback for rows whose snapshot
+# is missing/blank.
+ROLE_LABELS_FALLBACK = {
+    "O":  "Operator",
+    "SO": "Support Operator",
+    "OB": "Observation",
+}
+PATIENT_DETAIL_LABELS_FALLBACK = {
+    "ISP": "I saw a patient",
+    "FTA": "Failed to attend (FTA)",
+    "PCW": "Patient cancelled within 24 hours",
+    "NPB": "New patient block not filled",
+    "UBP": "Unable to book a patient",
+}
+
+
+def _labelMapFromSnapshots(snapshots, fieldKey, fallback=None):
+    """Build a {code: label} map for *fieldKey* (e.g. 'role', 'patient.details')
+    by scanning an iterable of context_schema_snapshot values. Each snapshot is
+    the per-form list of field defs [{key, options:{code:label}, ...}]; entries
+    may arrive as parsed lists or JSON strings. Later (newer) snapshots override
+    earlier ones, so the current form definition wins. Starts from *fallback*
+    (dict) so codes absent from every snapshot still resolve."""
+    labelMap = dict(fallback) if fallback else {}
+    for snap in snapshots:
+        if snap is None:
+            continue
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(snap, list):
+            continue
+        for field in snap:
+            if isinstance(field, dict) and field.get("key") == fieldKey:
+                opts = field.get("options")
+                if isinstance(opts, dict):
+                    labelMap.update({str(k): str(v) for k, v in opts.items()})
+    return labelMap
+
+
+def _labelledCountsText(series, labelMap):
+    """value_counts() of *series* rendered as plain labelled rows using
+    *labelMap* (code → full name). Blank/NaN codes are skipped; unknown codes
+    fall back to the raw code so nothing is silently lost."""
+    counts = series.dropna().astype(str).str.strip()
+    counts = counts[counts != ""].value_counts()
+    return "<br/> ".join(
+        f"{labelMap.get(code, code)}: {n}" for code, n in counts.items()
+    )
 
 
 def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
@@ -1142,14 +2148,11 @@ def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
  
     if patientInfo:
         if isSimulation:
+            # Simulation forms have no patient and no role/patient-details
+            # (both clinic-only) — leave those rows blank instead of rendering
+            # empty-code counts like ": 16".
             metrics["Mean Patient Age"] = ""
             metrics["Patient Age Dist."] = ""
-            roleCounts = adf["role"].value_counts().to_dict()
-            roleCountsText = "<br/> ".join(f"{k}: {v}" for k, v in roleCounts.items())
-            patientDetails = adf["patient_details"].value_counts().to_dict()
-            patientDetailsText = "<br/> ".join(f"{k}: {v}" for k, v in patientDetails.items())
-            metrics["Role Counts"] = roleCountsText
-            metrics["Patient Details"] = patientDetailsText
         else:
             patientAge = adf["patient_age"].clip(lower=0, upper=120)
             meanAge = patientAge.dropna().mean()
@@ -1159,15 +2162,19 @@ def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
                 ("18+", adf[adf["patient_age"] >= 18].shape[0]),
             ])
             ageCountsText = "<br/> ".join(f"{k}: {v}" for k, v in ageBuckets.items())
-            roleCounts = adf["role"].value_counts().to_dict()
-            roleCountsText = "<br/> ".join(f"{k}: {v}" for k, v in roleCounts.items())
-            patientDetails = adf["patient_details"].value_counts().to_dict()
-            patientDetailsText = "<br/> ".join(f"{k}: {v}" for k, v in patientDetails.items())
- 
+
             metrics["Mean Patient Age"] = f"{meanAge:.2f}" if not np.isnan(meanAge) else "N/A"
             metrics["Patient Age Dist."] = ageCountsText
-            metrics["Role Counts"] = roleCountsText
-            metrics["Patient Details"] = patientDetailsText
+            # Full names read DYNAMICALLY from each form's context_schema_snapshot
+            # (fallback constants cover rows whose snapshot is missing).
+            snapshots = (
+                df["context_schema_snapshot"]
+                if "context_schema_snapshot" in df.columns else []
+            )
+            roleMap = _labelMapFromSnapshots(snapshots, "role", ROLE_LABELS_FALLBACK)
+            detailMap = _labelMapFromSnapshots(snapshots, "patient.details", PATIENT_DETAIL_LABELS_FALLBACK)
+            metrics["Role Counts"] = _labelledCountsText(adf["role"], roleMap)
+            metrics["Patient Details"] = _labelledCountsText(adf["patient_details"], detailMap)
  
     return metrics
 
@@ -1274,38 +2281,41 @@ def _makeRatingsFigure(simDf, clinicDf, hasSim, hasClinic):
     return fig
 
 
-def _addTimeSeriesPage(elements, df, typeLabel, subheadingStyle):
+def _addTimeSeriesPage(elements, df, typeLabel, subheadingStyle, combined=None):
     """
     Append the time-series scatter + entrustment/GR rubric plots for a single
     form type ('Simulation' or 'Clinic') to *elements*.
- 
+
     Caller is responsible for adding the PageBreak afterwards.
     *df* is expected to be assessor-submitted, type-filtered, sorted by date.
+
+    ``combined`` (like buildCohortTimeSeriesPdf): None -> module default
+    ``COMBINE_TIMESERIES_PANELS``; False -> two separate figures (scatter, then the
+    Entrustment/Global Rating panels) with matched widths; True -> one combined
+    figure (taller scatter + the 2 rubric panels) sharing a single x-axis. Dates are
+    treated as categories, so ticks are equidistant either way.
     """
+    if combined is None:
+        combined = COMBINE_TIMESERIES_PANELS
     if df.empty:
         return
- 
+
     elements.append(Spacer(1, 24))
     heading = Paragraph(f"{typeLabel} — Performance Over Time", subheadingStyle)
- 
-    # Item-score scatter plot
-    timeSeriesDf = df[[
-        "datetimeutc", "entrustment", "global_rating", "item_codes",
-        "scores", "assessor_data", "assessor_name",
-    ]].copy()
+
+    # Shared equidistant category axis (every form day) across scatter + rubric,
+    # so their columns line up.
+    xCategories = sorted(df["datetimeutc"].dt.strftime("%Y-%m-%d").unique())
+
+    # Item-score scatter frame
+    scatterCols = ["datetimeutc", "entrustment", "global_rating", "item_codes",
+                   "scores", "assessor_data", "assessor_name"]
+    if "clinic" in df.columns:
+        scatterCols.append("clinic")
+    timeSeriesDf = df[scatterCols].copy()
     timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
-    fig = plotStudentScoresTimeSeries(
-        timeSeriesDf, dateCol="Date", scoreDictCol="scores",
-        scoreKey="score", fallbackKey=None,
-        title=f"{typeLabel} — Performance on Assessed Items Over Time",
-    )
-    timeSeriesImg = addPlotImage(fig) if fig is not None else None
-    # if fig is not None:
-        # elements.append(KeepTogether([heading, Spacer(1, 12), addPlotImage(fig)]))
-        # plt.close(fig)
- 
-    # Entrustment + GR rubric panels
-    fig, axes = plt.subplots(2, 1, figsize=(14, 6))
+
+    # Entrustment + Global Rating rubric frame (one row per day)
     rubricPlotDf = df[["datetimeutc", "entrustment", "global_rating"]].copy()
     rubricPlotDf.rename(columns={
         "datetimeutc": "Date",
@@ -1314,17 +2324,62 @@ def _addTimeSeriesPage(elements, df, typeLabel, subheadingStyle):
     }, inplace=True)
     rubricPlotDf.sort_values("Date", inplace=True)
     rubricPlotDf["Date"] = rubricPlotDf["Date"].dt.strftime("%Y-%m-%d")
-    rubricPlotDf["Entrustment"] = rubricPlotDf["Entrustment"].astype("Int64")
-    rubricPlotDf["Global Rating"] = rubricPlotDf["Global Rating"].astype("Int64")
-    rubricPlot(axes[0], rubricPlotDf, "Entrustment", "blue", maxY=4.5)
-    rubricPlot(axes[1], rubricPlotDf, "Global Rating", "green", maxY=5.5)
-    plt.subplots_adjust(hspace=0.5)
-    rubricImg = addPlotImage(fig)
+    rubricPlotDf["Entrustment"] = pd.to_numeric(rubricPlotDf["Entrustment"], errors="coerce")
+    rubricPlotDf["Global Rating"] = pd.to_numeric(rubricPlotDf["Global Rating"], errors="coerce")
+
+    rubricSpecs = [("Entrustment", "blue", 4.5), ("Global Rating", "green", 5.5)]
+
+    if combined:
+        # ── One combined figure: taller scatter on top, then the 2 rubric panels,
+        # all sharing one equidistant x-axis. ──
+        fig, axes = plt.subplots(
+            3, 1, figsize=(16, 14), sharex=True,
+            gridspec_kw={"height_ratios": [5, 1, 1]},
+        )
+        _drawScoresScatter(
+            axes[0], timeSeriesDf, dateCol="Date", scoreDictCol="scores",
+            scoreKey="score", fallbackKey=None, xCategories=xCategories,
+        )
+        axes[0].set_title(f"{typeLabel} — Performance on Assessed Items Over Time")
+        for ax, (lbl, col, my) in zip(axes[1:], rubricSpecs):
+            rubricPlot(ax, rubricPlotDf, lbl, col, maxY=my, xCategories=xCategories)
+        for ax in axes[:-1]:
+            ax.tick_params(axis="x", labelbottom=False)
+        axes[-1].set_xlabel("Date")
+        fig.subplots_adjust(left=0.075, right=0.985, top=0.95, bottom=0.12, hspace=0.35)
+        plt.close(fig)
+        elements.append(Spacer(1, 18))
+        elements.append(KeepTogether([heading, Spacer(1, 12), addPlotImage(fig, 0.95)]))
+        return
+
+    # ── Two separate figures with MATCHED widths (same fig width 14, identical
+    # left/right margins, same page-width scaling, same equidistant categories). ──
+    scatterMargins = dict(left=0.09, right=0.985, top=0.92, bottom=0.24)
+    rubricMargins = dict(left=0.09, right=0.985, top=0.93, bottom=0.22, hspace=0.5)
+
+    fig = plotStudentScoresTimeSeries(
+        timeSeriesDf, dateCol="Date", scoreDictCol="scores",
+        scoreKey="score", fallbackKey=None,
+        title=f"{typeLabel} — Performance on Assessed Items Over Time",
+        xCategories=xCategories, marginFractions=scatterMargins,
+    )
+    timeSeriesImg = addPlotImage(fig, 0.9) if fig is not None else None
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+    for i, (ax, (lbl, col, my)) in enumerate(zip(axes, rubricSpecs)):
+        rubricPlot(ax, rubricPlotDf, lbl, col, maxY=my, xCategories=xCategories)
+        if i < len(axes) - 1:
+            ax.tick_params(axis="x", labelbottom=False)
+    fig.subplots_adjust(**rubricMargins)
+    rubricImg = addPlotImage(fig, 0.9)
     plt.close(fig)
- 
+
     elements.append(Spacer(1, 18))
-    # elements.append(Paragraph(f"{typeLabel} — Entrustment and Global Rating Over Time", subheadingStyle,))
-    elements.append(KeepTogether([heading, Spacer(1, 12), timeSeriesImg, rubricImg]))
+    parts = [heading, Spacer(1, 12)]
+    if timeSeriesImg is not None:
+        parts.append(timeSeriesImg)
+    parts.append(rubricImg)
+    elements.append(KeepTogether(parts))
 
 
 def _addReflectionsTable(elements, df, typeLabel, subheadingStyle,
@@ -1338,17 +2393,21 @@ def _addReflectionsTable(elements, df, typeLabel, subheadingStyle,
     if df.empty:
         return
  
+    # Prefer the composite (bold-labelled, all comment keys) columns; fall back
+    # to the plain scalar reflection columns if a caller passed a df without them.
+    studentCol = "student_reflection_full" if "student_reflection_full" in df.columns else "student_reflection"
+    assessorCol = "assessor_reflection_full" if "assessor_reflection_full" in df.columns else "assessor_reflection"
     reflectionsDf = df[
-        ["datetimeutc", "item_codes", "student_reflection", "assessor_reflection"]
+        ["datetimeutc", "item_codes", studentCol, assessorCol]
     ].copy()
     reflectionsDf["item_codes"] = reflectionsDf["item_codes"].apply(
         lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) and len(v) > 0 else ""
     )
-    reflectionsDf["student_reflection"] = (
-        reflectionsDf["student_reflection"].apply(truncateText).str.replace("\n", "<br/>")
+    reflectionsDf[studentCol] = (
+        reflectionsDf[studentCol].apply(_safeHtmlTruncate).str.replace("\n", "<br/>")
     )
-    reflectionsDf["assessor_reflection"] = (
-        reflectionsDf["assessor_reflection"].apply(truncateText).str.replace("\n", "<br/>")
+    reflectionsDf[assessorCol] = (
+        reflectionsDf[assessorCol].apply(_safeHtmlTruncate).str.replace("\n", "<br/>")
     )
     reflectionsDf.columns = ["Date", "Item Codes", "Student Reflection", "Assessor Reflection"]
     reflectionsDf = reflectionsDf.sort_values("Date")
@@ -1365,6 +2424,231 @@ def _addReflectionsTable(elements, df, typeLabel, subheadingStyle,
         bottomPadding=6, topPadding=6,
     )
     elements.append(reflectionsTable)
+
+
+# ── Item-code counts TABLE (cohort time-series PDF) ─────────────────────────
+# The individual student reports show this as a bar chart
+# (_addItemCodeCountsBarChart). The cohort time-series PDF wants the same
+# information as exact numbers, so it is laid out as a table instead. Codes are
+# split across side-by-side column GROUPS rather than one long column, because a
+# BOH2 clinic student can carry 60+ codes and a single column would push the
+# charts onto another page.
+
+ITEM_COUNTS_MAX_ROWS_PER_GROUP = 26
+ITEM_COUNTS_MAX_GROUPS = 4
+# Beside-the-charts layout: gap between chart and table, and the narrowest
+# gutter still worth using (below it the table stacks underneath instead).
+ITEM_COUNTS_GUTTER_PAD = 12
+ITEM_COUNTS_MIN_SIDE_WIDTH = 170
+
+# Which form types get the table by default. Simulation is excluded on purpose:
+# a sim session IS one task, so the code list restates the timetable and adds
+# nothing the charts do not already show. Override per call with
+# ``itemCountsTable=`` — True (every type), False (none), or your own tuple.
+ITEM_COUNTS_FORM_TYPES = ("Clinic",)
+
+
+def wantsItemCountsTable(itemCountsTable, formType):
+    """Resolve the ``itemCountsTable=`` selector for one form type.
+
+    Accepts True (always), False/None (never), or a collection of form-type
+    names, matched case-insensitively. ``formType=None`` ("all form types")
+    matches only the explicit True, because a per-type list cannot answer a
+    request that isn't for a type.
+    """
+    if itemCountsTable is True:
+        return True
+    if not itemCountsTable:
+        return False
+    if isinstance(itemCountsTable, str):
+        itemCountsTable = (itemCountsTable,)
+    wanted = {str(t).strip().casefold() for t in itemCountsTable}
+    return str(formType or "").strip().casefold() in wanted
+
+
+def normalizeItemCodeCounts(counts, classAvgItemCounts=None):
+    """Collapse item-code variants onto their bare numeric code.
+
+    DASH stores the same clinical item under several labels — a bare ``'011'``,
+    a cohort/semester-prefixed ``'BOH2 S2 011'``, and a suffixed ``'011-COE'`` —
+    which split one item across three rows of the counts table. ``_shortItemCode``
+    already reduces a label to its standalone 3-digit code(s) for the scatter
+    point labels; this applies the same rule to the counts, so all three become
+    ``'011'`` and their counts add up.
+
+    Labels with no 3-digit code (``'LA'``, ``'BOH-DD'``) fall through
+    ``_shortItemCode`` unchanged and stay their own rows — that is the whole
+    point of the fallback.
+
+    Cohort averages are summed across the codes that merge, which is exact: the
+    average is *mean forms per student per code*, and the mean of a sum is the
+    sum of the means.
+
+    Returns ``(counts, classAvgItemCounts)`` — a new Series and a new dict.
+    """
+    if counts is None or len(counts) == 0:
+        return counts, (classAvgItemCounts or {})
+    counts = counts.rename(index=lambda c: _shortItemCode(c)).groupby(level=0).sum()
+    merged = defaultdict(float)
+    for code, value in (classAvgItemCounts or {}).items():
+        try:
+            merged[_shortItemCode(code)] += float(value)
+        except (TypeError, ValueError):
+            continue
+    return counts, dict(merged)
+
+
+def _countsColumnWidths(data, colsPerGroup, nGroups, fontSize, maxWidth,
+                        fit=True, hasAvg=True, cellPad=7,
+                        headerFont="Helvetica-Bold", bodyFont="Helvetica"):
+    """Column widths for the counts table — content-fitted, not stretched.
+
+    The item codes are three characters (``'141'``, ``'LA'``, ``'BOH-DD'``), so
+    the old fixed 3:1:1.3 ratio stretched to fill the gutter gave the code column
+    ~55% of a table that was already wider than its contents needed. Here each
+    column is measured against its widest actual cell — in practice the *header*
+    ("Item Code", "Cohort Avg") is what sets the width — and ``maxWidth`` becomes
+    a CEILING: the table only scales down, never up.
+
+    Column widths are shared across the side-by-side groups (position *j* in
+    every group gets the same width), so the group separators line up.
+    """
+    if not fit:
+        ratio = [3.0, 1.0] + ([1.3] if hasAvg else [])
+        groupWidth = maxWidth / nGroups
+        return [groupWidth * w / sum(ratio) for w in ratio] * nGroups
+
+    widths = [0.0] * colsPerGroup
+    for r, row in enumerate(data):
+        font = headerFont if r == 0 else bodyFont
+        for j, cell in enumerate(row):
+            text = "" if cell is None else str(cell)
+            if not text:
+                continue
+            try:
+                w = pdfmetrics.stringWidth(text, font, fontSize)
+            except Exception:                       # unregistered font, odd glyph
+                w = len(text) * fontSize * 0.6
+            slot = j % colsPerGroup
+            if w > widths[slot]:
+                widths[slot] = w
+    widths = [w + cellPad * 2 for w in widths]
+
+    total = sum(widths) * nGroups
+    if maxWidth and total > maxWidth:               # ceiling, not a target
+        widths = [w * maxWidth / total for w in widths]
+    return widths * nGroups
+
+
+def makeItemCodeCountsTable(df, classAvgItemCounts=None, title=None,
+                            titleStyle=None, headerColor=None, fontSize=7.5,
+                            maxWidth=None, maxRowsPerGroup=ITEM_COUNTS_MAX_ROWS_PER_GROUP,
+                            maxGroups=ITEM_COUNTS_MAX_GROUPS, sortBy="count",
+                            asList=False, normalizeCodes=True,
+                            fitColumns=True, cellPad=7):
+    """Flowable listing how many times this student performed each item code.
+
+    Columns per group: ``Item Code | Count | Cohort Avg``. ``classAvgItemCounts``
+    is the {code: mean count per student} dict from
+    ``getCohortItemCodeAverages``; pass None/{} to drop the average column.
+
+    ``normalizeCodes`` (default True) merges label variants of the same item —
+    ``'BOH2 S2 011'`` and ``'011-COE'`` both become ``'011'`` — via
+    ``normalizeItemCodeCounts``. Codes with no 3-digit part (``'LA'``,
+    ``'BOH-DD'``) are left alone. Pass False for the raw DASH labels.
+
+    ``fitColumns`` (default True) sizes every column to its widest cell plus
+    ``cellPad``, so the table is only as wide as its contents. ``maxWidth`` then
+    acts as a CEILING rather than a target — see ``_countsColumnWidths``. Pass
+    False for the old behaviour, where the columns were split by a fixed 3:1:1.3
+    ratio and stretched to fill ``maxWidth``.
+
+    Codes are dealt DOWN each group in turn (group 1 gets the first slice, group
+    2 the next), so reading order is top-to-bottom then left-to-right. Rows are
+    balanced across groups, so 30 codes become 15+15 rather than 26+4.
+
+    Returns None when the student has no item codes — the caller appends nothing
+    rather than a "No data" box.
+    """
+    if df is None or df.empty or "item_codes" not in df.columns:
+        return None
+    counts = df["item_codes"].dropna().explode().dropna().value_counts()
+    if counts.empty:
+        return None
+    if normalizeCodes:
+        counts, classAvgItemCounts = normalizeItemCodeCounts(counts, classAvgItemCounts)
+
+    hasAvg = bool(classAvgItemCounts)
+    codes = list(counts.index)
+    if sortBy == "code":
+        codes.sort(key=lambda c: str(c))
+    else:
+        codes.sort(key=lambda c: (-int(counts[c]), str(c)))
+
+    nGroups = max(1, min(maxGroups, -(-len(codes) // maxRowsPerGroup)))
+    perGroup = -(-len(codes) // nGroups)          # balanced, not maxed-out
+    groups = [codes[i:i + perGroup] for i in range(0, len(codes), perGroup)]
+    nGroups = len(groups)
+    rowsPerGroup = max(len(g) for g in groups)
+
+    header = ["Item Code", "Count"] + (["Cohort Avg"] if hasAvg else [])
+    colsPerGroup = len(header)
+    data = [header * nGroups]
+    for r in range(rowsPerGroup):
+        row = []
+        for g in groups:
+            if r < len(g):
+                code = g[r]
+                cells = [str(code), str(int(counts[code]))]
+                if hasAvg:
+                    cells.append(f"{float(classAvgItemCounts.get(code, 0.0)):.1f}")
+                row += cells
+            else:
+                row += [""] * colsPerGroup
+        data.append(row)
+
+    if maxWidth is None:
+        maxWidth = variableUtils.pageSize[0] - variableUtils.leftMargin - variableUtils.rightMargin
+    colWidths = _countsColumnWidths(
+        data, colsPerGroup, nGroups, fontSize, maxWidth,
+        fit=fitColumns, hasAvg=hasAvg, cellPad=cellPad,
+    )
+
+    if headerColor is None:
+        headerColor = variableUtils.uniColor
+    table = Table(data, colWidths=colWidths, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(headerColor)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), fontSize),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#999999")),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+        # must match the cellPad used by _countsColumnWidths, or reportlab's
+        # default 6pt side padding re-wraps cells the measurement said would fit
+        ("LEFTPADDING", (0, 0), (-1, -1), cellPad),
+        ("RIGHTPADDING", (0, 0), (-1, -1), cellPad),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F2F2")]),
+    ]
+    # thicker rule between the side-by-side groups so they don't read as one row
+    for g in range(1, nGroups):
+        x = g * colsPerGroup
+        style.append(("LINEBEFORE", (x, 0), (x, -1), 1.4, colors.HexColor("#444444")))
+    table.setStyle(TableStyle(style))
+
+    if title is None:
+        return [table] if asList else table
+    titleStyle = titleStyle or variableUtils.subsubheadingStyle
+    content = [Paragraph(title, titleStyle), Spacer(1, 4), table]
+    # asList matters: KeepTogether.wrap() reports a height of 0xFFFFFF, which a
+    # Table CELL reads as "infinitely tall" and then refuses to lay out
+    # ("tallest row 16777215 … too large on page N"). Anything destined for a
+    # cell must be a plain list of flowables.
+    return content if asList else KeepTogether(content)
 
 
 def _addItemCodeCountsBarChart(elements, df, classAvgItemCounts,
@@ -1672,14 +2956,68 @@ def _addSectionPerformance(elements, longDf, typePages, subheadingStyle,
 # 6. Student PDF report builder
 # ═══════════════════════════════════════════════════════════════════════════
 def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
-                              formType=None, formsTable="rawform_forms",
+                              formType=None, formsTable="rawform_forms_v3",
                               scoreMap=None, subheadingStyle=None, uniColor=None,
                               pageSize=None, rightMargin=36, leftMargin=36,
-                              topMargin=48, bottomMargin=36):
+                              topMargin=48, bottomMargin=36, combined=None,
+                              pageWidthFactor=1.25,
+                              itemCountsTable=ITEM_COUNTS_FORM_TYPES,
+                              normalizeItemCodes=True,
+                              useSchedule=True, scheduleYear=2026,
+                              scheduleMaxDate=None, rosterOrder=True,
+                              dateRangeInBanner=True):
     """
     Scrollable PDF with every student's score scatter + rubric time series,
     optionally filtered to Simulation or Clinic.
+
+    ``combined`` controls the per-student layout:
+        None  -> use the module default ``COMBINE_TIMESERIES_PANELS``
+        False -> two separate figures (scatter, then the 5 rubric panels) with
+                 matched widths so their equidistant date ticks line up vertically
+        True  -> one combined figure (scatter + 5 rubric panels) sharing one x-axis
+    Dates are treated as categories, so ticks are equidistant either way.
+
+    Added 2026-08-18 — every one of these degrades to the previous behaviour if
+    its input is missing, so a cohort without a roster or a timetable still
+    builds:
+
+    ``rosterOrder``      students in SURNAME order, taken from
+                         ``<COHORT>/<COHORT> Roster <year>.xlsx`` when present and
+                         from the last name token otherwise (``_surnameKey``).
+    ``dateRangeInBanner``  the period the charts cover, on the first-page banner.
+    ``useSchedule``      for Simulation, x ticks come from the union of the
+                         student's own form dates and the published timetable
+                         (``<COHORT>/<COHORT> Sim Sessions <year>.xlsx``), and a
+                         scheduled date with no form gets a purple dot at y=0 on
+                         the scatter and on every rubric panel. Dates in the data
+                         but NOT on the timetable are kept, never dropped.
+                         ``scheduleMaxDate`` caps the timetable (default: today)
+                         so sessions that have not happened yet do not show up as
+                         a wall of absences.
+    ``itemCountsTable``  which form types get the per-student
+                         ``Item Code | Count | Cohort Avg`` table. Accepts True
+                         (every type), False (none), or a collection of form-type
+                         names. Defaults to ``ITEM_COUNTS_FORM_TYPES`` =
+                         ``("Clinic",)`` — Simulation is excluded because a sim
+                         session is one task, so its code list just restates the
+                         timetable. ``itemCountsTable=("Clinic","Simulation")``
+                         or ``True`` turns it on everywhere.
+    ``normalizeItemCodes``  merge item-code label variants in that table:
+                         ``'BOH2 S2 011'`` and ``'011-COE'`` both count towards
+                         ``'011'``, while codes with no 3-digit part (``'LA'``,
+                         ``'BOH-DD'``) stay as they are. False keeps the raw DASH
+                         labels.
+    ``pageWidthFactor``  widens the PAGE (not the charts) to make room for that
+                         table. The figures are still scaled against the original
+                         ``variableUtils.pageSize``, so they render at exactly the
+                         size they did before — set this to 1.0 to restore the
+                         original page. The page is NOT widened when no form type
+                         in this run gets a table. 1.25 leaves a ~237pt gutter for
+                         a ~151pt content-fitted table; it was 1.45 while the
+                         table still stretched to fill whatever it was given.
     """
+    if combined is None:
+        combined = COMBINE_TIMESERIES_PANELS
     if scoreMap is None:
         scoreMap = SCORE_MAP
     if uniColor is None:
@@ -1689,10 +3027,55 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
     if pageSize is None:
         pageSize = variableUtils.pageSize
 
+    # Does THIS form type get a counts table? Resolved once — it decides whether
+    # the averages query runs, whether the page is widened at all, and whether the
+    # per-student layout has a second column.
+    showCounts = wantsItemCountsTable(itemCountsTable, formType)
+
+    # The page gets wider to fit the counts table; the CHARTS keep sizing against
+    # the original page so the graphs are unchanged. addPlotImage's own default
+    # is bound at import time, so this has to be passed explicitly. No table for
+    # this form type -> no widening, or the PDF is wide with an empty gutter.
+    chartPageSize = tuple(pageSize)
+    if showCounts:
+        pageSize = (pageSize[0] * float(pageWidthFactor), pageSize[1])
+    contentWidth = pageSize[0] - leftMargin - rightMargin
+
     filters = {"type": formType} if formType else None
 
+    # Cohort-average item counts for the table's third column — one query, reused
+    # for every student. Failure here must not lose the whole PDF, so the table
+    # simply falls back to student counts only.
+    # (formType=None means "all form types"; there is no meaningful per-type
+    # average then, so the table falls back to the student's own counts.)
+    classAvgItemCounts = {}
+    if showCounts and formType:
+        try:
+            classAvgItemCounts = getCohortItemCodeAverages(
+                engine, cohort, formType=formType, formsTable=formsTable,
+            ) or {}
+        except Exception as exc:                       # noqa: BLE001 - reported, not raised
+            print(f"[timeseries] cohort item-code averages unavailable for "
+                  f"{cohort}/{formType}: {exc}")
+
+    # Published timetable (Simulation only — see SCHEDULED_FORM_TYPES).
+    scheduledDates = []
+    if useSchedule:
+        scheduledDates = getScheduledSessionDates(
+            cohort, formType=formType, year=scheduleYear, maxDate=scheduleMaxDate,
+        )
+        if scheduledDates:
+            print(f"[timeseries] {cohort} {formType}: {len(scheduledDates)} scheduled "
+                  f"session(s) {scheduledDates[0]} … {scheduledDates[-1]}")
+
     elements = []
-    elements.append(Spacer(1, 72+12))
+    # Stays 72 whether or not the banner grows a second line. The per-student
+    # composite is a single unsplittable flowable up to 994.5pt tall, and the
+    # first-page budget is frame(1106.9) - spacer - title(~36); at 72 that
+    # leaves ~4pt of slack, and any larger spacer pushes student 1's charts onto
+    # page 2 and leaves a near-empty first page. The banner is sized to fit
+    # underneath instead (see bannerHeight below).
+    elements.append(Spacer(1, 72))
 
     doc = SimpleDocTemplate(
         str(outPath), pagesize=pageSize, rightMargin=rightMargin,
@@ -1700,20 +3083,33 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
     )
 
     studentsDf = getStudentsInCohort(engine, cohort, formsTable)
-    studentsDf.sort_values("student_name", inplace=True)
+    if rosterOrder:
+        studentsDf = orderStudentsBySurname(studentsDf, cohort, year=scheduleYear)
+    else:
+        studentsDf = studentsDf.sort_values("student_name")
+
+    # Widest span of x categories seen across the cohort — becomes the banner's
+    # "date range covered" line. Collected during the loop and read afterwards,
+    # because the banner is drawn by doc.build() at the very end.
+    coveredDates = set()
 
     for _, sRow in studentsDf.iterrows():
         studentName = sRow["student_name"]
         studentNumber = sRow["student_number"]
-        if cohort == 'BOH2' and studentNumber in BOH2_REMOVED_STUDENTS:
+        if cohort == 'BOH2' and studentNumber in variableUtils.BOH2_REMOVED_STUDENTS:
             continue
-        if cohort == 'DDS2' and studentNumber in DDS2_REMOVED_STUDENTS:
+        if cohort == 'DDS2' and studentNumber in variableUtils.DDS2_REMOVED_STUDENTS:
             continue
         # studentIds = ['1678748', '1684643', '1362959', '1309866', '1362803', '1346824']
         # if str(studentNumber) not in studentIds:
         #     continue
-
-        studentDataDf = getStudentData(engine, cohort, studentNumber, formsTable, filters=filters)
+        # Merge, don't overwrite: dropping the type filter here made the
+        # Simulation and Clinic PDFs come out identical (every call loaded all of
+        # the student's forms). `type` is a real v3 column.
+        filters = {"student_number": studentNumber}
+        if formType:
+            filters["type"] = formType
+        studentDataDf = getDataDf(engine, cohort, formsTable, filters=filters)
         if studentDataDf.empty:
             continue
 
@@ -1721,15 +3117,8 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
             pd.to_datetime(studentDataDf["datetimeutc"], utc=True)
             .dt.tz_convert("Australia/Melbourne")
         )
-        if cohort == 'BOH2' and formType == 'Clinic':
-            # filter out Smile Squad clinic, in these student_data is to be treated as assessor_data, to be filtered out by submitted_by_student
-            smileSquadDf = studentDataDf[studentDataDf["clinic"] == "Smile Squad"]
-            # display(smileSquadDf[["clinic", "student_data", "assessor_data", "submitted_by_student"]])
-            # exchange the columns student_data and assessor_data for these rows
-            studentDataDf.loc[smileSquadDf.index, ["student_data", "assessor_data"]] = studentDataDf.loc[smileSquadDf.index, ["assessor_data", "student_data"]].values
-            studentDataDf.loc[smileSquadDf.index, ["submitted_by_student", "submitted_by_assessor"]] = studentDataDf.loc[smileSquadDf.index, ["submitted_by_assessor", "submitted_by_student"]].values
-            # display(studentDataDf[["clinic", "student_data", "assessor_data", "submitted_by_student"]][studentDataDf["clinic"] == "Smile Squad"])
-        
+        # BOH2 Smile Squad forms (student fills the assessor side) are swapped in
+        # getDataDf via applySmileSquadSwap, so they survive the filter below.
         studentDataDf = studentDataDf[studentDataDf["submitted_by_assessor"]].copy()
         if studentDataDf.empty:
             continue
@@ -1738,26 +3127,23 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
         )
         studentDataDf.sort_values("datetimeutc", inplace=True)
 
+        # Shared categorical x-axis for the scatter + 5 rubric charts: dates are
+        # treated as strings so ticks are EQUIDISTANT and every assessment date
+        # lines up vertically. Categories = each distinct form day (union of all
+        # this student's assessor-submitted forms), sorted — plus, for Simulation,
+        # the published timetable, so a session the student missed still gets a
+        # column. Dates in the data but NOT on the timetable are kept: the union
+        # never removes an observed date.
+        observedDates = set(studentDataDf["datetimeutc"].dt.strftime("%Y-%m-%d"))
+        xCategories = sorted(observedDates | set(scheduledDates))
+        missingDates = sorted(set(scheduledDates) - observedDates)
+        coveredDates.update(xCategories)
+
         titleText = f"{studentName} ({studentNumber})"
         elements.append(Paragraph(titleText, subheadingStyle))
         elements.append(Spacer(1, 6))
 
-        # ── 1. Item-code score scatter ──
-        timeSeriesDf = studentDataDf[
-            ["datetimeutc", "entrustment", "global_rating", "communication", "professionalism", "time_management",
-             "item_codes", "scores", "assessor_data", "assessor_name", 'clinic']
-        ].copy()
-        timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
-        scoreFig = plotStudentScoresTimeSeries(
-            timeSeriesDf, dateCol="Date", scoreDictCol="scores",
-            scoreKey="score", fallbackKey=None,
-            title=f"Item Scores – {titleText}",
-        )
-        if scoreFig is not None:
-            elements.append(addPlotImage(scoreFig, 0.9))
-            elements.append(Spacer(1, 12))
-
-        # ── 2. Rubric lines (entrustment + global rating) ──
+        # ── Build the per-day rubric averages ──
         rubricDf = studentDataDf[["datetimeutc", "entrustment", "global_rating", "communication", "professionalism", "time_management"]].copy()
         rubricDf["entrustment"] = pd.to_numeric(rubricDf["entrustment"], errors="coerce")
         rubricDf["global_rating"] = pd.to_numeric(rubricDf["global_rating"], errors="coerce")
@@ -1781,28 +3167,146 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
             "time_management": "Time Management",
         }, inplace=True)
 
-        fig, axes = plt.subplots(5, 1, figsize=(14, 10))
-        rubricPlot(axes[0], rubricDf, "Entrustment", "steelblue", maxY=4.5)
-        axes[0].tick_params(axis="x", labelbottom=False)
-        rubricPlot(axes[1], rubricDf, "Global Rating", "darkorange", maxY=5.5)
-        axes[1].tick_params(axis="x", labelbottom=False)
-        rubricPlot(axes[2], rubricDf, "Communication", "green", maxY=3.0)
-        axes[2].tick_params(axis="x", labelbottom=False)
-        rubricPlot(axes[3], rubricDf, "Professionalism", "purple", maxY=3.0)
-        axes[3].tick_params(axis="x", labelbottom=False)
-        rubricPlot(axes[4], rubricDf, "Time Management", "red", maxY=5.0)
-        plt.subplots_adjust(hspace=0.5)
-        plt.close(fig)
-        elements.append(addPlotImage(fig, 0.9))
+        timeSeriesDf = studentDataDf[
+            ["datetimeutc", "entrustment", "global_rating", "communication", "professionalism", "time_management",
+             "item_codes", "scores", "assessor_data", "assessor_name", 'clinic']
+        ].copy()
+        timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
+
+        # Time Management is published with a varying number of levels (usually
+        # 5, sometimes 2), so its ceiling is resolved per student from the form's
+        # own scale definition rather than hardcoded — see rubricAxisMax. The
+        # other four scales are fixed across every template in use.
+        snapshots = (studentDataDf["context_schema_snapshot"]
+                     if "context_schema_snapshot" in studentDataDf.columns else [])
+        timeMgmtMax = rubricAxisMax(
+            "Time Management", series=rubricDf.get("Time Management"),
+            snapshots=snapshots, default=5.0,
+        )
+
+        _rubricSpecs = [
+            ("Entrustment", "steelblue", 4.5),
+            ("Global Rating", "darkorange", 5.5),
+            ("Communication", "green", 3.0),
+            ("Professionalism", "purple", 3.0),
+            ("Time Management", "red", timeMgmtMax),
+        ]
+
+        chartFlowables = []
+        if combined:
+            # ── One combined figure: scatter on top, then the 5 rubric panels,
+            # all sharing one x-axis (alignment guaranteed by construction). The
+            # scatter gets a taller share (5:1) and the whole figure is larger. ──
+            fig, axes = plt.subplots(
+                6, 1, figsize=(16, 22), sharex=True,
+                gridspec_kw={"height_ratios": [5, 1, 1, 1, 1, 1]},
+            )
+            _drawScoresScatter(
+                axes[0], timeSeriesDf, dateCol="Date", scoreDictCol="scores",
+                scoreKey="score", fallbackKey=None, xCategories=xCategories,
+                missingDates=missingDates,
+            )
+            axes[0].set_title(f"Item Scores – {titleText}")
+            for ax, (lbl, col, my) in zip(axes[1:], _rubricSpecs):
+                rubricPlot(ax, rubricDf, lbl, col, maxY=my, xCategories=xCategories,
+                           missingDates=missingDates)
+            for ax in axes[:-1]:
+                ax.tick_params(axis="x", labelbottom=False)
+            axes[-1].set_xlabel("Date")
+            fig.subplots_adjust(left=0.075, right=0.985, top=0.965, bottom=0.09, hspace=0.35)
+            plt.close(fig)
+            chartFlowables.append(addPlotImage(fig, 0.95, pageSize=chartPageSize))
+        else:
+            # ── Two separate figures with MATCHED widths: same figure width (14),
+            # identical left/right margins, same page-width scaling, and the same
+            # equidistant categories, so their ticks line up vertically. ──
+            scatterMargins = dict(left=0.09, right=0.985, top=0.92, bottom=0.24)
+            rubricMargins = dict(left=0.09, right=0.985, top=0.96, bottom=0.16, hspace=0.5)
+
+            scoreFig = plotStudentScoresTimeSeries(
+                timeSeriesDf, dateCol="Date", scoreDictCol="scores",
+                scoreKey="score", fallbackKey=None,
+                title=f"Item Scores – {titleText}",
+                xCategories=xCategories, marginFractions=scatterMargins,
+                missingDates=missingDates,
+            )
+            if scoreFig is not None:
+                chartFlowables.append(addPlotImage(scoreFig, 0.9, pageSize=chartPageSize))
+                chartFlowables.append(Spacer(1, 12))
+
+            fig, axes = plt.subplots(5, 1, figsize=(14, 10), sharex=True)
+            for i, (ax, (lbl, col, my)) in enumerate(zip(axes, _rubricSpecs)):
+                rubricPlot(ax, rubricDf, lbl, col, maxY=my, xCategories=xCategories,
+                           missingDates=missingDates)
+                if i < len(axes) - 1:
+                    ax.tick_params(axis="x", labelbottom=False)
+            fig.subplots_adjust(**rubricMargins)
+            plt.close(fig)
+            chartFlowables.append(addPlotImage(fig, 0.9, pageSize=chartPageSize))
+
+        # ── Item-code counts table ────────────────────────────────────────────
+        # The charts are HEIGHT-limited (a 16x22in figure on a 11.69x16.54in
+        # page), so the width the page just gained is width the charts will never
+        # use. Put the table in that gutter, beside the charts, and each student
+        # still fits on ONE page. If the gutter comes out too narrow to read —
+        # pageWidthFactor=1.0, a narrower page, an unusually wide figure — fall
+        # back to stacking the table underneath at full width.
+        if not showCounts:
+            elements.extend(chartFlowables)
+        else:
+            chartWidth = max((getattr(f, "drawWidth", 0) or 0) for f in chartFlowables) \
+                if chartFlowables else 0
+            gutter = contentWidth - chartWidth - ITEM_COUNTS_GUTTER_PAD
+            sideBySide = chartWidth > 0 and gutter >= ITEM_COUNTS_MIN_SIDE_WIDTH
+            countsTable = makeItemCodeCountsTable(
+                studentDataDf, classAvgItemCounts,
+                title=f"Item Code Counts – {typeLabelFor(formType)}",
+                titleStyle=variableUtils.subsubheadingStyle, headerColor=uniColor,
+                maxWidth=gutter if sideBySide else contentWidth,
+                maxGroups=1 if sideBySide else ITEM_COUNTS_MAX_GROUPS,
+                maxRowsPerGroup=10 ** 6 if sideBySide else ITEM_COUNTS_MAX_ROWS_PER_GROUP,
+                asList=sideBySide, normalizeCodes=normalizeItemCodes,
+            )
+            if countsTable is None:
+                elements.extend(chartFlowables)
+            elif sideBySide:
+                layout = Table(
+                    [[chartFlowables, countsTable]],
+                    colWidths=[chartWidth + ITEM_COUNTS_GUTTER_PAD, gutter],
+                )
+                layout.setStyle(TableStyle([
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (0, 0), ITEM_COUNTS_GUTTER_PAD),
+                    ("RIGHTPADDING", (1, 0), (1, 0), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ]))
+                elements.append(layout)
+            else:
+                elements.extend(chartFlowables)
+                elements.append(Spacer(1, 10))
+                elements.append(countsTable)
 
         elements.append(PageBreak())
         # break  # TEMP: only first student for now
 
-    doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, ""))
-
+    bannerHeight = 82
+    secondLine = ""
+    if dateRangeInBanner and coveredDates:
+        secondLine = f"Covering {formatDateRange(coveredDates)}"
+        # getBannerDrawer draws line 2 at a FIXED 108pt from the top of the page
+        # (topOffset 72 + lineSpacing 36), so the rectangle has to reach past it
+        # or the date range is painted on white. 116 clears the descenders and
+        # still stops just above where the first student's title starts
+        # (topMargin 48 + the 72pt spacer = 120).
+        bannerHeight = 116
+    doc.build(elements,
+              onFirstPage=getBannerDrawer(bannerTitle, secondLine, bannerHeight=bannerHeight))
 
 def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadingStyle=None, subsubheadingStyleL=None,
-                       tableTextStyle=None, tableTextStyleSmall=None, uniColor=None, cohort=None, classAvgItemCounts:dict=None):
+                       tableTextStyle=None, tableTextStyleSmall=None, uniColor=None, cohort=None, classAvgItemCounts:dict=None,
+                       combined=None):
     """
     Build reportlab elements for a single student's PDF report.
  
@@ -1842,7 +3346,7 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadi
     
     if cohort == 'DDS3':
         hasSim = False
-    if cohort == 'BOH1':
+    if cohort in ('BOH1', 'DDS1'):
         hasClinic = False
 
     if hasSim and hasClinic:
@@ -1883,7 +3387,7 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadi
             subsubheadingStyleL,
         ))
     elements.append(summaryTable)
-    elements.append(Spacer(1, 16))
+    elements.append(Spacer(1, 50))
  
     # ── Rating Distribution: entrustment + global-rating pies per type ──
     ratingsFig = _makeRatingsFigure(simDf, clinicDf, hasSim, hasClinic)
@@ -1900,6 +3404,14 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadi
 
     # ── Filter to assessor-submitted for plots & reflections ──
     studentDataDf = studentDataDf[studentDataDf["submitted_by_assessor"]].copy()
+    if studentDataDf.empty:
+        # No assessor-submitted forms (e.g. BOH1 student-only cohorts): the
+        # summary/ratings pages above already rendered. An empty frame's
+        # apply(axis=1) returns a multi-column DataFrame that can't be assigned
+        # to a single column, so short-circuit — all downstream sections guard
+        # on .empty and simply produce nothing.
+        studentDataDf["scores"] = pd.Series(dtype=object)
+        return elements
     studentDataDf["scores"] = studentDataDf.apply(lambda row: calcScore(row, scoreMap), axis=1)
     studentDataDf.sort_values("datetimeutc", inplace=True)
     # display(studentDataDf.head())
@@ -1950,7 +3462,7 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadi
     for idx, (typeLabel, typeDf) in enumerate(typePages):
         _addTimeSeriesPage(
             elements, typeDf, typeLabel,
-            subheadingStyle=subheadingStyle,
+            subheadingStyle=subheadingStyle, combined=combined,
         )
         elements.append(PageBreak())
 
@@ -1967,16 +3479,18 @@ def buildStudentReport(studentDataDf, patientInfo=False, scoreMap=None, subheadi
 
     return elements
 
-
-
-def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
+def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms_v3",
                                      patientInfo=False,
                                      pageSize=None, leftMargin=None, rightMargin=None,
                                      topMargin=None, bottomMargin=None,
                                      subheadingStyle=None, subsubheadingStyleL=None,
                                      tableTextStyle=None, tableTextStyleSmall=None,
-                                     uniColor=None, scoreMap=None):
-    """Build individual student PDF reports for every student in a cohort."""
+                                     uniColor=None, scoreMap=None, combined=None):
+    """Build individual student PDF reports for every student in a cohort.
+
+    ``combined`` is passed through to each student's time-series page
+    (None -> module default COMBINE_TIMESERIES_PANELS; False -> two matched-width
+    figures; True -> one combined figure)."""
     if pageSize is None:
         pageSize = variableUtils.pageSize
     if leftMargin is None:
@@ -1997,19 +3511,12 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
     classAvgItemCountsSim = None
     classAvgItemCountsClinic = None
     if cohort not in ["DDS2", "DDS3"]:
-        classAvgItemCountsSim = getCohortItemCodeAverages(
-            engine, cohort, formType="Simulation", formsTable=formsTable,
-        )
+        classAvgItemCountsSim = getCohortItemCodeAverages(engine, cohort, formType="Simulation", formsTable=formsTable,)
         print(f"Computed class averages over {len(classAvgItemCountsSim)} item codes for {cohort} Simulation")
     if cohort not in ["BOH1"]:
-        classAvgItemCountsClinic = getCohortItemCodeAverages(
-            engine, cohort, formType="Clinic", formsTable=formsTable,
-        )
+        classAvgItemCountsClinic = getCohortItemCodeAverages(engine, cohort, formType="Clinic", formsTable=formsTable,)
         print(f"Computed class averages over {len(classAvgItemCountsClinic)} item codes for {cohort} Clinic")
-    classAvgItemCounts = {
-        "Simulation": classAvgItemCountsSim,
-        "Clinic": classAvgItemCountsClinic,
-    }
+    classAvgItemCounts = {"Simulation": classAvgItemCountsSim,"Clinic": classAvgItemCountsClinic,}
     # studentIds = ['1678748', '1684643', '1362959', '1309866', '1362803', '1346824']
     # studentIds = [int(id) for id in studentIds]
     for studentNumber in studentIds:
@@ -2019,7 +3526,8 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
             continue
         studentName = studentInfoDf.loc[studentNumber, "student_name"]
         print(f"Building report for student {studentNumber} - {studentName}")
-        studentDataDf = getStudentData(engine, cohort, studentNumber, formsTable)
+        filters = {"student_number": studentNumber}
+        studentDataDf = getDataDf(engine, cohort, formsTable, filters)
         # studentDataDf = studentDataDf[studentDataDf['type'] == 'Simulation']
         filename = f"{savefolder}/{studentNumber}.pdf"
         doc = SimpleDocTemplate(
@@ -2031,7 +3539,8 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
             studentDataDf, patientInfo=patientInfo, scoreMap=scoreMap,
             subheadingStyle=subheadingStyle, subsubheadingStyleL=subsubheadingStyleL,
             tableTextStyle=tableTextStyle, tableTextStyleSmall=tableTextStyleSmall,
-            uniColor=uniColor, cohort=cohort, classAvgItemCounts=classAvgItemCounts
+            uniColor=uniColor, cohort=cohort, classAvgItemCounts=classAvgItemCounts,
+            combined=combined,
         )
         doc.build(
             elements,
@@ -2040,3 +3549,1569 @@ def buildEntireCohortStudentReports(engine, cohort, formsTable="rawform_forms",
         )
         print(f"Report saved to {filename}\n")
         # break  # TEMP - remove this to build for all students
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. REDESIGNED student report (V2)  ── ADDITIVE ONLY ──
+#    Every function below is NEW. Nothing above this line is modified, so the
+#    original buildStudentReport / buildEntireCohortStudentReports still work
+#    unchanged. Switch back by calling the non-V2 builder.
+# ═══════════════════════════════════════════════════════════════════════════
+from reportlab.lib.styles import ParagraphStyle as _V2ParagraphStyle
+
+# One shared palette for the redesign (see mockup).
+V2_SIM_COLOR = "#2f6fb0"
+V2_CLINIC_COLOR = "#c8622d"
+V2_INK = "#1b2230"
+V2_MUTED = "#5b6478"
+V2_LINE = "#d7dbe4"
+V2_PAGE = "#e9edf3"
+V2_TRACK = "#d7dce4"
+V2_UP = "#2e8b57"
+V2_DOWN = "#d98a2b"
+V2_EQ = "#8a90a0"
+V2_CHIP_BG = "#dfe4ee"
+V2_CHIP_AMBER_BG = "#f6e3c9"
+V2_CHIP_AMBER_TEXT = "#b5691f"
+# Ordered rating ramp (poor -> excellent), reused in EVERY V2 chart.
+V2_GR_COLORS = {1: "#c1443b", 2: "#e0863a", 3: "#e7c757", 4: "#8fbf5a", 5: "#3e9b57"}
+V2_ENT_COLORS = {1: "#c1443b", 2: "#e0863a", 3: "#8fbf5a", 4: "#3e9b57"}
+
+
+def _v2TypeColor(typeLabel):
+    return V2_SIM_COLOR if str(typeLabel).lower().startswith("sim") else V2_CLINIC_COLOR
+
+
+# ── 7a. KPI strip ───────────────────────────────────────────────────────────
+def _v2KpiCell(label, simVal, clinicVal, showSim=True, showClinic=True):
+    """Return a Paragraph flowable for a single KPI tile (label + up to two values)."""
+    style = _V2ParagraphStyle(
+        "v2kpi", parent=variableUtils.styles["Normal"],
+        fontSize=15, leading=19, alignment=0,
+    )
+    parts = [f'<font size=8 color="{V2_MUTED}">{escape(str(label)).upper()}</font><br/>']
+    vals = []
+    if showSim:
+        vals.append(f'<font size=17 color="{V2_INK}"><b>{escape(str(simVal))}</b></font>'
+                    f' <font size=8 color="{V2_SIM_COLOR}">SIM</font>')
+    if showClinic:
+        vals.append(f'<font size=17 color="{V2_INK}"><b>{escape(str(clinicVal))}</b></font>'
+                    f' <font size=8 color="{V2_CLINIC_COLOR}">CLINIC</font>')
+    parts.append('&nbsp;&nbsp;&nbsp;'.join(vals))
+    return Paragraph("".join(parts), style)
+
+
+def _addKpiStripV2(elements, simMetrics, clinicMetrics, hasSim, hasClinic):
+    """Append a 4-tile KPI strip summarising the headline numbers."""
+    def g(m, k):
+        v = m.get(k, "")
+        return v if v not in (None, "") else "—"
+    tiles = [
+        ("Avg Global Rating", g(simMetrics, "Avg Global Rating"), g(clinicMetrics, "Avg Global Rating")),
+        ("Forms Completed",   g(simMetrics, "# Forms"),           g(clinicMetrics, "# Forms")),
+        ("Critical Incidents", g(simMetrics, "Critical Incidents"), g(clinicMetrics, "Critical Incidents")),
+        ("Assessor Submitted", g(simMetrics, "# Assessor Submitted"), g(clinicMetrics, "# Assessor Submitted")),
+    ]
+    cells = [_v2KpiCell(lab, s, c, showSim=hasSim, showClinic=hasClinic) for lab, s, c in tiles]
+    contentW = variableUtils.pageSize[0] - variableUtils.leftMargin - variableUtils.rightMargin
+    colW = (contentW * 0.98) / len(cells)
+    tbl = Table([cells], colWidths=[colW] * len(cells))
+    tbl.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor(V2_LINE)),
+        ("INNERGRID", (0, 0), (-1, -1), 0.75, colors.HexColor(V2_LINE)),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
+    ]))
+    elements.append(tbl)
+    elements.append(Spacer(1, 16))
+
+
+# ── 7b. Rating distribution as 100% stacked horizontal bars (replaces pies) ──
+def _v2StackedRow(ax, y, counts, colorMap, height=0.62):
+    total = sum(counts.values())
+    if total == 0:
+        ax.text(1, y, "No data", va="center", ha="left", fontsize=9, color=V2_MUTED)
+        return
+    left = 0.0
+    for lvl in sorted(counts):
+        n = counts[lvl]
+        frac = n / total * 100.0
+        ax.barh(y, frac, left=left, height=height,
+                color=colorMap.get(lvl, "#999999"), edgecolor="white", linewidth=1)
+        if frac >= 9:
+            ax.text(left + frac / 2, y, f"{lvl}: {n} ({frac:.0f}%)",
+                    va="center", ha="center", fontsize=8.5, color="white", fontweight="bold")
+        elif frac >= 3:
+            ax.text(left + frac / 2, y, str(n),
+                    va="center", ha="center", fontsize=8, color="white", fontweight="bold")
+        # smaller slivers carry no inline label — the legend identifies the level
+        left += frac
+
+
+def _v2EntCounts(adf):
+    return adf["entrustment"].dropna().astype(int).value_counts().to_dict()
+
+
+def _v2GrCounts(adf):
+    gr = adf["global_rating"].dropna().astype(float)
+    return gr.round().astype(int).value_counts().to_dict()
+
+
+def _makeRatingBarsFigureV2(simDf, clinicDf, hasSim, hasClinic):
+    """Two horizontal stacked-bar panels (Entrustment, Global Rating), Sim above
+    Clinic, on one shared 0-100% axis. Replacement for the four pie charts."""
+    if not (hasSim or hasClinic):
+        return None
+    simA = simDf[simDf["submitted_by_assessor"]] if hasSim else None
+    clinA = clinicDf[clinicDf["submitted_by_assessor"]] if hasClinic else None
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 5.2), facecolor=V2_PAGE, dpi=200)
+    panels = [
+        ("Entrustment", V2_ENT_COLORS, _v2EntCounts, "Level"),
+        ("Global Rating", V2_GR_COLORS, _v2GrCounts, "GR"),
+    ]
+    for ax, (title, cmap, counter, legPrefix) in zip(axes, panels):
+        rows = []
+        if hasClinic:
+            rows.append(("Clinic", counter(clinA), V2_CLINIC_COLOR))
+        if hasSim:
+            rows.append(("Simulation", counter(simA), V2_SIM_COLOR))
+        levels = set()
+        for _lab, counts, _c in rows:
+            levels |= set(counts)
+        for yi, (lab, counts, _c) in enumerate(rows):
+            _v2StackedRow(ax, yi, counts, cmap)
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels([r[0] for r in rows], fontsize=10)
+        ax.set_xlim(0, 100)
+        ax.set_xticks([0, 20, 40, 60, 80, 100])
+        ax.set_ylim(-0.6, len(rows) - 0.4)
+        ax.set_title(title, fontsize=12, fontweight="bold", loc="left", color=V2_INK)
+        ax.set_facecolor(V2_PAGE)
+        for sp in ("top", "right", "left"):
+            ax.spines[sp].set_visible(False)
+        ax.tick_params(length=0)
+        ax.set_axisbelow(True)
+        ax.xaxis.grid(True, linestyle="--", alpha=0.3)
+        handles = [Rectangle((0, 0), 1, 1, facecolor=cmap.get(l, "#999999")) for l in sorted(levels)]
+        labs = [f"{legPrefix} {l}" for l in sorted(levels)]
+        ax.legend(handles, labs, loc="upper center", bbox_to_anchor=(0.5, -0.30),
+                  ncol=max(1, len(handles)), frameon=False, fontsize=8.5,
+                  handlelength=1.1, handleheight=1.1, columnspacing=1.5, handletextpad=0.5)
+    fig.subplots_adjust(left=0.08, right=0.985, top=0.93, bottom=0.06, hspace=1.2)
+    return fig
+
+
+def _addRatingBarsV2(elements, simDf, clinicDf, hasSim, hasClinic, subheadingStyle):
+    fig = _makeRatingBarsFigureV2(simDf, clinicDf, hasSim, hasClinic)
+    if fig is None:
+        return
+    elements.append(KeepTogether([
+        Spacer(1, 24),
+        Paragraph("Rating Distribution", subheadingStyle),
+        Spacer(1, 6),
+        addPlotImage(fig, ratio=0.96),
+    ]))
+
+
+# ── 7c. Procedures performed: horizontal sorted bars + class-average tick ────
+def _addItemCodeCountsBarChartHV2(elements, df, classAvgItemCounts,
+                                  typeLabel, subheadingStyle, maxCodes=30):
+    """Horizontal bar chart of item-code counts, sorted worst by student count,
+    with the class average drawn as a reference tick. Fits one (tall) page."""
+    if df.empty:
+        return
+    studentCounts = df["item_codes"].dropna().explode().value_counts().to_dict()
+    if not studentCounts:
+        return
+    hasAvg = bool(classAvgItemCounts)
+    codes = sorted(studentCounts.keys(), key=lambda c: (-studentCounts[c], c))
+    # keep only codes the student actually did (>0)
+    codes = [c for c in codes if studentCounts.get(c, 0) > 0]
+    if not codes:
+        return
+    remainder = codes[maxCodes:]
+    codes = codes[:maxCodes]
+
+    barColor = _v2TypeColor(typeLabel)
+    yvals = list(range(len(codes)))[::-1]  # first code at top
+    studentVals = [studentCounts.get(c, 0) for c in codes]
+
+    fig, ax = plt.subplots(figsize=(11, max(3.2, 0.34 * len(codes) + 1.1)), dpi=200)
+    ax.barh(yvals, studentVals, height=0.62, color=barColor, zorder=2)
+    for y, v in zip(yvals, studentVals):
+        ax.text(v + max(studentVals) * 0.012, y, str(int(v)),
+                va="center", ha="left", fontsize=8, color=V2_INK)
+    if hasAvg:
+        avgVals = [classAvgItemCounts.get(c, 0.0) for c in codes]
+        ax.scatter(avgVals, yvals, marker="D", s=26, color=V2_INK, zorder=3,
+                   label="Class average")
+        ax.legend(loc="lower right", fontsize=9, frameon=False)
+    ax.set_yticks(yvals)
+    ax.set_yticklabels(codes, fontsize=8)
+    ax.set_xlabel("Count", fontsize=9)
+    ax.set_xlim(0, max(studentVals) * 1.15 + 1)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    ax.xaxis.grid(True, linestyle="--", alpha=0.3)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    img = addPlotImage(fig, 0.9)
+    plt.close(fig)
+
+    parts = [Paragraph(f"{typeLabel} — Procedures Performed", subheadingStyle),
+             Spacer(1, 8), img]
+    if remainder:
+        parts.append(Spacer(1, 4))
+        parts.append(Paragraph(
+            f"<font size=9 color='{V2_MUTED}'>+ {len(remainder)} more codes done once each: "
+            f"{escape(', '.join(map(str, remainder)))}</font>",
+            variableUtils.subsubheadingStyleL,
+        ))
+    elements.append(Spacer(1, 18))
+    elements.append(KeepTogether(parts))
+
+
+# ── 7d. Section performance: readable spider, Clinic default ─────────────────
+def _v2SectionAggs(longDf, typePages):
+    aggs = {}
+    for typeLabel, _ in typePages:
+        t = longDf[(longDf["Type"] == typeLabel) & (longDf["Section"] != "Unmapped")]
+        if t.empty:
+            continue
+        a = (t.groupby("Section").agg(
+                count=("Score", "size"),
+                mean_score=("Score", "mean"),
+                mean_gr=("Global Rating", lambda s: s.dropna().astype(float).mean()),
+                mean_es=("Entrustment", lambda s: s.dropna().astype(float).mean()),
+             ).sort_values("count", ascending=False))
+        a = a[a["count"] > 0]
+        if not a.empty:
+            aggs[typeLabel] = a
+    return aggs
+
+
+def _v2DrawSpider(ax, agg, title, valueKind):
+    """valueKind: 'score' (0-1, single blue) or 'grentrust' (GR/5 + ES/4 overlay)."""
+    sections = agg.index.tolist()
+    N = len(sections)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    ac = angles + [angles[0]]
+    labels = [_sectionLabel(s) + f"\n(n={int(agg.loc[s, 'count'])})" for s in sections]
+
+    def close(v):
+        return v + [v[0]]
+
+    if valueKind == "score":
+        vals = agg["mean_score"].tolist()
+        ax.fill(ac, close(vals), alpha=0.25, color=V2_CLINIC_COLOR)
+        ax.plot(ac, close(vals), "o-", color=V2_CLINIC_COLOR, linewidth=2, markersize=5)
+        for ang, s in zip(angles, sections):
+            v = agg.loc[s, "mean_score"]
+            ax.text(ang, min(v + 0.08, 1.06), f"{v:.0%}", ha="center", va="center",
+                    fontsize=8, color=V2_INK, fontweight="bold")
+    else:
+        grv = [agg.loc[s, "mean_gr"] / 5 if not np.isnan(agg.loc[s, "mean_gr"]) else 0 for s in sections]
+        esv = [agg.loc[s, "mean_es"] / 4 if not np.isnan(agg.loc[s, "mean_es"]) else 0 for s in sections]
+        ax.fill(ac, close(grv), alpha=0.15, color="#2ca02c")
+        ax.plot(ac, close(grv), "o-", color="#2ca02c", linewidth=2, markersize=4, label="Global Rating (/5)")
+        ax.plot(ac, close(esv), "o-", color="#ff7f0e", linewidth=2, markersize=4, label="Entrustment (/4)")
+        for ang, s in zip(angles, sections):
+            g = agg.loc[s, "mean_gr"]
+            if not np.isnan(g):
+                ax.text(ang, min(g / 5 + 0.08, 1.08), f"{g:.1f}", ha="center", va="center",
+                        fontsize=7.5, color="#1f6f1f", fontweight="bold")
+        ax.legend(loc="upper right", bbox_to_anchor=(1.28, 1.12), fontsize=8)
+
+    ax.set_xticks(angles)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+    ax.set_yticklabels(["25%", "50%", "75%", "100%"], fontsize=7, color=V2_MUTED)
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=26, color=V2_INK)
+
+
+def _addSectionPerformanceV2(elements, longDf, typePages, subheadingStyle,
+                             tableTextStyle, uniColor,
+                             sectionStreams=("Clinic",), minSectionsForSpider=3):
+    """Readable spider charts, one row (Mean Score + GR/Entrustment) per selected
+    stream. Defaults to Clinic only; pass sectionStreams=("Simulation","Clinic")
+    to include Sim. A per-section summary table is added under each spider."""
+    if longDf.empty or "Section" not in longDf.columns:
+        return
+    wanted = {str(s).lower() for s in sectionStreams}
+    selPages = [(t, d) for (t, d) in typePages if str(t).lower() in wanted]
+    if not selPages:
+        return
+    aggs = _v2SectionAggs(longDf, selPages)
+    aggs = {t: a for t, a in aggs.items() if len(a) >= minSectionsForSpider}
+    if not aggs:
+        return
+
+    _v2SecHeadingPending = [Paragraph("Performance by Section", subheadingStyle)]
+    for typeLabel, agg in aggs.items():
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5.2), subplot_kw=dict(polar=True),
+                                 dpi=200, facecolor=V2_PAGE)
+        _v2DrawSpider(axes[0], agg, f"{typeLabel} — Mean Score", "score")
+        _v2DrawSpider(axes[1], agg, f"{typeLabel} — GR & Entrustment", "grentrust")
+        for _ax in axes:          # tint the polar area to match the page, not white
+            _ax.set_facecolor(V2_PAGE)
+        plt.subplots_adjust(wspace=0.5)
+        plt.tight_layout()
+        img = addPlotImage(fig, 0.9)
+        plt.close(fig)
+
+        sections = agg.index.tolist()
+        tableDf = pd.DataFrame({
+            "Section": [_sectionLabel(s) for s in sections],
+            "# Items": [int(agg.loc[s, "count"]) for s in sections],
+            "Mean Score": [f"{agg.loc[s, 'mean_score']:.0%}" for s in sections],
+            "Mean GR": [f"{agg.loc[s, 'mean_gr']:.1f}/5" if not np.isnan(agg.loc[s, 'mean_gr']) else "N/A" for s in sections],
+            "Mean ES": [f"{agg.loc[s, 'mean_es']:.1f}/4" if not np.isnan(agg.loc[s, 'mean_es']) else "N/A" for s in sections],
+        })
+        secTable = createTable(
+            tableDf, title=f"{typeLabel} — Section Summary",
+            colRatio=[3, 1, 1, 1, 1], customTextCols=list(range(tableDf.shape[1])),
+            titleStyle=subheadingStyle, tableTextStyle=tableTextStyle,
+            headerColor=uniColor, bottomPadding=6, topPadding=6,
+        )
+        block = [Spacer(1, 8), img, Spacer(1, 10), secTable]
+        if _v2SecHeadingPending:
+            block = _v2SecHeadingPending + [Spacer(1, 8)] + block
+            _v2SecHeadingPending = []
+        elements.append(KeepTogether(block))
+
+
+# ── 7e. Time series: ORIGINAL charts + a rolling-average line ────────────────
+def _v2SessionMeanByDate(df):
+    """Per-date mean of assessed item scores (0-100). Returns a pd.Series indexed
+    by 'YYYY-MM-DD' or None."""
+    rows = []
+    for _, r in df.iterrows():
+        sc = r.get("scores")
+        if not isinstance(sc, dict):
+            continue
+        vals = [sd.get("score") for sd in sc.values()
+                if isinstance(sd, dict) and sd.get("score") is not None and not pd.isna(sd.get("score"))]
+        if not vals:
+            continue
+        rows.append({"DateStr": r["datetimeutc"].strftime("%Y-%m-%d"), "m": float(np.mean(vals)) * 100.0})
+    if not rows:
+        return None
+    s = pd.DataFrame(rows).groupby("DateStr")["m"].mean()
+    return s
+
+
+def _addTimeSeriesPageV2(elements, df, typeLabel, subheadingStyle, combined=None, cohort=None):
+    """Same time-series page as the original, plus a rolling-average line over
+    the score scatter. Reuses the existing plotting functions unchanged."""
+    if combined is None:
+        combined = COMBINE_TIMESERIES_PANELS
+    if df.empty:
+        return
+
+    # Sim on a weekly-sim cohort: colour + shorten the session-name labels.
+    streamCohort = cohort if str(typeLabel).strip().lower().startswith("sim") else None
+
+    heading = Paragraph(f"{typeLabel} — Performance Over Time", subheadingStyle)
+    xCategories = sorted(df["datetimeutc"].dt.strftime("%Y-%m-%d").unique())
+
+    scatterCols = ["datetimeutc", "entrustment", "global_rating", "item_codes",
+                   "scores", "assessor_data", "assessor_name"]
+    if "clinic" in df.columns:
+        scatterCols.append("clinic")
+    timeSeriesDf = df[scatterCols].copy()
+    timeSeriesDf["Date"] = timeSeriesDf["datetimeutc"]
+
+    rubricPlotDf = df[["datetimeutc", "entrustment", "global_rating"]].copy()
+    rubricPlotDf.rename(columns={"datetimeutc": "Date", "entrustment": "Entrustment",
+                                 "global_rating": "Global Rating"}, inplace=True)
+    rubricPlotDf.sort_values("Date", inplace=True)
+    rubricPlotDf["Date"] = rubricPlotDf["Date"].dt.strftime("%Y-%m-%d")
+    rubricPlotDf["Entrustment"] = pd.to_numeric(rubricPlotDf["Entrustment"], errors="coerce")
+    rubricPlotDf["Global Rating"] = pd.to_numeric(rubricPlotDf["Global Rating"], errors="coerce")
+    rubricSpecs = [("Entrustment", "blue", 4.5), ("Global Rating", "green", 5.5)]
+
+    scatterMargins = dict(left=0.09, right=0.985, top=0.92, bottom=0.24)
+    rubricMargins = dict(left=0.09, right=0.985, top=0.93, bottom=0.22, hspace=0.5)
+
+    fig = plotStudentScoresTimeSeries(
+        timeSeriesDf, dateCol="Date", scoreDictCol="scores", scoreKey="score",
+        fallbackKey=None, title=f"{typeLabel} — Performance on Assessed Items Over Time",
+        xCategories=xCategories, marginFractions=scatterMargins, streamCohort=streamCohort,
+    )
+    # ── the only addition: rolling-average line over the scatter ──
+    if fig is not None:
+        fig.set_dpi(200)
+        fig.patch.set_facecolor(V2_PAGE)
+        for _ax in fig.axes:
+            _ax.set_facecolor(V2_PAGE)
+        perDate = _v2SessionMeanByDate(df)
+        if perDate is not None:
+            perDate = perDate.reindex(xCategories)
+            roll = perDate.rolling(3, min_periods=1).mean()
+            xi = [i for i, d in enumerate(xCategories) if not pd.isna(perDate.get(d))]
+            yi = [roll[xCategories[i]] for i in xi]
+            if len(xi) >= 2:
+                ax = fig.axes[0]
+                ax.plot(xi, yi, "-", color=variableUtils.uniColor, linewidth=1.4,
+                        alpha=0.5, zorder=5, label="Rolling avg (3)")
+                ax.legend(loc="upper left", bbox_to_anchor=(0.0, 0.98),
+                          fontsize=(7.5 if streamCohort else 8),
+                          ncol=(2 if streamCohort else 1))
+    timeSeriesImg = _v2FullFigImage(fig, 0.98) if fig is not None else None
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True, dpi=200, facecolor=V2_PAGE)
+    for i, (ax, (lbl, col, my)) in enumerate(zip(axes, rubricSpecs)):
+        rubricPlot(ax, rubricPlotDf, lbl, col, maxY=my, xCategories=xCategories)
+        ax.set_facecolor(V2_PAGE)
+        if i < len(axes) - 1:
+            ax.tick_params(axis="x", labelbottom=False)
+    fig.subplots_adjust(**rubricMargins)
+    rubricImg = _v2FullFigImage(fig, 0.98)
+    plt.close(fig)
+
+    elements.append(Spacer(1, 18))
+    parts = [heading, Spacer(1, 12)]
+    if timeSeriesImg is not None:
+        parts.append(timeSeriesImg)
+    parts.append(rubricImg)
+    elements.append(KeepTogether(parts))
+
+
+# ── 7e-bis. Time-series FHY/SHY split + interactive-embed (2026-09-16, additive) ──
+# All functions here are ADDITIVE; _addTimeSeriesPageV2 above is unchanged. The
+# static path (_addTimeSeriesPageV2Split) reuses it verbatim, once per segment.
+# The interactive path embeds a self-contained ECharts HTML into the PDF and reuses
+# student_report_html_utils._timeseriesBlock so the numbers match the HTML report.
+
+def _v2SplitFhyShy(df, splitDate=None, dateCol="datetimeutc"):
+    """Split a stream's forms at splitDate (default TS_SPLIT_DATE): FHY = before,
+    SHY = on/after. Returns [(suffix, subDf), ...] with TWO segments ONLY when both
+    halves have rows; otherwise a single ("", df) segment (no split)."""
+    if splitDate is None:
+        splitDate = TS_SPLIT_DATE
+    if df is None or df.empty:
+        return [("", df)]
+    d = pd.to_datetime(df[dateCol], utc=True).dt.tz_convert(splitDate.tz)
+    fhy, shy = df[d < splitDate], df[d >= splitDate]
+    if len(fhy) and len(shy):
+        return [("First half (to 14 Jun)", fhy), ("Second half (from 15 Jun)", shy)]
+    return [("", df)]
+
+
+def _addTimeSeriesPageV2Split(elements, df, typeLabel, subheadingStyle, combined=None,
+                              cohort=None, tsSplit=True, splitDate=None):
+    """Static time-series that splits into a FHY page and a SHY page (PageBreak
+    between) when the stream spans splitDate. Reuses _addTimeSeriesPageV2 UNCHANGED,
+    once per segment. A single segment renders exactly the original single page."""
+    segs = _v2SplitFhyShy(df, splitDate) if tsSplit else [("", df)]
+    for i, (suffix, sub) in enumerate(segs):
+        if i:
+            elements.append(PageBreak())
+        # Keep the stream word first ("Simulation ..."/"Clinic ...") so the sim
+        # label-shortening in _addTimeSeriesPageV2 still triggers on the suffixed label.
+        label = f"{typeLabel} · {suffix}" if suffix else typeLabel
+        _addTimeSeriesPageV2(elements, sub, label, subheadingStyle=subheadingStyle,
+                             combined=combined, cohort=cohort)
+
+
+def _v2CleanPreviewImage(segments, typeLabel, cohort=None):
+    """Clean, label-free printable preview for the interactive page: assessed-item
+    scatter (no code labels) + rolling avg on top, Entrustment/Global-Rating rubric
+    below, one column per FHY/SHY segment. Item codes are intentionally omitted —
+    they live on hover in the embedded interactive chart."""
+    import student_report_html_utils as _sh  # lazy: avoids an import cycle at load
+    isSim = str(typeLabel).strip().lower().startswith("sim")
+    pointColor = V2_SIM_COLOR if isSim else V2_CLINIC_COLOR
+    n = max(1, len(segments))
+    fig, axes = plt.subplots(2, n, figsize=(7.0 * n, 5.0), dpi=200, squeeze=False,
+                             gridspec_kw={"height_ratios": [3, 2]}, facecolor=V2_PAGE)
+    for c, (suffix, sub) in enumerate(segments):
+        ax0, ax1 = axes[0][c], axes[1][c]
+        for ax in (ax0, ax1):
+            ax.set_facecolor(V2_PAGE)
+        b = _sh._timeseriesBlock(sub, cohort)
+        if not b or not b["dates"]:
+            ax0.set_axis_off(); ax1.set_axis_off(); continue
+        dates = b["dates"]
+        xs = [dates.index(p["date"]) for p in b["points"]]
+        ys = [p["score"] for p in b["points"]]
+        ax0.scatter(xs, ys, s=16, color=pointColor, alpha=0.75, zorder=2)
+        rx = [i for i, r in enumerate(b["roll"]) if r["mean"] is not None]
+        ry = [b["roll"][i]["mean"] for i in rx]
+        if len(rx) >= 2:
+            ax0.plot(rx, ry, "-", color=variableUtils.uniColor, lw=1.6, alpha=0.55,
+                     zorder=3, label="Rolling avg (3)")
+            ax0.legend(fontsize=7, loc="lower left")
+        ax0.set_ylim(0, 100); ax0.set_xlim(-0.5, len(dates) - 0.5)
+        ax0.set_title(suffix or typeLabel, fontsize=10, loc="left", color=V2_INK)
+        ax0.set_xticks([]); ax0.grid(True, ls="--", alpha=0.25)
+        ex = [dates.index(r["date"]) for r in b["rubric"]]
+        ax1.plot(ex, [r["entrust"] for r in b["rubric"]], "-o", ms=3, color="#1f77b4",
+                 label="Entrustment")
+        ax1.plot(ex, [r["gr"] for r in b["rubric"]], "-o", ms=3, color="#2ca02c",
+                 label="Global Rating")
+        ax1.set_xlim(-0.5, len(dates) - 0.5)
+        ax1.set_xticks(range(len(dates))); ax1.set_xticklabels(dates, rotation=45, fontsize=5)
+        ax1.grid(True, ls="--", alpha=0.25); ax1.legend(fontsize=6, ncol=2, loc="upper right")
+    fig.suptitle(f"{typeLabel} — static preview (interactive chart embedded — hover for item codes)",
+                 fontsize=10, color=V2_MUTED, x=0.02, ha="left")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return _v2FullFigImage(fig, 0.98)
+
+
+# Compact standalone ECharts config for the embedded interactive time-series. Mirrors
+# student_report_html_utils._ecScatter/_ecRubric (hover reveals code/score/rating/
+# assessor/clinic; comma + wildcard code filter; FHY/SHY tabs). %TOKENS% substituted.
+_V2_INTERACTIVE_TS_JS = r"""
+const P={navy:"%NAVY%",clinic:"%POINT%",ink:"%INK%",muted:"%MUTED%"};
+const axisText={color:P.muted,fontSize:10};
+const baseTip={backgroundColor:'#fff',borderColor:'#d6dbe4',borderWidth:1,textStyle:{color:P.ink,fontSize:12}};
+function esc(s){return (''+s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function _parseCodeQuery(q){q=(q||'').trim();if(!q)return[];return q.split(',').map(t=>t.trim()).filter(Boolean).map(t=>new RegExp('^'+t.replace(/[.+?^${}()|[\]\\]/g,'\\$&').replace(/\*/g,'.*').replace(/x/gi,'.')+'$','i'));}
+function _matchCode(code,rx){if(!rx.length)return true;return rx.some(r=>r.test(code));}
+function _roll(points,dates){const by={};points.forEach(p=>{(by[p.date]=by[p.date]||[]).push(p.score);});
+  const m=dates.map(d=>by[d]?by[d].reduce((a,b)=>a+b,0)/by[d].length:null);
+  const out=[];for(let i=0;i<dates.length;i++){let s=0,n=0;for(let k=Math.max(0,i-2);k<=i;k++){if(m[k]!=null){s+=m[k];n++;}}out.push([i,n?+(s/n).toFixed(1):null]);}return out;}
+function scatterOpt(ts,query){
+  const dates=ts.dates, rx=_parseCodeQuery(query);
+  const fp=ts.points.filter(p=>_matchCode(p.code,rx));
+  const pts=fp.map(p=>({value:[dates.indexOf(p.date),p.score],raw:p}));
+  const roll=_roll(fp,dates);
+  return {backgroundColor:'transparent',grid:{left:48,right:20,top:18,bottom:78},
+    tooltip:{...baseTip,formatter:pm=>{if(pm.seriesType==='line')return 'Rolling avg (3): '+(pm.value[1]!=null?pm.value[1].toFixed(0)+'%':'—');
+      const r=pm.data.raw;return '<b>'+r.date+'</b> · '+esc(r.code)+'<br/>Score: '+r.score.toFixed(0)+'%'
+      +(r.gr!=null?'<br/>GR '+r.gr+' · ES '+(r.entrust!=null?r.entrust:'—'):'')
+      +(r.assessor?'<br/>Assessor: '+esc(r.assessor):'')+(r.clinic?'<br/>Clinic: '+esc(r.clinic):'');}},
+    legend:{bottom:38,textStyle:axisText,data:['Item scores','Rolling avg (3)']},
+    dataZoom:[{type:'slider',xAxisIndex:0,bottom:6,height:16,startValue:0}],
+    xAxis:{type:'category',data:dates,axisLabel:{...axisText,rotate:45,fontSize:9},boundaryGap:true},
+    yAxis:{type:'value',min:0,max:100,axisLabel:{...axisText,formatter:'{value}%'},splitLine:{lineStyle:{type:'dashed',opacity:.35}}},
+    series:[{name:'Item scores',type:'scatter',symbolSize:9,itemStyle:{color:P.clinic,opacity:.78},data:pts},
+      {name:'Rolling avg (3)',type:'line',smooth:true,symbol:'none',lineStyle:{color:P.navy,width:1.8,opacity:.6},data:roll}]};
+}
+function rubricOpt(ts){
+  const dates=ts.dates;
+  const ent=ts.rubric.map(r=>[dates.indexOf(r.date),r.entrust]);
+  const gr=ts.rubric.map(r=>[dates.indexOf(r.date),r.gr]);
+  return {backgroundColor:'transparent',grid:{left:48,right:20,top:26,bottom:56},
+    tooltip:{...baseTip,trigger:'axis'},legend:{top:0,textStyle:axisText,data:['Entrustment','Global Rating']},
+    dataZoom:[{type:'slider',xAxisIndex:0,bottom:6,height:14}],
+    xAxis:{type:'category',data:dates,axisLabel:{...axisText,rotate:45,fontSize:9}},
+    yAxis:{type:'value',min:0,axisLabel:axisText,splitLine:{lineStyle:{type:'dashed',opacity:.35}}},
+    series:[{name:'Entrustment',type:'line',connectNulls:true,symbolSize:6,lineStyle:{color:'#1f77b4'},itemStyle:{color:'#1f77b4'},data:ent},
+      {name:'Global Rating',type:'line',connectNulls:true,symbolSize:6,lineStyle:{color:'#2ca02c'},itemStyle:{color:'#2ca02c'},data:gr}]};
+}
+function initSeg(seg){
+  const sc=echarts.init(document.getElementById('sc_'+seg.id));
+  const ru=echarts.init(document.getElementById('ru_'+seg.id));
+  sc.setOption(scatterOpt(seg.ts,''));ru.setOption(rubricOpt(seg.ts));
+  const box=document.getElementById('q_'+seg.id), cnt=document.getElementById('cnt_'+seg.id);
+  function apply(){const q=box.value;sc.setOption(scatterOpt(seg.ts,q),true);
+    const rx=_parseCodeQuery(q);const n=seg.ts.points.filter(p=>_matchCode(p.code,rx)).length;
+    cnt.textContent=rx.length?(n+' of '+seg.ts.points.length+' items'):'';}
+  box.addEventListener('input',apply);
+  document.getElementById('clr_'+seg.id).addEventListener('click',()=>{box.value='';apply();});
+  window.addEventListener('resize',()=>{sc.resize();ru.resize();});
+  return {sc,ru};
+}
+function showTab(id){document.querySelectorAll('.seg').forEach(s=>s.style.display='none');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  document.getElementById('seg_'+id).style.display='block';
+  document.getElementById('tab_'+id).classList.add('on');
+  SEGS.forEach(s=>{if(s.id===id&&s._h){s._h.sc.resize();s._h.ru.resize();}});}
+"""
+
+
+def _v2InteractiveTsHtml(segments, typeLabel, cohort=None, studentName="", studentNumber="",
+                         echartsJs=None):
+    """Self-contained interactive time-series HTML (one file, ECharts inlined).
+    Data via student_report_html_utils._timeseriesBlock so it matches the HTML
+    report and the PDF numbers. FHY/SHY become tabs when there are two segments."""
+    import student_report_html_utils as _sh  # lazy: avoids an import cycle at load
+    if echartsJs is None:
+        echartsJs = _sh._loadEcharts(getattr(_sh, "DEFAULT_ASSETS_DIR", "_assets"))
+    isSim = str(typeLabel).strip().lower().startswith("sim")
+    pointColor = V2_SIM_COLOR if isSim else V2_CLINIC_COLOR
+    navy = variableUtils.uniColor if isinstance(variableUtils.uniColor, str) else "#12284c"
+
+    segData = []
+    for i, (suffix, sub) in enumerate(segments):
+        ts = _sh._timeseriesBlock(sub, cohort)
+        if ts is None:
+            ts = {"points": [], "rubric": [], "roll": [], "dates": []}
+        segData.append({"id": f"s{i}", "label": suffix or typeLabel, "ts": ts})
+
+    js = (_V2_INTERACTIVE_TS_JS.replace("%NAVY%", navy).replace("%POINT%", pointColor)
+          .replace("%INK%", V2_INK).replace("%MUTED%", V2_MUTED))
+    tabs = ""
+    if len(segData) > 1:
+        tabs = '<div class="tabs">' + "".join(
+            f'<button class="tab{" on" if i == 0 else ""}" id="tab_{s["id"]}" '
+            f'onclick="showTab(\'{s["id"]}\')">{escape(s["label"])}</button>'
+            for i, s in enumerate(segData)) + '</div>'
+    segsHtml = ""
+    for i, s in enumerate(segData):
+        disp = "block" if i == 0 else "none"
+        segsHtml += (
+            f'<div class="seg" id="seg_{s["id"]}" style="display:{disp}">'
+            f'<div class="filterbar"><label>Filter item codes '
+            f'<input class="q" id="q_{s["id"]}" placeholder="e.g. 5xx, 011, 4*"/></label>'
+            f'<button class="clr" id="clr_{s["id"]}">Clear</button>'
+            f'<span class="cnt" id="cnt_{s["id"]}"></span></div>'
+            f'<div class="chartcard"><div class="ctitle">Assessed-item scores over time '
+            f'<span class="hint">hover a point for its item code, score &amp; assessor</span></div>'
+            f'<div class="chart" id="sc_{s["id"]}"></div></div>'
+            f'<div class="chartcard"><div class="ctitle">Rubric trends — Entrustment &amp; Global Rating</div>'
+            f'<div class="chart rub" id="ru_{s["id"]}"></div></div></div>')
+    payload = json.dumps(segData, allow_nan=False)
+    title = f"{typeLabel} — Performance Over Time"
+    sub = (f"{escape(str(studentName))} ({escape(str(studentNumber))}) · {cohort}"
+           if studentName else (cohort or ""))
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
+        f"<title>{escape(title)} — {escape(str(studentNumber))}</title><style>"
+        f":root{{--ink:{V2_INK};--muted:{V2_MUTED};--navy:{navy};--page:{V2_PAGE};}}"
+        "*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);"
+        "font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:18px}"
+        ".wrap{max-width:1040px;margin:0 auto}h1{color:var(--navy);font-size:22px;margin:0 0 2px}"
+        ".subtitle{color:var(--muted);font-size:13px;margin:0 0 14px}.tabs{display:flex;gap:8px;margin:0 0 12px}"
+        ".tab{border:1px solid #cfd6e2;background:#fff;color:var(--muted);padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px}"
+        ".tab.on{background:var(--navy);color:#fff;border-color:var(--navy);font-weight:600}"
+        ".filterbar{display:flex;align-items:center;gap:10px;margin:0 0 10px;font-size:13px;color:var(--muted)}"
+        ".q{border:1px solid #cfd6e2;border-radius:7px;padding:6px 9px;font-size:13px;margin-left:6px;width:180px}"
+        ".clr{border:1px solid #cfd6e2;background:#fff;border-radius:7px;padding:6px 10px;cursor:pointer;font-size:12px}"
+        ".cnt{color:var(--navy);font-weight:600}.chartcard{background:#fff;border:1px solid #e2e7ef;border-radius:12px;"
+        "padding:10px 12px 4px;margin:0 0 14px;box-shadow:0 1px 2px rgba(20,40,76,.04)}"
+        ".ctitle{font-size:13px;font-weight:600;color:var(--ink);margin:2px 2px 4px}.hint{font-weight:400;color:var(--muted);font-size:11.5px}"
+        ".chart{height:420px;width:100%}.chart.rub{height:300px}</style></head><body><div class=\"wrap\">"
+        f"<h1>{escape(title)}</h1><div class=\"subtitle\">{sub}</div>{tabs}{segsHtml}</div>"
+        f"<script>{echartsJs}</script><script>{js}\nconst SEGS={payload};\n"
+        "SEGS.forEach(s=>{s._h=initSeg(s);});</script></body></html>")
+
+
+class _V2AttachAnchor(Flowable):
+    """Zero-size flowable that records the 1-based page number it renders on, so the
+    driver can drop the interactive-chart paperclip annotation on the right page."""
+    def __init__(self, sink):
+        Flowable.__init__(self)
+        self.sink = sink
+        self.width = 0
+        self.height = 0
+
+    def wrap(self, *a):
+        return (0, 0)
+
+    def draw(self):
+        try:
+            self.sink["page"] = self.canv.getPageNumber()
+        except Exception:
+            pass
+
+
+def _addTimeSeriesPageV2Interactive(elements, df, typeLabel, subheadingStyle, cohort=None,
+                                    tsSplit=True, splitDate=None, studentName=None,
+                                    studentNumber=None, attachSink=None):
+    """Interactive time-series page: a clean, label-free printable preview (FHY/SHY
+    side by side) + a callout, and — via attachSink — the self-contained interactive
+    HTML for the driver to embed as a PDF attachment with an in-page paperclip.
+    Falls back to the static split page when attachSink is None (e.g. direct callers)."""
+    if df is None or df.empty:
+        return
+    segs = _v2SplitFhyShy(df, splitDate) if tsSplit else [("", df)]
+    if attachSink is None:  # no place to stash the embed → give the static split page
+        _addTimeSeriesPageV2Split(elements, df, typeLabel, subheadingStyle=subheadingStyle,
+                                  cohort=cohort, tsSplit=tsSplit, splitDate=splitDate)
+        return
+    attachName = f"{str(typeLabel).split()[0]}_time_series_{studentNumber or 'student'}.html"
+    noteStyle = _V2ParagraphStyle("v2itsnote", parent=variableUtils.styles["Normal"],
+                                  fontSize=10, leading=14, textColor=colors.HexColor(V2_INK),
+                                  backColor=colors.HexColor("#dfe9f7"), borderPadding=8)
+    note = Paragraph(
+        "<b>\U0001F4CE Interactive chart embedded in this PDF.</b> Double-click the paperclip "
+        f"icon on this page, or open <b>{escape(attachName)}</b> from your PDF viewer’s "
+        "attachments panel, to hover each point for its item code / score / rating / assessor, "
+        "filter by item code, and switch between first- and second-half of year. The chart below "
+        "is the static, printable version.", noteStyle)
+    preview = _v2CleanPreviewImage(segs, typeLabel, cohort=cohort)
+    ref = {"name": attachName, "page": None,
+           "html": _v2InteractiveTsHtml(segs, typeLabel, cohort=cohort,
+                                        studentName=studentName, studentNumber=studentNumber)}
+    attachSink.append(ref)
+    elements.append(Paragraph(f"{typeLabel} — Performance Over Time", subheadingStyle))
+    elements.append(Spacer(1, 10))
+    elements.append(note)
+    elements.append(Spacer(1, 10))
+    elements.append(preview)
+    elements.append(_V2AttachAnchor(ref))
+
+
+def _v2EmbedInteractiveAttachments(pdfPath, attachSink):
+    """Post-process a finished V2 PDF: embed each registered interactive-chart HTML
+    as a file attachment (visible in every viewer's attachments panel) and drop a
+    FileAttachment paperclip annotation on its recorded page. No-op when empty."""
+    items = [a for a in (attachSink or []) if a.get("html")]
+    if not items:
+        return
+    import pikepdf
+    with pikepdf.open(pdfPath, allow_overwriting_input=True) as pdf:
+        for it in items:
+            fs = pikepdf.AttachedFileSpec(pdf, it["html"].encode("utf-8"),
+                                          mime_type="text/html", filename=it["name"],
+                                          description="Interactive time-series (opens in a browser)")
+            pdf.attachments[it["name"]] = fs
+            pg = it.get("page")
+            if pg and 1 <= pg <= len(pdf.pages):
+                page = pdf.pages[pg - 1]
+                W = float(page.mediabox[2]); H = float(page.mediabox[3])
+                rect = [W - 66, H - 92, W - 42, H - 68]
+                annot = pikepdf.Dictionary(
+                    Type=pikepdf.Name.Annot, Subtype=pikepdf.Name.FileAttachment,
+                    FS=fs.obj, Name=pikepdf.Name.Paperclip,
+                    Rect=pikepdf.Array([float(x) for x in rect]),
+                    Contents=pikepdf.String("Open the interactive time-series chart"),
+                    T=pikepdf.String("Interactive chart"),
+                    C=pikepdf.Array([0.07, 0.16, 0.30]))
+                if pikepdf.Name.Annots in page:
+                    page.Annots.append(pdf.make_indirect(annot))
+                else:
+                    page.Annots = pikepdf.Array([pdf.make_indirect(annot)])
+        pdf.save(pdfPath)
+
+
+# ── 7f. Reflections as GR-keyed cards + a collapsed log for assist/DA rows ───
+def _v2IsMinorReflection(studentText, minorMaxChars=25):
+    t = re.sub(r"\s+", " ", str(studentText or "")).strip()
+    return len(t) <= minorMaxChars
+
+
+def _v2LogTag(studentText, assessorText):
+    low = f"{studentText or ''} {assessorText or ''}".lower()
+    if "fta" in low or "cancel" in low:
+        return "FTA"
+    if "support" in low:
+        return "Support"
+    if re.search(r"\bda\b", low) or "assist" in low:
+        return "DA / Assist"
+    return "—"
+
+
+def _v2ReflectionCard(dateStr, itemCodes, studentHtml, assessorHtml, gr):
+    """Return a card flowable: a coloured left band (keyed to GR) + a 2-column
+    reflection/feedback body with a header row."""
+    contentW = variableUtils.pageSize[0] - variableUtils.leftMargin - variableUtils.rightMargin
+    cardW = contentW * 0.94
+    barW = 6
+    innerW = cardW - barW
+    innerContent = innerW - 20  # inner cell has 10px L/R padding
+
+    grInt = None
+    try:
+        if gr is not None and not pd.isna(gr):
+            grInt = int(round(float(gr)))
+    except (TypeError, ValueError):
+        grInt = None
+    barColor = colors.HexColor(V2_GR_COLORS.get(grInt, "#c9ced8"))
+    grBadge = f"GR {grInt}" if grInt is not None else "GR —"
+
+    lblStyle = _V2ParagraphStyle("v2rlab", parent=variableUtils.styles["Normal"],
+                                 fontSize=8, textColor=colors.HexColor(V2_MUTED), leading=11)
+    hdrStyle = _V2ParagraphStyle("v2rhd", parent=variableUtils.styles["Normal"],
+                                 fontSize=10, leading=13, textColor=colors.HexColor(V2_INK))
+    bodyStyle = _V2ParagraphStyle("v2rbody", parent=variableUtils.styles["Normal"],
+                                  fontSize=9.5, leading=13, textColor=colors.HexColor(V2_INK))
+    grStyle = _V2ParagraphStyle("v2rgr", parent=variableUtils.styles["Normal"],
+                                fontSize=10, alignment=2,
+                                textColor=colors.HexColor(V2_GR_COLORS.get(grInt, "#8a90a0")))
+
+    codeStr = escape(str(itemCodes)) if itemCodes else ""
+    header = Table(
+        [[Paragraph(f"<b>{escape(dateStr)}</b>&nbsp;&nbsp;<font color='{V2_MUTED}'>{codeStr}</font>", hdrStyle),
+          Paragraph(f"<b>{grBadge}</b>", grStyle)]],
+        colWidths=[innerContent * 0.74, innerContent * 0.26],
+    )
+    header.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                                ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+    body = Table(
+        [[Paragraph("YOUR REFLECTION", lblStyle), Paragraph("ASSESSOR FEEDBACK", lblStyle)],
+         [Paragraph(studentHtml or "<i>—</i>", bodyStyle), Paragraph(assessorHtml or "<i>—</i>", bodyStyle)]],
+        colWidths=[innerContent * 0.5, innerContent * 0.5],
+    )
+    body.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                              ("LEFTPADDING", (0, 0), (0, -1), 0),
+                              ("LEFTPADDING", (1, 0), (1, -1), 12),
+                              ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                              ("TOPPADDING", (0, 0), (-1, -1), 1),
+                              ("BOTTOMPADDING", (0, 0), (0, 0), 3)]))
+    inner = Table([[header], [body]], colWidths=[innerW])
+    inner.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 10),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                               ("TOPPADDING", (0, 0), (-1, -1), 8),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                               ("LINEBELOW", (0, 0), (0, 0), 0.5, colors.HexColor(V2_LINE))]))
+    card = Table([["", inner]], colWidths=[barW, innerW])
+    card.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, 0), barColor),
+                              ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor(V2_LINE)),
+                              ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                              ("LEFTPADDING", (0, 0), (0, 0), 0),
+                              ("RIGHTPADDING", (0, 0), (0, 0), 0),
+                              ("TOPPADDING", (0, 0), (0, 0), 0),
+                              ("BOTTOMPADDING", (0, 0), (0, 0), 0)]))
+    return card
+
+
+def _v2VisibleReflection(html):
+    """Visible reflection text with the bold <b>Label: </b> key headings stripped,
+    so 'Reflection: ' / 'Feedback: ' etc. do not count as written content when
+    deciding card-vs-log or building the collapsed-log note."""
+    if html is None:
+        return ""
+    try:
+        if isinstance(html, float) and pd.isna(html):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = re.sub(r"<b>.*?</b>", " ", str(html), flags=re.S)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _addReflectionCardsV2(elements, df, typeLabel, subheadingStyle,
+                          tableTextStyleSmall, uniColor, minorMaxChars=25):
+    """Full reflections become GR-keyed cards; short assist/DA/FTA rows collapse
+    into one compact log table."""
+    if df.empty:
+        return
+    studentCol = "student_reflection_full" if "student_reflection_full" in df.columns else "student_reflection"
+    assessorCol = "assessor_reflection_full" if "assessor_reflection_full" in df.columns else "assessor_reflection"
+    rawStudentCol = "student_reflection" if "student_reflection" in df.columns else studentCol
+
+    work = df.sort_values("datetimeutc").copy()
+    elements.append(Spacer(1, 18))
+    elements.append(Paragraph(f"{typeLabel} — Reflections", subheadingStyle))
+    elements.append(Spacer(1, 8))
+
+    minorRows = []
+    cards = []
+    for _, row in work.iterrows():
+        dateStr = row["datetimeutc"].strftime("%Y-%m-%d")
+        codesVal = row.get("item_codes")
+        codeStr = ", ".join(map(str, codesVal)) if isinstance(codesVal, (list, tuple)) and len(codesVal) else ""
+        # Decide card-vs-log from the FULL composite (every comment key), not the
+        # plain 'reflection' key. On DDS2 clinic the student writes into the
+        # structured keys and the assessor comment lives in reflection-student-*/
+        # additional-comments, so gating on the plain reflection dropped ~half of
+        # these forms into the log with the real comment lost.
+        studentFull = row.get(studentCol)
+        assessorFull = row.get(assessorCol)
+        studentVisible = _v2VisibleReflection(studentFull)
+        assessorVisible = _v2VisibleReflection(assessorFull)
+        # Collapse to the log only when BOTH sides are trivial (genuine
+        # assist / DA / FTA / support rows); any substantive comment -> a card.
+        if len(studentVisible) <= minorMaxChars and len(assessorVisible) <= minorMaxChars:
+            note = assessorVisible or studentVisible or "—"
+            minorRows.append((dateStr, _v2LogTag(studentVisible, assessorVisible), truncateText(note, 110)))
+            continue
+        sHtml = _safeHtmlTruncate(studentFull).replace("\n", "<br/>") if studentFull else ""
+        aHtml = _safeHtmlTruncate(assessorFull).replace("\n", "<br/>") if assessorFull else ""
+        cards.append(_v2ReflectionCard(dateStr, codeStr, sHtml, aHtml, row.get("global_rating")))
+
+    for c in cards:
+        elements.append(KeepTogether([c, Spacer(1, 10)]))
+
+    if minorRows:
+        logDf = pd.DataFrame(minorRows, columns=["Date", "Type", "Note"])
+        logTable = createTable(
+            logDf, title=f"{typeLabel} — Assist / Support / Cancelled sessions",
+            colRatio=[1.2, 1.4, 7.0], customTextCols=[0, 1, 2],
+            titleStyle=subheadingStyle, tableTextStyle=tableTextStyleSmall,
+            headerColor=uniColor, bottomPadding=5, topPadding=5,
+        )
+        elements.append(Spacer(1, 14))
+        elements.append(logTable)
+
+
+# ── 7g. V2 report builders ───────────────────────────────────────────────────
+# Dynamic cover / contents. Each section drops a zero-size _V2TocMark in front of
+# its content; on a two-pass multiBuild the marker reports the page it landed on
+# to the cover TableOfContents. Add or remove a section and the contents follow —
+# nothing is hard-coded.
+class _V2TocMark(Flowable):
+    def __init__(self, text, level=0):
+        Flowable.__init__(self)
+        self.tocText = text
+        self.tocLevel = level
+        self.tocKey = f"v2toc_{id(self)}"   # stable across multiBuild passes → link target
+        self.width = 0
+        self.height = 0
+
+    def draw(self):
+        pass
+
+
+class _V2DocTemplate(SimpleDocTemplate):
+    """Feeds _V2TocMark markers to the TableOfContents each multiBuild pass, and
+    drops a page bookmark at each so the contents entries are clickable links."""
+    def afterFlowable(self, flowable):
+        if isinstance(flowable, _V2TocMark):
+            self.canv.bookmarkPage(flowable.tocKey)
+            self.notify("TOCEntry",
+                        (flowable.tocLevel, flowable.tocText, self.page, flowable.tocKey))
+
+
+def _v2TocText(title, explanation):
+    """Contents line: bold title + a muted one-line explanation (Paragraph markup;
+    an escaped '&' must already be '&amp;')."""
+    return (f"<b>{title}</b>  "
+            f"<font size=8 color='{V2_MUTED}'>\u2014 {explanation}</font>")
+
+
+def _v2MakeTocFlowable():
+    toc = TableOfContents()
+    toc.dotsMinLevel = 0
+    toc.levelStyles = [_V2ParagraphStyle(
+        "v2toc", parent=variableUtils.styles["Normal"], fontSize=10.5, leading=20,
+        textColor=colors.HexColor(V2_INK))]
+    return toc
+
+
+def _v2AddSection(elements, mark, builder):
+    """Append the marker, run the section builder, and page-break — but only if
+    the builder actually rendered something (else drop the orphan marker so the
+    contents never lists an empty page)."""
+    n0 = len(elements)
+    elements.append(mark)
+    builder()
+    if len(elements) > n0 + 1:
+        elements.append(PageBreak())
+    else:
+        elements.remove(mark)
+
+
+def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subheadingStyle=None,
+                         subsubheadingStyleL=None, tableTextStyle=None, tableTextStyleSmall=None,
+                         uniColor=None, cohort=None, classAvgItemCounts=None, combined=None,
+                         sectionStreams=("Clinic",), studentName=None, studentNumber=None,
+                         interactiveTimeSeries=None, tsSplit=True, tsSplitDate=None,
+                         attachSink=None):
+    """Redesigned single-student report (see mockup). Builds reportlab flowables
+    using ONLY the new V2 helpers; the original buildStudentReport is untouched.
+
+    Time-series options (2026-09-16, additive):
+      interactiveTimeSeries : None -> cohort default (True for INTERACTIVE_TS_COHORTS,
+                              e.g. DDS3, else False). True embeds a self-contained
+                              interactive chart in the PDF (needs `attachSink`, which
+                              the cohort driver supplies + post-processes); False keeps
+                              the static matplotlib charts.
+      tsSplit               : True -> split a stream into a FHY page and a SHY page
+                              (PageBreak between) when it spans TS_SPLIT_DATE; both the
+                              static and interactive paths honour it. False -> one page.
+      tsSplitDate           : override the 15-Jun-2026 boundary (a tz-aware Timestamp).
+      attachSink            : mutable list the interactive path appends embed payloads to;
+                              None -> the interactive path degrades to the static split page."""
+    if scoreMap is None:
+        scoreMap = SCORE_MAP
+    if interactiveTimeSeries is None:
+        interactiveTimeSeries = cohort in INTERACTIVE_TS_COHORTS
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
+    if subheadingStyle is None:
+        subheadingStyle = variableUtils.subheadingStyle
+    if tableTextStyle is None:
+        tableTextStyle = variableUtils.tableTextStyle
+
+    elements = []
+    elements.append(Spacer(1, 72))                      # clears the banner on the cover page
+
+    # ── Cover / contents (page 1). The TOC is filled by the _V2TocMark markers
+    # placed in front of each section below, resolved over a two-pass build. The
+    # banner (drawn by the page decorator) already carries the title + name.
+    _toc = _v2MakeTocFlowable()
+    _coverIntro = _V2ParagraphStyle("v2coverintro", parent=variableUtils.styles["Normal"],
+                                    fontSize=10.5, leading=15, textColor=colors.HexColor(V2_INK))
+    elements.append(Paragraph(
+        "This is your individual performance report for the 2026 clinical program. "
+        "It brings together, in one place, your assessment activity so far: how much "
+        "you have done, how your ratings and scores are tracking against the cohort, "
+        "where your strengths and gaps sit across clinical sections, how your "
+        "performance is trending over time, and your reflections alongside your "
+        "assessors\u2019 feedback.", _coverIntro))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(
+        "Only the sections relevant to you appear \u2014 the contents below list "
+        "exactly what this report contains. Each entry is a clickable link, or use "
+        "the page number to jump to it.", _coverIntro))
+    elements.append(Spacer(1, 16))
+    elements.append(Paragraph("Contents", subheadingStyle))
+    elements.append(Spacer(1, 6))
+    elements.append(_toc)
+    elements.append(PageBreak())
+
+    # Summary (page 2) — always present.
+    elements.append(_V2TocMark(_v2TocText(
+        "Summary &amp; Rating Distribution",
+        "your activity totals and how your entrustment / global ratings are spread")))
+
+    studentDataDf = studentDataDf.copy()
+    studentDataDf["datetimeutc"] = (
+        pd.to_datetime(studentDataDf["datetimeutc"], utc=True).dt.tz_convert("Australia/Melbourne")
+    )
+
+    simDf = studentDataDf[studentDataDf["type"] == "Simulation"]
+    clinicDf = studentDataDf[studentDataDf["type"] == "Clinic"]
+    simMetrics = _computeSummaryMetrics(simDf, patientInfo=patientInfo, isSimulation=True)
+    clinicMetrics = _computeSummaryMetrics(clinicDf, patientInfo=patientInfo)
+    # Patient age distribution + patient outcomes: count Operator-role forms only.
+    if patientInfo and clinicMetrics:
+        _opClinic = _v2OperatorClinicDf(clinicDf)
+        _opMetrics = _computeSummaryMetrics(_opClinic, patientInfo=patientInfo)
+        for _k in ("Patient Age Dist.", "Patient Details"):
+            if _k in clinicMetrics:
+                clinicMetrics[_k] = _opMetrics.get(_k, clinicMetrics[_k])
+    allKeys = list(OrderedDict.fromkeys(list(simMetrics.keys()) + list(clinicMetrics.keys())))
+
+    hasSim = bool(simMetrics)
+    hasClinic = bool(clinicMetrics)
+    if cohort == "DDS3":
+        hasSim = False
+    if cohort in ("BOH1", "DDS1"):
+        hasClinic = False
+
+    # Summary table (same data as original; grouped intro paragraph kept)
+    if hasSim and hasClinic:
+        summaryDf = pd.DataFrame({"Metric": allKeys,
+                                  "Simulation": [simMetrics.get(k, "") for k in allKeys],
+                                  "Clinic": [clinicMetrics.get(k, "") for k in allKeys]})
+        colRatio, customTextCols = [2, 1, 1], [0, 1, 2]
+    elif hasSim:
+        summaryDf = pd.DataFrame({"Metric": allKeys, "Simulation": [simMetrics.get(k, "") for k in allKeys]})
+        colRatio, customTextCols = [2, 1], [0, 1]
+    else:
+        summaryDf = pd.DataFrame({"Metric": allKeys, "Clinic": [clinicMetrics.get(k, "") for k in allKeys]})
+        colRatio, customTextCols = [2, 1], [0, 1]
+    summaryTable = _v2SummaryTable(allKeys, simMetrics, clinicMetrics, hasSim, hasClinic,
+                                   subheadingStyle=subheadingStyle, uniColor=uniColor)
+    if subsubheadingStyleL is not None:
+        elements.append(Paragraph(
+            "This is a summary report of your activity so far in 2026. "
+            "For detailed information please review your completed forms in the DASH program."
+            "<br/> We are working on an interactive live dashboard for future reports.",
+            subsubheadingStyleL))
+    elements.append(summaryTable)
+    elements.append(Spacer(1, 16))
+
+    # Rating distribution — stacked bars (replaces pies)
+    _addRatingBarsV2(elements, simDf, clinicDf, hasSim, hasClinic, subheadingStyle)
+    elements.append(PageBreak())
+
+    # Assessor-submitted only for the analytic pages
+    studentDataDf = studentDataDf[studentDataDf["submitted_by_assessor"]].copy()
+    if studentDataDf.empty:
+        studentDataDf["scores"] = pd.Series(dtype=object)
+        return elements
+    studentDataDf["scores"] = studentDataDf.apply(lambda row: calcScore(row, scoreMap), axis=1)
+    studentDataDf.sort_values("datetimeutc", inplace=True)
+
+    longDf = explodeScoresToLong(studentDataDf)
+    longDf = _mergeSection(longDf)
+    longDf = _v2RemapUnmappedSections(longDf)   # checklist codes (e.g. "BOH2 S2 115") -> section via their 3-digit code
+    longDf["Section"] = longDf["Section"].replace("Unmapped", "Miscellaneous")
+
+    simAdf = studentDataDf[studentDataDf["type"] == "Simulation"]
+    clinicAdf = studentDataDf[studentDataDf["type"] == "Clinic"]
+    typePages = []
+    if not simAdf.empty and hasSim:
+        typePages.append(("Simulation", simAdf))
+    if not clinicAdf.empty and hasClinic:
+        typePages.append(("Clinic", clinicAdf))
+
+    # Procedures performed — Simulation & Clinic side by side (same gating as original)
+    procPanels = []
+    if classAvgItemCounts and classAvgItemCounts.get("Simulation") and not simAdf.empty and cohort not in ["DDS3", "DDS2"]:
+        procPanels.append(("Simulation", simAdf, classAvgItemCounts["Simulation"], V2_SIM_COLOR))
+    if classAvgItemCounts and classAvgItemCounts.get("Clinic") and not clinicAdf.empty and cohort not in ["BOH1"]:
+        procPanels.append(("Clinic", clinicAdf, classAvgItemCounts["Clinic"], V2_CLINIC_COLOR))
+    if procPanels:
+        elements.append(_V2TocMark(_v2TocText(
+            "Procedures Performed",
+            "how many of each procedure you did, against the cohort average")))
+    _addProceduresV2(elements, procPanels, subheadingStyle)
+    if procPanels:
+        elements.append(PageBreak())
+
+    # Section performance (spider, Clinic default). Only page-break when it
+    # actually rendered — a cohort with no forms in any sectionStreams type
+    # (e.g. BOH1, whose Section is Sim while the default is Clinic) adds nothing,
+    # and an unconditional PageBreak there left a blank page after Procedures.
+    _v2AddSection(
+        elements,
+        _V2TocMark(_v2TocText("Performance by Section",
+                              "mean score and ratings across clinical sections")),
+        lambda: (None if longDf.empty else _addSectionPerformanceV2(
+            elements, longDf, typePages, subheadingStyle=subheadingStyle,
+            tableTextStyle=tableTextStyle, uniColor=uniColor,
+            sectionStreams=sectionStreams)))
+
+    # Time series \u2014 FHY/SHY split (both streams, only when a stream spans the
+    # boundary) + interactive embed for INTERACTIVE_TS_COHORTS, static otherwise.
+    for typeLabel, typeDf in typePages:
+        if interactiveTimeSeries:
+            _v2AddSection(
+                elements,
+                _V2TocMark(_v2TocText(f"{typeLabel} \u2014 Performance Over Time",
+                                      "assessed-item scores &amp; rubric trends (interactive chart embedded)")),
+                lambda e=typeDf, t=typeLabel: _addTimeSeriesPageV2Interactive(
+                    elements, e, t, subheadingStyle=subheadingStyle, cohort=cohort,
+                    tsSplit=tsSplit, splitDate=tsSplitDate, studentName=studentName,
+                    studentNumber=studentNumber, attachSink=attachSink))
+        else:
+            _v2AddSection(
+                elements,
+                _V2TocMark(_v2TocText(f"{typeLabel} \u2014 Performance Over Time",
+                                      "assessed-item scores and rubric trends over the year")),
+                lambda e=typeDf, t=typeLabel: _addTimeSeriesPageV2Split(
+                    elements, e, t, subheadingStyle=subheadingStyle, combined=combined,
+                    cohort=cohort, tsSplit=tsSplit, splitDate=tsSplitDate))
+
+    # Reflections as cards + collapsed log
+    for typeLabel, typeDf in typePages:
+        _v2AddSection(
+            elements,
+            _V2TocMark(_v2TocText(f"{typeLabel} \u2014 Reflections",
+                                  "your reflections and the assessor\u2019s feedback")),
+            lambda e=typeDf, t=typeLabel: _addReflectionCardsV2(
+                elements, e, t, subheadingStyle=subheadingStyle,
+                tableTextStyleSmall=tableTextStyleSmall, uniColor=uniColor))
+
+    return elements
+
+
+def buildEntireCohortStudentReportsV2(engine, cohort, formsTable="rawform_forms_v3",
+                                      patientInfo=True, pageSize=None, leftMargin=None,
+                                      rightMargin=None, topMargin=None, bottomMargin=None,
+                                      subheadingStyle=None, subsubheadingStyleL=None,
+                                      tableTextStyle=None, tableTextStyleSmall=None,
+                                      uniColor=None, scoreMap=None, combined=None,
+                                      sectionStreams=("Clinic",), outSubfolder="Individual Student Reports V2",
+                                      onlyStudents=None, interactiveTimeSeries=None,
+                                      tsSplit=True, tsSplitDate=None):
+    """V2 equivalent of buildEntireCohortStudentReports — same data/gating, new
+    layout. Saves to a separate folder so the original reports are not overwritten.
+
+    Time-series kwargs (2026-09-16): interactiveTimeSeries (None -> DDS3 on, others off;
+    True/False forces it), tsSplit (FHY/SHY two-page split when a stream spans
+    tsSplitDate; default True), tsSplitDate (override the 15-Jun-2026 boundary). When
+    interactive, the interactive chart is embedded into each PDF here after multiBuild."""
+    if pageSize is None:
+        pageSize = variableUtils.pageSize
+    if leftMargin is None:
+        leftMargin = variableUtils.leftMargin
+    if rightMargin is None:
+        rightMargin = variableUtils.rightMargin
+    if topMargin is None:
+        topMargin = variableUtils.topMargin
+    if bottomMargin is None:
+        bottomMargin = variableUtils.bottomMargin
+
+    studentInfoDf = getStudentsInCohort(engine, cohort, formsTable).set_index("student_number")
+    studentIds = studentInfoDf.index.tolist()
+    if onlyStudents is not None:
+        _want = {str(x) for x in onlyStudents}
+        studentIds = [i for i in studentIds if str(i) in _want]
+    print(f"Building reports for {len(studentIds)} students in cohort {cohort}")
+    savefolder = f"{cohort}/{outSubfolder}"
+    os.makedirs(savefolder, exist_ok=True)
+
+    classAvgItemCountsSim = None
+    classAvgItemCountsClinic = None
+    if cohort not in ["DDS2", "DDS3"]:
+        classAvgItemCountsSim = getCohortItemCodeAverages(engine, cohort, formType="Simulation", formsTable=formsTable)
+        print(f"Computed class averages over {len(classAvgItemCountsSim)} item codes for {cohort} Simulation")
+    if cohort not in ["BOH1"]:
+        classAvgItemCountsClinic = getCohortItemCodeAverages(engine, cohort, formType="Clinic", formsTable=formsTable)
+        print(f"Computed class averages over {len(classAvgItemCountsClinic)} item codes for {cohort} Clinic")
+    classAvgItemCounts = {"Simulation": classAvgItemCountsSim, "Clinic": classAvgItemCountsClinic}
+
+    for studentNumber in studentIds:
+        if cohort == "DDS2" and studentNumber in DDS2_REMOVED_STUDENTS:
+            continue
+        if cohort == "BOH2" and studentNumber in BOH2_REMOVED_STUDENTS:
+            continue
+        studentName = studentInfoDf.loc[studentNumber, "student_name"]
+        print(f"[V2] Building report for student {studentNumber} - {studentName}")
+        filters = {"student_number": studentNumber}
+        studentDataDf = getDataDf(engine, cohort, formsTable, filters)
+        filename = f"{savefolder}/{studentNumber}.pdf"
+        doc = _V2DocTemplate(filename, pagesize=pageSize, rightMargin=rightMargin,
+                             leftMargin=leftMargin, topMargin=topMargin, bottomMargin=bottomMargin)
+        attachSink = []   # interactive time-series embeds register here (empty when static)
+        elements = buildStudentReportV2(
+            studentDataDf, patientInfo=patientInfo, scoreMap=scoreMap,
+            subheadingStyle=subheadingStyle, subsubheadingStyleL=subsubheadingStyleL,
+            tableTextStyle=tableTextStyle, tableTextStyleSmall=tableTextStyleSmall,
+            uniColor=uniColor, cohort=cohort, classAvgItemCounts=classAvgItemCounts,
+            combined=combined, sectionStreams=sectionStreams,
+            studentName=studentName, studentNumber=studentNumber,
+            interactiveTimeSeries=interactiveTimeSeries, tsSplit=tsSplit,
+            tsSplitDate=tsSplitDate, attachSink=attachSink,
+        )
+        _v2First, _v2Later = _v2MakePageDecorators("Till Date performance report",
+                                                   f"{studentName} ({studentNumber})")
+        # multiBuild: two passes so the contents page numbers resolve.
+        doc.multiBuild(elements, onFirstPage=_v2First, onLaterPages=_v2Later)
+        # Embed the interactive time-series HTML into the finished PDF (no-op if static).
+        _v2EmbedInteractiveAttachments(filename, attachSink)
+        print(f"[V2] Report saved to {filename}\n")
+        # break #
+
+_V2_METRIC_DISPLAY = {
+    "Patient Age Dist.": "Patient age distribution",
+    "Role Counts": "Role counts",
+    "Patient Details": "Patient outcomes",
+}
+_V2_LABEL_SHORT = [
+    ("i saw a patient", "Saw pt"),
+    ("failed to attend", "FTA"),
+    ("cancelled within 24", "Cancelled &lt;24h"),
+    ("support operator", "Support"),
+]
+
+
+def _v2ShortLabel(lbl):
+    low = str(lbl).lower()
+    for k, v in _V2_LABEL_SHORT:
+        if k in low:
+            return v
+    return escape(str(lbl))
+
+
+def _v2SplitPairs(val):
+    """Parse a "label: n<br/> label: n" metric string into [(label, n), ...]."""
+    pairs = []
+    for part in str(val).split("<br/>"):
+        part = part.strip()
+        if not part:
+            continue
+        lbl, _sep, num = part.rpartition(":")
+        pairs.append((lbl.strip(), num.strip()))
+    return pairs
+
+
+def _v2SummaryTable(allKeys, simMetrics, clinicMetrics, hasSim, hasClinic, subheadingStyle, uniColor):
+    """Summary table styled like the mockup: left-aligned metric, centred values,
+    zebra rows, white ground so it reads as a card on the tinted page."""
+    valCols = []
+    if hasSim:
+        valCols.append(("Simulation", simMetrics))
+    if hasClinic:
+        valCols.append(("Clinic", clinicMetrics))
+
+    metricStyle = _V2ParagraphStyle("v2sm_m", parent=variableUtils.styles["Normal"],
+                                    fontSize=11, leading=14, alignment=0, textColor=colors.HexColor(V2_INK))
+    metricMulti = _V2ParagraphStyle("v2sm_mm", parent=variableUtils.styles["Normal"],
+                                    fontSize=11, leading=13, alignment=0, textColor=colors.HexColor(V2_INK))
+    valStyle = _V2ParagraphStyle("v2sm_v", parent=variableUtils.styles["Normal"],
+                                 fontSize=11, leading=14, alignment=2, textColor=colors.HexColor(V2_INK))
+    hdrC = _V2ParagraphStyle("v2sm_h", parent=variableUtils.styles["Normal"],
+                             fontSize=11, leading=14, alignment=2, textColor=colors.white)
+    hdrL = _V2ParagraphStyle("v2sm_hl", parent=variableUtils.styles["Normal"],
+                             fontSize=11, leading=14, alignment=0, textColor=colors.white)
+
+    header = [Paragraph("<b>Metric</b>", hdrL)] + [Paragraph(f"<b>{c}</b>", hdrC) for c, _ in valCols]
+    data = [header]
+    for k in allKeys:
+        pairCols = {name: _v2SplitPairs(m.get(k, "")) for name, m in valCols
+                    if "<br/>" in str(m.get(k, ""))}
+        if pairCols:
+            somePairs = next(iter(pairCols.values()))
+            sep = " / " if len(somePairs) == 2 else " &#183; "
+            sub = sep.join(_v2ShortLabel(lbl) for lbl, _ in somePairs)
+            name = _V2_METRIC_DISPLAY.get(k, k)
+            row = [Paragraph(f'<b>{name}</b><br/><font size=8 color="{V2_MUTED}">{sub}</font>', metricMulti)]
+            for cname, m in valCols:
+                raw = str(m.get(k, ""))
+                if "<br/>" in raw:
+                    nums = [n for _, n in _v2SplitPairs(raw)]
+                    row.append(Paragraph(sep.join(nums), valStyle))
+                else:
+                    row.append(Paragraph("&#8212;", valStyle))
+        else:
+            row = [Paragraph(_V2_METRIC_DISPLAY.get(k, k), metricStyle)]
+            for _, m in valCols:
+                v = m.get(k, "")
+                row.append(Paragraph("&#8212;" if v in (None, "") else str(v), valStyle))
+        data.append(row)
+
+    ratio = [2.0] + [1.0] * len(valCols)
+    if valCols and valCols[-1][0] == "Clinic":
+        ratio[-1] = 1.25
+    contentW = variableUtils.pageSize[0] * 0.9
+    colW = [r / sum(ratio) * contentW for r in ratio]
+    navy = colors.HexColor(uniColor) if isinstance(uniColor, str) else colors.HexColor(variableUtils.uniColor)
+    tbl = Table(data, colWidths=colW)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), navy),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#dfe6f0")]),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor(V2_LINE)),
+        ("LINEBEFORE", (1, 0), (-1, -1), 0.4, colors.HexColor(V2_LINE)),
+        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor(V2_LINE)),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return KeepTogether([Paragraph("Summary", subheadingStyle), Spacer(1, 8), tbl])
+
+
+def _v2MakePageDecorators(firstLine, secondLine, groundColor="#e9edf3",
+                          sheetColor="#ffffff", bannerHeight=132):
+    """Return (firstPage, laterPage) canvas callbacks that paint a soft grey
+    ground with a white rounded content sheet (mockup look), then the banner on
+    the first page. Existing getBannerDrawer is reused unchanged."""
+    bannerFn = getBannerDrawer(firstLine, secondLine, bannerHeight=bannerHeight)
+
+    def _ground(canvas, doc, topInset):
+        W, H = doc.pagesize
+        canvas.saveState()
+        canvas.setFillColor(colors.HexColor(groundColor))
+        canvas.rect(0, 0, W, H, fill=1, stroke=0)
+        canvas.restoreState()
+
+    def first(canvas, doc):
+        _ground(canvas, doc, topInset=bannerHeight)
+        bannerFn(canvas, doc)
+
+    def _pageNumber(canvas, doc):
+        # cover is page 1 (first) and stays unnumbered; content pages number from 2,
+        # matching the page numbers printed in the contents.
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#6a7385"))
+        canvas.drawCentredString(doc.pagesize[0] / 2.0, 16, str(canvas.getPageNumber()))
+        canvas.restoreState()
+
+    def later(canvas, doc):
+        _ground(canvas, doc, topInset=20)
+        _pageNumber(canvas, doc)
+
+    return first, later
+
+
+def _v2ProcPanel(ax, title, adf, classAvg, barColor, maxRows, maxCodes=14):
+    """Draw one procedures panel (meter bars + class-average tick + count/delta).
+    Returns the list of single-occurrence (count==1) codes for the caption."""
+    counts = adf["item_codes"].dropna().explode().value_counts().to_dict() if not adf.empty else {}
+    codes = sorted(counts, key=lambda c: (-counts[c], c))
+    multi = [c for c in codes if counts[c] >= 2][:maxCodes]
+    if not multi:
+        multi = codes[:maxCodes]
+    singles = [c for c in codes if counts[c] == 1]
+    n = len(multi)
+    ypos = [maxRows - 1 - i for i in range(n)]
+    vals = [counts[c] for c in multi]
+    maxv = max(vals + [1])
+    rightpad = maxv * 0.46
+    for yy in ypos:
+        ax.barh(yy, maxv, height=0.62, color=V2_TRACK, zorder=1)
+    ax.barh(ypos, vals, height=0.62, color=barColor, zorder=2)
+    for c, yy, v in zip(multi, ypos, vals):
+        ravg = int(round(classAvg.get(c, 0.0)))
+        if 0 <= ravg <= maxv:
+            ax.plot([ravg, ravg], [yy - 0.33, yy + 0.33], color="white", lw=2, zorder=3)
+            ax.text(ravg, yy + 0.40, str(ravg), ha="center", va="bottom",
+                    fontsize=6.5, color=V2_MUTED, zorder=4)
+        cx = maxv + rightpad * 0.10
+        ax.text(cx, yy, str(v), ha="left", va="center", fontsize=9,
+                fontweight="bold", color=V2_INK, zorder=4)
+        d = v - ravg
+        if d > 0:
+            sym, dc, dt = "\u25B2", V2_UP, f"+{d}"
+        elif d < 0:
+            sym, dc, dt = "\u25BD", V2_DOWN, f"\u2212{abs(d)}"
+        else:
+            sym, dc, dt = "=", V2_EQ, "0"
+        ax.text(cx + maxv * 0.155, yy, f"{sym} {dt}", ha="left", va="center",
+                fontsize=8.5, color=dc, zorder=4)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(multi, fontsize=8)
+    ax.set_xlim(0, maxv + rightpad)
+    ax.set_ylim(-0.6, maxRows - 0.4)
+    step = max(1, round(maxv / 7) or 1)
+    ax.set_xticks(list(range(0, maxv + 1, step)))
+    ax.set_title(title, fontsize=12, fontweight="bold", loc="left", color=V2_INK, pad=8)
+    ax.set_facecolor(V2_PAGE)
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.tick_params(length=0)
+    ax.set_axisbelow(True)
+    ax.xaxis.grid(True, linestyle="--", alpha=0.25)
+    return singles
+
+
+def _addProceduresV2(elements, panels, subheadingStyle):
+    """Procedures Performed: Simulation and Clinic side by side (meter bars with
+    class-average tick + count/delta), with single-occurrence codes listed below.
+    ``panels`` is a list of (title, adf, classAvg, barColor)."""
+    if not panels:
+        return
+    counts_per = []
+    for title, adf, cavg, color in panels:
+        c = adf["item_codes"].dropna().explode().value_counts().to_dict() if not adf.empty else {}
+        counts_per.append(c)
+    maxRows = max((len([k for k, v in c.items() if v >= 2]) or len(c)) for c in counts_per)
+    maxRows = max(1, min(maxRows, 14))
+
+    npan = len(panels)
+    fig, axes = plt.subplots(1, npan, figsize=(11, max(3.0, 0.55 * maxRows + 1.2)),
+                             dpi=200, facecolor=V2_PAGE, squeeze=False)
+    axes = axes[0]
+    singlesByPanel = []
+    for ax, (title, adf, cavg, color) in zip(axes, panels):
+        singles = _v2ProcPanel(ax, title, adf, cavg, color, maxRows)
+        singlesByPanel.append((title, singles, cavg))
+    plt.tight_layout()
+    img = addPlotImage(fig, 0.96)
+    plt.close(fig)
+
+    elements.append(Spacer(1, 18))
+    elements.append(KeepTogether([Paragraph("Procedures Performed", subheadingStyle), Spacer(1, 8), img]))
+    for title, singles, cavg in singlesByPanel:
+        if not singles:
+            continue
+        chipItems = [(f"{c} ({int(round(cavg.get(c, 0.0)))})",
+                      int(round(cavg.get(c, 0.0))) > 1) for c in singles]
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph(
+            f'<font size=9 color="{V2_MUTED}"><b>{escape(title)} — single occurrences</b> (count 1) '
+            f'\u00b7 class average in brackets \u00b7 '
+            f'<font color="{V2_DOWN}">amber</font> = you did fewer than the cohort typically does:</font>',
+            variableUtils.subsubheadingStyleL))
+        elements.append(Spacer(1, 5))
+        chipsFig = _v2ChipsImage(chipItems)
+        if chipsFig is not None:
+            elements.append(addPlotImage(chipsFig, 0.99))
+
+
+def _v2ChipsImage(items, fontsize=7.5, dpi=200):
+    """Render single-occurrence codes as rounded pill chips (matplotlib) so they
+    have real rounded corners, gaps and small text. ``items`` = [(text, amber)].
+    Returns a Figure sized to the wrapped rows (or None if empty)."""
+    if not items:
+        return None
+    from matplotlib.patches import FancyBboxPatch
+    Win = (variableUtils.pageSize[0] - variableUtils.leftMargin - variableUtils.rightMargin) / inch
+    Wpx = Win * dpi
+    fig = plt.figure(figsize=(Win, 3), dpi=dpi)
+    fig.patch.set_facecolor(V2_PAGE)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    r = fig.canvas.get_renderer()
+    padH = 7 * dpi / 72; padV = 4.5 * dpi / 72; gap = 10 * dpi / 72; rowgap = 9 * dpi / 72
+    widths = []
+    for text, _a in items:
+        t = ax.text(0, 0, text, fontsize=fontsize)
+        widths.append(t.get_window_extent(renderer=r).width)
+        t.remove()
+    chipH = fontsize * dpi / 72 + 2 * padV
+    x = 0.0; y = 0.0; pos = []
+    for (text, amber), w in zip(items, widths):
+        cw = w + 2 * padH
+        if x > 0 and x + cw > Wpx:
+            x = 0.0; y += chipH + rowgap
+        pos.append((x, y, cw, text, amber))
+        x += cw + gap
+    Hpx = y + chipH
+    fig.set_size_inches(Win, max(Hpx / dpi, 0.2))
+    ax.set_xlim(0, Wpx); ax.set_ylim(0, Hpx); ax.invert_yaxis()
+    for x, y, cw, text, amber in pos:
+        fc = V2_CHIP_AMBER_BG if amber else V2_CHIP_BG
+        tc = V2_CHIP_AMBER_TEXT if amber else V2_INK
+        ax.add_patch(FancyBboxPatch((x, y), cw, chipH,
+                     boxstyle=f"round,pad=0,rounding_size={chipH * 0.5}",
+                     linewidth=0, facecolor=fc))
+        ax.text(x + cw / 2, y + chipH / 2, text, ha="center", va="center",
+                fontsize=fontsize, color=tc)
+    return fig
+
+
+def _v2FullFigImage(fig, ratio=0.9):
+    """Embed a matplotlib figure WITHOUT bbox_inches='tight' so its fixed
+    left/right margins are preserved. Two figures built at the same width and
+    margins therefore line up column-for-column (x-tick alignment)."""
+    import io as _io
+    from reportlab.platypus import Image as _RLImage
+    buf = _io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    image = _RLImage(buf)
+    maxW = (variableUtils.pageSize[0] - variableUtils.leftMargin - variableUtils.rightMargin) * ratio
+    maxH = (variableUtils.pageSize[1] - variableUtils.topMargin - variableUtils.bottomMargin) * ratio
+    ar = min(maxW / image.drawWidth, maxH / image.drawHeight)
+    image.drawWidth *= ar
+    image.drawHeight *= ar
+    return image
+
+
+_V2_SECTION_LOOKUP = None
+
+
+def _v2SectionLookup():
+    """Cache the item-code -> (Section, Sub-section) maps from the mapping file."""
+    global _V2_SECTION_LOOKUP
+    if _V2_SECTION_LOOKUP is None:
+        m = _loadSectionMapping().copy()
+        m["Item Code"] = m["Item Code"].astype(str).str.strip()
+        sec = dict(zip(m["Item Code"], m["Section"]))
+        sub = dict(zip(m["Item Code"], m["Sub-section"])) if "Sub-section" in m.columns else {}
+        _V2_SECTION_LOOKUP = (sec, sub)
+    return _V2_SECTION_LOOKUP
+
+
+def _v2RemapUnmappedSections(longDf, sectionCol="Section", codeCol="Item Code"):
+    """Re-map rows the direct merge left as 'Unmapped' by using the FIRST 3-digit
+    code inside the item label (e.g. "BOH2 S2 115" -> 115, "14MODB (534 577)" ->
+    534). Checklist-style codes carry a session prefix that never matches the
+    mapping's 3-digit keys, so without this they all fall into Miscellaneous."""
+    if longDf is None or longDf.empty or sectionCol not in longDf.columns or codeCol not in longDf.columns:
+        return longDf
+    sec, sub = _v2SectionLookup()
+
+    def firstThree(item):
+        found = re.findall(r"\b\d{3}\b", str(item))
+        return found[0] if found else None
+
+    unmapped = longDf[sectionCol].astype(str).eq("Unmapped")
+    if not unmapped.any():
+        return longDf
+    codes3 = longDf.loc[unmapped, codeCol].map(firstThree)
+    newSec = codes3.map(sec)
+    longDf.loc[unmapped, sectionCol] = newSec.fillna(longDf.loc[unmapped, sectionCol])
+    if "Sub-section" in longDf.columns and sub:
+        newSub = codes3.map(sub)
+        longDf.loc[unmapped, "Sub-section"] = newSub.fillna(longDf.loc[unmapped, "Sub-section"])
+    return longDf
+
+
+def _v2OperatorClinicDf(clinicDf):
+    """Return only the Operator-role clinic forms (role code 'O') so patient-age
+    and patient-outcome counts reflect sessions the student operated, not
+    Support-Operator / Observation sessions. Falls back to the input frame when
+    the role column or snapshots are unavailable."""
+    if clinicDf is None or clinicDf.empty or "role" not in clinicDf.columns:
+        return clinicDf
+    snaps = clinicDf["context_schema_snapshot"] if "context_schema_snapshot" in clinicDf.columns else []
+    roleMap = _labelMapFromSnapshots(snaps, "role", ROLE_LABELS_FALLBACK)
+    resolved = clinicDf["role"].map(lambda r: roleMap.get(r, r))
+    mask = resolved.astype(str).str.strip().str.casefold() == "operator"
+    return clinicDf[mask]

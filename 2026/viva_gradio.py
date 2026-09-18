@@ -20,13 +20,65 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from gradio_utils import *
 from gradio_utils import _WRAP, _CARD_LABELS, _def_active, _def_secs
-# ── Load .env (optional — token field is still editable if not set) ──────────
-load_dotenv()
-ENV_TOKEN  = os.getenv("DASH_TOKEN", "")
-LOGIN_USER = os.getenv("VIVA_USERNAME")
-LOGIN_PASS = os.getenv("VIVA_PASSWORD")
+# ── Load .env (read the FILE directly; it must win over any stale DASH_* shell/conda env var) ──
+# Anchor to gradio_utils' location (always valid, even under `gradio` reload where __file__ is unset)
+# so we find the .env next to this project regardless of the process working directory.
+from pathlib import Path as _Path
+import gradio_utils as _gu
+def _read_env_file(path):
+    d = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                d[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return d
+
+_ENV_PATH = _Path(_gu.__file__).with_name(".env")
+_ENV_FILE = _read_env_file(_ENV_PATH)          # .env file values are authoritative
+load_dotenv(_ENV_PATH, override=True)          # also refresh os.environ for any other reader
+
+DASH_EMAIL    = _ENV_FILE.get("DASH_EMAIL")    or os.getenv("DASH_EMAIL", "")
+DASH_PASSWORD = _ENV_FILE.get("DASH_PASSWORD") or os.getenv("DASH_PASSWORD", "")
+ENV_TOKEN     = _ENV_FILE.get("DASH_TOKEN")    or os.getenv("DASH_TOKEN", "")
+LOGIN_USER    = _ENV_FILE.get("VIVA_USERNAME") or os.getenv("VIVA_USERNAME")
+LOGIN_PASS    = _ENV_FILE.get("VIVA_PASSWORD") or os.getenv("VIVA_PASSWORD")
+print(f"[VIVA] env from {_ENV_PATH} (exists={_ENV_PATH.exists()}) "
+      f"email={DASH_EMAIL!r} pw_len={len(DASH_PASSWORD)}", flush=True)
+
+_TOKEN_CACHE = {"token": None}     # cached API token; always login fresh first (ENV_TOKEN is last-resort only)
+
+def get_token(force: bool = False) -> str:
+    """
+    Return a DASH API token. Logs in dynamically via POST /accounts/login using
+    DASH_EMAIL / DASH_PASSWORD (same as main.ipynb), since the token now rotates.
+    Caches the result; pass force=True to re-authenticate (e.g. after a 401).
+    """
+    if not force and _TOKEN_CACHE.get("token"):
+        return _TOKEN_CACHE["token"]
+    if not (DASH_EMAIL and DASH_PASSWORD):
+        raise RuntimeError("DASH_EMAIL / DASH_PASSWORD not set in .env")
+    print(f"[VIVA] get_token: POST /accounts/login as email={DASH_EMAIL!r} (pw set={bool(DASH_PASSWORD)})", flush=True)
+    resp = requests.post(f"{API_BASE}/accounts/login",
+                         json={"email": DASH_EMAIL, "password": DASH_PASSWORD},
+                         timeout=60)
+    print(f"[VIVA] get_token: login status={resp.status_code}", flush=True)
+    if resp.status_code != 200:
+        print(f"[VIVA] get_token: login FAILED body={resp.text[:300]}", flush=True)
+    resp.raise_for_status()
+    token = resp.json()["result"]["user"]["token"]
+    _TOKEN_CACHE["token"] = token
+    print(f"[VIVA] get_token: token obtained len={len(token)}", flush=True)
+    return token
 # print gradio version for debugging
 print(f"Using Gradio version: {gr.__version__}")
+APP_BUILD = "build 20260913_170831"   # visible build stamp so you can confirm the running version
+print("=" * 60)
+print(f"  >>> VIVA DASHBOARD  {APP_BUILD}  <<<")
+print("=" * 60, flush=True)
 
 
 def set_interval(choice):
@@ -58,6 +110,7 @@ def fetch_all(token: str, cohorts: list, year: str) -> list:
         else:                            # paginated DRF response
             records.extend(d.get("results", []))
             url = d.get("next")
+    print(f"[VIVA] fetch_all: fetched {len(records)} records for cohorts {cohort_str} and year {year}")
     return records
 
 
@@ -697,16 +750,28 @@ def make_table_html(rows: list) -> str:
 def do_load(cohorts, submitted_only, unsubmitted_only, search,
             sort_opt=DEFAULT_SORT, date_from="", date_to=""):
     """Fetch from API → parse → cache in State → return filtered view."""
-    _empty = ([], make_table_html([]), build_stats_html([]), "", "")
+    _empty = ([], make_table_html([]), build_stats_html([]), "")
 
-    if not ENV_TOKEN:
-        return *_empty, "❌ No API token found in .env file."
+    print(f"[VIVA] do_load START cohorts={cohorts} dates={date_from!r}..{date_to!r} "
+          f"sub_only={submitted_only} unsub_only={unsubmitted_only} search={search!r}", flush=True)
+
+    if not (DASH_EMAIL and DASH_PASSWORD) and not ENV_TOKEN:
+        return *_empty, "❌ No DASH_EMAIL / DASH_PASSWORD in .env (needed to fetch API token)."
     if not cohorts:
         return *_empty, "❌ Please select at least one cohort."
 
     try:
-        raw  = fetch_all(ENV_TOKEN, cohorts, "2026")
+        try:
+            raw = fetch_all(get_token(), cohorts, "2026")
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else None
+            if code in (400, 401, 403):
+                print(f"[VIVA] first fetch HTTP {code} -> re-login and retry", flush=True)
+                raw = fetch_all(get_token(force=True), cohorts, "2026")   # token stale/invalid -> re-login once
+            else:
+                raise
         rows = parse_records(raw)
+        print(f"[VIVA] fetched raw={len(raw)}  parsed rows={len(rows)}", flush=True)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "?"
         msg = {401: "Unauthorised — check your API token",
@@ -717,6 +782,8 @@ def do_load(cohorts, submitted_only, unsubmitted_only, search,
         return *_empty, f"❌ Connection error: {e}"
 
     filtered = apply_filters(rows, submitted_only, unsubmitted_only, search, sort_opt, date_from, date_to)
+    print(f"[VIVA] after filters: {len(filtered)} rows shown "
+          f"(from {len(rows)} parsed)", flush=True)
     ts       = datetime.now().strftime("%H:%M:%S")
     return (
         rows,
@@ -975,7 +1042,7 @@ footer {{ display:none !important; }}
 """
 
 
-with gr.Blocks(title="DASH · Viva Monitor", theme=gr.themes.Default(primary_hue="indigo")) as demo:
+with gr.Blocks(title=f"DASH · Viva Monitor · {APP_BUILD}", theme=gr.themes.Default(primary_hue="indigo")) as demo:
 
     raw_state = gr.State([])
     timer     = gr.Timer(value=_def_secs, active=_def_active)
@@ -984,14 +1051,15 @@ with gr.Blocks(title="DASH · Viva Monitor", theme=gr.themes.Default(primary_hue
     gr.HTML(
         '<div id="dash-header">'
         '<h2>DASH</h2>'
-        '<p>Viva Exam Live Monitor</p>'
+        f'<p>Viva Exam Live Monitor &nbsp;&middot;&nbsp; '
+        f'<span style="background:#4f5fb2;color:#fff;padding:2px 8px;border-radius:6px;font-weight:700;font-size:12px;">{APP_BUILD}</span></p>'
         '</div>'
     )
 
     # ── Row 1: date range + refresh interval + load button ───────────────
     with gr.Row(elem_classes="compact-row"):
-        date_from   = gr.Textbox(label="From", value="2026-06-10", placeholder="YYYY-MM-DD", scale=2)
-        date_to     = gr.Textbox(label="To",   value="2026-06-11", placeholder="YYYY-MM-DD", scale=2)
+        date_from   = gr.Textbox(label="From", value="2026-09-10", placeholder="YYYY-MM-DD", scale=2)
+        date_to     = gr.Textbox(label="To",   value="2026-09-11", placeholder="YYYY-MM-DD", scale=2)
         interval_dd = gr.Dropdown(
             list(INTERVAL_MAP.keys()), value=DEFAULT_INTERVAL,
             label="Refresh", scale=2,
@@ -1001,7 +1069,7 @@ with gr.Blocks(title="DASH · Viva Monitor", theme=gr.themes.Default(primary_hue
     # ── Row 2: cohorts + search + sort + submitted checkboxes ────────────
     with gr.Row(elem_classes="compact-row"):
         cohort_in = gr.CheckboxGroup(
-            ALL_COHORTS, value=["DDS3", "DDS4", "DDS2"],
+            ALL_COHORTS, value=["BOH1", "BOH2", "BOH3", "DDS3", "DDS4", "DDS2"],
             label="Cohorts", scale=2,
         )
         search_in = gr.Textbox(
@@ -1039,7 +1107,7 @@ with gr.Blocks(title="DASH · Viva Monitor", theme=gr.themes.Default(primary_hue
 
     load_btn.click(fn=do_load, inputs=load_inputs, outputs=load_outputs)
     demo.load(
-        fn=lambda: do_load(["DDS3", "DDS4", "DDS2"], False, False, "", DEFAULT_SORT, "2026-06-09", "2026-06-10"),
+        fn=lambda: do_load(["DDS3", "DDS4", "DDS2", "BOH3"], False, False, "", DEFAULT_SORT, "2026-09-09", "2026-09-10"),
         outputs=load_outputs,
     )
 
@@ -1067,5 +1135,4 @@ if __name__ == "__main__":
     print("  ─────────────────────────────")
     print("  Opening at http://localhost:7860")
     print("  Press Ctrl+C to stop\n")
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True, max_threads=10, css=css,
-                auth=(LOGIN_USER, LOGIN_PASS) if LOGIN_USER and LOGIN_PASS else None)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, max_threads=10, css=css)

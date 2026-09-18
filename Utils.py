@@ -1664,14 +1664,14 @@ class BannerDrawer:
 
         canvas.restoreState()
 
-def getBannerDrawer( firstline, secondline):
-    def drawBanner(canvas, doc):
+def getBannerDrawer( firstline, secondline, bannerHeight=132, bgColor='#010d44'):
+    def drawBanner(canvas, doc, bannerHeight=bannerHeight, bgColor=bgColor):
         canvas.saveState()
 
         # Banner layout
         pageWidth, pageHeight = doc.pagesize
-        bannerHeight = 132
-        canvas.setFillColor(colors.HexColor("#010d44"))
+        bannerHeight = bannerHeight
+        canvas.setFillColor(colors.HexColor(bgColor))
         canvas.rect(0, pageHeight - bannerHeight, pageWidth, bannerHeight, fill=1, stroke=0)
 
         # Text: internal margin from left and top

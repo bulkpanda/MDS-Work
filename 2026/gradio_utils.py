@@ -3,7 +3,7 @@
 API_BASE    = "https://api.unimelb-dash.com"
 ASSESS_TYPE = "viva"
 EXCLUDE     = set(['kunal patel', 'suhrid gupta', 'test student'])   # lowercase names of test students to skip; empty = include all
-ALL_COHORTS = ["DDS2", "DDS3", "DDS4"]
+ALL_COHORTS = ["BOH1", "BOH2", "BOH3", "DDS2", "DDS3", "DDS4"]
 
 # Known viva domain keys (DDS4 schema). Non-comment, non-scale keys under assessor.
 # The parser discovers domains dynamically, so this list only drives display ordering.

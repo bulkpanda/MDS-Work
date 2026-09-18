@@ -1,5 +1,6 @@
 # PDF Report creation utils
 from __future__ import annotations
+from openpyxl.styles import Font, PatternFill
 from reportlab.lib.units import inch
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from typing import Any, Literal, Optional, Dict
@@ -31,13 +32,14 @@ colClinicChoice = 'Sim or Clinic'
 
 
 # Styles for the PDF report
-
 pageSize = ( 11.69 * inch, 8.27 * 2 * inch) # page size
 print(pageSize)
 figSize = (pageSize[0] / 100, pageSize[1] / 100)
 uniColor = '#010d44'
 textcolor = "#4f5fb2"
 whitecolor = 'white'
+HEADER_COLOR = uniColor   # navy, matching uniColor
+HEADER_FONT  = "FFFFFF"
 # Define the margins
 leftMargin = 0.5* inch
 rightMargin = 0.5 * inch
@@ -64,16 +66,49 @@ tableTextStyleLSmall = ParagraphStyle('LargeFont', parent=styles['Normal'], font
 tableTextStyleSmall= ParagraphStyle('SmallFont', parent=styles['Normal'], fontSize=11, alignment=1)
 tableTextStyleSmallWhite = ParagraphStyle('SmallFont', parent=styles['Normal'], fontSize=11, alignment=1, textColor=whitecolor)
 tableTextStyleLarge = ParagraphStyle('LargeFont', parent=styles['Normal'], fontSize=15, alignment=1, leading=20)
+bannerHeadingStyle = ParagraphStyle(name='BannerHeading',fontName='Helvetica-Bold', fontSize=18, textColor='white',alignment=0,leading=22,spaceAfter=0,spaceBefore=0)
+
 Checklistcolors = {'Yes': 'blue', 'No': 'orange', 'Not Reviewed': 'lightgrey'}
 
 
-bannerHeadingStyle = ParagraphStyle(name='BannerHeading',fontName='Helvetica-Bold', fontSize=18,
-    textColor='white',alignment=0,leading=22,spaceAfter=0,spaceBefore=0)
+allCohorts = ["DDS4","BOH3","DDS1","DDS2","DDS3","BOH2","BOH1"]
+year = 2026
+excludeNames = {"kunal patel", "suhrid gupta", "test student"}
+
+
 
 studentEmailFile = r'C:\Users\Kunal Patel\D folder\MDS Work\2026\RE_ Student List.xlsx'
 itemSectionMappingFile = r'C:\Users\Kunal Patel\D folder\MDS Work\2026\item_section_mapping.xlsx'
+
+
+# For DDS2 Weekly Sim report
+DEFAULT_DATE_REGEX = r"\d{4}-\d{2}-\d{2}"
+DEFAULT_FILE_PATTERN = r"assessment_data\.xlsx$"
+DEFAULT_ID_COLS = ["student_number"]
+FAIL_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # light red
+FAIL_TEXT = Font(color="9C0006")  # dark red text
+ITEM_CODE_COL = "item_code"
+
+BOH2_REMOVED_STUDENTS = [1352051, 1606158, 1605793, 1617958, 1605538]
+DDS2_REMOVED_STUDENTS = [1270152, 1155940, 914405]
+BOH1_REMOVED_STUDENTS = [1895048, 1895910, 1904651]
+REMOVE_STUDENTS_DICT = {"BOH1": BOH1_REMOVED_STUDENTS, "BOH2": BOH2_REMOVED_STUDENTS, "DDS2": DDS2_REMOVED_STUDENTS, "DDS3": []}
+
+
+
+
+
+
+
+
+
 # some utils for loading the schema.yaml and providing convenient access to tables, columns, types etc. as variables in code (instead of hardcoding strings everywhere). Also auto-reloads if the file changes on disk.
 schemaPath  = 'schema.yaml'  # relative to this file
+
+
+
+
+
 class Dot:
     """
     Dict -> attribute access wrapper.

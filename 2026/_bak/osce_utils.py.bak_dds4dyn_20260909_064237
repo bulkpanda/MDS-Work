@@ -1,0 +1,865 @@
+"""
+osce_utils.py
+=============
+Support functions to build the station-wise OSCE workbook (detail sheets, station
+summary, MC item stats, checklist legend), Borderline-Regression (BLR) standard-setting
+analysis with embedded graphs, per-station validity/reliability metrics, and a
+standard-setting cut-score comparison.
+
+Scoring (integer points, chosen per checklist by its number of response levels):
+  * 4-level checklists (Very good / Satisfactory / Borderline / Unsatisfactory):
+        Very good = 4, Satisfactory = 3, Borderline = 2, Unsatisfactory = 0
+  * 3-level checklists (Very good / Satisfactory / Unsatisfactory):
+        Very good = 2, Satisfactory = 1, Unsatisfactory = 0
+  Level count is detected from the checklist rubric (distinct O-keys) and the labels
+  actually used; e.g. Occlusal Assessment is 3-level, the rest of round 1 are 4-level.
+  Score (%) = total points / (n items x max points per item) x 100.
+
+Score items by the response LABEL, never the O-key (O-keys are inconsistent across
+checklists, e.g. O3 = 'Borderline' in one, 'Unsatisfactory' in another).
+
+Global Rating is reversed to the standard direction (5=Excellent .. 1=Fail), so the BLR
+slope is positive and the cut is taken at GR = Borderline (2).
+
+Students are excluded when: (a) a test/dummy/model placeholder, or (b) their student number
+is in IGNORE_STUDENT_NUMBERS (resolved to names via the roster CSV).
+
+Public entry point:
+    buildOsceWorkbook(srcPath, outPath, imgDir, cohortLabel="", borderlineGr=2,
+                      ignoreStudentNumbers=None, rosterPath="studentEmailList.csv")
+"""
+
+import os
+import csv
+import json
+import statistics
+from collections import Counter, OrderedDict
+
+import numpy as np
+from scipy import stats
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XlImage
+
+# ── students to exclude by student number (add more as needed) ──
+IGNORE_STUDENT_NUMBERS = {"1357773"}   # 1357773 = Nethmini Nanayakkara (DDS2)
+
+# ── per-level scoring maps (by response label) ──
+POINTS_4LEVEL = {"Very good": 4, "Satisfactory": 3, "Borderline": 2, "Unsatisfactory": 0}
+POINTS_3LEVEL = {"Very good": 2, "Satisfactory": 1, "Unsatisfactory": 0, "Borderline": 1}
+MAXPTS = {4: 4, 3: 2}
+
+# ── MC cell colours keyed by LABEL (unambiguous; the integer value is not) ──
+LABEL_FILL = {"Very good": "C6EFCE", "Satisfactory": "DDEBF7", "Borderline": "FFEB9C", "Unsatisfactory": "FF0000"}
+LABEL_FONT = {"Very good": "000000", "Satisfactory": "000000", "Borderline": "000000", "Unsatisfactory": "FFFFFF"}
+
+# ── Global Rating, reversed to standard (5 best .. 1 worst); data key -> num = 6 - key ──
+GR_LABELS = {5: "Excellent", 4: "Very good", 3: "Pass", 2: "Borderline", 1: "Fail"}
+GR_FILL   = {5: "C6EFCE", 4: "C6EFCE", 3: "E2EFDA", 2: "FFEB9C", 1: "FF0000"}
+GR_FONTC  = {5: "000000", 4: "000000", 3: "000000", 2: "000000", 1: "FFFFFF"}
+GR_COLORS = {5: "#1D9E75", 4: "#57B894", 3: "#3266ad", 2: "#EF9F27", 1: "#E24B4A"}
+HEAD = "1F3864"
+
+CHECKLIST_SHORT = {
+    "infection-control": "Infection Control",
+    "communication-with-a-patient": "Communication",
+    "occlusal-assessment-note-to-markers-student-must-write-no-nil-no-marks-awarded-for-blank-boxes": "Occlusal",
+    "conservative-dentistry": "Conservative Dent",
+    "radiography": "Radiography",
+    "local-anaesthetic": "Local Anaesthetic",
+    "medical-history": "Medical History",
+    "medical-emergency": "Medical Emergency",
+    "periodontics": "Periodontics",
+    "risk-and-recall": "Risk & Recall",
+    "referral": "Referral",
+    "informed-consent": "Informed Consent",
+    "communication-with-staff": "Comm with Staff",
+    "orthodontics": "Orthodontics",
+}
+
+# short sheet-name abbreviations: sheet = f"S{station} {abbr}"
+CHECKLIST_ABBR = {
+    "infection-control": "IC",
+    "radiography": "Rad",
+    "communication-with-a-patient": "Comm",
+    "local-anaesthetic": "LA",
+    "medical-history": "MedHx",
+    "occlusal-assessment-note-to-markers-student-must-write-no-nil-no-marks-awarded-for-blank-boxes": "Occl",
+    "conservative-dentistry": "ConsDent",
+    "medical-emergency": "MedEmerg",
+    "periodontics": "Perio",
+    "risk-and-recall": "RiskRecall",
+    "referral": "Referral",
+    "informed-consent": "Consent",
+    "communication-with-staff": "CommStaff",
+    "orthodontics": "Ortho",
+}
+
+
+# ───────────────────────── pure support functions ─────────────────────────
+def isTestStudent(name):
+    """True for test/dummy/model placeholder students (excluded from analysis)."""
+    n = (name or "").lower()
+    return any(t in n for t in ["dummy", "model", "test"])
+
+
+def loadRoster(rosterPath):
+    """Return {studentNumber(str): studentName} from the roster CSV (student_number, student_name)."""
+    roster = {}
+    if rosterPath and os.path.exists(rosterPath):
+        with open(rosterPath, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                num = (row.get("student_number") or "").strip()
+                nm = (row.get("student_name") or "").strip()
+                if num:
+                    roster[num] = nm
+    return roster
+
+
+def resolveIgnoreNames(ignoreNumbers, rosterPath):
+    """Map a set of student numbers to lower-cased student names via the roster."""
+    roster = loadRoster(rosterPath)
+    names = set()
+    for num in (ignoreNumbers or set()):
+        nm = roster.get(str(num).strip())
+        if nm:
+            names.add(nm.strip().lower())
+    return names
+
+
+def loadOsceRecords(srcPath, ignoreStudentNumbers=None, rosterPath="studentEmailList.csv"):
+    """Load OSCE JSON; keep submitted, real students, minus any ignored-by-number students."""
+    with open(srcPath, encoding="utf-8") as fh:
+        data = json.load(fh)
+    ignoreNames = resolveIgnoreNames(
+        IGNORE_STUDENT_NUMBERS if ignoreStudentNumbers is None else ignoreStudentNumbers, rosterPath)
+    out = []
+    for r in data:
+        if not r.get("submitted"):
+            continue
+        nm = r.get("student")
+        if isTestStudent(nm) or (nm or "").strip().lower() in ignoreNames:
+            continue
+        out.append(r)
+    return out
+
+
+def checklistScale(cfg, usedLabels):
+    """
+    Decide a checklist's scoring scale. Returns (pointMap, maxPerItem, levelCount).
+    4-level if the rubric defines 4 distinct O-keys OR 'Borderline' is used; else 3-level.
+    """
+    okeys = set()
+    for mk, rub in (cfg.get("extra_config", {}) or {}).get("rubric", {}).items():
+        for k in rub:
+            if k != "label" and str(k).startswith("O"):
+                okeys.add(k)
+    fourLevel = (len(okeys) >= 4) or ("Borderline" in usedLabels)
+    if fourLevel:
+        return POINTS_4LEVEL, MAXPTS[4], 4
+    return POINTS_3LEVEL, MAXPTS[3], 3
+
+
+def buildStationSpecs(records):
+    """
+    Group records by (station, checklist) actually filled, tidy each into rows, and attach
+    the per-checklist scoring scale. GR is reversed to the standard 5..1 direction.
+    Returns list of dicts: {st, ck, cfg, rows, pointMap, maxPerItem, levels}.
+    """
+    groups = OrderedDict()
+    for r in records:
+        for ck, cv in r["form_data"].get("checklists", {}).items():
+            if cv:
+                groups.setdefault((r["station"], ck), []).append(r)
+
+    specs = []
+    for (st, ck), recs in sorted(groups.items()):
+        cfg = recs[0]["form_config"]["checklists"][ck]
+        usedLabels = set()
+        for r in recs:
+            for mv in r["form_data"]["checklists"][ck].values():
+                if isinstance(mv, dict) and mv.get("value"):
+                    usedLabels.add(mv["value"])
+        pointMap, maxPerItem, levels = checklistScale(cfg, usedLabels)
+
+        rows = []
+        for r in recs:
+            cv = r["form_data"]["checklists"][ck]
+            labels, points = {}, {}
+            for i in range(1, 11):
+                c = cv.get(f"MC{i}")
+                lab = c["value"] if isinstance(c, dict) and c.get("value") in pointMap else None
+                labels[i] = lab
+                points[i] = pointMap[lab] if lab is not None else None
+            got = [points[i] for i in range(1, 11) if points[i] is not None]
+            gk = r["form_data"].get("scales", {}).get("global-rating", {}).get("key")
+            rows.append({
+                "circuit": r["circuit"], "student": r["student"], "assessor": r["assessor"],
+                "gr": (6 - int(gk)) if str(gk).isdigit() else None,
+                "labels": labels, "points": points,
+                "score": (sum(got) / (len(got) * maxPerItem)) if got else None,   # fraction 0..1
+                "feedback": r["form_data"].get("texts", {}).get("feedback-on-student-performance", "") or "",
+                "blfail": r["form_data"].get("texts", {}).get(
+                    "if-you-have-awarded-a-global-rating-of-borderline-or-fail-please-provide-additional-information", "") or "",
+                "optComments": r["form_data"].get("texts", {}).get("comments-on-the-osce", "") or "",
+            })
+        specs.append({"st": st, "ck": ck, "cfg": cfg, "rows": rows,
+                      "pointMap": pointMap, "maxPerItem": maxPerItem, "levels": levels})
+    return specs
+
+
+def computeBlr(rows, borderlineGr=2):
+    """Borderline-Regression on the score fraction: cut = predicted score at the borderline grade."""
+    grs = np.array([r["gr"] for r in rows if r["gr"] is not None and r["score"] is not None])
+    scs = np.array([r["score"] for r in rows if r["gr"] is not None and r["score"] is not None])
+    slope, intercept, rval, pval, se = stats.linregress(grs, scs)
+    cut = slope * borderlineGr + intercept
+    m = float(scs.mean()) if len(scs) else float("nan")
+    sd = float(scs.std(ddof=1)) if len(scs) > 1 else 0.0
+    return dict(slope=slope, intercept=intercept, r2=rval ** 2, p=pval,
+                cut=cut, cutPct=round(cut * 100, 1), grs=grs, scs=scs,
+                mean=m, sd=sd, mean2sd=m - 2 * sd, mean2sdPct=round((m - 2 * sd) * 100, 1))
+
+
+def pct1(x):
+    """Score fraction -> percentage rounded to 1 dp (canonical for pass/fail comparisons)."""
+    return round(x * 100, 1)
+
+
+def gradientHex(t):
+    """t in [0,1] -> hex on a red->yellow->green scale (Excel-style)."""
+    t = max(0.0, min(1.0, t))
+    stops = [(0.0, (248, 105, 107)), (0.5, (255, 235, 132)), (1.0, (99, 190, 123))]
+    for i in range(len(stops) - 1):
+        t0, c0 = stops[i]; t1, c1 = stops[i + 1]
+        if t <= t1:
+            f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            return "%02X%02X%02X" % tuple(round(c0[k] + (c1[k] - c0[k]) * f) for k in range(3))
+    return "%02X%02X%02X" % stops[-1][1]
+
+
+def countBelow(scs, cutFrac):
+    """Number of scores strictly below the 1-dp-rounded cut."""
+    cp = round(cutFrac * 100, 1)
+    return int(sum(1 for x in scs if round(x * 100, 1) < cp))
+
+
+def cronbachAlpha(rows):
+    """Cronbach's alpha over the 10 checklist items (using the stored integer points)."""
+    M = np.array([[r["points"][i] for i in range(1, 11)]
+                  for r in rows if all(r["points"][i] is not None for i in range(1, 11))], float)
+    k = M.shape[1]
+    if k <= 1:
+        return float("nan")
+    itemVar = M.var(axis=0, ddof=1).sum()
+    totalVar = M.sum(axis=1).var(ddof=1)
+    return (k / (k - 1)) * (1 - itemVar / totalVar) if totalVar > 0 else float("nan")
+
+
+def itemTotalCorrs(rows):
+    """Item-total correlation (discrimination) for each of the 10 items, on integer points."""
+    items = list(range(1, 11))
+    tot = np.array([np.mean([r["points"][j] for j in items if r["points"][j] is not None]) for r in rows])
+    out = []
+    for i in items:
+        v = np.array([r["points"][i] if r["points"][i] is not None else np.nan for r in rows], float)
+        out.append(np.corrcoef(v, tot)[0, 1] if np.nanstd(v) > 0 else np.nan)
+    return out
+
+
+def alphaInterpretation(a):
+    if a != a:
+        return "-"
+    if a >= 0.9:
+        return "Excellent"
+    if a >= 0.8:
+        return "Good"
+    if a >= 0.7:
+        return "Acceptable"
+    if a >= 0.6:
+        return "Questionable"
+    return "Poor"
+
+
+def difficultyBand(fracMean):
+    return "Easy" if fracMean >= 0.8 else ("Hard" if fracMean < 0.6 else "Moderate")
+
+
+def stationTitle(st, ck):
+    """Short sheet name, e.g. 'S1 IC'."""
+    return f"S{st} {CHECKLIST_ABBR.get(ck, ck[:12])}"
+
+
+def buildBlrFigure(spec, blr, imgDir, borderlineGr=2):
+    """4-panel BLR figure. Saves a PNG into imgDir and returns (path, itemMeanFracs, itemCorrs)."""
+    st, ck, cfg, rows = spec["st"], spec["ck"], spec["cfg"], spec["rows"]
+    maxPer = spec["maxPerItem"]
+    grs, scs = blr["grs"], blr["scs"]
+    items = list(range(1, 11))
+    means = [np.mean([r["points"][i] for r in rows if r["points"][i] is not None]) / maxPer for i in items]
+    corr = itemTotalCorrs(rows)
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+    fig.suptitle(f"Station {st} — {cfg['name'].split('.')[0]}  (BLR, {spec['levels']}-level)", fontsize=14, fontweight="bold")
+
+    a = ax[0, 0]
+    for gr in sorted(set(grs)):
+        m = grs == gr
+        jit = np.random.uniform(-0.13, 0.13, m.sum())
+        a.scatter(grs[m] + jit, scs[m] * 100, c=GR_COLORS.get(gr, "#888"), s=38, alpha=0.75,
+                  edgecolors="white", linewidth=0.5, label=f"{GR_LABELS[gr]} (n={m.sum()})")
+    xl = np.array([0.5, 5.5])
+    a.plot(xl, (blr["slope"] * xl + blr["intercept"]) * 100, "k--", lw=1.5, label=f"Regression (R²={blr['r2']:.3f})")
+    a.axhline(blr["cut"] * 100, color="#E24B4A", ls=":", lw=1.6, label=f"BLR cut {blr['cut']*100:.1f}%")
+    a.axvline(borderlineGr, color="#999", lw=0.8, alpha=0.6)
+    a.set_xlabel("Global Rating (1=Fail .. 5=Excellent)"); a.set_ylabel("Checklist score (%)")
+    a.set_title("Score vs Global Rating"); a.set_xlim(0.5, 5.5); a.set_ylim(-5, 105)
+    a.set_xticks([1, 2, 3, 4, 5]); a.legend(fontsize=7, loc="upper left")
+
+    a = ax[0, 1]
+    order = sorted(set(grs)); data = [scs[grs == g] * 100 for g in order]
+    bp = a.boxplot(data, tick_labels=[GR_LABELS[g] for g in order], patch_artist=True, widths=0.5)
+    for i, patch in enumerate(bp["boxes"]):
+        patch.set_facecolor(GR_COLORS.get(order[i], "#888")); patch.set_alpha(0.45)
+        patch.set_edgecolor(GR_COLORS.get(order[i], "#888"))
+    a.axhline(blr["cut"] * 100, color="#E24B4A", ls=":", lw=1.6, label=f"BLR cut {blr['cut']*100:.1f}%")
+    a.set_ylabel("Checklist score (%)"); a.set_title("Score distribution by GR"); a.legend(fontsize=8)
+    a.tick_params(axis="x", rotation=30)
+
+    a = ax[1, 0]; x = np.arange(len(items))
+    a.bar(x, np.array(means) * 100, color="#3266ad", alpha=0.55, edgecolor="#3266ad", label="Item mean (%)")
+    a.set_ylabel("Mean (%)"); a.set_ylim(0, 110)
+    a2 = a.twinx(); a2.plot(x, corr, "o-", color="#1D9E75", lw=2, ms=5, label="Item-total r")
+    a2.set_ylabel("Item-total r"); a2.set_ylim(0, 1)
+    a.set_xticks(x); a.set_xticklabels([f"MC{i}" for i in items], rotation=45, ha="right"); a.set_title("Item analysis")
+    l1, la1 = a.get_legend_handles_labels(); l2, la2 = a2.get_legend_handles_labels()
+    a.legend(l1 + l2, la1 + la2, fontsize=7, loc="lower left")
+
+    a = ax[1, 1]
+    a.hist(scs * 100, bins=15, color="#3266ad", alpha=0.4, edgecolor="#3266ad")
+    a.axvline(blr["cut"] * 100, color="#E24B4A", ls=":", lw=2, label=f"BLR cut {blr['cut']*100:.1f}%")
+    a.axvline(scs.mean() * 100, color="#333", ls="--", lw=1, label=f"Mean {scs.mean()*100:.1f}%")
+    a.set_xlabel("Checklist score (%)"); a.set_ylabel("Frequency"); a.set_title("Score distribution"); a.legend(fontsize=8)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    os.makedirs(imgDir, exist_ok=True)
+    path = os.path.join(imgDir, f"blr_station{st}_{ck[:20]}.png")
+    fig.savefig(path, dpi=140, bbox_inches="tight"); plt.close(fig)
+    return path, means, corr
+
+
+def computeAssessorHarshness(spec, blr):
+    """
+    Per-assessor harshness at one station. Assumes ~random allocation of students to
+    assessors (OSCE circuits), so an assessor's mean minus the station mean estimates
+    harshness. Also reports the mean BLR residual (checklist score vs the score their
+    GRs predict). Returns (rows, stationMeanPct, stationMeanGr) sorted harsh -> lenient.
+    """
+    rows = [r for r in spec["rows"] if r["score"] is not None and r["gr"] is not None]
+    if not rows:
+        return [], float("nan"), float("nan")
+    stMeanPct = float(np.mean([r["score"] for r in rows])) * 100
+    stMeanGr = float(np.mean([r["gr"] for r in rows]))
+    slope, intercept = blr["slope"], blr["intercept"]
+    byA = {}
+    for r in rows:
+        byA.setdefault(r["assessor"], []).append(r)
+    out = []
+    for a, rs in byA.items():
+        pct = float(np.mean([r["score"] for r in rs])) * 100
+        gr = float(np.mean([r["gr"] for r in rs]))
+        resid = float(np.mean([(r["score"] - (slope * r["gr"] + intercept)) for r in rs])) * 100
+        dpct = pct - stMeanPct
+        dgr = gr - stMeanGr
+        flag = "Harsh" if (dpct <= -5 or dgr <= -0.4) else ("Lenient" if (dpct >= 5 or dgr >= 0.4) else "Typical")
+        out.append({"assessor": a, "n": len(rs), "meanPct": pct, "dPct": dpct,
+                    "meanGr": gr, "dGr": dgr, "residPct": resid, "flag": flag})
+    out.sort(key=lambda x: x["dPct"])
+    return out, stMeanPct, stMeanGr
+
+
+def buildHarshnessFigure(spec, harsh, stMeanPct, imgDir):
+    """Horizontal bar of each assessor's deviation from the station mean checklist %."""
+    st, ck, cfg = spec["st"], spec["ck"], spec["cfg"]
+    if not harsh:
+        return None
+    labels = [f"{h['assessor']} (n={h['n']})" for h in harsh]
+    deltas = [h["dPct"] for h in harsh]
+    colors = ["#E24B4A" if d < -5 else ("#1D9E75" if d > 5 else "#9aa7b4") for d in deltas]
+    fig, ax = plt.subplots(figsize=(8, max(2.4, 0.42 * len(harsh) + 1.1)))
+    y = np.arange(len(harsh))
+    ax.barh(y, deltas, color=colors, edgecolor="white")
+    ax.axvline(0, color="#333", lw=1)
+    ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean checklist % minus station mean  (harsh <-- 0 --> lenient)")
+    ax.set_title(f"Station {st} — {cfg['name'].split('.')[0]}: assessor harshness (station mean {stMeanPct:.1f}%)", fontsize=10)
+    for yi, d in zip(y, deltas):
+        ax.text(d + (0.4 if d >= 0 else -0.4), yi, f"{d:+.1f}", va="center",
+                ha="left" if d >= 0 else "right", fontsize=7)
+    plt.tight_layout()
+    os.makedirs(imgDir, exist_ok=True)
+    path = os.path.join(imgDir, f"harsh_station{st}_{ck[:20]}.png")
+    fig.savefig(path, dpi=140, bbox_inches="tight"); plt.close(fig)
+    return path
+
+
+# ───────────────────────── workbook assembly ─────────────────────────
+def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel="", borderlineGr=2,
+                      ignoreStudentNumbers=None, rosterPath="studentEmailList.csv"):
+    """
+    Build TWO workbooks from an OSCE JSON dump:
+      stationPath  : station workbook (Read Me, Station Summary, per-station detail, MC Item Stats, Checklist Legend)
+      analysisPath : analysis workbook (BLR Analysis, Station Validity, Standard Setting, Assessor Harshness)
+      imgDir       : folder for BLR + harshness PNGs (created if missing)
+    Returns a summary dict.
+    """
+    records = loadOsceRecords(srcPath, ignoreStudentNumbers, rosterPath)
+    specs = buildStationSpecs(records)
+    os.makedirs(imgDir, exist_ok=True)
+    blr = {s["ck"]: computeBlr(s["rows"], borderlineGr) for s in specs}
+
+    # shared styles / helpers
+    hFont = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+    bFont = Font(name="Arial", size=10)
+    hFill = PatternFill("solid", fgColor=HEAD)
+    thin = Side(style="thin", color="C5D5E8")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ctrW = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ctr = Alignment(horizontal="center", vertical="center")
+    topL = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    flatL = Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+    def styleHeader(ws, ncol, row=1):
+        for c in range(1, ncol + 1):
+            cell = ws.cell(row, c); cell.font = hFont; cell.fill = hFill; cell.alignment = ctrW; cell.border = box
+
+    def readMe(ws, title, extra):
+        ws.sheet_view.showGridLines = False
+        lines = [(title, 13, True), ("", 10, False),
+                 (f"Source: {os.path.basename(srcPath)} (DASH OSCE v3). Submitted only; test/dummy/model and ignored students excluded.", 10, False),
+                 (f"Ignored student numbers: {sorted(IGNORE_STUDENT_NUMBERS if ignoreStudentNumbers is None else ignoreStudentNumbers)} (resolved via roster).", 10, False),
+                 ("Scoring by response LABEL, integer points per checklist level:", 11, True),
+                 ("    4-level: Very good=4, Satisfactory=3, Borderline=2, Unsatisfactory=0", 10, False),
+                 ("    3-level: Very good=2, Satisfactory=1, Unsatisfactory=0  (e.g. Occlusal)", 10, False),
+                 ("    Score(%) = total points / (n items x max pts/item) x 100.", 10, False),
+                 ("GR numbered per standard: 5=Excellent .. 1=Fail; BLR cut at GR=Borderline(2).", 10, False),
+                 ("", 10, False)] + [(t, 10, False) for t in extra]
+        for i, (t, sz, b) in enumerate(lines, 1):
+            ws.cell(i, 1, t).font = Font(name="Arial", size=sz, bold=b, color=HEAD if b else "000000")
+        ws.column_dimensions["A"].width = 120
+
+    # =================== STATION WORKBOOK ===================
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    readMe(wb.create_sheet("Read Me"), f"{cohortLabel} OSCE — Round 1 (stations)".strip(),
+           ["This workbook holds the per-station results only.",
+            "BLR standard-setting, validity and assessor-harshness analysis are in the separate analysis workbook.",
+            "Sheet names are abbreviated: e.g. S1 IC = Station 1 Infection Control, S1 Rad = Radiography.",
+            "MC cells show integer points, coloured by label (green=Very good, blue=Satisfactory, amber=Borderline, red=Unsatisfactory)."])
+
+    # Station Summary
+    summ = wb.create_sheet("Station Summary")
+    sh = ["Station", "Checklist", "Levels", "N", "Mean %", "SD %", "Median %", "Min %", "Max %", "GR Mean",
+          "Excellent", "Very good", "Pass", "Borderline", "Fail", "Fails (BLR)", "Pass+ %", "BLR Cut %"]
+    summ.append(sh); styleHeader(summ, len(sh))
+    for s in specs:
+        rows = s["rows"]
+        pcts = [r["score"] * 100 for r in rows if r["score"] is not None]
+        grs = [r["gr"] for r in rows if r["gr"] is not None]
+        lc = Counter(GR_LABELS[g] for g in grs)
+        passplus = lc["Excellent"] + lc["Very good"] + lc["Pass"]
+        cutP = blr[s["ck"]]["cutPct"]
+        failsBlr = sum(1 for r in rows if r["score"] is not None and pct1(r["score"]) < cutP)
+        summ.append([s["st"], s["cfg"]["name"].split(".")[0][:40], s["levels"], len(rows),
+                     round(statistics.mean(pcts), 1), round(statistics.pstdev(pcts), 1),
+                     round(statistics.median(pcts), 1), round(min(pcts), 1), round(max(pcts), 1),
+                     round(statistics.mean(grs), 2) if grs else None,
+                     lc["Excellent"], lc["Very good"], lc["Pass"], lc["Borderline"], lc["Fail"],
+                     failsBlr, round(passplus / len(grs) * 100, 1) if grs else None,
+                     cutP])
+    failCol = sh.index("Fails (BLR)") + 1
+    for rr in range(2, summ.max_row + 1):
+        for c in range(1, len(sh) + 1):
+            cell = summ.cell(rr, c); cell.font = bFont; cell.border = box; cell.alignment = ctr
+        fv = summ.cell(rr, failCol).value
+        if isinstance(fv, int) and fv > 0:
+            summ.cell(rr, failCol).fill = PatternFill("solid", fgColor="FFC7CE")
+            summ.cell(rr, failCol).font = Font(name="Arial", size=10, bold=True, color="9C0006")
+    summ.column_dimensions["A"].width = 8; summ.column_dimensions["B"].width = 26
+    for c in range(3, len(sh) + 1):
+        summ.column_dimensions[get_column_letter(c)].width = 11
+    summ.freeze_panes = "A2"
+
+    # detail sheets (GR Label removed; Borderline/Fail Info AFTER Feedback; rows sorted by Score desc)
+    for s in specs:
+        st, ck, cfg, rows = s["st"], s["ck"], s["cfg"], s["rows"]
+        ws = wb.create_sheet(stationTitle(st, ck)[:31])
+        hdr = ["Circuit", "Student Name", "Assessor"] + [f"MC{i}" for i in range(1, 11)] + \
+              ["Score (%)", "GR", "Feedback", "Borderline/Fail Info"]
+        ws.append(hdr); styleHeader(ws, len(hdr))
+        C = {h: i + 1 for i, h in enumerate(hdr)}
+        srt = sorted(rows, key=lambda r: (r["score"] if r["score"] is not None else -1), reverse=True)
+        for r in srt:
+            pts = [r["points"][i] for i in range(1, 11)]
+            pct = round(r["score"] * 100, 2) if r["score"] is not None else None
+            ws.append([r["circuit"], r["student"], r["assessor"]] + pts +
+                      [pct, r["gr"], r["feedback"], r["blfail"]])
+        nrow = ws.max_row; ncol = len(hdr)
+        mc0 = C["MC1"]; gcol = C["GR"]; icol = C["Borderline/Fail Info"]; fcol = C["Feedback"]
+        for ri, r in enumerate(srt, start=2):
+            for c in range(1, ncol + 1):
+                cell = ws.cell(ri, c); cell.font = bFont; cell.border = box
+                cell.alignment = flatL if c in (icol, fcol) else (
+                    Alignment(horizontal="left", vertical="center") if c in (2, 3) else ctr)
+            for i in range(1, 11):
+                lab = r["labels"][i]
+                if lab in LABEL_FILL:
+                    cc = ws.cell(ri, mc0 + i - 1)
+                    cc.fill = PatternFill("solid", fgColor=LABEL_FILL[lab]); cc.font = Font(name="Arial", size=10, color=LABEL_FONT[lab])
+            ws.cell(ri, C["Score (%)"]).number_format = "0.00"
+            gv = ws.cell(ri, gcol).value
+            if gv in GR_FILL:
+                ws.cell(ri, gcol).fill = PatternFill("solid", fgColor=GR_FILL[gv]); ws.cell(ri, gcol).font = Font(name="Arial", size=10, color=GR_FONTC[gv])
+            if gv == 1:
+                ws.cell(ri, icol).fill = PatternFill("solid", fgColor="FFC7CE"); ws.cell(ri, icol).font = Font(name="Arial", size=10, bold=True, color="9C0006")
+            elif gv == 2:
+                ws.cell(ri, icol).fill = PatternFill("solid", fgColor="FFEB9C"); ws.cell(ri, icol).font = Font(name="Arial", size=10, color="7F6000")
+        ws.column_dimensions["A"].width = 7; ws.column_dimensions["B"].width = 22; ws.column_dimensions["C"].width = 20
+        for c in range(mc0, mc0 + 10):
+            ws.column_dimensions[get_column_letter(c)].width = 6
+        ws.column_dimensions[get_column_letter(C["Score (%)"])].width = 9
+        ws.column_dimensions[get_column_letter(gcol)].width = 5
+        ws.column_dimensions[get_column_letter(fcol)].width = 55
+        ws.column_dimensions[get_column_letter(icol)].width = 55
+        ws.freeze_panes = "D2"; ws.auto_filter.ref = f"A1:{get_column_letter(ncol)}{nrow}"
+
+    # MC Item Stats
+    mcw = wb.create_sheet("MC Item Stats"); rp = 1
+    for s in specs:
+        st, ck, cfg, rows, maxPer = s["st"], s["ck"], s["cfg"], s["rows"], s["maxPerItem"]
+        mcw.cell(rp, 1, f"Station {st} — {cfg['name'].split('.')[0]}  ({s['levels']}-level, max {maxPer} pts/item)").font = Font(name="Arial", size=11, bold=True, color=HEAD); rp += 1
+        hdr = ["MC", "Description", "n", "Very good", "Satisfactory", "Borderline", "Unsatisfactory", "Avg Points", "Avg %"]
+        for c, h in enumerate(hdr, 1):
+            cc = mcw.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctrW; cc.border = box
+        rp += 1
+        for i in range(1, 11):
+            lab = Counter(r["labels"][i] for r in rows if r["labels"][i])
+            vals = [r["points"][i] for r in rows if r["points"][i] is not None]
+            avg = sum(vals) / len(vals) if vals else 0
+            line = [f"MC{i}", cfg["fields"].get(f"MC{i}", "").strip(), len(vals),
+                    lab["Very good"], lab["Satisfactory"], lab["Borderline"], lab["Unsatisfactory"], round(avg, 2), round(avg / maxPer * 100, 1)]
+            for c, v in enumerate(line, 1):
+                cc = mcw.cell(rp, c, v); cc.font = bFont; cc.border = box; cc.alignment = topL if c == 2 else ctr
+            rp += 1
+        rp += 1
+    mcw.column_dimensions["A"].width = 6; mcw.column_dimensions["B"].width = 55
+    for c in "CDEFGHI":
+        mcw.column_dimensions[c].width = 12
+
+    # Checklist Legend
+    leg = wb.create_sheet("Checklist Legend"); leg.append(["Station", "Sheet", "Checklist", "Levels", "MC", "Description"]); styleHeader(leg, 6)
+    for s in specs:
+        for i in range(1, 11):
+            leg.append([s["st"], stationTitle(s["st"], s["ck"]), s["cfg"]["name"].split(".")[0][:40], f"{s['levels']}-level", f"MC{i}", s["cfg"]["fields"].get(f"MC{i}", "").strip()])
+    for rr in range(2, leg.max_row + 1):
+        for c in range(1, 7):
+            cell = leg.cell(rr, c); cell.font = bFont; cell.border = box; cell.alignment = topL if c == 6 else ctr
+    leg.column_dimensions["A"].width = 8; leg.column_dimensions["B"].width = 12; leg.column_dimensions["C"].width = 24
+    leg.column_dimensions["D"].width = 9; leg.column_dimensions["E"].width = 7; leg.column_dimensions["F"].width = 78
+    leg.freeze_panes = "A2"
+
+    # ---- Assessors (unique assessors and the stations they assessed) ----
+    asr = wb.create_sheet("Assessors"); asr.sheet_view.showGridLines = False
+    aMap = {}   # assessor -> {sheetTitle: n}
+    for s in specs:
+        title = stationTitle(s["st"], s["ck"])
+        for r in s["rows"]:
+            aMap.setdefault(r["assessor"], {})
+            aMap[r["assessor"]][title] = aMap[r["assessor"]].get(title, 0) + 1
+    asr.cell(1, 1, f"Unique assessors: {len(aMap)}   (across {len(specs)} station-checklists)").font = Font(name="Arial", size=12, bold=True, color=HEAD)
+    ah = ["Assessor", "# Stations", "Assessments (n)", "Stations assessed (n each)"]
+    for c, h in enumerate(ah, 1):
+        cc = asr.cell(3, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctrW; cc.border = box
+    rr = 4
+    for a in sorted(aMap, key=lambda a: (-len(aMap[a]), a)):
+        stns = sorted(aMap[a])
+        detail = ", ".join(f"{t} ({aMap[a][t]})" for t in stns)
+        vals = [a, len(stns), sum(aMap[a].values()), detail]
+        for c, v in enumerate(vals, 1):
+            cc = asr.cell(rr, c, v); cc.font = bFont; cc.border = box
+            cc.alignment = Alignment(horizontal="left", vertical="center") if c in (1, 4) else ctr
+        rr += 1
+    asr.column_dimensions["A"].width = 24; asr.column_dimensions["B"].width = 11
+    asr.column_dimensions["C"].width = 15; asr.column_dimensions["D"].width = 90
+    asr.freeze_panes = "A4"; asr.auto_filter.ref = f"A3:D{rr-1}"
+
+    os.makedirs(os.path.dirname(stationPath) or ".", exist_ok=True)
+    wb.save(stationPath)
+
+    # =================== ANALYSIS WORKBOOK ===================
+    awb = openpyxl.Workbook(); awb.remove(awb.active)
+    readMe(awb.create_sheet("Read Me"), f"{cohortLabel} OSCE — Round 1 (BLR & validity)".strip(),
+           ["This workbook holds the standard-setting, reliability/validity and assessor-harshness analysis.",
+            "Per-station detail sheets are in the separate station workbook.",
+            "BLR = Borderline Regression: cut score = checklist % predicted at GR=Borderline.",
+            "Assessor Harshness assumes ~random allocation of students to assessors within a station."])
+
+    # BLR Analysis
+    bl = awb.create_sheet("BLR Analysis"); bl.sheet_view.showGridLines = False; rp = 1
+    firstBlr = True
+    for s in specs:
+        st, ck, cfg, rows, maxPer = s["st"], s["ck"], s["cfg"], s["rows"], s["maxPerItem"]
+        b = blr[ck]; grs, scs = b["grs"], b["scs"]
+        img, means, corr = buildBlrFigure(s, b, imgDir, borderlineGr)
+        if not firstBlr:
+            rp += 1   # blank spacer between stations
+        top = rp
+        # full-width banner heading + separator line
+        for c in range(1, 13):
+            hc = bl.cell(rp, c)
+            hc.fill = PatternFill("solid", fgColor=HEAD)
+            hc.border = Border(top=Side(style="medium", color="000000"))
+        tc = bl.cell(rp, 1, f"Station {st} — {cfg['name'].split('.')[0]}   (n={len(scs)}, {s['levels']}-level, borderline GR={borderlineGr})")
+        tc.font = Font(name="Arial", size=12, bold=True, color="FFFFFF"); tc.alignment = Alignment(horizontal="left", vertical="center")
+        bl.row_dimensions[rp].height = 22
+        rp += 2   # banner row + one blank row before the metrics
+        firstBlr = False
+        bmask = grs == borderlineGr
+        bmean = scs[bmask].mean() * 100 if bmask.any() else float("nan")
+        bsd = scs[bmask].std(ddof=1) * 100 if bmask.sum() > 1 else 0.0
+        cutP = b["cutPct"]; m2P = b["mean2sdPct"]
+        nfail = countBelow(scs, b["cut"])
+        metrics = [
+            ("N (submitted)", len(scs), "BLR cut (%)", cutP),
+            ("Overall Mean %", round(scs.mean() * 100, 1), "Overall SD %", round(scs.std(ddof=1) * 100, 1)),
+            ("Mean - 2SD (%)", m2P, "Cronbach's a", round(cronbachAlpha(rows), 3)),
+            ("Borderline N", int(bmask.sum()), "Borderline Mean %", round(bmean, 1)),
+            ("Slope (b)", round(b["slope"] * 100, 2), "Intercept (a) %", round(b["intercept"] * 100, 2)),
+            ("R^2", round(b["r2"], 3), "p-value", ("%.2e" % b["p"])),
+            ("Students < cut", nfail, "Fail rate %", round(nfail / len(scs) * 100, 1) if len(scs) else 0),
+        ]
+        for c, h in enumerate(["Metric", "Value", "", "Metric", "Value"], 1):
+            if h:
+                cc = bl.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctr; cc.border = box
+        rp += 1
+        for m1, v1, m2, v2 in metrics:
+            bl.cell(rp, 1, m1).font = Font(name="Arial", size=10, bold=True); bl.cell(rp, 2, v1).font = bFont
+            bl.cell(rp, 4, m2).font = Font(name="Arial", size=10, bold=True); bl.cell(rp, 5, v2).font = bFont
+            for c in (1, 2, 4, 5):
+                bl.cell(rp, c).border = box; bl.cell(rp, c).alignment = ctr if c in (2, 5) else Alignment(horizontal="left")
+            rp += 1
+        rp += 1
+        for c, h in enumerate(["GR", "GR Label", "N", "Mean %", "SD %"], 1):
+            cc = bl.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctr; cc.border = box
+        rp += 1
+        for g in range(5, 0, -1):
+            gm = grs == g
+            if gm.any():
+                bl.cell(rp, 1, g); bl.cell(rp, 2, GR_LABELS[g]); bl.cell(rp, 3, int(gm.sum()))
+                bl.cell(rp, 4, round(scs[gm].mean() * 100, 1))
+                bl.cell(rp, 5, round(scs[gm].std(ddof=1) * 100, 1) if gm.sum() > 1 else 0.0)
+                for c in range(1, 6):
+                    bl.cell(rp, c).font = bFont; bl.cell(rp, c).border = box; bl.cell(rp, c).alignment = ctr
+                gv = bl.cell(rp, 2); gv.fill = PatternFill("solid", fgColor=GR_FILL[g]); gv.font = Font(name="Arial", size=10, color=GR_FONTC[g])
+                rp += 1
+        rp += 1
+        bl.cell(rp, 1, f"Students below BLR cut ({cutP}%)").font = Font(name="Arial", size=11, bold=True, color=HEAD); rp += 1
+        for c, h in enumerate(["Student", "Assessor", "GR", "GR Label", "Score %", "vs Cut"], 1):
+            cc = bl.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctr; cc.border = box
+        rp += 1
+        below = sorted([r for r in rows if r["score"] is not None and pct1(r["score"]) < cutP], key=lambda r: r["score"])
+        for r in below:
+            vals = [r["student"], r["assessor"], r["gr"], GR_LABELS.get(r["gr"], ""), pct1(r["score"]), round(pct1(r["score"]) - cutP, 1)]
+            for c, val in enumerate(vals, 1):
+                cc = bl.cell(rp, c, val); cc.font = bFont; cc.border = box; cc.alignment = Alignment(horizontal="left") if c in (1, 2) else ctr
+            rp += 1
+        if not below:
+            bl.cell(rp, 1, "None"); rp += 1
+        xi = XlImage(img); xi.width = 620; xi.height = 430; bl.add_image(xi, f"H{top+2}")
+        rp = max(rp, top + 25) + 2
+    for col, w in {"A": 20, "B": 22, "C": 8, "D": 15, "E": 12, "F": 11}.items():
+        bl.column_dimensions[col].width = w
+
+    # AMEE Guide 49 rigorous station + assessor analysis (osce_metrics.py)
+    import osce_metrics
+    osce_metrics.buildStationMetricsSheet(awb, specs, blr)
+    osce_metrics.buildCircuitCutSheet(awb, specs, blr, borderlineGr)
+    osce_metrics.buildAssessorAnalysisSheet(awb, specs, blr, imgDir)
+
+    # Standard Setting
+    ss = awb.create_sheet("Standard Setting"); rp = 1
+    ss.cell(rp, 1, "Cut scores by standard-setting method").font = Font(name="Arial", size=12, bold=True, color=HEAD); rp += 2
+    for c, h in enumerate(["Station", "Checklist", "N", "BLR cut %", "Mean-2SD %", "BGM cut %", "Cohen 0.6xP95 %", "Fixed 50 %", "Fixed 60 %"], 1):
+        cc = ss.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctrW; cc.border = box
+    rp += 1
+    cutstore = {}
+    for s in specs:
+        b = blr[s["ck"]]; grs, scs = b["grs"], b["scs"]
+        bgm = scs[grs == borderlineGr].mean() if (grs == borderlineGr).any() else float("nan")
+        cohen = 0.6 * np.percentile(scs, 95)
+        m2 = b["mean2sd"]
+        cutstore[s["ck"]] = (scs, {"BLR": b["cut"], "M2SD": m2, "BGM": bgm, "Cohen": cohen})
+        line = [s["st"], s["cfg"]["name"].split(".")[0][:40], len(scs), b["cutPct"], round(m2 * 100, 1), round(bgm * 100, 1), round(cohen * 100, 1), 50.0, 60.0]
+        for c, v in enumerate(line, 1):
+            cc = ss.cell(rp, c, v); cc.font = bFont; cc.border = box; cc.alignment = ctr
+        rp += 1
+    rp += 2
+    ss.cell(rp, 1, "Number failing (score < cut) under each method").font = Font(name="Arial", size=12, bold=True, color=HEAD); rp += 2
+    for c, h in enumerate(["Station", "Checklist", "N", "Fails BLR", "Fails M-2SD", "Fails BGM", "Fails Cohen", "Fails F50", "Fails F60"], 1):
+        cc = ss.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctrW; cc.border = box
+    rp += 1
+    for s in specs:
+        scs, cuts = cutstore[s["ck"]]
+        nf = lambda cut: countBelow(scs, cut)
+        line = [s["st"], s["cfg"]["name"].split(".")[0][:40], len(scs), nf(cuts["BLR"]), nf(cuts["M2SD"]), nf(cuts["BGM"]), nf(cuts["Cohen"]), nf(0.5), nf(0.6)]
+        for c, v in enumerate(line, 1):
+            cc = ss.cell(rp, c, v); cc.font = bFont; cc.border = box; cc.alignment = ctr
+        rp += 1
+    rp += 2
+    for i, t in enumerate([
+        "BLR = Borderline Regression: score predicted at the Borderline grade (defensible, most used for OSCE).",
+        "BGM = Borderline Group Method: mean checklist score of students rated exactly Borderline.",
+        "Cohen = 0.6 x 95th-percentile score: norm-referenced backup when borderline groups are small.",
+        "Mean-2SD = mean minus two SDs of the checklist score (low-outlier threshold).",
+        "Fixed 50 / 60 = absolute cut scores.  Fail = checklist score < cut (both rounded to 1 dp)."]):
+        ss.cell(rp + i, 1, t).font = Font(name="Arial", size=9, italic=True, color="555555")
+    ss.column_dimensions["A"].width = 8; ss.column_dimensions["B"].width = 26
+    for c in range(3, 9):
+        ss.column_dimensions[get_column_letter(c)].width = 14
+
+    # ---- Assessor Grid (student x station = assessor name; colour = assessor mean %, red harsh -> green lenient) ----
+    ag = awb.create_sheet("Assessor Grid"); ag.sheet_view.showGridLines = False
+    aMean = {}          # (ck, assessor) -> mean %
+    assessorOf = {}     # student -> {ck: assessor}
+    for sp in specs:
+        byA = {}
+        for r in sp["rows"]:
+            if r["score"] is None:
+                continue
+            byA.setdefault(r["assessor"], []).append(r["score"] * 100)
+            assessorOf.setdefault(r["student"], {})[sp["ck"]] = r["assessor"]
+        for a, vs in byA.items():
+            aMean[(sp["ck"], a)] = sum(vs) / len(vs)
+    allMeans = list(aMean.values()); vmin = min(allMeans); vmax = max(allMeans)
+    agStudents = sorted(assessorOf, key=lambda x: (x.split()[-1], x))
+    hdr = ["Student"] + [stationTitle(sp["st"], sp["ck"]) for sp in specs]
+    ag.append(hdr); styleHeader(ag, len(hdr))
+    for st in agStudents:
+        ag.append([st] + [assessorOf[st].get(sp["ck"], "") for sp in specs])
+    nrow = ag.max_row; ncol = len(hdr)
+    gthin = Side(style="thin", color="D9D9D9")
+    gbox = Border(left=gthin, right=gthin, top=gthin, bottom=gthin)
+    for ri, st in enumerate(agStudents, start=2):
+        c0 = ag.cell(ri, 1); c0.font = bFont; c0.alignment = Alignment(horizontal="left", vertical="center"); c0.border = gbox
+        for ci, sp in enumerate(specs, start=2):
+            c = ag.cell(ri, ci); c.font = Font(name="Arial", size=8); c.border = gbox
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            a = assessorOf[st].get(sp["ck"])
+            if a and (sp["ck"], a) in aMean:
+                t = (aMean[(sp["ck"], a)] - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+                c.fill = PatternFill("solid", fgColor=gradientHex(t))
+    ag.column_dimensions["A"].width = 22
+    for c in range(2, ncol + 1):
+        ag.column_dimensions[get_column_letter(c)].width = 16
+    ag.freeze_panes = "B2"; ag.auto_filter.ref = f"A1:{get_column_letter(ncol)}{nrow}"
+    # legend (top-right)
+    lc = ncol + 2
+    ag.cell(1, lc, "Colour = assessor's mean % at that station").font = Font(name="Arial", size=9, bold=True, color=HEAD)
+    r2 = ag.cell(2, lc, f"Red = {vmin:.1f}%  (harshest)"); r2.fill = PatternFill("solid", fgColor=gradientHex(0.0)); r2.font = Font(name="Arial", size=9)
+    r3 = ag.cell(3, lc, f"Yellow = {(vmin+vmax)/2:.1f}%  (mid)"); r3.fill = PatternFill("solid", fgColor=gradientHex(0.5)); r3.font = Font(name="Arial", size=9)
+    r4 = ag.cell(4, lc, f"Green = {vmax:.1f}%  (most lenient)"); r4.fill = PatternFill("solid", fgColor=gradientHex(1.0)); r4.font = Font(name="Arial", size=9)
+    ag.column_dimensions[get_column_letter(lc)].width = 28
+    ag.cell(nrow + 2, 1, "Each cell = the assessor who marked that student at that station; fill is a red->green gradient by the assessor's mean checklist % at that station (across all stations here).").font = Font(name="Arial", size=9, italic=True, color="555555")
+
+    # ---- Student x Station pivot (BLR / Mean-2SD colour coding) ----
+    piv = awb.create_sheet("Student x Station", 1)
+    piv.sheet_view.showGridLines = False
+    colSpecs = specs
+    cutP = {sp["ck"]: blr[sp["ck"]]["cutPct"] for sp in colSpecs}
+    m2P = {sp["ck"]: blr[sp["ck"]]["mean2sdPct"] for sp in colSpecs}
+    # scoreOf[student][ck] = (pct, status): 0 pass, 1 <BLR only, 2 <Mean-2SD only, 3 <both
+    scoreOf = {}; students = set()
+    for sp in colSpecs:
+        for r in sp["rows"]:
+            if r["score"] is None:
+                continue
+            pp = pct1(r["score"]); students.add(r["student"])
+            bBLR = pp < cutP[sp["ck"]]; b2 = pp < m2P[sp["ck"]]
+            status = 3 if (bBLR and b2) else (1 if bBLR else (2 if b2 else 0))
+            scoreOf.setdefault(r["student"], {})[sp["ck"]] = (pp, status)
+    hdr = ["Student"] + [stationTitle(sp["st"], sp["ck"]) for sp in colSpecs] + ["Mean %", "Fails (BLR)", "< M-2SD"]
+    piv.append(hdr); styleHeader(piv, len(hdr))
+    def studFailsBLR(st):
+        return sum(1 for sp in colSpecs if scoreOf.get(st, {}).get(sp["ck"], (None, 0))[1] in (1, 3))
+    def studBelow2(st):
+        return sum(1 for sp in colSpecs if scoreOf.get(st, {}).get(sp["ck"], (None, 0))[1] in (2, 3))
+    def studMean(st):
+        vs = [scoreOf[st][sp["ck"]][0] for sp in colSpecs if sp["ck"] in scoreOf.get(st, {})]
+        return sum(vs) / len(vs) if vs else None
+    ordered = sorted(students, key=lambda st: (-studFailsBLR(st), -(studMean(st) or 0), st))
+    STATUS_FILL = {1: "FF0000", 2: "FFC000", 3: "7030A0"}
+    STATUS_FONT = {1: "FFFFFF", 2: "000000", 3: "FFFFFF"}
+    for st in ordered:
+        row = [st]
+        for sp in colSpecs:
+            cell = scoreOf.get(st, {}).get(sp["ck"]); row.append(cell[0] if cell else "")
+        m = studMean(st)
+        row += [round(m, 1) if m is not None else "", studFailsBLR(st), studBelow2(st)]
+        piv.append(row)
+    nrow = piv.max_row; ncol = len(hdr)
+    for ri, st in enumerate(ordered, start=2):
+        c0 = piv.cell(ri, 1); c0.font = bFont; c0.alignment = Alignment(horizontal="left", vertical="center"); c0.border = box
+        for ci, sp in enumerate(colSpecs, start=2):
+            c = piv.cell(ri, ci); c.font = bFont; c.border = box; c.alignment = ctr
+            cell = scoreOf.get(st, {}).get(sp["ck"])
+            if cell:
+                c.number_format = "0.0"; stt = cell[1]
+                if stt in STATUS_FILL:
+                    c.fill = PatternFill("solid", fgColor=STATUS_FILL[stt])
+                    c.font = Font(name="Arial", size=10, bold=(stt != 2), color=STATUS_FONT[stt])
+            else:
+                c.fill = PatternFill("solid", fgColor="F2F2F2")
+        mc = piv.cell(ri, ncol - 2); mc.font = bFont; mc.border = box; mc.alignment = ctr; mc.number_format = "0.0"
+        fc = piv.cell(ri, ncol - 1); fc.border = box; fc.alignment = ctr; fv = studFailsBLR(st); fc.value = fv
+        fc.font = Font(name="Arial", size=10, bold=True, color="9C0006" if fv else "000000")
+        if fv:
+            fc.fill = PatternFill("solid", fgColor="FFC7CE")
+        bc = piv.cell(ri, ncol); bc.border = box; bc.alignment = ctr; bv = studBelow2(st); bc.value = bv
+        bc.font = Font(name="Arial", size=10, bold=True, color="7030A0" if bv else "000000")
+    trow = nrow + 1
+    piv.cell(trow, 1, "Fails (BLR) / station").font = Font(name="Arial", size=10, bold=True, color=HEAD)
+    for ci, sp in enumerate(colSpecs, start=2):
+        nf = sum(1 for st in students if scoreOf.get(st, {}).get(sp["ck"], (None, 0))[1] in (1, 3))
+        cc = piv.cell(trow, ci, nf); cc.font = Font(name="Arial", size=10, bold=True); cc.alignment = ctr; cc.border = box
+    piv.cell(trow, ncol - 1, sum(studFailsBLR(st) for st in students)).font = Font(name="Arial", size=10, bold=True)
+    piv.cell(trow, ncol - 1).alignment = ctr; piv.cell(trow, ncol - 1).border = box
+    piv.column_dimensions["A"].width = 24
+    for c in range(2, ncol + 1):
+        piv.column_dimensions[get_column_letter(c)].width = 10
+    piv.freeze_panes = "B2"; piv.auto_filter.ref = f"A1:{get_column_letter(ncol)}{nrow}"
+    # legend (top-right of the table)
+    lc0 = ncol + 2
+    piv.cell(1, lc0, "Legend").font = Font(name="Arial", size=10, bold=True, color=HEAD)
+    for i, (stt, lab) in enumerate([(1, "Below BLR cut"), (2, "Below Mean-2SD"), (3, "Below both"), (None, "Not attempted")], start=2):
+        sw = piv.cell(i, lc0); sw.fill = PatternFill("solid", fgColor=(STATUS_FILL[stt] if stt else "F2F2F2")); sw.border = box
+        lb = piv.cell(i, lc0 + 1, lab); lb.font = Font(name="Arial", size=9); lb.alignment = Alignment(horizontal="left", vertical="center")
+    piv.column_dimensions[get_column_letter(lc0)].width = 5
+    piv.column_dimensions[get_column_letter(lc0 + 1)].width = 18
+    note = trow + 2
+    piv.cell(note, 1, "Colours: red=below BLR cut; orange=below Mean-2SD; purple=below both; grey=not attempted. Compared at 1 dp.").font = Font(name="Arial", size=9, italic=True, color="555555")
+    piv.cell(note + 1, 1, "BLR cut per station (%): " + "  ".join(f"{stationTitle(sp['st'], sp['ck'])}={cutP[sp['ck']]}" for sp in colSpecs)).font = Font(name="Arial", size=9, italic=True, color="555555")
+    piv.cell(note + 2, 1, "Mean-2SD per station (%): " + "  ".join(f"{stationTitle(sp['st'], sp['ck'])}={m2P[sp['ck']]}" for sp in colSpecs)).font = Font(name="Arial", size=9, italic=True, color="555555")
+
+    os.makedirs(os.path.dirname(analysisPath) or ".", exist_ok=True)
+    awb.save(analysisPath)
+
+    return {
+        "stations": [{"station": s["st"], "checklist": s["ck"], "sheet": stationTitle(s["st"], s["ck"]),
+                      "levels": s["levels"], "n": len(s["rows"]), "blrCut": round(blr[s["ck"]]["cut"] * 100, 1)} for s in specs],
+        "stationWorkbook": stationPath, "analysisWorkbook": analysisPath, "imgDir": imgDir,
+        "ignored": sorted(IGNORE_STUDENT_NUMBERS if ignoreStudentNumbers is None else ignoreStudentNumbers),
+    }

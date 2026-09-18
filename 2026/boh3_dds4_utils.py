@@ -19,21 +19,49 @@ from sqlalchemy import text
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.formatting.rule import ColorScaleRule, CellIsRule
 
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
-    SimpleDocTemplate, PageBreak, Paragraph, Spacer, Flowable
+    SimpleDocTemplate, PageBreak, Paragraph, Spacer, Flowable, KeepTogether,
+    Table, TableStyle
 )
 from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.platypus.tableofcontents import TableOfContents
 import matplotlib.dates as mdates
 import seaborn as sns
 # These come from your existing Utils.py / variableUtils.py — imported here
 # so callers only need `from boh3_dds4_utils import *`.
 from Utils import createTable, addPlotImage, getBannerDrawer, getmodeArgs, readDf, runDdl, toInt, autoFitColumns, autopct
+from general_utils import nameSortKey
 import variableUtils
+from functools import reduce
+import itables
+import dtale
 
 
+CLINIC_DICT = {
+          "EC01": "Holstep (Banyule)",
+          "EC02": "Cobram District CHC",
+          "EC03": "Cohealth (Footscray)",  
+          "EC04": "DTC",
+          "EC05": "EACH (Ferntree Gully)",
+          "EC06": "GV Health (Shepparton)",
+          "EC07": "Health Ability (Box Hill)",
+          "EC08": "IPC (Wyndham Vale)",
+          "EC09": "La Trobe Community Health (Moe)",
+          "EC10": "Link Health (Clayton)",
+          "EC11": "MDC",
+          "EC12": "Northwest Health (Wangaratta)",
+          "EC13": "Rumbalara (Shepparton)",
+          "EC14": "VAHS (Fitzroy)",
+          "EC15": "Your Community (Preston)",
+          "EC16": "Congress (Alice Springs)",
+          "EC17": "Peninsula Health (Frankston)"
+    }
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Helper functions for Excel and PDF report generation
 # ═══════════════════════════════════════════════════════════════════════════
@@ -122,14 +150,83 @@ CREATE INDEX IF NOT EXISTS idx_dds4_boh3_forms_student_name ON dds4_boh3_forms (
 
 """
 
-def getClinicStandardizationSql(fromNames: list[str], toName: str, tableName: str = "dds4_boh3_forms"):
+def getStandardizationSql(fromNames: list[str], toName: str, tableName: str = "dds4_boh3_forms_v3", colName = "external_clinic"):
     fromNamesList = ", ".join(f"'{n}'" for n in fromNames)
     sql = f"""UPDATE {tableName}
-          SET external_clinic = '{toName}'
-          WHERE external_clinic IN (
+          SET {colName} = '{toName}'
+          WHERE {colName} IN (
             {fromNamesList}
           );"""
     return sql
+
+
+def getClinicCodeStandardizationSql(clinicDict: dict = None,
+                                    tableName: str = "dds4_boh3_forms_v3",
+                                    columns=("external_clinic", "clinic")):
+    """Map raw clinic *codes* (e.g. 'EC02') to their readable names from ``clinicDict``.
+
+    The new (v3) DASH form engine stores ``form_context.placement.external_clinic`` as a
+    code such as ``EC02`` in both the ``external_clinic`` and ``clinic`` columns. This helper
+    converts those codes to display names (``'Cobram District CHC'``) so the free-text
+    standardization UPDATEs and downstream reporting operate on readable names.
+
+    Returns a single UPDATE statement with one independent ``CASE`` per column, so each column
+    is remapped from its own value (no cross-column mismatch). Values not present in
+    ``clinicDict`` are left unchanged via ``ELSE``. Run this *before* the free-text
+    ``getClinicStandardizationSql`` UPDATEs. Returns ``''`` if ``clinicDict`` is empty.
+    """
+    if clinicDict is None:
+        clinicDict = CLINIC_DICT
+    if not clinicDict:
+        return ""
+
+    def esc(s):
+        return str(s).replace("'", "''")
+
+    codesList = ", ".join(f"'{esc(code)}'" for code in clinicDict)
+    setClauses = []
+    for col in columns:
+        whens = "\n            ".join(
+            f"WHEN '{esc(code)}' THEN '{esc(name)}'" for code, name in clinicDict.items()
+        )
+        setClauses.append(f"{col} = CASE {col}\n            {whens}\n            ELSE {col} END")
+    setSql = ",\n          ".join(setClauses)
+    whereSql = " OR ".join(f"{col} IN ({codesList})" for col in columns)
+    return f"""UPDATE {tableName}
+          SET {setSql}
+          WHERE {whereSql};"""
+
+def smartTitleCaseClinic(name):
+    """Title-case a clinic name for standard naming, preserving acronyms.
+
+    Capitalizes the first alphabetic character of each whitespace-separated word and lowercases
+    the rest, BUT leaves any token whose letters are all uppercase (>=2 letters) unchanged so
+    acronyms survive: 'DTC', 'CHC', 'MDC', 'PC', 'GV', 'VAHS', 'IPC', 'EACH'. Punctuation and
+    bracketed suffixes are preserved: 'gv health (shepparton)' -> 'GV Health (Shepparton)'.
+    Returns the input unchanged if empty/None.
+    """
+    if name is None:
+        return None
+    s = str(name)
+    if not s.strip():
+        return s
+    out = []
+    for word in s.split():
+        letters = [c for c in word if c.isalpha()]
+        if len(letters) >= 2 and all(c.isupper() for c in letters):
+            out.append(word)  # acronym — keep as-is
+            continue
+        chars, capped = [], False
+        for c in word:
+            if c.isalpha() and not capped:
+                chars.append(c.upper()); capped = True
+            elif c.isalpha():
+                chars.append(c.lower())
+            else:
+                chars.append(c)
+        out.append("".join(chars))
+    return " ".join(out)
+
 
 def getBoh3Dds4FormsProcessSql(replace=False, tableName="dds4_boh3_forms"):
     """Return (createTableSql, upsertSql) for the dds4_boh3_forms pipeline."""
@@ -215,6 +312,163 @@ def getBoh3Dds4FormsProcessSql(replace=False, tableName="dds4_boh3_forms"):
   """
     return createTableSql, upsertSql
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2b. v3 pipeline — new rawforms JSON structure (form_context/patients/placement,
+#     assessor_data.radio/texts). Keeps v2 column names so downstream reporting
+#     works unchanged; only the JSON source paths differ. Adds assessor_email,
+#     context_schema_snapshot and additional_concerns_occurred.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CREATE_TABLE_V3_SQL = """
+CREATE TABLE IF NOT EXISTS dds4_boh3_forms_v3 (
+    assessmentId BIGINT NOT NULL,
+    form_code TEXT NOT NULL,
+    cohort TEXT,
+    subject TEXT,
+    type TEXT,
+    completed BOOLEAN,
+    datetimeUtc TIMESTAMPTZ,
+    student_number BIGINT,
+    student_name TEXT,
+    student_email TEXT,
+
+    formId BIGINT,
+    version INT,
+    clinic TEXT,
+    assessorId BIGINT,
+    assessor_name TEXT,
+    assessor_email TEXT,
+    rotation TEXT,
+    createdAt TIMESTAMPTZ,
+    updatedAt TIMESTAMPTZ,
+
+    patient_data JSONB,
+    student_data JSONB,
+    assessor_data JSONB,
+    student_config JSONB,
+    assessor_config JSONB,
+    context_schema_snapshot JSONB,
+
+    external_clinic TEXT,
+    additional_concerns TEXT,
+    additional_concerns_occurred BOOLEAN,
+    submitted_by_student BOOLEAN,
+    submitted_by_assessor BOOLEAN,
+
+    insertedAt TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (assessmentId, form_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dds4_boh3_forms_v3_datetimeUtc ON dds4_boh3_forms_v3 (datetimeUtc);
+CREATE INDEX IF NOT EXISTS idx_dds4_boh3_forms_v3_cohort ON dds4_boh3_forms_v3 (cohort);
+CREATE INDEX IF NOT EXISTS idx_dds4_boh3_forms_v3_student_name ON dds4_boh3_forms_v3 (student_name);
+
+"""
+
+
+def getBoh3Dds4FormsV3ProcessSql(replace=False, tableName="dds4_boh3_forms_v3"):
+    """Return (createTableSql, upsertSql) for the dds4_boh3_forms_v3 pipeline.
+
+    Reads the new rawforms structure where form-level context lives under
+    form_context (patients[], placement.rotation, placement.external_clinic) and
+    assessor concerns live under assessor_data.radio / assessor_data.texts.
+    Column names match v2 dds4_boh3_forms so reporting code is unchanged.
+    """
+    if replace:
+        onconflict = f"""
+      ON CONFLICT (assessmentId, form_code) DO UPDATE SET
+      cohort = EXCLUDED.cohort,
+      subject = EXCLUDED.subject,
+      type = EXCLUDED.type,
+      completed = EXCLUDED.completed,
+      datetimeutc = EXCLUDED.datetimeutc,
+      student_number = EXCLUDED.student_number,
+      student_name = EXCLUDED.student_name,
+      student_email = EXCLUDED.student_email,
+
+      formid = EXCLUDED.formid,
+      version = EXCLUDED.version,
+      clinic = EXCLUDED.clinic,
+      assessorid = EXCLUDED.assessorid,
+      assessor_name = EXCLUDED.assessor_name,
+      assessor_email = EXCLUDED.assessor_email,
+      rotation = EXCLUDED.rotation,
+      createdat = EXCLUDED.createdat,
+      updatedat = EXCLUDED.updatedat,
+
+      patient_data = EXCLUDED.patient_data,
+      student_data = EXCLUDED.student_data,
+      assessor_data = EXCLUDED.assessor_data,
+      student_config = EXCLUDED.student_config,
+      assessor_config = EXCLUDED.assessor_config,
+      context_schema_snapshot = EXCLUDED.context_schema_snapshot,
+
+      external_clinic = EXCLUDED.external_clinic,
+      additional_concerns = EXCLUDED.additional_concerns,
+      additional_concerns_occurred = EXCLUDED.additional_concerns_occurred,
+      submitted_by_student = EXCLUDED.submitted_by_student,
+      submitted_by_assessor = EXCLUDED.submitted_by_assessor,
+      insertedAt = now();
+        """
+    else:
+        onconflict = "ON CONFLICT (assessmentId, form_code) DO NOTHING"
+
+    createTableSql = _CREATE_TABLE_V3_SQL.replace("dds4_boh3_forms_v3", tableName)
+    upsertSql = f"""
+  INSERT INTO {tableName} (
+    assessmentid, form_code,
+    cohort, subject, type, completed, datetimeutc,
+    student_number, student_name, student_email,
+    formid, version, clinic, assessorid, assessor_name, assessor_email, rotation, createdat, updatedat,
+    patient_data, student_data, assessor_data, student_config, assessor_config, context_schema_snapshot,
+    external_clinic, additional_concerns, additional_concerns_occurred,
+    submitted_by_student, submitted_by_assessor
+  )
+  SELECT
+    r.assessmentid,
+    f.form_value->>'form_key' AS form_code,
+    r.cohort, r.subject, r.type, r.completed, r.datetimeutc,
+    r.student_number, r.student_name, r.student_email,
+    NULLIF(f.form_value->>'id','')::bigint AS formid,
+    NULLIF(f.form_value->>'version','')::int AS version,
+    NULLIF(f.form_value->'form_context'->'placement'->>'external_clinic','') AS clinic,
+    NULLIF(f.form_value->>'assessor','')::bigint AS assessorId,
+    f.form_value->>'assessor_name' AS assessor_name,
+    f.form_value->>'assessor_email' AS assessor_email,
+    f.form_value->'form_context'->'placement'->>'rotation' AS rotation,
+    NULLIF(f.form_value->>'created_at','')::timestamptz AS createdAt,
+    NULLIF(f.form_value->>'updated_at','')::timestamptz AS updatedAt,
+    f.form_value->'form_context'->'patients' AS patient_data,
+    f.form_value->'student_data' AS student_data,
+    f.form_value->'assessor_data' AS assessor_data,
+    f.form_value->'student_config' AS student_config,
+    f.form_value->'assessor_config' AS assessor_config,
+    f.form_value->'context_schema_snapshot' AS context_schema_snapshot,
+    NULLIF(f.form_value->'form_context'->'placement'->>'external_clinic','') AS external_clinic,
+    NULLIF(f.form_value->'assessor_data'->'texts'->>'additional-concerns','') AS additional_concerns,
+    CASE lower(f.form_value->'assessor_data'->'radio'->>'additional-concerns-occurred')
+         WHEN 'yes' THEN true WHEN 'no' THEN false ELSE NULL END AS additional_concerns_occurred,
+    (f.form_value->>'submitted_by_student')::boolean AS submitted_by_student,
+    (f.form_value->>'submitted_by_assessor')::boolean AS submitted_by_assessor
+  FROM rawforms r
+  CROSS JOIN LATERAL (
+    SELECT a.value AS form_value
+    FROM jsonb_array_elements(r.forms) a
+    WHERE jsonb_typeof(r.forms) = 'array'
+    UNION ALL
+    SELECT e.value AS form_value
+    FROM jsonb_each(r.forms) e
+    WHERE jsonb_typeof(r.forms) = 'object'
+  ) f
+  WHERE r.cohort = ANY(:targetCohorts)
+    AND (f.form_value ? 'form_key')
+    AND r.datetimeUtc >= TIMESTAMPTZ '2026-01-01'
+    {onconflict}
+  """
+    return createTableSql, upsertSql
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. Cohort-level query functions
 # ═══════════════════════════════════════════════════════════════════════════
@@ -242,19 +496,19 @@ def _where(cohort, filters):
     return "cohort = :cohort", {"cohort": cohort}
 
 
-def getFullDf(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getFullDf(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"SELECT * FROM {formsTable} WHERE {whereClause};"
     return readDf(engine, sql, params)
 
 
-def getTotalForms(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getTotalForms(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"SELECT COUNT(*)::bigint AS totalForms FROM {formsTable} WHERE {whereClause};"
     return readDf(engine, sql, params)
 
 
-def getAgeCounts(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getAgeCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT
@@ -262,81 +516,82 @@ def getAgeCounts(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
       COUNT(*) FILTER (WHERE age BETWEEN 7 AND 17)::bigint AS age7to17,
       COUNT(*) FILTER (WHERE age >= 18)::bigint            AS age18plus
     FROM (
-      SELECT NULLIF(pd->>'patientAge','')::int AS age
+      SELECT NULLIF(pd->>'patient_age','')::int AS age
       FROM {formsTable}
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(patient_data, '[]'::jsonb)) pd
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(patient_data)='array' THEN patient_data ELSE '[]'::jsonb END) pd
       WHERE {whereClause}
-      AND (pd->>'patientAttended')::boolean = true
+      AND (pd->>'patient_attended')::boolean = true
     ) x;
     """
     return readDf(engine, sql, params)
 
 
-def getAgeCountsBatch(engine, cohort, formsTable="dds4_boh3_forms"):
+def getAgeCountsBatch(engine, cohort, formsTable="dds4_boh3_forms_v3"):
     """
     Batch version of getAgeCounts — one query for ALL students in the cohort.
     Returns a DataFrame with columns: student_name, age0to6, age7to17, age18plus.
     """
     sql = f"""
     SELECT
+      f.student_number,
       f.student_name,
-      COUNT(*) FILTER (WHERE NULLIF(pd->>'patientAge','')::int BETWEEN 0 AND 6)::bigint  AS age0to6,
-      COUNT(*) FILTER (WHERE NULLIF(pd->>'patientAge','')::int BETWEEN 7 AND 17)::bigint AS age7to17,
-      COUNT(*) FILTER (WHERE NULLIF(pd->>'patientAge','')::int >= 18)::bigint            AS age18plus
+      COUNT(*) FILTER (WHERE NULLIF(pd->>'patient_age','')::int BETWEEN 0 AND 6)::bigint  AS age0to6,
+      COUNT(*) FILTER (WHERE NULLIF(pd->>'patient_age','')::int BETWEEN 7 AND 17)::bigint AS age7to17,
+      COUNT(*) FILTER (WHERE NULLIF(pd->>'patient_age','')::int >= 18)::bigint            AS age18plus
     FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data, '[]'::jsonb)) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
     WHERE f.cohort = :cohort
-      AND (pd->>'patientAttended')::boolean = true
+      AND (pd->>'patient_attended')::boolean = true
       AND f.student_name IS NOT NULL
-    GROUP BY f.student_name
+    GROUP BY f.student_number, f.student_name
     ORDER BY f.student_name;
     """
     return readDf(engine, sql, {"cohort": cohort})
 
 
-def getAgeList(engine, cohort, formsTable="dds4_boh3_forms", filters=None, paramsAdd=None):
+def getAgeList(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None, paramsAdd=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
-    SELECT NULLIF(pd->>'patientAge','')::int AS age
+    SELECT NULLIF(pd->>'patient_age','')::int AS age
     FROM {formsTable}
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(patient_data, '[]'::jsonb)) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(patient_data)='array' THEN patient_data ELSE '[]'::jsonb END) pd
     WHERE {whereClause}
-      AND NULLIF(pd->>'patientAge','') ~ '^\\d+$';
+      AND NULLIF(pd->>'patient_age','') ~ '^\\d+$';
     """
     if paramsAdd:
         params.update(paramsAdd)
     return readDf(engine, sql, params)
 
 
-def getAvgAge(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getAvgAge(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT ROUND(AVG(
       CASE
-        WHEN (pd->>'patientAge') ~ '^\\s*\\d+\\s*$'
-        AND (pd->>'patientAge')::int BETWEEN 0 AND 120
-        THEN (pd->>'patientAge')::int
+        WHEN (pd->>'patient_age') ~ '^\\s*\\d+\\s*$'
+        AND (pd->>'patient_age')::int BETWEEN 0 AND 120
+        THEN (pd->>'patient_age')::int
         ELSE NULL
       END
     )::numeric, 2) AS avgAge
     FROM {formsTable}
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(patient_data, '[]'::jsonb)) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(patient_data)='array' THEN patient_data ELSE '[]'::jsonb END) pd
     WHERE {whereClause};
     """
     return readDf(engine, sql, params)
 
 
-def getPatientsPerStudentStats(engine, cohort, formsTable="dds4_boh3_forms", attended=True, filters=None):
+def getPatientsPerStudentStats(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None):
     whereClause, params = _where(cohort, filters)
     params["attended"] = attended
     sql = f"""
     WITH perStudent AS (
       SELECT student_name, COUNT(*)::int AS patients
       FROM {formsTable}
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(patient_data, '[]'::jsonb)) pd
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(patient_data)='array' THEN patient_data ELSE '[]'::jsonb END) pd
       WHERE {whereClause}
         AND student_name IS NOT NULL
-        AND (pd->>'patientAttended')::boolean = :attended
+        AND (pd->>'patient_attended')::boolean = :attended
       GROUP BY student_name
     )
     SELECT
@@ -348,7 +603,7 @@ def getPatientsPerStudentStats(engine, cohort, formsTable="dds4_boh3_forms", att
     return readDf(engine, sql, params)
 
 
-def getPatientPerStudent(engine, cohort, formsTable="dds4_boh3_forms", attended=True, filters=None):
+def getPatientPerStudent(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None):
     whereClause, params = _where(cohort, filters)
     params["attended"] = attended
     sql = f"""
@@ -361,7 +616,7 @@ def getPatientPerStudent(engine, cohort, formsTable="dds4_boh3_forms", attended=
       FROM jsonb_array_elements(
         CASE WHEN jsonb_typeof(f.patient_data) = 'array' THEN f.patient_data ELSE '[]'::jsonb END
       ) elem
-      WHERE (elem->>'patientAttended')::boolean = :attended
+      WHERE (elem->>'patient_attended')::boolean = :attended
     ) pd ON TRUE
     WHERE {whereClause}
       AND f.student_name IS NOT NULL
@@ -371,7 +626,7 @@ def getPatientPerStudent(engine, cohort, formsTable="dds4_boh3_forms", attended=
     return readDf(engine, sql, params)
 
 
-def getClinicForStudent(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getClinicForStudent(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT student_name, COALESCE(NULLIF(external_clinic, ''), '(unknown)') AS clinic
@@ -382,7 +637,7 @@ def getClinicForStudent(engine, cohort, formsTable="dds4_boh3_forms", filters=No
     return readDf(engine, sql, params)
 
 
-def getClinicPatientCounts(engine, cohort, formsTable="dds4_boh3_forms", attended=True, filters=None):
+def getClinicPatientCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None):
     whereClause, params = _where(cohort, filters)
     params["attended"] = attended
     sql = f"""
@@ -390,16 +645,16 @@ def getClinicPatientCounts(engine, cohort, formsTable="dds4_boh3_forms", attende
       COALESCE(NULLIF(external_clinic,''), '(unknown)') AS clinic,
       COUNT(*)::bigint AS patients
     FROM {formsTable}
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(patient_data, '[]'::jsonb)) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(patient_data)='array' THEN patient_data ELSE '[]'::jsonb END) pd
     WHERE {whereClause}
-      AND (pd->>'patientAttended')::boolean = :attended
+      AND (pd->>'patient_attended')::boolean = :attended
     GROUP BY 1
     ORDER BY patients DESC, clinic;
     """
     return readDf(engine, sql, params)
 
 
-def getSubmittedCounts(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getSubmittedCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT
@@ -411,19 +666,19 @@ def getSubmittedCounts(engine, cohort, formsTable="dds4_boh3_forms", filters=Non
     return readDf(engine, sql, params)
 
 
-def getTopItemCodes(engine, cohort, formsTable="dds4_boh3_forms", limit=5, filters=None):
+def getTopItemCodes(engine, cohort, formsTable="dds4_boh3_forms_v3", limit=5, filters=None):
     whereClause, params = _where(cohort, filters)
     ageClause = ""
     if filters:
         if "age_min" in filters:
-            ageClause += " AND NULLIF(pd->>'patientAge','')::int >= :age_min"
+            ageClause += " AND NULLIF(pd->>'patient_age','')::int >= :age_min"
         if "age_max" in filters:
-            ageClause += " AND NULLIF(pd->>'patientAge','')::int <= :age_max"
+            ageClause += " AND NULLIF(pd->>'patient_age','')::int <= :age_max"
     sql = f"""
-    SELECT ic->>'code' AS itemCode, COUNT(*)::bigint AS freq
+    SELECT ic->>'code' AS itemCode, SUM(COALESCE(NULLIF(ic->>'quantity','')::int, 1))::bigint AS freq
     FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data, '[]'::jsonb)) pd
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes', '[]'::jsonb)) ic
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
     WHERE {whereClause}
       AND ic ? 'code'
       {ageClause}
@@ -435,36 +690,84 @@ def getTopItemCodes(engine, cohort, formsTable="dds4_boh3_forms", limit=5, filte
     return readDf(engine, sql, params)
 
 
-def getItemCodesPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms"):
+def getItemCodeDescriptionMap(engine, cohort, formsTable="dds4_boh3_forms_v3"):
+    """Return {item_code: description} from the form's context_schema_snapshot.
+
+    v3 `item_codes` rows carry only {{code, quantity}} — the descriptions live in the
+    item_code_picker `options` inside `context_schema_snapshot` (same schema across a
+    cohort's forms). Reads one recent snapshot and flattens every category's code→description.
+    Returns {{}} if none found.
+    """
+    sql = f"""
+      SELECT context_schema_snapshot
+      FROM {formsTable}
+      WHERE cohort = :cohort AND context_schema_snapshot IS NOT NULL
+      ORDER BY datetimeutc DESC NULLS LAST
+      LIMIT 1;
+    """
+    df = readDf(engine, sql, {"cohort": cohort})
+    if df.empty or df.iloc[0, 0] is None:
+        return {}
+    css = df.iloc[0, 0]
+    if isinstance(css, str):
+        css = json.loads(css)
+
+    descMap = {}
+
+    def harvest(field):
+        if not isinstance(field, dict):
+            return
+        if field.get("type") == "item_code_picker" or field.get("key") == "item_codes":
+            for arr in (field.get("options") or {}).values():
+                for opt in arr or []:
+                    code = opt.get("code")
+                    if code is not None:
+                        descMap[str(code).strip()] = opt.get("description")
+        for sub in field.get("fields", []) or []:
+            harvest(sub)
+
+    for f in css or []:
+        harvest(f)
+    return descMap
+
+
+def getItemCodesPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms_v3"):
     """
     All item codes per student in one query. Can be used to create pivot tables later
     Returns: Student ID, Student Name, Item Code, Description, Total Qty
+    Description is sourced from context_schema_snapshot (v3 item_codes carry only code+qty).
     """
     sql = f"""
     SELECT
       f.student_number AS "Student ID",
       f.student_name   AS "Student Name",
       ic->>'code'      AS "Item Code",
-      MAX(ic->>'description') AS "Description",
       SUM(COALESCE(NULLIF(ic->>'quantity','')::int, 1))::int AS "Total Qty"
     FROM {formsTable} f
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
     WHERE f.cohort = :cohort
       AND ic ? 'code'
-      AND (pd->>'patientAttended')::boolean = true
+      AND (pd->>'patient_attended')::boolean = true
     GROUP BY f.student_number, f.student_name, ic->>'code'
     ORDER BY f.student_name, "Total Qty" DESC;
     """
-    return readDf(engine, sql, {"cohort": cohort})
+    df = readDf(engine, sql, {"cohort": cohort})
+    descMap = getItemCodeDescriptionMap(engine, cohort, formsTable)
+    # Restore the Description column (position 3) sourced from the schema snapshot.
+    descValues = df["Item Code"].map(lambda c: descMap.get(str(c).strip())) if not df.empty else df.get("Item Code")
+    df.insert(3, "Description", descValues if not df.empty else [])
+    return df
 
 
-def getCafFinalEvalScoreStudent(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getCafFinalEvalScoreStudent(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     WITH itemScores AS (
       SELECT f.assessmentid, f.form_code, f.cohort, kv.key AS mc,
-        CASE kv.value
+        -- v3 checklist values are objects {{"key":"O1","value":"Done well"}}; v2 were plain
+        -- strings. COALESCE reads the label from either shape.
+        CASE COALESCE(kv.value->>'value', kv.value#>>'{{}}')
           WHEN 'Done well'      THEN 1.0
           WHEN 'Done'           THEN 0.8
           WHEN 'Mostly done'    THEN 0.6
@@ -473,7 +776,7 @@ def getCafFinalEvalScoreStudent(engine, cohort, formsTable="dds4_boh3_forms", fi
           ELSE NULL
         END::numeric AS score
       FROM {formsTable} f
-      CROSS JOIN LATERAL jsonb_each_text(
+      CROSS JOIN LATERAL jsonb_each(
         COALESCE(f.student_data->'checklists'->'checklist-caf-final-eval', '{{}}'::jsonb)
       ) kv(key, value)
       WHERE {whereClause}
@@ -485,10 +788,12 @@ def getCafFinalEvalScoreStudent(engine, cohort, formsTable="dds4_boh3_forms", fi
     return readDf(engine, sql, params)
 
 
-def getAdditionalConcerns(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getAdditionalConcerns(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
-    SELECT cohort AS "Cohort", student_name AS "Student Name", date_trunc('day', datetimeutc) AS "Date",
+    SELECT cohort AS "Cohort", student_name AS "Student Name",
+           student_number AS "Student ID", rotation AS "Rotation",
+           date_trunc('day', datetimeutc) AS "Date",
            assessor_name AS "Assessor Name", additional_concerns AS "Additional Concerns"
     FROM {formsTable}
     WHERE {whereClause}
@@ -500,13 +805,14 @@ def getAdditionalConcerns(engine, cohort, formsTable="dds4_boh3_forms", filters=
     return df
 
 
-def getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms", filters=None,
+def getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None,
                                extractValue='clinical-incident', colName='Clinical Incidents'):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT
       f.cohort AS "Cohort", date_trunc('day', f.datetimeutc) AS "Date",
       f.assessor_name AS "Assessor Name", f.student_name AS "Student Name",
+      f.student_number AS "Student ID", f.rotation AS "Rotation",
       STRING_AGG(DISTINCT codes_agg.codes, '; ') AS "Item Codes",
       STRING_AGG(ci->>'value', '; ' ORDER BY ci->>'name') AS "{colName}"
       
@@ -516,12 +822,13 @@ def getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms", fil
     ) AS ci ON TRUE
     LEFT JOIN LATERAL (
       SELECT STRING_AGG(DISTINCT ic->>'code', ', ' ORDER BY ic->>'code') AS codes
-      FROM jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
       WHERE ic ? 'code'
     ) codes_agg ON TRUE
     WHERE {whereClause} AND ci IS NOT NULL
-    GROUP BY f.cohort, date_trunc('day', f.datetimeutc), f.assessor_name, f.student_name
+    GROUP BY f.cohort, date_trunc('day', f.datetimeutc), f.assessor_name, f.student_name,
+             f.student_number, f.rotation
     ORDER BY date_trunc('day', f.datetimeutc), f.assessor_name;
     """
     df = readDf(engine, sql, params)
@@ -529,7 +836,7 @@ def getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms", fil
     return df
 
 
-def getPatientCountPerRow(engine, cohort, formsTable="dds4_boh3_forms", attended=True, filters=None):
+def getPatientCountPerRow(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None):
     whereClause, params = _where(cohort, filters)
     params["attended"] = attended
     sql = f"""
@@ -540,7 +847,7 @@ def getPatientCountPerRow(engine, cohort, formsTable="dds4_boh3_forms", attended
       SELECT * FROM jsonb_array_elements(
         CASE WHEN jsonb_typeof(patient_data) = 'array' THEN patient_data ELSE '[]'::jsonb END
       ) elem
-      WHERE (elem->>'patientAttended')::boolean = :attended
+      WHERE (elem->>'patient_attended')::boolean = :attended
     ) pd ON TRUE
     WHERE {whereClause}
     GROUP BY assessmentid, form_code, student_name;
@@ -548,28 +855,28 @@ def getPatientCountPerRow(engine, cohort, formsTable="dds4_boh3_forms", attended
     return readDf(engine, sql, params)
 
 
-def getEntrustmentSummary(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getEntrustmentSummary(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT
-      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'scale','')
+      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','')
         WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
       END::smallint AS entrustment,
       COUNT(*)::bigint AS cnt
     FROM {formsTable}
     WHERE {whereClause}
-      AND assessor_data->'scales'->'scale-entrustment'->>'scale' IS NOT NULL
+      AND assessor_data->'scales'->'scale-entrustment'->>'key' IN ('S1','S2','S3','S4')
     GROUP BY entrustment
     ORDER BY entrustment;
     """
     return readDf(engine, sql, params)
 
 
-def getAvgEntrustment(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getAvgEntrustment(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT ROUND(AVG(
-      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'scale','')
+      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','')
         WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4 ELSE NULL
       END
     )::numeric, 2) AS avgEntrustment
@@ -579,18 +886,29 @@ def getAvgEntrustment(engine, cohort, formsTable="dds4_boh3_forms", filters=None
     return readDf(engine, sql, params)
 
 
-def getEntrustmentPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms"):
+def getEntrustmentPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms_v3", rotationRange=None):
+    """Per-student entrustment breakdown.
+
+    rotationRange: optional (lo, hi) inclusive tuple of rotation numbers. Filters to forms whose
+    rotation number (parsed robustly from 'Rotation 6' or 'R6') falls within [lo, hi].
+    """
+    rotationClause = ""
+    if rotationRange is not None:
+        rotationClause = ("AND NULLIF(regexp_replace(COALESCE(rotation,''),'[^0-9]','','g'),'')::int "
+                          "BETWEEN :rotLo AND :rotHi")
     sql = f"""
     WITH base AS (
       SELECT
         student_number,
         student_name,
-        CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'scale','')
+        CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','')
           WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
         END::smallint AS entrustment,
-        assessor_data->'multi-select' AS multi
+        assessor_data->'multi-select' AS multi,
+        NULLIF(TRIM(additional_concerns),'') AS additional_concerns
       FROM {formsTable}
       WHERE cohort = :cohort
+      {rotationClause}
       --  AND submitted_by_assessor
     )
     SELECT
@@ -603,7 +921,6 @@ def getEntrustmentPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms"):
       COUNT(*) FILTER (WHERE entrustment = 4) AS "Entrustment Lvl 4",
       ROUND(AVG(entrustment)::numeric, 2)     AS "Entrustment Avg",
 
-      
       COALESCE(SUM(jsonb_array_length(COALESCE(multi->'weakness-timeliness','[]'::jsonb))),0)::int AS "Weakness Timeliness",
       COALESCE(SUM(jsonb_array_length(COALESCE(multi->'weakness-communication','[]'::jsonb))),0)::int AS "Weakness Communication",
       COALESCE(SUM(jsonb_array_length(COALESCE(multi->'weakness-technical-skills','[]'::jsonb))),0)::int AS "Weakness Technical",
@@ -613,15 +930,21 @@ def getEntrustmentPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms"):
       COALESCE(SUM(jsonb_array_length(COALESCE(multi->'weakness-knowledge-clinical-reasoning','[]'::jsonb))),0)::int AS "Weakness Clinical Reasoning",
       COALESCE(SUM(jsonb_array_length(COALESCE(multi->'weakness-other','[]'::jsonb))),0)::int AS "Weakness Other",
       COALESCE(SUM(jsonb_array_length(COALESCE(multi->'strengths','[]'::jsonb))),0)::int AS "Commendations",
-      COUNT(*) AS "Total Forms"
+      COUNT(*) AS "Total Forms",
+
+      COUNT(*) FILTER (WHERE jsonb_array_length(COALESCE(multi->'clinical-incident','[]'::jsonb)) > 0)::int AS "Clinical Incidents",
+      COUNT(*) FILTER (WHERE additional_concerns IS NOT NULL)::int AS "Additional Concerns"
     FROM base
     GROUP BY student_number, student_name
     ORDER BY student_name;
     """
-    return readDf(engine, sql, {"cohort": cohort})
+    params = {"cohort": cohort}
+    if rotationRange is not None:
+        params["rotLo"], params["rotHi"] = rotationRange
+    return readDf(engine, sql, params)
 
 
-def getNotSubmitted(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getNotSubmitted(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT assessmentid, form_code, student_name, assessor_name,
@@ -634,7 +957,7 @@ def getNotSubmitted(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
     return readDf(engine, sql, params)
 
 
-def createPatientStatsPerClinic(engine, cohort, formsTable="dds4_boh3_forms", attended=True, filters=None):
+def createPatientStatsPerClinic(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None):
     countsperrow = getPatientCountPerRow(engine, cohort, formsTable, attended, filters)
     studentClinicDf = countsperrow.groupby(
         ["external_clinic", "student_name"], as_index=False
@@ -655,10 +978,10 @@ def createPatientStatsPerClinic(engine, cohort, formsTable="dds4_boh3_forms", at
     return clinicStats[["external_clinic", "patientsSummary"]], studentClinicDf
 
 
-def createPatientStatsPerClinicPerRotation(engine, cohort, formsTable="dds4_boh3_forms", attended=True):
+def createPatientStatsPerClinicPerRotation(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True):
     filepath = f"BOH3_DDS4/patient_stats_by_clinic_{cohort}.xlsx"
     studentclinicfilepath = f"BOH3_DDS4/patient_stats_by_clinic_{cohort}_detailed.xlsx"
-    for rotation in ["Rotation 1", "Rotation 2", "Rotation 3"]:
+    for rotation in ["Rotation 1", "Rotation 2", "Rotation 3", "Rotation 4", "Rotation 5"]:
         kwargs = getmodeArgs(filepath)
         kwargs2 = getmodeArgs(studentclinicfilepath)
         filters = {"rotation": rotation}
@@ -671,7 +994,7 @@ def createPatientStatsPerClinicPerRotation(engine, cohort, formsTable="dds4_boh3
             studentClinicDf.to_excel(writer, sheet_name=rotation, index=False)
 
 
-def getCounts(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     whereClause, params = _where(cohort, filters)
     sql = f"""
     SELECT
@@ -686,10 +1009,330 @@ def getCounts(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3a. PBN + Leave columns (external workbooks, matched by Student ID / name)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PBN_FILE   = "MDS Professional Behaviour Notification Form.xlsx"
+# Raw Qualtrics leave export (dates entered as dd/mm/yyyy text; row 0 = question codes,
+# row 1 = human-readable headers, data from row 2).
+LEAVE_FILE = "Melbourne Dental School Student Leave Form_July 31, 2026_13.05.xlsx"
+
+# Official Victorian public holidays 2026 (business.vic.gov.au). Weekend-dated ones
+# are harmless to include since np.busday_count already excludes weekends.
+VIC_HOLIDAYS_2026 = [
+    "2026-01-01",  # New Year's Day
+    "2026-01-26",  # Australia Day
+    "2026-03-09",  # Labour Day
+    "2026-04-03",  # Good Friday
+    "2026-04-06",  # Easter Monday
+    "2026-06-08",  # King's Birthday
+    "2026-09-25",  # Friday before AFL Grand Final
+    "2026-11-03",  # Melbourne Cup
+    "2026-12-25",  # Christmas Day
+    "2026-12-28",  # Boxing Day (observed Mon, as 26 Dec is a Saturday)
+]
+
+
+def _normName(x):
+    return re.sub(r"\s+", " ", str(x).strip().lower()) if pd.notna(x) else ""
+
+
+def _parseLeaveDate(v):
+    """Parse a leave date. The raw Qualtrics export stores dates as dd/mm/yyyy text, so string
+    cells are parsed day-first; genuine datetime cells (rare) are trusted as-is. Junk like 'test'
+    or blanks return None."""
+    from datetime import datetime, date
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, (datetime, pd.Timestamp, date)):
+        return pd.Timestamp(v).normalize()
+    s = str(v).strip()
+    m = re.search(r"\d{1,4}[/\-.]\d{1,2}[/\-.]\d{1,4}", s)  # pull date out of "(02/04/2026)" etc.
+    if m:
+        s = m.group(0)
+    elif re.fullmatch(r"\d{8}", s):                          # ddmmyyyy typo e.g. 20052026
+        try:
+            return pd.Timestamp(datetime.strptime(s, "%d%m%Y"))
+        except ValueError:
+            return None
+    else:
+        return None
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return pd.Timestamp(datetime.strptime(s, fmt))
+        except ValueError:
+            pass
+    try:
+        return pd.to_datetime(s, dayfirst=True)
+    except Exception:
+        return None
+
+
+def _vicBusinessDays(a, b, year=2026, holidays=None):
+    """Inclusive VIC working days between a and b, clamped to `year`."""
+    hol = np.array(holidays or VIC_HOLIDAYS_2026, dtype="datetime64[D]")
+    lo = max(a, pd.Timestamp(f"{year}-01-01"))
+    hi = min(b, pd.Timestamp(f"{year}-12-31"))
+    if hi < lo:
+        return 0
+    return int(np.busday_count(lo.date(), (hi + pd.Timedelta(days=1)).date(), holidays=hol))
+
+
+def leaveWorkingDays(planned, start, end, year=2026):
+    """Category-guided working-day count for one leave row.
+
+    - 'Hours ...' or 'Half day' (partial-day) -> 0 days.
+    - '1 day' -> 1 working day on the Start date (0 if Start is a weekend/holiday).
+    - '2 or more days' / 'Other' (and anything else) -> inclusive working days across
+      Start->End, with a year-typo guard and range-ordering safety.
+    """
+    p = str(planned).strip().lower()
+    if p.startswith("hours") or p == "half day":
+        return 0
+    s = _parseLeaveDate(start)
+    e = _parseLeaveDate(end)
+    if p == "1 day":
+        return _vicBusinessDays(s, s, year) if s is not None else 0
+    if s is None and e is None:
+        return 0
+    if s is None:
+        return _vicBusinessDays(e, e, year)
+    if e is None:
+        return _vicBusinessDays(s, s, year)
+    if e.year != year and s.year == year:      # year-typo guard (e.g. end 2027)
+        e = e.replace(year=year)
+    if s.year != year and e.year == year:
+        s = s.replace(year=year)
+    if e < s:                                  # safety: order the range
+        s, e = e, s
+    return _vicBusinessDays(s, e, year)
+
+
+def getLeaveDaysByStudent(ids, year=2026, leaveFile=LEAVE_FILE):
+    """Return {student_id: total VIC working days of leave in `year`} for the given ids.
+
+    Reads the raw Qualtrics leave export (header on the 2nd row). Keeps only finished, non-preview
+    responses, matches on Student ID, and sums working days per the category-guided rule."""
+    ids = set(int(i) for i in ids)
+    lv = pd.read_excel(leaveFile, sheet_name=0, header=1)
+
+    def _find(pred):
+        for c in lv.columns:
+            if pred(str(c)):
+                return c
+        return None
+
+    idCol       = _find(lambda c: c.strip() == "Student ID")
+    startCol    = _find(lambda c: c.startswith("Absence Start Date"))
+    endCol      = _find(lambda c: c.startswith("Absence End Date"))
+    dayCol      = _find(lambda c: "How many days" in c and "Selected Choice" in c)
+    finishedCol = _find(lambda c: c.strip() == "Finished")
+    respCol     = _find(lambda c: c.strip() == "Response Type")
+
+    if finishedCol:
+        lv = lv[lv[finishedCol].astype(str).str.strip().str.lower() == "true"]
+    if respCol:
+        lv = lv[lv[respCol].astype(str).str.strip() != "Survey Preview"]
+
+    def _digits(x):
+        d = re.sub(r"\D", "", str(x)) if pd.notna(x) else ""
+        return int(d) if d else None
+
+    lv = lv.copy()
+    lv["_sid"] = lv[idCol].map(_digits)
+    lv = lv[lv["_sid"].isin(ids)]
+    if lv.empty:
+        return {}
+    lv["_days"] = lv.apply(
+        lambda r: leaveWorkingDays(r[dayCol], r[startCol], r[endCol], year), axis=1
+    )
+    return lv.groupby("_sid")["_days"].sum().astype(int).to_dict()
+
+
+def getPbnCountByStudent(rosterDf, year=2026, pbnFile=PBN_FILE):
+    """Return {student_id: # PBNs in `year`}. Matches by Student ID, falling back to name
+    for the many PBN rows that have no Student ID recorded."""
+    id2name = dict(zip(rosterDf["Student ID"].dropna().astype(int), rosterDf["Student Name"]))
+    name2id = {_normName(n): i for i, n in id2name.items()}
+    ids = set(id2name)
+
+    pbn = pd.read_excel(pbnFile, sheet_name="Sheet1")
+
+    def _digits(x):
+        d = re.sub(r"\D", "", str(x)) if pd.notna(x) else ""
+        return int(d) if d else None
+
+    pbn["_id"] = pbn["Student ID (if known)"].map(_digits)
+    pbn["_resolved"] = pbn.apply(
+        lambda r: r["_id"] if r["_id"] in ids else name2id.get(_normName(r["Student Name"])),
+        axis=1,
+    )
+    yr = pd.to_datetime(pbn["Date of incident"], errors="coerce").dt.year
+    pbn = pbn[(pbn["_resolved"].isin(ids)) & ((yr == year) | (yr.isna()))]
+    return pbn.groupby("_resolved").size().astype(int).to_dict()
+
+
+def addPbnLeaveColumns(entrustmentDf, year=2026, pbnFile=PBN_FILE, leaveFile=LEAVE_FILE):
+    """Append 'PBNs {year}' and 'Leave Days {year}' (VIC working days) to an entrustment
+    DataFrame, matched on Student ID. Returns the same df with two new trailing columns."""
+    roster = entrustmentDf[["Student ID", "Student Name"]].copy()
+    try:
+        pbnMap = getPbnCountByStudent(roster, year, pbnFile)
+    except Exception as ex:
+        print(f"[addPbnLeaveColumns] PBN read failed ({ex}); filling 0")
+        pbnMap = {}
+    try:
+        leaveMap = getLeaveDaysByStudent(roster["Student ID"].dropna().astype(int), year, leaveFile)
+    except Exception as ex:
+        print(f"[addPbnLeaveColumns] Leave read failed ({ex}); filling 0")
+        leaveMap = {}
+    sid = entrustmentDf["Student ID"]
+    entrustmentDf[f"PBNs {year}"] = sid.map(lambda x: pbnMap.get(int(x), 0) if pd.notna(x) else 0).astype(int)
+    entrustmentDf[f"Leave Days {year}"] = sid.map(lambda x: leaveMap.get(int(x), 0) if pd.notna(x) else 0).astype(int)
+    return entrustmentDf
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. Summary workbook professional formatting
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Brand palette (matches variableUtils.uniColor navy theme)
+_FMT_NAVY  = "010D44"   # header fill
+_FMT_BAND  = "EEF1F8"   # zebra band (very light navy tint)
+_FMT_WHITE = "FFFFFF"
+_FMT_GRID  = "D9D9D9"   # light grey borders
+
+_FMT_SIDE   = Side(style="thin", color=_FMT_GRID)
+_FMT_BORDER = Border(left=_FMT_SIDE, right=_FMT_SIDE, top=_FMT_SIDE, bottom=_FMT_SIDE)
+_FMT_HEADER_FILL = PatternFill("solid", fgColor=_FMT_NAVY)
+_FMT_BAND_FILL   = PatternFill("solid", fgColor=_FMT_BAND)
+_FMT_HEADER_FONT = Font(name="Calibri", bold=True, color=_FMT_WHITE, size=11)
+_FMT_DATA_FONT   = Font(name="Calibri", size=11)
+# conditional-format flag fills MUST use bgColor to render in a differential style
+_FMT_INCIDENT_FILL = PatternFill(bgColor="FFC7CE")   # red
+_FMT_INCIDENT_FONT = Font(name="Calibri", size=11, color="9C0006", bold=True)
+_FMT_CONCERN_FILL  = PatternFill(bgColor="FFEB9C")   # amber
+_FMT_CONCERN_FONT  = Font(name="Calibri", size=11, color="9C6500", bold=True)
+
+# long free-text columns: left-align, single line, wide (no wrap)
+_FMT_TEXT_COLS = {"Clinical Incidents", "Additional Concerns", "Description", "Item Codes"}
+_FMT_NUMFMT    = {"Entrustment Avg": "0.00"}
+
+
+def _fmtColWidth(header, values, isText):
+    if isText:
+        return 60
+    longest = max([len(str(header))] + [len(str(v)) for v in values if v is not None] or [0])
+    return max(9, min(28, longest + 2))
+
+
+def _fmtSheet(ws):
+    """Foundational styling: navy headers, freeze panes, zebra banding, borders, widths."""
+    rows = list(ws.iter_rows())
+    if not rows:
+        return
+    headers = [c.value for c in rows[0]]
+    nCols = len(headers)
+    freezeCol = "C" if ("Student ID" in headers and "Student Name" in headers) else "A"
+    ws.freeze_panes = f"{freezeCol}2"
+
+    ws.row_dimensions[1].height = 30
+    for cell in rows[0]:
+        cell.fill = _FMT_HEADER_FILL
+        cell.font = _FMT_HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = _FMT_BORDER
+
+    for i, row in enumerate(rows[1:], start=2):
+        band = (i % 2 == 0)
+        for j, cell in enumerate(row):
+            header = headers[j] if j < nCols else ""
+            isText = any(t in str(header) for t in _FMT_TEXT_COLS)
+            cell.font = _FMT_DATA_FONT
+            cell.border = _FMT_BORDER
+            if band:
+                cell.fill = _FMT_BAND_FILL
+            cell.alignment = Alignment(horizontal="left" if isText else "center",
+                                       vertical="center", wrap_text=False)
+            if header in _FMT_NUMFMT and isinstance(cell.value, (int, float)):
+                cell.number_format = _FMT_NUMFMT[header]
+
+    for j in range(nCols):
+        header = headers[j]
+        isText = any(t in str(header) for t in _FMT_TEXT_COLS)
+        colVals = [rows[r][j].value for r in range(1, min(len(rows), 60))]
+        ws.column_dimensions[get_column_letter(j+1)].width = _fmtColWidth(header, colVals, isText)
+
+
+def _fmtEntrustmentHighlights(ws):
+    """Conditional formatting for the Entrustment sheets."""
+    rows = list(ws.iter_rows())
+    if len(rows) < 2:
+        return
+    headers = [c.value for c in rows[0]]
+    last = len(rows)
+
+    def colOf(name):
+        return get_column_letter(headers.index(name) + 1) if name in headers else None
+
+    # Entrustment Avg -> red/amber/green 3-colour scale
+    c = colOf("Entrustment Avg")
+    if c:
+        ws.conditional_formatting.add(f"{c}2:{c}{last}", ColorScaleRule(
+            start_type="num", start_value=1, start_color="F8696B",
+            mid_type="num",   mid_value=2.5, mid_color="FFEB84",
+            end_type="num",   end_value=4,   end_color="63BE7B"))
+
+    # Clinical Incidents / PBNs / Additional Concerns > 0 -> filled flag cell
+    for name, fill, font in (("Clinical Incidents", _FMT_INCIDENT_FILL, _FMT_INCIDENT_FONT),
+                             ("PBNs 2026", _FMT_INCIDENT_FILL, _FMT_INCIDENT_FONT),
+                             ("Additional Concerns", _FMT_CONCERN_FILL, _FMT_CONCERN_FONT)):
+        c = colOf(name)
+        if c:
+            ws.conditional_formatting.add(f"{c}2:{c}{last}", CellIsRule(
+                operator="greaterThan", formula=["0"], fill=fill, font=font))
+
+    # Weakness block (excluding "Weakness Other") -> subtle white->orange heatmap per column
+    for i, h in enumerate(headers):
+        if str(h).startswith("Weakness") and str(h) != "Weakness Other":
+            c = get_column_letter(i + 1)
+            ws.conditional_formatting.add(f"{c}2:{c}{last}", ColorScaleRule(
+                start_type="num", start_value=0, start_color="FFFFFF",
+                end_type="max", end_color="F4B183"))
+
+
+def formatSummaryExcel(path, cohort, sheetOrder=None):
+    """Apply professional formatting to an already-written *_Summary_Details.xlsx workbook.
+
+    - Navy branded headers, frozen panes, zebra banding, borders, number formats, column widths.
+    - Conditional highlights on any sheet whose title starts with 'Entrustment'.
+    - Optionally reorders sheets to `sheetOrder` (falls back to keeping rotation sheets after Entrustment).
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(path)
+
+    if sheetOrder is None:
+        sheetOrder = [f"Age Counts {cohort}", f"Entrustment {cohort}",
+                      f"Entrustment R1-3 {cohort}", f"Entrustment R4-6 {cohort}",
+                      f"Incidents {cohort}", f"Concerns {cohort}",
+                      f"Merged Item-Section {cohort}", f"Section Pivot {cohort}"]
+    byTitle = {ws.title: ws for ws in wb._sheets}
+    wb._sheets = ([byTitle[t] for t in sheetOrder if t in byTitle]
+                  + [ws for ws in wb._sheets if ws.title not in sheetOrder])
+
+    for ws in wb.worksheets:
+        _fmtSheet(ws)
+        if ws.title.startswith("Entrustment"):
+            _fmtEntrustmentHighlights(ws)
+    wb.save(path)
+    return path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 4. Cohort summary report (PDF)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def getFrontPageSummaryTable(engine, cohort, formsTable="dds4_boh3_forms", filters=None):
+def getFrontPageSummaryTable(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
     """Build the single-row summary DataFrame for the cohort front page."""
     totalFormsDf = getTotalForms(engine, cohort, formsTable, filters)
     ageDf = getAgeCounts(engine, cohort, formsTable, filters)
@@ -717,10 +1360,13 @@ def getFrontPageSummaryTable(engine, cohort, formsTable="dds4_boh3_forms", filte
 
     ageStr = f"0–6: {age0to6}<br/> 7–17: {age7to17}<br/> 18+: {age18plus}"
     patientStatsStr = f"{int(avgPts)} ({int(minPts)} - {int(maxPts)})"
-    clinicStr = "<br/>".join(f"{row.clinic}: {row.patients}" for _, row in clinicDf.iterrows())
+    clinicStr = "<br/>".join(f"{row.clinic}: {row.patients}" for _, row in clinicDf.iterrows() if row.patients>=5)
     topItemsStr = ", ".join(f"{row.itemcode}" for _, row in topItemsDf.iterrows())
     cafScoreStr = f"{cafScore:.2f}" if cafScore is not None else "NA"
-    entrustmentStr = "<br/>".join(f"S{int(row.entrustment)}: {row.cnt}" for _, row in entrustmentDf.iterrows())
+    entrustmentStr = "<br/>".join(
+        f"S{int(row.entrustment)}: {row.cnt}"
+        for _, row in entrustmentDf.iterrows() if pd.notna(row.entrustment)
+    )
 
     summary = {
         "Total forms": totalForms,
@@ -733,7 +1379,7 @@ def getFrontPageSummaryTable(engine, cohort, formsTable="dds4_boh3_forms", filte
         "Top item codes": topItemsStr,
         "Avg CAF final eval score (student)": cafScoreStr,
         "Entrustment levels": entrustmentStr,
-        "Avg Entrustment": getAvgEntrustment(engine, cohort).iloc[0, 0],
+        "Avg Entrustment": getAvgEntrustment(engine, cohort, filters=filters).iloc[0, 0],
     }
     return pd.DataFrame([summary])
 
@@ -771,13 +1417,61 @@ def buildFrontPage(engine, cohort, filters, elements, subheadingColor,
     img = addPlotImage(fig, 0.9)
     elements.append(Spacer(1, 24))
     elements.append(img)
+    return metrics
+
+
+def getRotationRange(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None, minForms=20):
+    """Return (minNum, maxNum) of rotation numbers for the cohort.
+
+    The MAX is gated to rotations backed by at least `minForms` forms, so a stray one-off
+    entry (e.g. a single form logged against a far-future rotation) doesn't inflate the range.
+    If no rotation reaches the threshold (e.g. very early in a cohort) it falls back to the raw
+    max. MIN is the earliest rotation present, clamped to not exceed the chosen max. Robust to
+    the rotation column holding either a label ('Rotation 6') or a code ('R6'). Returns
+    (None, None) if no rotations at all.
+    """
+    whereClause, params = _where(cohort, filters)
+    params = dict(params)
+    params["min_forms"] = int(minForms)
+    sql = f"""
+      WITH rots AS (
+        SELECT NULLIF(regexp_replace(rotation, '[^0-9]', '', 'g'), '')::int AS rnum,
+               COUNT(*)::int AS n
+        FROM {formsTable}
+        WHERE {whereClause} AND rotation IS NOT NULL AND btrim(rotation) <> ''
+        GROUP BY 1
+      )
+      SELECT
+        MIN(rnum) FILTER (WHERE rnum IS NOT NULL)                       AS min_all,
+        MAX(rnum) FILTER (WHERE rnum IS NOT NULL)                       AS max_all,
+        MAX(rnum) FILTER (WHERE rnum IS NOT NULL AND n >= :min_forms)   AS max_ok
+      FROM rots;
+    """
+    df = readDf(engine, sql, params)
+    if df.empty or pd.isna(df.iloc[0]["max_all"]):
+        return None, None
+    row = df.iloc[0]
+    hi = int(row["max_ok"]) if not pd.isna(row["max_ok"]) else int(row["max_all"])
+    lo = min(int(row["min_all"]), hi)
+    return lo, hi
+
+
+def buildBannerSubtitle(engine, cohort, formsTable="dds4_boh3_forms_v3"):
+    """Professional banner subtitle: rotation range covered + report generation date.
+    e.g. 'Rotations 1 to 6   •   Generated 31 July 2026'."""
+    loRot, hiRot = getRotationRange(engine, cohort, formsTable)
+    creationDate = pd.Timestamp.now().strftime("%d %B %Y")
+    if loRot is not None:
+        rotPart = f"Rotation {loRot}" if loRot == hiRot else f"Rotations {loRot} to {hiRot}"
+        return f"{rotPart}   •   Generated {creationDate}"
+    return f"Generated {creationDate}"
 
 
 def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
                           subheadingStyle, subheadingColor, concernsDf, incidentsDf,
                           patientPerStudentDf, pageSize, rightMargin, leftMargin,
                           topMargin, bottomMargin, tableTextStyleSmall, uniColor, figSize,
-                          superExcelPath=None):
+                          superExcelPath=None, addClinics = False):
     elements = []
     elements.append(Spacer(1, 72))
     doc = SimpleDocTemplate(outPath, pagesize=pageSize, rightMargin=rightMargin,
@@ -804,22 +1498,60 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     elements.append(img)
     elements.append(PageBreak())
 
-    # Per-rotation summaries
-    for rotation in ["Rotation 1", "Rotation 2", "Rotation 3", "Rotation 4", "Rotation 5"]:
-        elements.append(Paragraph(f"{rotation} Summary", subheadingStyle))
-        buildFrontPage(engine, cohort, filters={"rotation": rotation}, elements=elements,
-                       subheadingColor=subheadingColor, subheadingStyle=subheadingStyle,
-                       tableTextStyleSmall=tableTextStyleSmall, uniColor=uniColor, figSize=figSize)
-        elements.append(PageBreak())
+    # # Per-rotation summaries
+    # for rotation in ["Rotation 1", "Rotation 2", "Rotation 3", "Rotation 4", "Rotation 5"]:
+    #     elements.append(Paragraph(f"{rotation} Summary", subheadingStyle))
+    #     buildFrontPage(engine, cohort, filters={"rotation": rotation}, elements=elements,
+    #                    subheadingColor=subheadingColor, subheadingStyle=subheadingStyle,
+    #                    tableTextStyleSmall=tableTextStyleSmall, uniColor=uniColor, figSize=figSize)
+    #     elements.append(PageBreak())
+
+    # Per clinic summaries (only with count>=10)
+    
+    allClinics = getClinicPatientCounts(engine, cohort, filters=None)
+    clinicMetrics = {}
+    for _, row in allClinics.iterrows():
+        clinic = row["clinic"]
+        count = row["patients"]
+        if count < 10:
+            continue
+        # Metrics are collected for EVERY qualifying clinic so clinic_metrics_<cohort>.xlsx
+        # is always complete. ``addClinics`` only controls whether the per-clinic pages are
+        # rendered into the PDF: when False the flowables go to a throwaway list, so
+        # buildFrontPage still returns its metrics but nothing reaches the document.
+        clinicElements = elements if addClinics else []
+        if addClinics:
+            clinicElements.append(Paragraph(f"Clinic: {clinic} (n={count})", subheadingStyle))
+        metrics = buildFrontPage(engine, cohort, filters={"external_clinic": clinic}, elements=clinicElements,
+                    subheadingColor=subheadingColor, subheadingStyle=subheadingStyle,
+                    tableTextStyleSmall=tableTextStyleSmall, uniColor=uniColor, figSize=figSize)
+        clinicMetrics[clinic] = metrics
+        if addClinics:
+            clinicElements.append(PageBreak())
+
+    # Guard: a cohort with no clinic at >=10 patients leaves clinicMetrics empty, and
+    # reduce() over an empty list raises "reduce() of empty iterable with no initial value".
+    if clinicMetrics:
+        combined = reduce(
+            lambda left, right: pd.merge(left, right, on="Metric", how="outer"),
+            [df.rename(columns={"Value": clinic}) for clinic, df in clinicMetrics.items()]
+        )
+        # convert <br/> to newlines for Excel readability in Entrustment levels and Patient age distribution metrics
+        combined = combined.map(lambda x: x.replace("<br/>", "\n") if isinstance(x, str) else x)
+        combined.to_excel(f"BOH3_DDS4/clinic_metrics_{cohort}.xlsx", index=False)
+    else:
+        print(f"{cohort}: no clinic reached 10 patients - clinic_metrics_{cohort}.xlsx not written")
 
     # Concerns and incidents
     hasConcerns = concernsDf is not None and not concernsDf.empty
     hasIncidents = incidentsDf is not None and not incidentsDf.empty
     if hasConcerns or hasIncidents:
         if hasConcerns:
+            # PDF table excludes Student ID / Rotation (Excel keeps them)
+            concernsPdfDf = concernsDf.drop(columns=["Student ID", "Rotation"], errors="ignore")
             concernsTable = createTable(
-                concernsDf, colRatio=[1, 1, 1, 1, 3],
-                customTextCols=list(range(concernsDf.shape[1])),
+                concernsPdfDf, colRatio=[1, 1, 1, 1, 3],
+                customTextCols=list(range(concernsPdfDf.shape[1])),
                 bottomPadding=6, topPadding=6, title="Additional Concerns",
                 titleStyle=subheadingStyle, headerColor=subheadingColor,
                 tableTextStyle=tableTextStyleSmall,
@@ -827,10 +1559,11 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
             elements.append(concernsTable)
             elements.append(Spacer(1, 24))
         if hasIncidents:
-            incidentsDf.drop(columns=["Cohort"], inplace=True, errors="ignore")
+            # PDF table excludes Cohort / Student ID / Rotation (Excel keeps Student ID + Rotation)
+            incidentsPdfDf = incidentsDf.drop(columns=["Cohort", "Student ID", "Rotation"], errors="ignore")
             incidentsTable = createTable(
-                incidentsDf, colRatio=[1, 1, 1, 1, 3],
-                customTextCols=list(range(incidentsDf.shape[1])),
+                incidentsPdfDf, colRatio=[1, 1, 1, 1, 3],
+                customTextCols=list(range(incidentsPdfDf.shape[1])),
                 bottomPadding=6, topPadding=6, title="Clinical Incidents",
                 titleStyle=subheadingStyle, headerColor=subheadingColor,
                 tableTextStyle=tableTextStyleSmall,
@@ -842,8 +1575,17 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     ageCountsDf['Total Patients'] = ageCountsDf['age0to6'] + ageCountsDf['age7to17'] + ageCountsDf['age18plus']
     ageCountsDf.sort_values('Total Patients', ascending=False, inplace=True)
     entrustmentDf = getEntrustmentPerStudentBatch(engine, cohort) # batch entrustment data
+    # Append PBN count + Leave working-days (2026) from the external workbooks (main sheet only)
+    entrustmentDf = addPbnLeaveColumns(entrustmentDf, year=2026)
     entrustmentDf.sort_values('Entrustment Avg', ascending=False, inplace=True)
-
+    # Rotation-split entrustment breakdowns (R1-3 and R4-6) for separate Excel sheets
+    entrustmentDfR13 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(1, 3))
+    entrustmentDfR13.sort_values('Entrustment Avg', ascending=False, inplace=True)
+    entrustmentDfR46 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(4, 6))
+    entrustmentDfR46.sort_values('Entrustment Avg', ascending=False, inplace=True)
+    entrustmentDfR57 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(5, 7))
+    entrustmentDfR57.sort_values('Entrustment Avg', ascending=False, inplace=True)
+    entrustmentDfR7 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(7, 7))
     # Load section mapping and merge with item codes to get section-level summaries later if needed
     itemsDf = getItemCodesPerStudentBatch(engine, cohort)
     mappingDf = pd.read_excel(variableUtils.itemSectionMappingFile)
@@ -859,28 +1601,35 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     merged["Section"] = merged["Section"].fillna("Unmapped")
 
 
-    sectionPivot = merged.pivot_table(index=["Student Name"], columns="Section", values="Total Qty", aggfunc="sum", fill_value=np.nan).reset_index()
+    sectionPivot = merged.pivot_table(index=["Student ID", "Student Name"], columns="Section", values="Total Qty", aggfunc="sum", fill_value=np.nan).reset_index()
     sectionPivot.columns.name = None
-    sectionPivot["Total"] = sectionPivot.iloc[:, 1:].sum(axis=1)
+    _sectionCols = [c for c in sectionPivot.columns if c not in ("Student ID", "Student Name")]
+    sectionPivot["Total"] = sectionPivot[_sectionCols].sum(axis=1)
     sectionPivot.sort_values("Student Name", inplace=True)
 
     # save to excel for checking
     if superExcelPath:
+        # Incidents Excel sheet keeps Student ID + Rotation but not Cohort (matches prior layout)
+        incidentsExcelDf = incidentsDf.drop(columns=["Cohort"], errors="ignore")
+        # Age Counts display copy: Student ID + Student Name up front (raw df keeps lowercase for downstream merges)
+        ageCountsExcelDf = ageCountsDf.rename(columns={"student_number": "Student ID", "student_name": "Student Name"})
         modeArgs = getmodeArgs(superExcelPath)
         with pd.ExcelWriter(superExcelPath, **modeArgs) as writer:
-            ageCountsDf.to_excel(writer, sheet_name=f"Age Counts {cohort}", index=False)
+            ageCountsExcelDf.to_excel(writer, sheet_name=f"Age Counts {cohort}", index=False)
             entrustmentDf.to_excel(writer, sheet_name=f"Entrustment {cohort}", index=False)
-            incidentsDf.to_excel(writer, sheet_name=f"Incidents {cohort}", index=False)
+            entrustmentDfR13.to_excel(writer, sheet_name=f"Entrustment R1-3 {cohort}", index=False)
+            entrustmentDfR46.to_excel(writer, sheet_name=f"Entrustment R4-6 {cohort}", index=False)
+            entrustmentDfR57.to_excel(writer, sheet_name=f"Entrustment R5-7 {cohort}", index=False)
+            entrustmentDfR7.to_excel(writer, sheet_name=f"Entrustment R7 {cohort}", index=False)
+
+            incidentsExcelDf.to_excel(writer, sheet_name=f"Incidents {cohort}", index=False)
             concernsDf.to_excel(writer, sheet_name=f"Concerns {cohort}", index=False)
             merged.to_excel(writer, sheet_name=f"Merged Item-Section {cohort}", index=False)
             sectionPivot.to_excel(writer, sheet_name=f"Section Pivot {cohort}", index=False)
         
-        # autofit columns in the saved Excel file
-        with pd.ExcelWriter(superExcelPath, engine='openpyxl', mode='a') as writer:
-          workbook = writer.book
-          for sheet_name in writer.sheets:
-              ws = writer.sheets[sheet_name]
-              autoFitColumns(ws)
+        # professional formatting: navy headers, freeze panes, banding, borders, widths,
+        # conditional highlights on the Entrustment sheets, and sheet reordering.
+        formatSummaryExcel(superExcelPath, cohort)
 
     ageCountsDf["Age Count"] = (
         "0-6: " + ageCountsDf["age0to6"].astype(str)
@@ -910,23 +1659,26 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     elements.append(PageBreak())
     elements.append(patientPerStudentTable)
 
-    doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, ""))
+    # Note: More sections can be added here using the same pattern
+
+    bannerSubtitle = buildBannerSubtitle(engine, cohort)
+    doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, bannerSubtitle))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Student-level query functions
 # ═══════════════════════════════════════════════════════════════════════════
 
-def getStudentTopItemCodes(engine, cohort, studentNumber, limit=10, formsTable="dds4_boh3_forms"):
+def getStudentTopItemCodes(engine, cohort, studentNumber, limit=10, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     WITH student_codes AS (
       SELECT
         ic->>'code' AS itemCode,
-        MAX(ic->>'description') AS description,
+        NULL::text AS description,   -- v3 item_codes carry no description; filled from schema snapshot below
         SUM(COALESCE(NULLIF((ic->>'quantity')::int, NULL), 1))::int AS totalQty
       FROM {formsTable} f
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
       WHERE f.cohort = :cohort AND f.student_number = :studentNumber AND ic ? 'code'
       GROUP BY 1
     ),
@@ -935,8 +1687,8 @@ def getStudentTopItemCodes(engine, cohort, studentNumber, limit=10, formsTable="
         ic->>'code' AS itemCode,
         SUM(COALESCE(NULLIF((ic->>'quantity')::int, NULL), 1))::numeric AS cohortTotal
       FROM {formsTable} f
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(pd->'itemCodes','[]'::jsonb)) ic
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
       WHERE f.cohort = :cohort AND ic ? 'code'
       GROUP BY 1
     ),
@@ -954,10 +1706,311 @@ def getStudentTopItemCodes(engine, cohort, studentNumber, limit=10, formsTable="
     ORDER BY s.totalQty DESC, s.itemCode
     LIMIT :limit;
     """
-    return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber, "limit": int(limit)})
+    df = readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber, "limit": int(limit)})
+    # v3: item_codes have no inline description — source it from the context_schema_snapshot
+    if not df.empty and "description" in df.columns:
+        try:
+            descMap = getItemCodeDescriptionMap(engine, cohort, formsTable)
+            df["description"] = df["itemcode"].map(descMap)
+        except Exception as ex:
+            print(f"[getStudentTopItemCodes] description map failed: {ex}")
+    return df
 
 
-def getStudentsInCohort(engine, cohort, formsTable="dds4_boh3_forms"):
+
+
+# ── 5.0 Weakness (areas-for-improvement) constants & helpers ────────────────
+# Weaknesses ("areas for improvement") are recorded on the ASSESSOR side as tag
+# arrays under assessor_data->'multi-select'->'weakness-*'. The seven buckets and
+# their friendly labels are the SAME ones the PDF pie and the Feedback sheet use
+# (WEAKNESS_KEY_LABELS, defined in section 9). weakness-other is free text and is
+# handled elsewhere (Comments sheet), not counted here.
+WEAKNESS_TOTAL_COL = "Total areas for improvement"   # sum of the 7 category counts
+WEAKNESS_INCIDENT_COL = "Clinical incidents"         # count of clinical-incident tags
+WEAKNESS_CONCERN_COL = "Concern forms"               # forms with additional_concerns text
+WEAKNESS_ROTATION_COL = "Rotation #"                 # numeric rotation, for grouping
+
+# How the item-code views are split into panels. None → auto: "Rotations 1–3" and
+# "Rotations 4+". To pick your own divisions, call setWeaknessRotationGroups([...])
+# (star-import safe) BEFORE building — both the PDF and the Excel workbook read it, e.g.
+#   setWeaknessRotationGroups([("Rotations 1–4", [1,2,3,4]), ("Rotations 5+", [5,6,7,8,9,10,11,12])])
+WEAKNESS_ROTATION_GROUPS = None
+
+# How many item codes each per-rotation "most areas for improvement" chart/table shows
+# (worst-first). The Excel 'Weakness by Item Code' sheet always lists every code.
+# Raise it to surface more low-frequency codes, e.g. setWeaknessCodeTopN(30).
+WEAKNESS_CODE_TOPN = 20
+
+
+def setWeaknessRotationGroups(groups):
+    """Set the rotation split used by BOTH the PDF and Excel item-code views.
+
+    groups : list of (label, [rotation numbers]), or None to restore the default
+             ("Rotations 1–3" and "Rotations 4+"). Rotation numbers not present in a
+             student's data are ignored, and empty panels are dropped. Example:
+             setWeaknessRotationGroups([("Rotations 1–4",[1,2,3,4]),
+                                        ("Rotations 5+",[5,6,7,8,9,10,11,12])])
+    Call it once (e.g. in a notebook cell) before building the reports. Use this rather
+    than reassigning WEAKNESS_ROTATION_GROUPS directly — a `from … import *` copy of the
+    name would not reach the module global the builders read."""
+    global WEAKNESS_ROTATION_GROUPS
+    WEAKNESS_ROTATION_GROUPS = groups
+    return WEAKNESS_ROTATION_GROUPS
+
+
+def setWeaknessCodeTopN(n):
+    """Set how many item codes the per-rotation charts/tables show (worst-first)."""
+    global WEAKNESS_CODE_TOPN
+    WEAKNESS_CODE_TOPN = int(n)
+    return WEAKNESS_CODE_TOPN
+
+# Shared category palette (hex, no '#') — used for BOTH the matplotlib PDF charts and
+# the native Excel stacked bars, so the two deliverables read the same. Order matches
+# WEAKNESS_KEY_LABELS.values().
+WEAKNESS_PALETTE = ["66C2A5", "FC8D62", "8DA0CB", "E78AC3",
+                    "A6D854", "FFD92F", "E5C494"]
+
+
+def _weaknessLenExpr(key, src="assessor_data->'multi-select'"):
+    """SQL scalar: number of tags recorded in one weakness bucket on a form."""
+    return f"jsonb_array_length(COALESCE({src}->'{key}','[]'::jsonb))"
+
+
+def _weaknessCountSelect(indent="      "):
+    """`<len> AS "<Label>"` for every weakness bucket, comma+newline separated."""
+    sep = ",\n" + indent
+    return sep.join(f'{_weaknessLenExpr(k)} AS "{v}"'
+                    for k, v in WEAKNESS_KEY_LABELS.items())
+
+
+def _weaknessTotalExpr():
+    """SQL scalar: total weakness tags across all 7 buckets on a form."""
+    return " + ".join(_weaknessLenExpr(k) for k in WEAKNESS_KEY_LABELS)
+
+
+_ENT_CASE_SQL = ("""CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','')
+        WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
+      END::smallint""")
+
+# per-form aggregation of the item codes recorded on a form (correlated to alias f)
+_FORM_ITEMCODES_SQL = """(
+        SELECT STRING_AGG(DISTINCT ic->>'code', ', ' ORDER BY ic->>'code')
+        FROM jsonb_array_elements(
+          CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
+        WHERE ic ? 'code')"""
+
+
+def rotationSortKey(rotation):
+    """Order rotations by the number inside them ('Rotation 10' after 'Rotation 2');
+    blanks last. Public (may be handy in a notebook cell)."""
+    s = "" if rotation is None else str(rotation)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return (0, int(digits)) if digits else (1, 0)
+
+
+def rotationNumber(rotation):
+    """First integer inside a rotation label, or None."""
+    s = "" if rotation is None else str(rotation)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def getStudentWeaknessTimeline(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
+    """One row per assessor-submitted form: date, rotation, entrustment level, the
+    count of areas-for-improvement tags in each of the 7 categories (+ incidents,
+    concern flag) and the item codes recorded on that form. Feeds the 'weakness over
+    time' views. Ordered oldest-first, with a running Form # so the per-form axis
+    matches the entrustment time-series."""
+    countSelect = _weaknessCountSelect()
+    sql = f"""
+    SELECT
+      datetimeutc::date                                    AS "Date",
+      rotation                                             AS "Rotation",
+      {_ENT_CASE_SQL}                                      AS "Entrustment",
+      {countSelect},
+      jsonb_array_length(COALESCE(assessor_data->'multi-select'->'clinical-incident','[]'::jsonb))
+                                                           AS "{WEAKNESS_INCIDENT_COL}",
+      (NULLIF(additional_concerns,'') IS NOT NULL)::int    AS "Concern flag",
+      {_FORM_ITEMCODES_SQL}                                AS "Item Codes"
+    FROM {formsTable} f
+    WHERE cohort = :cohort AND student_number = :studentNumber AND submitted_by_assessor
+    ORDER BY datetimeutc, assessmentid;
+    """
+    df = readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    labels = list(WEAKNESS_KEY_LABELS.values())
+    df[WEAKNESS_TOTAL_COL] = df[labels].sum(axis=1).astype(int)
+    df.insert(0, "Form #", range(1, len(df) + 1))
+    return df
+
+
+def summariseWeaknessByRotation(timelineDf):
+    """Collapse getStudentWeaknessTimeline() to one row per rotation: forms assessed,
+    tag counts per category, total tags, incidents, and mean entrustment (context for
+    'is it improving between rotations'). Rotations ordered numerically."""
+    if timelineDf is None or timelineDf.empty:
+        return pd.DataFrame()
+    labels = list(WEAKNESS_KEY_LABELS.values())
+    df = timelineDf.copy()
+    df["Rotation"] = df["Rotation"].where(df["Rotation"].notna(), "—")
+    g = df.groupby("Rotation", sort=False)
+    out = g[labels + [WEAKNESS_TOTAL_COL, WEAKNESS_INCIDENT_COL]].sum()
+    out.insert(0, "Forms", g.size())
+    out["Mean entrustment"] = g["Entrustment"].mean().round(2)
+    out = out.reset_index()
+    out = (out.assign(_o=out["Rotation"].map(rotationSortKey))
+              .sort_values("_o").drop(columns="_o").reset_index(drop=True))
+    return out
+
+
+def getStudentWeaknessByCodeRotation(engine, cohort, studentNumber,
+                                     formsTable="dds4_boh3_forms_v3"):
+    """Per (item code, rotation number) weakness/flag counts — the detail frame the
+    rotation-split views aggregate. No HAVING filter, so any grouping of rotations can
+    be summed from it. See getStudentWeaknessByItemCode for the column meanings and the
+    per-FORM co-occurrence caveat."""
+    countSelect = _weaknessCountSelect(indent="        ")
+    totalExpr = _weaknessTotalExpr()
+    catSums = ",\n      ".join(f'SUM(fl."{v}")::int AS "{v}"'
+                               for v in WEAKNESS_KEY_LABELS.values())
+    sql = f"""
+    WITH form_level AS (
+      SELECT
+        assessmentid,
+        {_ENT_CASE_SQL}                                    AS ent,
+        NULLIF(substring(COALESCE(rotation,'') from '[0-9]+'), '')::int AS rot_num,
+        {countSelect},
+        ({totalExpr})                                      AS wtot,
+        jsonb_array_length(COALESCE(assessor_data->'multi-select'->'clinical-incident','[]'::jsonb))
+                                                           AS inc,
+        (NULLIF(additional_concerns,'') IS NOT NULL)::int  AS concern
+      FROM {formsTable}
+      WHERE cohort = :cohort AND student_number = :studentNumber AND submitted_by_assessor
+    ),
+    codes AS (
+      SELECT f.assessmentid, ic->>'code' AS code
+      FROM {formsTable} f
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
+      WHERE f.cohort = :cohort AND f.student_number = :studentNumber
+        AND f.submitted_by_assessor AND ic ? 'code'
+      GROUP BY f.assessmentid, ic->>'code'
+    )
+    SELECT
+      c.code                                               AS "Item Code",
+      fl.rot_num                                           AS "{WEAKNESS_ROTATION_COL}",
+      COUNT(*)::int                                        AS "Forms with code",
+      COUNT(*) FILTER (WHERE fl.wtot > 0)::int             AS "Forms with a weakness",
+      SUM(fl.wtot)::int                                    AS "{WEAKNESS_TOTAL_COL}",
+      {catSums},
+      COUNT(*) FILTER (WHERE fl.ent IN (1,2))::int         AS "Low-entrustment forms",
+      SUM(fl.inc)::int                                     AS "{WEAKNESS_INCIDENT_COL}",
+      COUNT(*) FILTER (WHERE fl.concern = 1)::int          AS "{WEAKNESS_CONCERN_COL}"
+    FROM codes c
+    JOIN form_level fl USING (assessmentid)
+    GROUP BY c.code, fl.rot_num
+    ORDER BY c.code, fl.rot_num;
+    """
+    df = readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
+    return df if df is not None else pd.DataFrame()
+
+
+def aggregateWeaknessByCode(detailDf, rotationNums=None, descMap=None, minWeaknessForms=1):
+    """Sum a getStudentWeaknessByCodeRotation() frame to one row per item code.
+
+    rotationNums : keep only these rotation numbers before summing (None = all).
+    descMap      : {code: description} to add a Description column.
+    A row survives if it has ≥ minWeaknessForms weakness-forms OR any low-entrustment /
+    incident / concern flag. Sorted worst-first, with Weakness rate % added."""
+    if detailDf is None or detailDf.empty:
+        return pd.DataFrame()
+    df = detailDf.copy()
+    if rotationNums is not None:
+        df = df[df[WEAKNESS_ROTATION_COL].isin(list(rotationNums))]
+    if df.empty:
+        return pd.DataFrame()
+    labels = list(WEAKNESS_KEY_LABELS.values())
+    sumCols = (["Forms with code", "Forms with a weakness", WEAKNESS_TOTAL_COL] + labels +
+               ["Low-entrustment forms", WEAKNESS_INCIDENT_COL, WEAKNESS_CONCERN_COL])
+    sumCols = [c for c in sumCols if c in df.columns]
+    out = df.groupby("Item Code", as_index=False)[sumCols].sum()
+    keep = ((out["Forms with a weakness"] >= minWeaknessForms) |
+            (out.get("Low-entrustment forms", 0) > 0) |
+            (out.get(WEAKNESS_INCIDENT_COL, 0) > 0) |
+            (out.get(WEAKNESS_CONCERN_COL, 0) > 0))
+    out = out[keep].copy()
+    if out.empty:
+        return pd.DataFrame()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rate = (100 * out["Forms with a weakness"] / out["Forms with code"]).round(0)
+    pos = out.columns.get_loc("Forms with a weakness") + 1
+    out.insert(pos, "Weakness rate %", rate.fillna(0).astype(int))
+    if descMap is not None:
+        out.insert(1, "Description", out["Item Code"].astype(str).str.strip().map(descMap))
+    out = out.sort_values(["Forms with a weakness", WEAKNESS_TOTAL_COL, "Item Code"],
+                          ascending=[False, False, True]).reset_index(drop=True)
+    return out
+
+
+def weaknessRotationGroups(rotationNumbersPresent, groups=None):
+    """Resolve rotation panels against the rotations actually present in the data.
+
+    groups=None → auto "Rotations 1–3" and "Rotations 4+". Otherwise `groups` is a
+    list of (label, [rotation numbers]); empty panels are dropped. Falls back to the
+    module-level WEAKNESS_ROTATION_GROUPS when groups is None and that is set."""
+    present = sorted(n for n in rotationNumbersPresent if n is not None)
+    if groups is None:
+        groups = WEAKNESS_ROTATION_GROUPS
+    if groups is None:
+        lo = [n for n in present if n <= 3]
+        hi = [n for n in present if n >= 4]
+        out = []
+        if lo:
+            out.append(("Rotations 1–3", lo))
+        if hi:
+            out.append(("Rotations 4+", hi))
+        return out or [("All rotations", present)]
+    resolved = []
+    for label, nums in groups:
+        keep = [n for n in nums if n in present]
+        if keep:
+            resolved.append((label, keep))
+    return resolved
+
+
+def getStudentWeaknessByItemCode(engine, cohort, studentNumber,
+                                 formsTable="dds4_boh3_forms_v3",
+                                 rotations=None, minWeaknessForms=1):
+    """Which procedures (item codes) carry this student's areas for improvement.
+
+    IMPORTANT — weaknesses are logged at the FORM level, not against an individual
+    procedure. A form has one set of weakness tags and (often) several item codes, so
+    every figure here is a CO-OCCURRENCE: the code was on a form that also recorded a
+    weakness/flag. It is an association, not a strict cause.
+    Pass rotations=[1,2,3] to restrict to those rotations. Columns:
+      Forms with code / Forms with a weakness / Weakness rate % /
+      Total areas for improvement / <7 category columns> /
+      Low-entrustment forms (S1/S2) / Clinical incidents / Concern forms.
+    A convenience wrapper over getStudentWeaknessByCodeRotation + aggregateWeaknessByCode."""
+    detail = getStudentWeaknessByCodeRotation(engine, cohort, studentNumber, formsTable)
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    try:
+        descMap = getItemCodeDescriptionMap(engine, cohort, formsTable)
+    except Exception as ex:
+        print(f"[getStudentWeaknessByItemCode] description map failed: {ex}")
+        descMap = {}
+    return aggregateWeaknessByCode(detail, rotationNums=rotations, descMap=descMap,
+                                   minWeaknessForms=minWeaknessForms)
+
+
+def getStudentsInCohort(engine, cohort, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     SELECT DISTINCT student_number, student_name
     FROM {formsTable}
@@ -968,14 +2021,14 @@ def getStudentsInCohort(engine, cohort, formsTable="dds4_boh3_forms"):
     return readDf(engine, sql, {"cohort": cohort})
 
 
-def getStudentPatientSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getStudentPatientSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     WITH pats AS (
       SELECT f.student_number, f.student_name, pd AS patient,
-             (pd->>'patientAttended')::boolean AS attended,
-             NULLIF(pd->>'patientAge','')::int AS age
+             (pd->>'patient_attended')::boolean AS attended,
+             NULLIF(pd->>'patient_age','')::int AS age
       FROM {formsTable} f
-      CROSS JOIN LATERAL jsonb_array_elements(COALESCE(f.patient_data,'[]'::jsonb)) pd
+      CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
       WHERE f.cohort = :cohort AND f.student_number = :studentNumber
     )
     SELECT
@@ -989,25 +2042,26 @@ def getStudentPatientSummary(engine, cohort, studentNumber, formsTable="dds4_boh
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
 
 
-def getStudentSelfSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getStudentSelfSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     WITH base AS (
       SELECT assessmentid, form_code, datetimeutc, subject, clinic, assessor_name,
         student_data->'texts'->>'reflection' AS student_reflection,
-        NULLIF(student_data->'scales'->'scale-practice-readiness'->>'scale','') AS practice_readiness,
+        NULLIF(student_data->'scales'->'scale-practice-readiness'->>'key','') AS practice_readiness,
         student_data->'checklists'->'checklist-caf-final-eval' AS caf
       FROM {formsTable}
       WHERE cohort = :cohort AND student_number = :studentNumber AND submitted_by_student
     ),
     cafRows AS (
       SELECT b.assessmentid, b.form_code, b.datetimeutc, b.subject, b.clinic, b.assessor_name,
-        b.student_reflection, b.practice_readiness, kv.key AS mc, kv.value AS ratingText,
-        CASE kv.value
+        b.student_reflection, b.practice_readiness, kv.key AS mc,
+        COALESCE(kv.value->>'value', kv.value#>>'{{}}') AS ratingText,
+        CASE COALESCE(kv.value->>'value', kv.value#>>'{{}}')
           WHEN 'Done well' THEN 1.0 WHEN 'Done' THEN 0.8 WHEN 'Mostly done' THEN 0.6
           WHEN 'Sometimes done' THEN 0.4 WHEN 'Not done' THEN 0.0 ELSE NULL
         END::numeric AS ratingScore
       FROM base b
-      LEFT JOIN LATERAL jsonb_each_text(COALESCE(b.caf, '{{}}'::jsonb)) kv(key, value) ON TRUE
+      LEFT JOIN LATERAL jsonb_each(COALESCE(b.caf, '{{}}'::jsonb)) kv(key, value) ON TRUE
     )
     SELECT assessmentid, form_code, datetimeutc, subject, clinic, assessor_name,
            practice_readiness, student_reflection,
@@ -1020,11 +2074,11 @@ def getStudentSelfSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_f
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
 
 
-def getStudentAssessorSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getStudentAssessorSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     WITH base AS (
       SELECT assessmentid, form_code, datetimeutc, subject, clinic, assessor_name,
-        NULLIF(assessor_data->'scales'->'scale-entrustment'->>'scale','') AS entrustment_scale,
+        NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','') AS entrustment_scale,
         NULLIF(additional_concerns,'') AS additional_concerns,
         assessor_data->'multi-select' AS multi
       FROM {formsTable}
@@ -1053,8 +2107,10 @@ def getStudentAssessorSummary(engine, cohort, studentNumber, formsTable="dds4_bo
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
 
 
-def getStudentSummaryTable(engine, cohort, studentNumber, studentName, formsTable="dds4_boh3_forms"):
+def getStudentSummaryTable(engine, cohort, studentNumber, studentName, formsTable="dds4_boh3_forms_v3"):
+    # print(f"[getStudentSummaryTable] cohort={cohort}, studentNumber={studentNumber}, studentName={studentName}")
     patientDf = getStudentPatientSummary(engine, cohort, studentNumber, formsTable)
+    # display(patientDf)
     selfDf = getStudentSelfSummary(engine, cohort, studentNumber, formsTable)
     assessorDf = getStudentAssessorSummary(engine, cohort, studentNumber, formsTable)
     
@@ -1073,9 +2129,19 @@ def getStudentSummaryTable(engine, cohort, studentNumber, studentName, formsTabl
     avgCaf = selfDf["caf_avg_score"].dropna().astype(float).mean()
 
     totalConcerns = assessorDf["additional_concerns"].dropna().shape[0]
-    totalIncidents = int(assessorDf["clinical_incident_count"].fillna(0).sum())
-    p = patientDf.iloc[0] if not patientDf.empty else pd.Series(dtype="object")
+    # Clinical incidents: count EVERY incident entry across ALL of the student's forms
+    # (no submitted-by-assessor filter), so this equals the entries shown in the
+    # Clinical Incidents table (getClinicalIncidentSummary). Previously this summed
+    # array lengths over assessor-submitted forms only, which under/over-counted.
+    totalIncidents = int(readDf(engine, f"""
+        SELECT COALESCE(SUM(jsonb_array_length(
+                 COALESCE(assessor_data->'multi-select'->'clinical-incident','[]'::jsonb))), 0)::int AS n
+        FROM {formsTable}
+        WHERE cohort = :cohort AND student_number = :studentNumber
+    """, {"cohort": cohort, "studentNumber": studentNumber}).iloc[0]["n"])
 
+    p = patientDf.iloc[0] if not patientDf.empty else pd.Series(dtype="object")
+    # print(p)
     metrics = [
         ("Total Forms", str(toInt(totalForms))),
         ("Submitted by Student", str(toInt(submittedByStudent))),
@@ -1090,20 +2156,21 @@ def getStudentSummaryTable(engine, cohort, studentNumber, studentName, formsTabl
         ("Entrustment Distribution (1–4)",
          "<br/>".join(f"Lvl {idx}: {cnt}" for idx, cnt in entrustmentDistribution.items())),
         ("Additional Concerns", str(toInt(totalConcerns))),
-        ("Clinical Incidents", str(toInt(totalIncidents))),
+        # ("Clinical Incidents", str(toInt(totalIncidents))),
     ]
     return pd.DataFrame(metrics, columns=["Metric", "Value"]), selfDf, assessorDf
 
 
-def getStudentTimeSeries(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getStudentTimeSeries(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     """Per-form entrustment (assessor) and practice readiness (student) over time."""
     sql = f"""
     SELECT
       datetimeutc::date AS date,
-      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'scale','')
+      rotation AS rotation,
+      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','')
         WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
       END::smallint AS entrustment,
-      CASE NULLIF(student_data->'scales'->'scale-practice-readiness'->>'scale','')
+      CASE NULLIF(student_data->'scales'->'scale-practice-readiness'->>'key','')
       WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
       END::smallint AS practice_readiness
     FROM {formsTable}
@@ -1114,22 +2181,22 @@ def getStudentTimeSeries(engine, cohort, studentNumber, formsTable="dds4_boh3_fo
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
 
 
-def getStudentRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getStudentRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     WITH base AS (
       SELECT student_data->'texts'->>'reflection' AS reflection,
-             NULLIF(student_data->'scales'->'scale-practice-readiness'->>'scale','') AS readiness,
+             NULLIF(student_data->'scales'->'scale-practice-readiness'->>'key','') AS readiness,
              student_data->'checklists'->'checklist-caf-final-eval' AS caf
       FROM {formsTable}
       WHERE cohort = :cohort AND student_number = :studentNumber
     ),
     caf_vals AS (
-      SELECT CASE kv.value
+      SELECT CASE COALESCE(kv.value->>'value', kv.value#>>'{{}}')
           WHEN 'Done well' THEN 1.0 WHEN 'Done' THEN 0.8 WHEN 'Mostly done' THEN 0.6
           WHEN 'Sometimes done' THEN 0.4 WHEN 'Not done' THEN 0.0 ELSE NULL
         END::numeric AS score
       FROM base b
-      LEFT JOIN LATERAL jsonb_each_text(COALESCE(b.caf,'{{}}'::jsonb)) kv(key, value) ON TRUE
+      LEFT JOIN LATERAL jsonb_each(COALESCE(b.caf,'{{}}'::jsonb)) kv(key, value) ON TRUE
     )
     SELECT
       (SELECT COUNT(*)::int FROM base) AS forms_count,
@@ -1142,7 +2209,7 @@ def getStudentRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"
     sql2 = f"""
       SELECT
         student_config->'scales'->'scale-practice-readiness'->'fields'
-          -> (student_data->'scales'->'scale-practice-readiness'->>'scale') AS readiness,
+          -> (student_data->'scales'->'scale-practice-readiness'->>'key') AS readiness,
         COUNT(*) AS n
       FROM {formsTable}
       WHERE cohort = :cohort AND student_number = :studentNumber
@@ -1153,7 +2220,7 @@ def getStudentRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"
     return roll, readinessDf
 
 
-def getAssessorRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getAssessorRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     """
     Get a single-row summary of all assessor-submitted forms for a given student, including average entrustment level,
     counts of various multi-select categories, and number of forms with additional concerns. This is used
@@ -1163,7 +2230,7 @@ def getAssessorRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms
     sql = f"""
     WITH base AS (
       SELECT
-        NULLIF(assessor_data->'scales'->'scale-entrustment'->>'scale','') AS entrustment_scale,
+        NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','') AS entrustment_scale,
         NULLIF(additional_concerns,'') AS additional_concerns,
         assessor_data->'multi-select' AS multi
       FROM {formsTable}
@@ -1201,19 +2268,19 @@ def getAssessorRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms
     sql_entrustment = f"""
       SELECT
         assessor_config->'scales'->'scale-entrustment'->'fields'
-          -> (assessor_data->'scales'->'scale-entrustment'->>'scale') AS "Entrustment",
+          -> (assessor_data->'scales'->'scale-entrustment'->>'key') AS "Entrustment",
         COUNT(*)::int AS "Count"
       FROM {formsTable}
       WHERE cohort = :cohort AND student_number = :studentNumber
         AND submitted_by_assessor
-        AND assessor_data->'scales'->'scale-entrustment'->>'scale' IS NOT NULL
+        AND assessor_data->'scales'->'scale-entrustment'->>'key' IS NOT NULL
       GROUP BY "Entrustment"
       ORDER BY "Entrustment";
     """
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber}), readDf(engine, sql_entrustment, {"cohort": cohort, "studentNumber": studentNumber})
 
 
-def getTopMultiSelectValues(engine, cohort, studentNumber, key, limit=6, formsTable="dds4_boh3_forms"):
+def getTopMultiSelectValues(engine, cohort, studentNumber, key, limit=6, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     WITH vals AS (
       SELECT x->>'value' AS v
@@ -1226,14 +2293,14 @@ def getTopMultiSelectValues(engine, cohort, studentNumber, key, limit=6, formsTa
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber, "key": key, "limit": int(limit)})
 
 
-def getSelfReflections(engine, cohort, studentNumber, formsTable="dds4_boh3_forms"):
+def getSelfReflections(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
     sql = f"""
     SELECT
       datetimeutc::date AS datetimeutc,
       student_data->'texts'->>'reflection' AS self_reflection,
       (SELECT string_agg(ic->>'code', ', ' ORDER BY ic->>'code')
-       FROM jsonb_array_elements(COALESCE(f.patient_data, '[]'::jsonb)) pd
-       CROSS JOIN jsonb_array_elements(COALESCE(pd->'itemCodes', '[]'::jsonb)) ic
+       FROM jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+       CROSS JOIN jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
        WHERE ic ? 'code') AS item_codes
     FROM {formsTable} f
     WHERE cohort=:cohort AND student_number=:studentNumber
@@ -1242,6 +2309,95 @@ def getSelfReflections(engine, cohort, studentNumber, formsTable="dds4_boh3_form
     ORDER BY datetimeutc;
     """
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
+
+
+# Friendly labels for the comment sources surfaced by getAllStudentComments.
+# texts.* keys not listed here fall back to a title-cased version of the key, so a
+# NEW comment field added to the DASH form still shows up (just with a generic name).
+COMMENT_TEXT_LABELS = {
+    "additional_comments": "Overall comment",
+    "additional-concerns": "Additional concern",
+    "clinical-incident-additional-details": "Clinical incident — details",
+    "reflection": "Reflection",
+}
+COMMENT_MULTISELECT_LABELS = {
+    "strengths": "Commendation",
+    "weakness-other": "Written feedback",
+    "clinical-incident": "Clinical incident",
+}
+
+# The PDF "Supervisor comments" table is for non-standard free-text feedback only —
+# the overall comment and the written feedback. Commendations, concerns and incidents
+# are standard/structured and shown elsewhere, so they are excluded here. (The Excel
+# 'All Comments' sheet still carries every type.)
+PDF_SUPERVISOR_COMMENT_TYPES = ("Overall comment", "Written feedback")
+
+# In the PDF, long comments are truncated to this many characters (with an ellipsis) so
+# a single comment never grows taller than a page. The Excel 'All Comments' sheet keeps
+# the full text. Set to 0 or None to disable truncation.
+PDF_COMMENT_MAXCHARS = 500
+
+
+def _commentTypeLabel(fieldKey, isMultiSelect=False):
+    src = COMMENT_MULTISELECT_LABELS if isMultiSelect else COMMENT_TEXT_LABELS
+    if fieldKey in src:
+        return src[fieldKey]
+    return str(fieldKey).replace("-", " ").replace("_", " ").strip().capitalize()
+
+
+def getAllStudentComments(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3",
+                          multiSelectFields=("strengths", "weakness-other", "clinical-incident")):
+    """Every free-text comment on a student's forms — supervisor and student — in one
+    long table. Pulls ALL keys from assessor_data->'texts' and student_data->'texts'
+    (so a new comment field on the form appears automatically) PLUS the free-text values
+    in the given assessor multi-select buckets. This is the single source for the
+    'All Comments' Excel sheet and the PDF comment tables — it is what surfaces the
+    assessor 'additional_comments' feedback that moved out of 'weakness-other' from
+    ~July 2026. Columns: Date, Rotation, From, Type, Comment, Item Codes, Supervisor."""
+    valuesClause = ", ".join(f"('{f}')" for f in multiSelectFields)
+    sql = f"""
+    WITH forms AS (
+      SELECT f.*, {_FORM_ITEMCODES_SQL} AS item_codes
+      FROM {formsTable} f
+      WHERE f.cohort = :cohort AND f.student_number = :studentNumber
+    )
+    SELECT "Date", "Rotation", "From", field_key, is_ms, "Comment", "Item Codes", "Supervisor"
+    FROM (
+      SELECT datetimeutc::date AS "Date", rotation AS "Rotation",
+             'Supervisor' AS "From", kv.key AS field_key, FALSE AS is_ms,
+             kv.value AS "Comment", item_codes AS "Item Codes",
+             assessor_name AS "Supervisor"
+      FROM forms
+      CROSS JOIN LATERAL jsonb_each_text(COALESCE(assessor_data->'texts','{{}}'::jsonb)) kv
+      WHERE submitted_by_assessor AND NULLIF(btrim(kv.value), '') IS NOT NULL
+      UNION ALL
+      SELECT datetimeutc::date, rotation, 'You', kv.key, FALSE,
+             kv.value, item_codes, NULL
+      FROM forms
+      CROSS JOIN LATERAL jsonb_each_text(COALESCE(student_data->'texts','{{}}'::jsonb)) kv
+      WHERE submitted_by_student AND NULLIF(btrim(kv.value), '') IS NOT NULL
+      UNION ALL
+      SELECT datetimeutc::date, rotation, 'Supervisor', ms.key, TRUE,
+             COALESCE(elem->>'value', elem#>>'{{}}'), item_codes, assessor_name
+      FROM forms
+      CROSS JOIN LATERAL (VALUES {valuesClause}) ms(key)
+      CROSS JOIN LATERAL jsonb_array_elements(
+        COALESCE(assessor_data->'multi-select'->ms.key, '[]'::jsonb)) elem
+      WHERE submitted_by_assessor
+        AND NULLIF(btrim(COALESCE(elem->>'value', elem#>>'{{}}')), '') IS NOT NULL
+    ) q
+    ORDER BY "Date", "From", field_key;
+    """
+    df = readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Date", "Rotation", "From", "Type", "Comment",
+                                     "Item Codes", "Supervisor"])
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df["Type"] = [_commentTypeLabel(k, bool(m))
+                  for k, m in zip(df["field_key"], df["is_ms"])]
+    df = df[["Date", "Rotation", "From", "Type", "Comment", "Item Codes", "Supervisor"]]
+    df = df.sort_values(["Date", "From", "Type"], na_position="last").reset_index(drop=True)
+    return df
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1280,8 +2436,9 @@ def weaknessPiePlot(weaknessCounts, totalWeaknesses, uniColor):
 
 
 def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, styles,
-                                  formsTable="dds4_boh3_forms",
-                                  subheadingStyle=None, uniColor=None, tableTextStyleSmall=None):
+                                  formsTable="dds4_boh3_forms_v3",
+                                  subheadingStyle=None, uniColor=None, tableTextStyleSmall=None,
+                                  tocMark=None):
     if subheadingStyle is None:
         subheadingStyle = styles.get("subheadingStyle")
     if uniColor is None:
@@ -1293,12 +2450,18 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
     topWeaknessOther = getTopMultiSelectValues(engine, cohort, studentNumber, "weakness-other", 30, formsTable)
     # topIncidents = getTopMultiSelectValues(engine, cohort, studentNumber, "clinical-incident", 6, formsTable)
     clinicalIncidents = getClinicalIncidentSummary(engine, cohort, filters={"student_number": studentNumber}, formsTable=formsTable)
-    clinicalIncidents.drop(columns=["Cohort", 'Student Name', 'Item Codes'], inplace=True)
+    # getClinicalIncidentSummary now also returns Student ID + Rotation (for the Excel sheets);
+    # drop them here so the PDF table keeps its 3-column layout (Date, Assessor Name, <col>).
+    clinicalIncidents.drop(columns=["Cohort", 'Student Name', 'Item Codes', 'Student ID', 'Rotation'],
+                           inplace=True, errors='ignore')
 
-    weaknessOther = getClinicalIncidentSummary(engine, cohort, filters={"student_number": studentNumber}, 
+    weaknessOther = getClinicalIncidentSummary(engine, cohort, filters={"student_number": studentNumber},
                                                formsTable=formsTable, extractValue='weakness-other', colName = 'Weakness/Strength')
-    weaknessOther.drop(columns=["Cohort", 'Student Name', 'Assessor Name'], inplace=True)
+    weaknessOther.drop(columns=["Cohort", 'Student Name', 'Assessor Name', 'Student ID', 'Rotation'],
+                       inplace=True, errors='ignore')
     elements.append(PageBreak())
+    if tocMark is not None:
+        elements.append(tocMark)
 
     # Practice readiness distribution
     if not readinessDf.empty:
@@ -1306,6 +2469,7 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
         rd.columns = ["Practice Readiness", "Count"]
         rd = rd[rd["Practice Readiness"].notna() & (rd["Practice Readiness"] != "")
                & (rd["Practice Readiness"].str.lower() != "none")]
+        elements.append(_StudentTocMark("Practice readiness distribution", level=1))
         elements.append(createTable(
             rd, colRatio=[3, 1], customTextCols=[0, 1], bottomPadding=6, topPadding=6,
             title="Student Judgement: Practice Readiness Distribution",
@@ -1314,6 +2478,7 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
         elements.append(Spacer(1, 18))
 
     # Assessor summary
+    elements.append(_StudentTocMark("Entrustment level distribution", level=1))
     elements.append(createTable(entrustmentDf, colRatio=[3, 1], customTextCols=[0, 1], bottomPadding=6, topPadding=6,
                         title="Assessor Judgement: Entrustment level distribution", titleStyle=subheadingStyle, headerColor=uniColor))
     
@@ -1346,6 +2511,8 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
     weaknessCounts = weaknessCounts[weaknessCounts["Count"] > 0]
     totalWeaknesses = weaknessCounts["Count"].sum()
 
+    if not weaknessCounts.empty:
+        elements.append(_StudentTocMark("Weaknesses by category (pie chart)", level=1))
     img = weaknessPiePlot(weaknessCounts, totalWeaknesses, uniColor)
     elements.append(img)
     # elements.append(createTable(
@@ -1373,40 +2540,83 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
         ))
         elements.append(Spacer(1, 12))
 
+    if topStrengths is not None and not topStrengths.empty:
+        elements.append(_StudentTocMark("Top commendations", level=1))
     renderTopDf(topStrengths, "Top commendations", "Commendation")
-    # renderTopDf(topWeaknessOther, "Other weaknesses and strengths", "Weakness/Strength", showCounts=False)
-    otherWeaknessTable = createTable(
-        weaknessOther, colRatio=[1, 1, 4], customTextCols=[0, 1, 2], bottomPadding=6, topPadding=6,
-        title="Other weaknesses/strengths", titleStyle=subheadingStyle, headerColor=uniColor,
-        tableTextStyle=tableTextStyleSmall,
-    )
-    elements.append(otherWeaknessTable)
-    elements.append(Spacer(1, 18))
 
-    ciTable = createTable(clinicalIncidents, colRatio=[1, 1, 4], customTextCols=[0, 1, 2], bottomPadding=6, topPadding=6,
-                        title="Clinical Incidents", titleStyle=subheadingStyle, headerColor=uniColor, tableTextStyle=tableTextStyleSmall)
-    elements.append(ciTable)
+    # Every written comment — supervisor and student, all text fields — in one place.
+    # (Replaces the old 'Other weaknesses/strengths' + reflections tables, which read
+    # only 'weakness-other' and so went blank when feedback moved to 'additional_comments'
+    # from ~July 2026. See getAllStudentComments.)
+    buildStudentCommentsTables(elements, engine, cohort, studentNumber, formsTable,
+                               subheadingStyle=subheadingStyle, uniColor=uniColor,
+                               tableTextStyleSmall=tableTextStyleSmall)
 
-    # Self reflections
-    reflectionsDf = getSelfReflections(engine, cohort, studentNumber, formsTable)
-    if not reflectionsDf.empty:
-        r = reflectionsDf.copy()
-        r.columns = ["Date", "Self Reflection", "Item Codes"]
-        r["Self Reflection"] = r["Self Reflection"].str.replace("\n", "<br/>")
+
+def _enableRowSplit(flowable):
+    """Let an over-tall table row flow across pages. createTable wraps its Table in a
+    KeepTogether; a single row taller than the page otherwise raises reportlab
+    LayoutError (a long free-text comment does this). Reach in, allow the row to split
+    and repeat the header on continuation pages. Safe no-op if the shape differs."""
+    try:
+        for f in (getattr(flowable, "_content", None) or []):
+            if isinstance(f, Table):
+                f.splitInRow = 1
+                f.repeatRows = 1
+    except Exception:
+        pass
+    return flowable
+
+
+def buildStudentCommentsTables(elements, engine, cohort, studentNumber,
+                               formsTable="dds4_boh3_forms_v3", subheadingStyle=None,
+                               uniColor=None, tableTextStyleSmall=None):
+    """Every written comment on the student's forms, in two tables (supervisor, then
+    student): Date · Type · Comment · Item Codes. Driven by getAllStudentComments.
+    Long comments are truncated (PDF_COMMENT_MAXCHARS) so a row never overflows a page;
+    the full text is in the Excel 'All Comments' sheet."""
+    allc = getAllStudentComments(engine, cohort, studentNumber, formsTable)
+    if allc is None or allc.empty:
+        return
+    cols = ["Date", "Type", "Comment", "Item Codes"]
+
+    def _trunc(v):
+        s = "" if v is None else str(v)
+        if PDF_COMMENT_MAXCHARS and len(s) > PDF_COMMENT_MAXCHARS:
+            s = s[:PDF_COMMENT_MAXCHARS].rstrip() + "…"
+        return s.replace("\n", "<br/>")
+
+    def _render(sub, title, tocText):
+        if sub is None or sub.empty:
+            return
+        t = sub[cols].copy()
+        t["Comment"] = t["Comment"].map(_trunc)
+        t["Item Codes"] = t["Item Codes"].fillna("").astype(str)
+        elements.append(_StudentTocMark(tocText, level=1))
         elements.append(createTable(
-            r, colRatio=[1, 6, 1.2], customTextCols=[0, 1, 2], bottomPadding=6, topPadding=6,
-            title="Student Judgement: Self Reflections",
-            titleStyle=subheadingStyle, headerColor=uniColor,
-            tableTextStyle=tableTextStyleSmall,
-        ))
-        elements.append(Spacer(1, 18))
+            t, colRatio=[1.0, 1.5, 5.5, 1.2], customTextCols=[0, 1, 2, 3],
+            bottomPadding=6, topPadding=6, title=title, titleStyle=subheadingStyle,
+            headerColor=uniColor, tableTextStyle=tableTextStyleSmall))
+        elements.append(Spacer(1, 14))
+
+    sup = allc[(allc["From"] == "Supervisor")
+               & (allc["Type"].isin(PDF_SUPERVISOR_COMMENT_TYPES))]
+    _render(sup, "Supervisor comments &amp; feedback (all forms)",
+            "Supervisor comments &amp; feedback")
+    _render(allc[allc["From"] == "You"], "Your reflections &amp; comments (all forms)",
+            "Your reflections &amp; comments")
 
 
-def plotEntrustmentReadinessTimeSeries(df, title, uniColor=None, useDateAxis=False):
+def plotEntrustmentReadinessTimeSeries(df, title, uniColor=None, useDateAxis=False, subtitle=None,
+                                       figWidth=None):
     """
     Time series of entrustment and practice readiness on the same axes with legend.
     useDateAxis=True  → matplotlib date axis with auto-spaced ticks (e.g. '21 Jan')
-    useDateAxis=False → string dates on x-axis (default, matches existing rubricPlot style)
+    useDateAxis=False → string dates on x-axis (matches existing rubricPlot style)
+
+    Polish additions: shaded risk zones (Level 1 red, Level 2 amber), the student's mean
+    entrustment as a dashed reference line, Level-1 entrustment forms marked with a red X,
+    and an optional stats `subtitle`.
     """
     if uniColor is None:
         uniColor = variableUtils.uniColor
@@ -1416,104 +2626,563 @@ def plotEntrustmentReadinessTimeSeries(df, title, uniColor=None, useDateAxis=Fal
     df.sort_values('date', inplace=True)
 
     # Aggregate by date — average if multiple forms on same day
-    entDf = df.dropna(subset=['entrustment']).groupby('date')['entrustment'].mean().reset_index()
-    prDf = df.dropna(subset=['practice_readiness']).groupby('date')['practice_readiness'].mean().reset_index()
+    entS = df.dropna(subset=['entrustment']).groupby('date')['entrustment'].mean()
+    prS = df.dropna(subset=['practice_readiness']).groupby('date')['practice_readiness'].mean()
 
-    if not useDateAxis:
-        entDf['date'] = entDf['date'].dt.strftime('%Y-%m-%d')
-        prDf['date'] = prDf['date'].dt.strftime('%Y-%m-%d')
+    # Common ordered date axis; string dates are plotted at integer positions so we can
+    # (a) label every OTHER date and (b) draw rotation division lines between forms.
+    allDates = sorted(set(entS.index) | set(prS.index))
+    pos = {d: i for i, d in enumerate(allDates)}
+    labels = [d.strftime('%Y-%m-%d') for d in allDates]
 
-    fig, ax = plt.subplots(figsize=(variableUtils.figSize[0], variableUtils.figSize[1] / 4), dpi = 200)
+    w = figWidth if figWidth is not None else variableUtils.figSize[0]
+    fig, ax = plt.subplots(figsize=(w, variableUtils.figSize[1] / 4), dpi=200)
 
+    # Rotation division lines + area labels — only if the series carries a 'rotation' column.
+    # Dashed vertical line between two consecutive dates whose rotation differs; a short
+    # rotation label (e.g. 'R3') centred over each contiguous band.
+    def _shortRot(r):
+        digits = ''.join(ch for ch in str(r) if ch.isdigit())
+        return f"R{digits}" if digits else str(r)
+    if 'rotation' in df.columns and df['rotation'].notna().any():
+        rotByDate = (df.dropna(subset=['rotation']).groupby('date')['rotation']
+                     .agg(lambda s: s.iloc[0]).to_dict())
+        spanStart = 0
+        prevRot = rotByDate.get(allDates[0]) if allDates else None
+        for i, d in enumerate(allDates):
+            r = rotByDate.get(d)
+            if r is not None and prevRot is not None and r != prevRot:
+                ax.axvline(i - 0.5, color='#b7c0da', lw=0.9, ls='--', zorder=0.5)
+                ax.text((spanStart + (i - 1)) / 2, 4.38, _shortRot(prevRot), ha='center',
+                        va='bottom', fontsize=7.5, color='#6b7490', fontweight='bold')
+                spanStart = i
+                prevRot = r
+            elif r is not None:
+                prevRot = r
+        if allDates:
+            ax.text((spanStart + (len(allDates) - 1)) / 2, 4.38, _shortRot(prevRot),
+                    ha='center', va='bottom', fontsize=7.5, color='#6b7490', fontweight='bold')
+
+    # original colour scheme (steelblue / darkorange); small vertical offset separates the lines
     offset = 0.05
-
-    if not entDf.empty:
-        ax.plot(entDf['date'], entDf['entrustment'] - offset, marker='o', color='steelblue',
-                label='Entrustment (Assessor)', linewidth=1.5, markersize=3)
-    if not prDf.empty:
-        ax.plot(prDf['date'], prDf['practice_readiness'] + offset, marker='s', color='darkorange',
-                label='Practice Readiness (Student)', linewidth=1.5, markersize=3)
+    if len(entS):
+        ax.plot([pos[d] for d in entS.index], entS.values - offset, marker='o', color='steelblue',
+                label='Entrustment (Assessor)', linewidth=1.4, markersize=2.5, zorder=3)
+    if len(prS):
+        ax.plot([pos[d] for d in prS.index], prS.values + offset, marker='s', color='darkorange',
+                label='Practice Readiness (Student)', linewidth=1.4, markersize=2.5, zorder=3)
+    lvl1x = [pos[d] for d in df[df['entrustment'] == 1]['date'] if d in pos]
+    if lvl1x:
+        ax.scatter(lvl1x, [1 - offset] * len(lvl1x), marker='X', color='#d32f2f',
+                   s=42, zorder=5, edgecolors='white', linewidths=0.5, label='Level 1 (flag)')
 
     ax.set_ylim(0.5, 4.5)
     ax.set_yticks([1, 2, 3, 4])
-    ax.set_yticklabels(['1', '2', '3', '4'], fontsize=6, color=uniColor)
+    ax.set_yticklabels(['1', '2', '3', '4'], fontsize=8, color=uniColor)
+    ax.set_ylabel('Level', fontsize=9, color=uniColor)
 
-    if useDateAxis:
-        ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
-        ax.tick_params(axis='x', rotation=45, labelsize=6)
-    else:
-        ax.tick_params(axis='x', rotation=90, labelsize=6)
-
+    # string dates, EVERY OTHER label
+    tickPos = list(range(0, len(allDates), 2))
+    ax.set_xticks(tickPos)
+    ax.set_xticklabels([labels[i] for i in tickPos], rotation=90, fontsize=6, color=uniColor)
+    ax.set_xlim(-0.5, len(allDates) - 0.5)
     ax.set_xlabel('')
-    ax.set_ylabel('Level', fontsize=8, color=uniColor)
-    ax.set_title(title, fontsize=10, color=uniColor)
+
+    fullTitle = title if not subtitle else (f"{title}\n{subtitle}" if title else subtitle)
+    ax.set_title(fullTitle, fontsize=11, color=uniColor, pad=22)
     ax.grid(True, axis='y', linestyle='-', alpha=0.3)
-    ax.grid(True, axis='x', linestyle=':', alpha=0.2)
+    ax.grid(True, axis='x', linestyle=':', alpha=0.25)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
-    ax.legend(loc='lower left', fontsize=7, framealpha=0.9)
+    ax.legend(loc='lower left', fontsize=7.5, framealpha=0.9)
     fig.tight_layout()
     plt.close(fig)
 
     return fig
 
 
+def _addProceduresBarChart(elements, topItemsDf, subheadingStyle, uniColor=None,
+                           maxCodesPerSubplot=25):
+    """Procedures-performed bar chart (Your count vs Class average) per item code —
+    same style as the boh2/dds2/dds3 reports. Consumes getStudentTopItemCodes output
+    (columns: itemcode, description, totalqty, cohortavg). Codes are split into
+    roughly-equal stacked subplots so labels stay legible, with a shared y-axis."""
+    if topItemsDf is None or topItemsDf.empty:
+        return
+    df = topItemsDf.copy()
+    df.columns = [str(c).lower() for c in df.columns]
+    codes = df["itemcode"].astype(str).tolist()
+    studentCounts = {c: int(v) for c, v in zip(codes, df["totalqty"].fillna(0))}
+    classAvg = {c: float(v) for c, v in zip(codes, df.get("cohortavg", pd.Series([0] * len(df))).fillna(0.0))}
+    hasAvg = any(v > 0 for v in classAvg.values())
+
+    # already sorted by count desc from SQL; drop codes with 0 count AND avg < 1
+    filteredCodes = [c for c in codes if not (studentCounts.get(c, 0) == 0 and classAvg.get(c, 0.0) < 1)]
+    if not filteredCodes:
+        return
+
+    n = len(filteredCodes)
+    nSubplots = (n + maxCodesPerSubplot - 1) // maxCodesPerSubplot
+    base, rem = divmod(n, nSubplots)
+    chunks, start = [], 0
+    for i in range(nSubplots):
+        size = base + (1 if i < rem else 0)
+        chunks.append(filteredCodes[start:start + size]); start += size
+
+    fig, axes = plt.subplots(nSubplots, 1, figsize=(14, 5 * nSubplots), sharey=False)
+    if nSubplots == 1:
+        axes = [axes]
+    for axIdx, (ax, chunk) in enumerate(zip(axes, chunks)):
+        x = np.arange(len(chunk))
+        sVals = [studentCounts.get(c, 0) for c in chunk]
+        # per-subplot y-axis: scale to this row's own values
+        rowMax = max([studentCounts.get(c, 0) for c in chunk]
+                     + ([classAvg.get(c, 0.0) for c in chunk] if hasAvg else [0]))
+        yLim = rowMax * 1.15 + 1
+        if hasAvg:
+            width = 0.4
+            aVals = [classAvg.get(c, 0.0) for c in chunk]
+            ax.bar(x - width / 2, sVals, width, label="Your count" if axIdx == 0 else None, color="#1f77b4")
+            ax.bar(x + width / 2, aVals, width, label="Class average" if axIdx == 0 else None, color="#fc8d59")
+            for xi, v in zip(x - width / 2, sVals):
+                if v > 0: ax.text(xi, v + 0.1, str(int(v)), ha="center", va="bottom", fontsize=8)
+            for xi, v in zip(x + width / 2, aVals):
+                if v > 0: ax.text(xi, v + 0.1, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+        else:
+            width = 0.65
+            ax.bar(x, sVals, width, color="#1f77b4")
+            for xi, v in zip(x, sVals):
+                if v > 0: ax.text(xi, v + 0.1, str(int(v)), ha="center", va="bottom", fontsize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(chunk, rotation=45, ha="right", fontsize=8)
+        ax.set_ylim(0, yLim)
+        ax.set_ylabel("Count")
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+    if hasAvg:
+        axes[0].legend(loc="upper right")
+    fig.suptitle("Item Code Counts vs Class Average" if hasAvg else "Item Code Counts",
+                 fontsize=13, fontweight="bold", y=1.0)
+    plt.tight_layout()
+    img = addPlotImage(fig, 0.9)
+    plt.close(fig)
+
+    elements.append(Spacer(1, 18))
+    elements.append(Paragraph("Procedures Performed", subheadingStyle))
+    elements.append(img)
+
+
+
+
+def _shortCodes(codesStr, maxCodes=4):
+    """'011, 114, 121, 131, 141' → '011, 114, 121, 131 +1' for a compact bar label."""
+    if codesStr is None or (isinstance(codesStr, float) and pd.isna(codesStr)):
+        return ""
+    parts = [p.strip() for p in str(codesStr).split(",") if p.strip()]
+    if not parts:
+        return ""
+    if len(parts) <= maxCodes:
+        return ", ".join(parts)
+    return ", ".join(parts[:maxCodes]) + f" +{len(parts) - maxCodes}"
+
+
+def plotWeaknessOverTime(timelineDf, byRotationDf, uniColor=None, figWidth=None):
+    """Two stacked-bar panels of areas for improvement:
+      top    — per rotation, with mean entrustment overlaid (secondary axis)
+      bottom — per FORM that recorded a weakness (empty forms dropped), on a numeric
+               date axis, with the item codes for that form printed above the bar
+    Categories are stacked in the shared WEAKNESS_PALETTE so the colours match Excel.
+    figWidth (inches) overrides the default width — pass the page width when embedding
+    in a wide report. Returns a matplotlib Figure (or None if there is nothing to plot)."""
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
+    labels = list(WEAKNESS_KEY_LABELS.values())
+    colors = ["#" + c for c in WEAKNESS_PALETTE]
+
+    hasRot = byRotationDf is not None and not byRotationDf.empty \
+        and byRotationDf[labels].to_numpy().sum() > 0
+    formDf = pd.DataFrame()
+    if timelineDf is not None and not timelineDf.empty:
+        formDf = timelineDf[timelineDf[WEAKNESS_TOTAL_COL] > 0].copy()   # drop empty forms
+    hasForm = not formDf.empty
+    if not hasRot and not hasForm:
+        return None
+
+    w = figWidth if figWidth is not None else variableUtils.figSize[0]
+    fig, axes = plt.subplots(2, 1, figsize=(w, variableUtils.figSize[1] * 0.66), dpi=200)
+
+    # ---- top: by rotation (+ mean entrustment line) ----
+    ax = axes[0]
+    if hasRot:
+        rd = byRotationDf.copy()
+        x = np.arange(len(rd))
+        bottom = np.zeros(len(rd))
+        for lab, col in zip(labels, colors):
+            vals = rd[lab].to_numpy(dtype=float)
+            ax.bar(x, vals, bottom=bottom, color=col, label=lab, width=0.62,
+                   edgecolor="white", linewidth=0.4)
+            bottom += vals
+        ax.set_xticks(x)
+        ax.set_xticklabels(rd["Rotation"].astype(str), fontsize=7.5, color=uniColor)
+        ax.set_ylabel("Tags", fontsize=9, color=uniColor)
+        ax.set_title("Areas for improvement by rotation", fontsize=10.5,
+                     color=uniColor, fontweight="bold")
+        if "Mean entrustment" in rd.columns and rd["Mean entrustment"].notna().any():
+            ax2 = ax.twinx()
+            ax2.plot(x, rd["Mean entrustment"].to_numpy(dtype=float), color=uniColor,
+                     marker="o", linewidth=1.4, markersize=3, label="Mean entrustment")
+            ax2.set_ylim(0.5, 4.5)
+            ax2.set_yticks([1, 2, 3, 4])
+            ax2.set_ylabel("Mean entrustment", fontsize=8, color=uniColor)
+            ax2.tick_params(labelsize=7, colors=uniColor)
+        ax.spines["top"].set_visible(False)
+        ax.grid(True, axis="y", linestyle=":", alpha=0.3)
+    else:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No areas for improvement recorded", ha="center", va="center",
+                fontsize=9, color="#6b7490")
+
+    # ---- bottom: per weakness-form over time (numeric date axis) ----
+    ax = axes[1]
+    if hasForm:
+        fd = formDf.reset_index(drop=True)
+        x = np.arange(len(fd))
+        bottom = np.zeros(len(fd))
+        for lab, col in zip(labels, colors):
+            vals = fd[lab].to_numpy(dtype=float)
+            ax.bar(x, vals, bottom=bottom, color=col, width=0.82,
+                   edgecolor="white", linewidth=0.3)
+            bottom += vals
+        # item codes for the form, printed above each bar (vertical, compact)
+        headroom = float(bottom.max()) if len(bottom) else 1.0
+        codesCol = fd["Item Codes"] if "Item Codes" in fd.columns else pd.Series([""] * len(fd))
+        for xi, top, codes in zip(x, bottom, codesCol):
+            lbl = _shortCodes(codes)
+            if lbl:
+                ax.text(xi, top + 0.08, lbl, rotation=90, ha="center", va="bottom",
+                        fontsize=5.2, color="#4a5170")
+        ax.set_ylim(0, headroom * 1.35 + 1)
+        # numeric date ticks (YYYY-MM-DD), same idea as the entrustment time-series
+        step = max(1, len(fd) // 26)
+        tickPos = list(range(0, len(fd), step))
+        labelsX = [pd.Timestamp(fd.iloc[i]["Date"]).strftime("%Y-%m-%d")
+                   if pd.notna(fd.iloc[i].get("Date")) else "" for i in tickPos]
+        ax.set_xticks(tickPos)
+        ax.set_xticklabels(labelsX, rotation=90, fontsize=6, color=uniColor)
+        ax.set_xlim(-0.6, len(fd) - 0.4)
+        ax.set_ylabel("Tags", fontsize=9, color=uniColor)
+        ax.set_title("Areas for improvement per form (only forms with feedback, oldest → newest)",
+                     fontsize=10.5, color=uniColor, fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, axis="y", linestyle=":", alpha=0.3)
+    else:
+        ax.axis("off")
+
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in colors]
+    fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=6.8,
+               frameon=False, bbox_to_anchor=(0.5, -0.02), labelcolor=uniColor)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    plt.close(fig)
+    return fig
+
+
+def plotWeaknessByItemCodeGroups(groupTables, uniColor=None, topN=None):
+    """One horizontal stacked-bar panel per rotation group. groupTables is a list of
+    (label, aggregated-by-code DataFrame). Codes with 0 tags are omitted from the bars.
+    topN defaults to WEAKNESS_CODE_TOPN. Returns a Figure or None if no group has tags."""
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
+    if topN is None:
+        topN = WEAKNESS_CODE_TOPN
+    labels = list(WEAKNESS_KEY_LABELS.values())
+    colors = ["#" + c for c in WEAKNESS_PALETTE]
+
+    panels = []
+    for label, df in groupTables:
+        if df is None or df.empty:
+            panels.append((label, pd.DataFrame()))
+            continue
+        d = df[df[WEAKNESS_TOTAL_COL] > 0].copy()
+        d = d.sort_values(WEAKNESS_TOTAL_COL, ascending=False).head(topN).iloc[::-1]
+        panels.append((label, d))
+    if not any(not d.empty for _, d in panels):
+        return None
+
+    heights = [max(len(d), 1) for _, d in panels]
+    w = variableUtils.figSize[0]
+    totalH = sum(0.42 * h + 1.1 for h in heights)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(w, max(2.4, totalH)), dpi=200,
+                             gridspec_kw={"height_ratios": heights})
+    if len(panels) == 1:
+        axes = [axes]
+    for ax, (label, d) in zip(axes, panels):
+        if d.empty:
+            ax.axis("off")
+            ax.text(0.5, 0.5, f"{label}: no areas for improvement", ha="center",
+                    va="center", fontsize=8.5, color="#6b7490")
+            continue
+        y = np.arange(len(d))
+        left = np.zeros(len(d))
+        for lab, col in zip(labels, colors):
+            vals = d[lab].to_numpy(dtype=float)
+            ax.barh(y, vals, left=left, color=col, label=lab, edgecolor="white", linewidth=0.4)
+            left += vals
+        for yi, tot in zip(y, d[WEAKNESS_TOTAL_COL].to_numpy()):
+            ax.text(tot + 0.1, yi, str(int(tot)), va="center", fontsize=7, color=uniColor)
+        ax.set_yticks(y)
+        ax.set_yticklabels(d["Item Code"].astype(str), fontsize=7.5, color=uniColor)
+        ax.set_title(f"{label} — item codes with the most areas for improvement",
+                     fontsize=10, color=uniColor, fontweight="bold")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(True, axis="x", linestyle=":", alpha=0.3)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for c in colors]
+    fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=6.5,
+               frameon=False, bbox_to_anchor=(0.5, -0.01), labelcolor=uniColor)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    plt.close(fig)
+    return fig
+
+
+def _weaknessCodeTablePdf(elements, df, label, subheadingStyle, uniColor,
+                          tableTextStyleSmall):
+    """Compact fixed-width top-codes table for one rotation group."""
+    if df is None or df.empty:
+        return
+    keep = ["Item Code", "Description", "Forms with a weakness", WEAKNESS_TOTAL_COL,
+            "Low-entrustment forms", WEAKNESS_INCIDENT_COL]
+    keep = [c for c in keep if c in df.columns]
+    tbl = df[keep].head(WEAKNESS_CODE_TOPN).copy()
+    rename = {"Forms with a weakness": "Weakness forms",
+              WEAKNESS_TOTAL_COL: "AFI tags",
+              "Low-entrustment forms": "Low-ent forms",
+              WEAKNESS_INCIDENT_COL: "Incidents"}
+    tbl.columns = [rename.get(c, c) for c in tbl.columns]
+    if "Description" in tbl.columns:
+        tbl["Description"] = tbl["Description"].fillna("").astype(str).str.replace("\n", "<br/>")
+    # widths chosen so every header fits without truncation
+    widthMap = {"Item Code": 0.95, "Description": 2.5, "Weakness forms": 1.4,
+                "AFI tags": 1.0, "Low-ent forms": 1.35, "Incidents": 1.1}
+    ratio = [widthMap.get(c, 1.0) for c in tbl.columns]
+    elements.append(_enableRowSplit(createTable(
+        tbl, colRatio=ratio, customTextCols=list(range(len(tbl.columns))),
+        bottomPadding=6, topPadding=6,
+        title=f"Item codes with the most areas for improvement — {label}",
+        titleStyle=subheadingStyle, headerColor=uniColor, tableTextStyle=tableTextStyleSmall)))
+    elements.append(Spacer(1, 10))
+
+
+def buildStudentWeaknessSection(engine, cohort, studentNumber, elements, styles,
+                                formsTable="dds4_boh3_forms_v3",
+                                subheadingStyle=None, subsubheadingStyleL=None,
+                                uniColor=None, tableTextStyleSmall=None,
+                                rotationGroups=None, tocMark=None):
+    """Append the 'areas for improvement — when and where' section to a student PDF:
+    a weakness-over-time chart (rotation + per-form) and, split by rotation group, a
+    weakness-by-item-code chart plus a compact top-codes table. rotationGroups overrides
+    the module default WEAKNESS_ROTATION_GROUPS. No-ops cleanly when nothing was recorded."""
+    if subheadingStyle is None:
+        subheadingStyle = styles.get("subheadingStyle") if styles else None
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
+
+    timelineDf = getStudentWeaknessTimeline(engine, cohort, studentNumber, formsTable)
+    byRotationDf = summariseWeaknessByRotation(timelineDf)
+    detail = getStudentWeaknessByCodeRotation(engine, cohort, studentNumber, formsTable)
+    try:
+        descMap = getItemCodeDescriptionMap(engine, cohort, formsTable)
+    except Exception as ex:
+        print(f"[buildStudentWeaknessSection] description map failed: {ex}")
+        descMap = {}
+
+    present = sorted(detail[WEAKNESS_ROTATION_COL].dropna().astype(int).unique().tolist()) \
+        if (detail is not None and not detail.empty
+            and WEAKNESS_ROTATION_COL in detail.columns) else []
+    groups = weaknessRotationGroups(present, rotationGroups)
+    groupTables = [(label, aggregateWeaknessByCode(detail, nums, descMap=descMap))
+                   for label, nums in groups]
+
+    labels = list(WEAKNESS_KEY_LABELS.values())
+    anyWeakness = (not timelineDf.empty) and timelineDf[labels].to_numpy().sum() > 0
+    anyCode = any(not d.empty for _, d in groupTables)
+    if not anyWeakness and not anyCode:
+        return
+
+    elements.append(PageBreak())
+    if tocMark is not None:
+        elements.append(tocMark)
+    elements.append(Paragraph("Areas for Improvement — When &amp; Where", subheadingStyle))
+    if subsubheadingStyleL is not None:
+        elements.append(Paragraph(
+            "These panels track the areas for improvement your supervisors recorded across "
+            "the year and against the procedures you performed. Note: feedback is recorded per "
+            "<i>form</i>, not per procedure, so an item code here means the code was on a form "
+            "that also noted an area for improvement (an association, not a strict cause).",
+            subsubheadingStyleL))
+        elements.append(Spacer(1, 8))
+
+    fig = plotWeaknessOverTime(timelineDf, byRotationDf, uniColor=uniColor)
+    if fig is not None:
+        elements.append(_StudentTocMark("Areas for improvement over time (rotation &amp; per form)",
+                                        level=1))
+        elements.append(addPlotImage(fig, 0.92))
+        elements.append(Spacer(1, 12))
+
+    fig2 = plotWeaknessByItemCodeGroups(groupTables, uniColor=uniColor)
+    if fig2 is not None:
+        elements.append(PageBreak())
+        elements.append(_StudentTocMark("Areas for improvement by item code (chart)", level=1))
+        elements.append(addPlotImage(fig2, 0.92))
+        elements.append(Spacer(1, 10))
+
+    for label, df in groupTables:
+        if df is not None and not df.empty:
+            elements.append(_StudentTocMark(
+                f"Item codes with the most areas for improvement — {label}", level=1))
+        _weaknessCodeTablePdf(elements, df, label, subheadingStyle, uniColor,
+                              tableTextStyleSmall)
+
+
+class _StudentTocMark(Flowable):
+    """Zero-size marker: on a multiBuild pass it reports the page it landed on to the
+    cover TableOfContents and bookmarks that page, so the contents line is a clickable
+    link. One is dropped at the top of each section's first page."""
+    def __init__(self, text, level=0):
+        Flowable.__init__(self)
+        self.tocText = text
+        self.tocLevel = level
+        self.tocKey = f"stutoc_{id(self)}"   # stable across multiBuild passes → link target
+        self.width = 0
+        self.height = 0
+
+    def draw(self):
+        pass
+
+
+class _StudentTocDoc(SimpleDocTemplate):
+    """SimpleDocTemplate that feeds _StudentTocMark markers to the TableOfContents on
+    each multiBuild pass and bookmarks their page for the clickable links."""
+    def afterFlowable(self, flowable):
+        if isinstance(flowable, _StudentTocMark):
+            self.canv.bookmarkPage(flowable.tocKey)
+            self.notify("TOCEntry",
+                        (flowable.tocLevel, flowable.tocText, self.page, flowable.tocKey))
+
+
+def _makeStudentToc(uniColor):
+    hexColor = uniColor if str(uniColor).startswith("#") else "#" + str(uniColor)
+    toc = TableOfContents()
+    toc.dotsMinLevel = 0
+    toc.levelStyles = [
+        # level 0 — section headers (bold navy)
+        ParagraphStyle("studentToc0", fontName="Helvetica-Bold", fontSize=11.5, leading=19,
+                       spaceBefore=6, textColor=colors.HexColor(hexColor)),
+        # level 1 — the tables / charts within a section (indented, smaller, muted)
+        ParagraphStyle("studentToc1", fontName="Helvetica", fontSize=9.5, leading=15,
+                       leftIndent=18, textColor=colors.HexColor("#4a5170")),
+    ]
+    return toc
+
+
+def _studentPageDecorators(bannerTitle, bannerSubtitle):
+    """(firstPage, laterPage) canvas callbacks: banner on the cover, and a centred page
+    number on every content page (the cover stays unnumbered, so the printed numbers
+    match the ones in the contents)."""
+    bannerFn = getBannerDrawer(bannerTitle, bannerSubtitle)
+
+    def first(canvas, doc):
+        bannerFn(canvas, doc)
+
+    def later(canvas, doc):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(colors.HexColor("#6a7385"))
+        canvas.drawCentredString(doc.pagesize[0] / 2.0, 16, str(canvas.getPageNumber()))
+        canvas.restoreState()
+
+    return first, later
+
+
 def buildStudentPdf(engine, cohort, studentNumber, studentName, outputPath,
-                    formsTable="dds4_boh3_forms", pageSize=None,
+                    formsTable="dds4_boh3_forms_v3", pageSize=None,
                     leftMargin=36, rightMargin=36, topMargin=48, bottomMargin=36,
                     styles=None, subheadingStyle=None, subsubheadingStyleL=None,
                     uniColor=None, tableTextStyleSmall=None):
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
     metricsDf, selfDf, assessorDf = getStudentSummaryTable(
         engine, cohort, studentNumber, studentName, formsTable
     )
-    doc = SimpleDocTemplate(str(outputPath), pagesize=pageSize, rightMargin=rightMargin,
-                            leftMargin=leftMargin, topMargin=topMargin, bottomMargin=bottomMargin)
+    # _StudentTocDoc + multiBuild: two passes so the contents page numbers resolve.
+    doc = _StudentTocDoc(str(outputPath), pagesize=pageSize, rightMargin=rightMargin,
+                         leftMargin=leftMargin, topMargin=topMargin, bottomMargin=bottomMargin)
     elements = []
-    elements.append(Spacer(1, 72))
+
+    # ── Cover / contents (page 1). The TOC is filled by the _StudentTocMark markers
+    # placed at the top of each section below; each entry is a clickable link. ──
+    elements.append(Spacer(1, 72))                      # clears the banner on the cover
     elements.append(Paragraph(
         "This is a summary report of your clinical activity so far in 2026. "
-        "For detailed information please review your completed forms in the DASH program."
-        "<br/> We are working on an interactive live dashboard for future reports.",
+        "For detailed information please review your completed forms in the DASH program. "
+        "Each entry in the contents below is a clickable link, or use the page number to "
+        "jump to it.",
         subsubheadingStyleL,
     ))
+    elements.append(Spacer(1, 14))
+    elements.append(Paragraph("Contents", subheadingStyle))
+    elements.append(Spacer(1, 6))
+    elements.append(_makeStudentToc(uniColor))
+    elements.append(PageBreak())
+
+    # ── Summary + entrustment trend (page 2) ──
+    elements.append(_StudentTocMark("Summary &amp; entrustment trend"))
+    elements.append(_StudentTocMark("Summary table", level=1))
     elements.append(createTable(
         metricsDf, colRatio=[2, 1], customTextCols=[0, 1], bottomPadding=6, topPadding=6,
         title="Summary", titleStyle=subheadingStyle, headerColor=uniColor,
     ))
-
-
     timeSeriesDf = getStudentTimeSeries(engine, cohort, studentNumber, formsTable)
     if not timeSeriesDf.empty:
-        fig = plotEntrustmentReadinessTimeSeries(timeSeriesDf, title="Entrustment & Practice Readiness Over Time",
-                                                  uniColor=uniColor, useDateAxis=False)
+        fig = plotEntrustmentReadinessTimeSeries(
+            timeSeriesDf, title="Entrustment & Practice Readiness Over Time",
+            uniColor=uniColor, useDateAxis=False)
         elements.append(Spacer(1, 24))
+        elements.append(_StudentTocMark("Entrustment &amp; practice readiness over time", level=1))
         elements.append(addPlotImage(fig, 0.9))
 
-    topItemsDf = getStudentTopItemCodes(engine, cohort, studentNumber, limit = 55, formsTable=formsTable)
+    # ── Procedures performed ──
+    topItemsDf = getStudentTopItemCodes(engine, cohort, studentNumber, limit=55, formsTable=formsTable)
     if not topItemsDf.empty:
-        # elements.append(Spacer(1, 18))
-        topItemsDf2 = topItemsDf.copy()
-        topItemsDf2.columns = ["Item Code", "Description", "Total Qty", "Cohort Avg"]
-        elements.append(createTable(
-            topItemsDf2, colRatio=[1, 4, 1, 1], customTextCols=[0, 1, 2, 3], bottomPadding=3, topPadding=3,
-            title="Top Procedures", titleStyle=subheadingStyle, headerColor=uniColor, tableTextStyle=tableTextStyleSmall,
-        ))
+        elements.append(PageBreak())
+        elements.append(_StudentTocMark("Procedures performed"))
+        elements.append(_StudentTocMark("Procedures — your count vs class average", level=1))
+        _addProceduresBarChart(elements, topItemsDf, subheadingStyle, uniColor=uniColor)
 
+    # ── Areas for improvement — the section adds its own page break, then the marker ──
+    buildStudentWeaknessSection(
+        engine, cohort, studentNumber, elements, styles, formsTable,
+        subheadingStyle=subheadingStyle, subsubheadingStyleL=subsubheadingStyleL,
+        uniColor=uniColor, tableTextStyleSmall=tableTextStyleSmall,
+        tocMark=_StudentTocMark("Areas for improvement — when &amp; where"),
+    )
 
-
+    # ── Comparison with assessors & comments ──
     buildStudentVsAssessorSection(
         engine, cohort, studentNumber, elements, styles, formsTable,
         subheadingStyle=subheadingStyle, uniColor=uniColor,
         tableTextStyleSmall=tableTextStyleSmall,
+        tocMark=_StudentTocMark("Comparison with assessors &amp; comments"),
     )
 
     bannerTitle = f"Student Summary - {cohort}"
     bannerSubtitle = f"{studentName} ({studentNumber})" if studentNumber else studentName
-    doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, bannerSubtitle))
+    firstPage, laterPage = _studentPageDecorators(bannerTitle, bannerSubtitle)
+    doc.multiBuild(elements, onFirstPage=firstPage, onLaterPages=laterPage)
 
 
-def buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_forms",
+def buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_forms_v3",
                               pageSize=None, leftMargin=36, rightMargin=36,
                               topMargin=48, bottomMargin=36, styles=None,
                               subheadingStyle=None, subsubheadingStyleL=None,
@@ -1527,6 +3196,7 @@ def buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_f
         studentName = row["student_name"]
         # if studentNumber !=1079946:  # temp filter for testing, remove in production
           # continue
+        print(f"Building PDF for student: {studentName} ({studentNumber})")
         safeName = "".join(c for c in str(studentNumber) if c.isalnum() or c in (" ", "_", "-")).strip()
         outPath = outputDir / f"{safeName}.pdf"
         buildStudentPdf(
@@ -1537,43 +3207,239 @@ def buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_f
             subsubheadingStyleL=subsubheadingStyleL, uniColor=uniColor,
             tableTextStyleSmall=tableTextStyleSmall,
         )
-        # break  # for testing, remove in production to generate for all students
+        # break  # for testing, remove in production to generate fsda222222222
+class _OutlineBookmark(Flowable):
+    """Zero-size flowable that registers a clickable PDF outline (bookmark) entry at its
+    position, so the generated PDF has a navigable student sidebar."""
+    def __init__(self, title, key, level=0):
+        super().__init__()
+        self.title = title
+        self.key = key
+        self.level = level
+        self.width = 0
+        self.height = 0
+
+    def draw(self):
+        self.canv.bookmarkPage(self.key)
+        self.canv.addOutlineEntry(self.title, self.key, level=self.level, closed=False)
 
 
 def buildEntrustmentTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
-                                  subheadingStyle, uniColor, formsTable="dds4_boh3_forms",
+                                  subheadingStyle, uniColor, formsTable="dds4_boh3_forms_v3",
                                   pageSize=None, rightMargin=36, leftMargin=36,
-                                  topMargin=48, bottomMargin=36):
-    if pageSize is None:
-        pageSize = variableUtils.pageSize
+                                  topMargin=48, bottomMargin=36, onlyLevel1=True):
+    """Per-student entrustment/readiness time-series report.
 
-    elements = []
-    elements.append(Spacer(1, 72))
+    Polish: only students who ever hit entrustment Level 1 (when onlyLevel1), sorted worst-first
+    (most Level-1 forms, then lowest average), one chart per page, each with a heading, a stats
+    line, and a clickable PDF outline bookmark for navigation.
+    """
+    if pageSize is None:
+        # Wider portrait page than the default A3 (11.69 x 16.54 in): keep the tall height so
+        # several charts still pack per page, but widen so the string-date x-axis has room.
+        pageSize = (15 * inch, variableUtils.pageSize[1])
 
     doc = SimpleDocTemplate(str(outPath), pagesize=pageSize, rightMargin=rightMargin,
                             leftMargin=leftMargin, topMargin=topMargin, bottomMargin=bottomMargin)
+    chartWidthInch = (pageSize[0] - leftMargin - rightMargin) / inch  # native figure width
 
+    # ── Pass 1: gather each student's series + summary stats, apply the filter ──
     studentsDf = getStudentsInCohort(engine, cohort, formsTable)
-    studentsDf.sort_values("student_name", inplace=True)
-    for i, row in studentsDf.iterrows():
-        studentName = row["student_name"]
-        studentNumber = row["student_number"]
+    
+    records = []
+    for _, row in studentsDf.iterrows():
+        if row["student_number"] in [40029860]:
+            print("Skipping", row["student_number"])
+            continue
+        tsDf = getStudentTimeSeries(engine, cohort, row["student_number"], formsTable)
+        if tsDf.empty:
+            continue
+        nLvl1 = int((tsDf["entrustment"] == 1).sum())
+        if onlyLevel1 and nLvl1 == 0:
+            continue
+        records.append({
+            "name": row["student_name"],
+            "number": row["student_number"],
+            "df": tsDf,
+            "forms": int(tsDf.shape[0]),
+            "avg": float(tsDf["entrustment"].mean()) if tsDf["entrustment"].notna().any() else float("nan"),
+            "nLvl1": nLvl1,
+        })
 
-        # elements.append(Paragraph(f"{studentName} ({studentNumber})", subheadingStyle))
-        elements.append(Spacer(1, 12))
-
-        timeSeriesDf = getStudentTimeSeries(engine, cohort, studentNumber, formsTable)
-        if not timeSeriesDf.empty:
-            fig = plotEntrustmentReadinessTimeSeries(timeSeriesDf, title=f"{studentName} ({studentNumber})", uniColor=uniColor,
-                                                      useDateAxis=False)
-            img = addPlotImage(fig, 0.9)
-            elements.append(img)
-        else:
-            elements.append(Paragraph("No entrustment/readiness data available.", subheadingStyle))
-
-        elements.append(Spacer(1, 36))
+    # worst-first: most Level-1 forms, then lowest average entrustment
+    # records.sort(key=lambda r: (-r["nLvl1"], r["avg"] if pd.notna(r["avg"]) else 99))
+    # Alphabetical by last name, then first name. nameSortKey recovers the surname from the
+    # single student_name column (see general_utils.nameSortKey); ties fall back to the
+    # student number so the page order is stable between runs.
+    records.sort(key=lambda r: (*nameSortKey(r["name"]), r["number"]))
+    # ── Pass 2: charts flow to pack the page (each student's block kept together) ──
+    elements = [Spacer(1, 72)]
+    for r in records:
+        avgTxt = f"{r['avg']:.2f}" if pd.notna(r["avg"]) else "n/a"
+        subtitle = f"Forms: {r['forms']}   •   Avg entrustment: {avgTxt}   •   Level-1 forms: {r['nLvl1']}"
+        fig = plotEntrustmentReadinessTimeSeries(
+            r["df"], title="", subtitle=subtitle, uniColor=uniColor,
+            useDateAxis=False, figWidth=chartWidthInch)
+        block = [
+            _OutlineBookmark(f"{r['name']} ({r['number']})", key=f"stu-{r['number']}"),
+            Paragraph(f"{r['name']} ({r['number']})", subheadingStyle),
+            Spacer(1, 4),
+            addPlotImage(fig, 0.98, pageSize=pageSize),
+            Spacer(1, 20),
+        ]
+        # Areas-for-improvement over time (per rotation + per form), matched to the page
+        # width — same panels as the student report's weakness section.
+        timelineDf = getStudentWeaknessTimeline(engine, cohort, r["number"], formsTable)
+        wkFig = plotWeaknessOverTime(timelineDf, summariseWeaknessByRotation(timelineDf),
+                                     uniColor=uniColor, figWidth=chartWidthInch)
+        if wkFig is not None:
+            block += [addPlotImage(wkFig, 0.98, pageSize=pageSize), Spacer(1, 20)]
+        elements.append(KeepTogether(block))
 
     doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, ""))
+
+
+# ── Interactive HTML version (self-contained, searchable student sidebar) ──────
+
+_TS_HTML_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>__TITLE__</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"></script>
+<style>
+:root{--navy:#010d44;--red:#d32f2f;--amber:#f9a825;}
+*{box-sizing:border-box;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+body{margin:0;color:#1a1a1a;background:#fff;}
+header{background:var(--navy);color:#fff;padding:14px 20px;}
+header h1{margin:0;font-size:18px;} header .sub{opacity:.8;font-size:12px;margin-top:2px;}
+.wrap{display:flex;height:calc(100vh - 60px);}
+.side{width:290px;border-right:1px solid #e3e6ef;display:flex;flex-direction:column;background:#f7f8fc;}
+.side .ctrls{padding:10px;border-bottom:1px solid #e3e6ef;}
+.side input[type=text]{width:100%;padding:8px 10px;border:1px solid #cfd4e4;border-radius:6px;font-size:13px;}
+.side label.chk{display:flex;align-items:center;gap:6px;font-size:12px;margin-top:8px;color:#444;}
+.list{overflow-y:auto;flex:1;}
+.item{padding:9px 12px;border-bottom:1px solid #eceffa;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-size:13px;}
+.item:hover{background:#eef1fb;} .item.active{background:#e3e9ff;border-left:3px solid var(--navy);}
+.item .nm{font-weight:600;color:#1a2340;} .item .id{color:#8890a8;font-size:11px;}
+.badge{background:var(--red);color:#fff;border-radius:10px;padding:1px 7px;font-size:11px;font-weight:600;}
+.badge.zero{background:#c3c8d6;}
+.main{flex:1;display:flex;flex-direction:column;padding:14px 18px;overflow:auto;}
+.stats{display:flex;gap:22px;margin:4px 0 10px;font-size:13px;color:#333;}
+.stats b{color:var(--navy);} #chart{flex:1;min-height:420px;}
+.hint{color:#8890a8;font-size:12px;padding:14px;}
+</style></head><body>
+<header><h1>__TITLE__</h1><div class="sub">Entrustment (assessor) vs Practice Readiness (student) · click or search a student</div></header>
+<div class="wrap">
+  <div class="side">
+    <div class="ctrls">
+      <input id="search" type="text" placeholder="Search student name or ID…">
+      <label class="chk"><input id="onlyes1" type="checkbox" checked> Only students with ES1 &ge; 1</label>
+    </div>
+    <div id="list" class="list"></div>
+  </div>
+  <div class="main">
+    <div id="stats" class="stats"></div>
+    <div id="chart"></div>
+  </div>
+</div>
+<script>
+const DATA=__DATA__, ORDER=__ORDER__;
+let current=null;
+const listEl=document.getElementById('list'), searchEl=document.getElementById('search'), onlyEl=document.getElementById('onlyes1');
+function visibleIds(){
+  const q=searchEl.value.trim().toLowerCase();
+  return ORDER.filter(id=>{
+    const d=DATA[id];
+    if(onlyEl.checked && d.nLvl1===0) return false;
+    if(q && !(d.name.toLowerCase().includes(q) || id.includes(q))) return false;
+    return true;
+  });
+}
+function buildList(){
+  const ids=visibleIds();
+  listEl.innerHTML='';
+  ids.forEach(id=>{
+    const d=DATA[id];
+    const row=document.createElement('div');
+    row.className='item'+(id===current?' active':'');
+    row.innerHTML=`<span><span class="nm">${d.name}</span> <span class="id">${id}</span></span>`+
+                  `<span class="badge${d.nLvl1===0?' zero':''}">ES1 &times;${d.nLvl1}</span>`;
+    row.onclick=()=>select(id);
+    listEl.appendChild(row);
+  });
+  if(ids.length && !ids.includes(current)) select(ids[0]);
+  else if(!ids.length){listEl.innerHTML='<div class="hint">No students match.</div>';}
+}
+function select(id){
+  current=id; buildList();
+  const d=DATA[id];
+  document.getElementById('stats').innerHTML=
+    `<span>Forms: <b>${d.forms}</b></span><span>Avg entrustment: <b>${d.avg}</b></span>`+
+    `<span>ES1 forms: <b style="color:var(--red)">${d.nLvl1}</b></span>`;
+  const lvl1x=[],lvl1y=[];
+  d.dates.forEach((dt,i)=>{ if(d.entrustment[i]===1){lvl1x.push(dt);lvl1y.push(1);} });
+  const traces=[
+    {x:d.dates,y:d.entrustment,mode:'lines+markers',name:'Entrustment (Assessor)',
+     line:{color:'steelblue',width:2},marker:{size:6},hovertemplate:'%{x|%d %b}: level %{y}<extra>Entrustment</extra>'},
+    {x:d.dates,y:d.readiness,mode:'lines+markers',name:'Practice Readiness (Student)',
+     line:{color:'darkorange',width:2},marker:{size:6,symbol:'square'},hovertemplate:'%{x|%d %b}: level %{y}<extra>Readiness</extra>'},
+    {x:lvl1x,y:lvl1y,mode:'markers',name:'Level 1 (flag)',
+     marker:{color:'#d32f2f',size:12,symbol:'x'},hovertemplate:'%{x|%d %b}: ES1<extra>Flag</extra>'}
+  ];
+  const shapes=[
+    {type:'rect',xref:'paper',x0:0,x1:1,yref:'y',y0:0.5,y1:1.5,fillcolor:'#d32f2f',opacity:0.07,line:{width:0},layer:'below'},
+    {type:'rect',xref:'paper',x0:0,x1:1,yref:'y',y0:1.5,y1:2.5,fillcolor:'#f9a825',opacity:0.06,line:{width:0},layer:'below'},
+    {type:'line',xref:'paper',x0:0,x1:1,yref:'y',y0:d.avg,y1:d.avg,line:{color:'steelblue',width:1,dash:'dash'},layer:'below'}
+  ];
+  Plotly.newPlot('chart',traces,{
+    margin:{l:40,r:20,t:10,b:40},yaxis:{range:[0.5,4.5],tickvals:[1,2,3,4],title:'Level'},
+    xaxis:{type:'date'},hovermode:'x unified',shapes:shapes,
+    legend:{orientation:'h',y:-0.18},plot_bgcolor:'#fff'
+  },{responsive:true,displayModeBar:true,displaylogo:false});
+}
+searchEl.oninput=buildList; onlyEl.onchange=buildList;
+buildList();
+</script></body></html>"""
+
+
+def buildEntrustmentTimeSeriesHtml(engine, cohort, outPath, title=None,
+                                   formsTable="dds4_boh3_forms_v3", onlyLevel1=False):
+    """Self-contained interactive HTML: searchable student sidebar + Plotly entrustment/readiness
+    time series (hover, zoom, risk-zone shading, ES1 flags). All data is embedded, so the file
+    works offline (Plotly is loaded from CDN). `onlyLevel1` only affects the sidebar's default
+    checkbox filter — every student is embedded so the toggle works client-side."""
+    if title is None:
+        title = f"Entrustment & Practice Readiness — {cohort}"
+
+    studentsDf = getStudentsInCohort(engine, cohort, formsTable)
+    data = {}
+    for _, row in studentsDf.iterrows():
+        ts = getStudentTimeSeries(engine, cohort, row["student_number"], formsTable)
+        if ts.empty:
+            continue
+        ts = ts.copy()
+        ts["date"] = pd.to_datetime(ts["date"])
+        ts.sort_values("date", inplace=True)
+        ent = ts["entrustment"]
+        nLvl1 = int((ent == 1).sum())
+        data[str(row["student_number"])] = {
+            "name": row["student_name"],
+            "dates": ts["date"].dt.strftime("%Y-%m-%d").tolist(),
+            "entrustment": [None if pd.isna(v) else int(v) for v in ent],
+            "readiness": [None if pd.isna(v) else int(v) for v in ts["practice_readiness"]],
+            "forms": int(ts.shape[0]),
+            "avg": round(float(ent.mean()), 2) if ent.notna().any() else None,
+            "nLvl1": nLvl1,
+        }
+
+    # sidebar order: worst-first (most ES1 forms, then lowest average)
+    order = sorted(data.keys(), key=lambda k: (-data[k]["nLvl1"],
+                                               data[k]["avg"] if data[k]["avg"] is not None else 99))
+    html = (_TS_HTML_TEMPLATE
+            .replace("__TITLE__", title)
+            .replace("__DATA__", json.dumps(data))
+            .replace("__ORDER__", json.dumps(order)))
+    with open(outPath, "w", encoding="utf-8") as f:
+        f.write(html)
+    return outPath
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1582,7 +3448,7 @@ def buildEntrustmentTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
 
 _MAIN_SQL = """WITH base AS (
   SELECT student_name, assessor_name, datetimeutc::date AS date, student_data, assessor_data
-  FROM dds4_boh3_forms
+  FROM dds4_boh3_forms_v3
   WHERE cohort = :cohort AND student_name = :studentName
 )
 SELECT b.student_name, b.date, b.assessor_name,
@@ -1597,14 +3463,14 @@ LEFT JOIN LATERAL (
     UNION ALL
     SELECT e->>'value' AS v
     FROM jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
-    WHERE COALESCE(e->>'name','') = 'Other'
+    WHERE COALESCE(e->>'key','') = 'Other'
   ) t
 ) os ON TRUE
 ORDER BY b.date, b.assessor_name;
 """
 
 _WEAKNESS_SQL = """WITH base AS (
-  SELECT assessor_data FROM dds4_boh3_forms
+  SELECT assessor_data FROM dds4_boh3_forms_v3
   WHERE cohort = :cohort AND student_name = :studentName
 )
 SELECT trim(e->>'value') AS weakness, COUNT(*)::int AS n
@@ -1617,19 +3483,19 @@ GROUP BY weakness ORDER BY n DESC, weakness;
 """
 
 _STRENGTH_SQL = """WITH base AS (
-  SELECT assessor_data FROM dds4_boh3_forms
+  SELECT assessor_data FROM dds4_boh3_forms_v3
   WHERE cohort = :cohort AND student_name = :studentName
 )
 SELECT trim(e->>'value') AS strength, COUNT(*)::int AS n
 FROM base b
 JOIN LATERAL jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e ON TRUE
-WHERE COALESCE(e->>'name','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL
+WHERE COALESCE(e->>'key','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL
 GROUP BY strength ORDER BY n DESC, strength;
 """
 
 _CONCERNS_SQL = """WITH base AS (
   SELECT student_name, assessor_name, datetimeutc::date AS date, additional_concerns, assessor_data
-  FROM dds4_boh3_forms WHERE cohort = :cohort AND student_name = :studentName
+  FROM dds4_boh3_forms_v3 WHERE cohort = :cohort AND student_name = :studentName
 )
 SELECT b.student_name, b.date, b.assessor_name,
   NULLIF(b.additional_concerns,'') AS additional_concerns,
@@ -1682,7 +3548,7 @@ def buildStudentSheet(engine, wb, cohort, studentName):
 
 def exportStudentTextWorkbook(engine, cohort, outPath):
     studentsSql = """
-    SELECT DISTINCT student_name FROM dds4_boh3_forms
+    SELECT DISTINCT student_name FROM dds4_boh3_forms_v3
     WHERE cohort = :cohort AND student_name IS NOT NULL AND student_name <> 'Test Student'
     ORDER BY student_name;
     """
@@ -1702,33 +3568,31 @@ def exportStudentTextWorkbook(engine, cohort, outPath):
 
 INDIVIDUAL_ENTRY_SQL = """
 WITH b AS (
-  SELECT * FROM dds4_boh3_forms WHERE assessmentid = :assessmentId
+  SELECT * FROM dds4_boh3_forms_v3 WHERE assessmentid = :assessmentId
 ),
 student AS (
   SELECT
-    b.assessmentid, b.form_code, b.cohort, b.subject, b.type,
+    b.assessmentid, b.form_code, b.cohort, b.subject, b.type, b.version,
     b.createdat::date AS created_date, b.updatedat::date AS updated_date,
+    b.createdat AS created_ts, b.updatedat AS updated_ts,
     b.clinic, b.rotation,
     b.student_number, b.student_name, b.student_email,
-    b.assessorid, b.assessor_name,
+    b.assessorid, b.assessor_name, b.assessor_email,
+    b.submitted_by_assessor, b.submitted_by_student,
     NULLIF(b.student_data->'texts'->>'reflection','') AS student_reflection,
-    b.student_data->'scales'->'scale-practice-readiness'->>'scale' AS practice_readiness_code,
+    b.student_data->'scales'->'scale-practice-readiness'->>'key' AS practice_readiness_code,
     b.student_config->'scales'->'scale-practice-readiness'->'fields'
-      -> (b.student_data->'scales'->'scale-practice-readiness'->>'scale') AS practice_readiness_text,
-    b.assessor_data->'scales'->'scale-entrustment'->>'scale' AS entrustment_code,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC1' AS mc1,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC2' AS mc2,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC3' AS mc3,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC4' AS mc4,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC5' AS mc5,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC6' AS mc6,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC7' AS mc7,
-    CASE b.assessor_data->'scales'->'scale-entrustment'->>'scale'
+      -> (b.student_data->'scales'->'scale-practice-readiness'->>'key') AS practice_readiness_text,
+    b.assessor_data->'scales'->'scale-entrustment'->>'key' AS entrustment_code,
+    CASE b.assessor_data->'scales'->'scale-entrustment'->>'key'
       WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4 ELSE NULL
     END AS entrustment_num,
     b.assessor_config->'scales'->'scale-entrustment'->'fields'
-      -> (b.assessor_data->'scales'->'scale-entrustment'->>'scale') AS entrustment_text,
+      -> (b.assessor_data->'scales'->'scale-entrustment'->>'key') AS entrustment_text,
     NULLIF(b.assessor_data->'texts'->>'additional_comments','') AS assessor_comments,
+    b.assessor_data->'radio'->>'clinical-incident-occurred' AS clinical_incident_occurred,
+    b.assessor_data->'radio'->>'additional-concerns-occurred' AS additional_concerns_occurred,
+    NULLIF(b.assessor_data->'texts'->>'clinical-incident-additional-details','') AS clinical_incident_details,
     NULLIF(b.additional_concerns,'') AS additional_concerns,
     b.patient_data, b.assessor_data
   FROM b
@@ -1737,76 +3601,94 @@ agg AS (
   SELECT s.*,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
-     WHERE COALESCE(e->>'name','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths,
+     WHERE COALESCE(e->>'key','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
-     WHERE COALESCE(e->>'name','') = 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths_other,
+     WHERE COALESCE(e->>'key','') = 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths_other,
+    (SELECT COALESCE(jsonb_agg(trim(e->>'value'))
+              FILTER (WHERE COALESCE(e->>'key','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL),
+              '[]'::jsonb)
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e) AS strengths_list,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_each(COALESCE(s.assessor_data->'multi-select','{}'::jsonb)) kv(key, arr)
      JOIN LATERAL jsonb_array_elements(COALESCE(kv.arr,'[]'::jsonb)) e ON TRUE
      WHERE kv.key LIKE 'weakness-%%' AND kv.key <> 'weakness-other'
        AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS weaknesses,
+    (SELECT COALESCE(jsonb_agg(jsonb_build_object('group', kv.key, 'value', trim(e->>'value')))
+              FILTER (WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL), '[]'::jsonb)
+     FROM jsonb_each(COALESCE(s.assessor_data->'multi-select','{}'::jsonb)) kv(key, arr)
+     JOIN LATERAL jsonb_array_elements(COALESCE(kv.arr,'[]'::jsonb)) e ON TRUE
+     WHERE kv.key LIKE 'weakness-%%' AND kv.key <> 'weakness-other') AS weaknesses_grouped,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'weakness-other','[]'::jsonb)) e
      WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS weaknesses_other,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) e
-     WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS clinical_incidents
+     WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS clinical_incidents,
+    (SELECT COALESCE(jsonb_agg(trim(e->>'value'))
+              FILTER (WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL), '[]'::jsonb)
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) e) AS clinical_incidents_list
   FROM student s
 )
 SELECT
-  assessmentid, form_code, cohort, subject, type, created_date, updated_date, clinic, rotation,
+  assessmentid, form_code, cohort, subject, type, version,
+  created_date, updated_date, created_ts, updated_ts, clinic, rotation,
   student_number, student_name, student_email,
-  assessorid, assessor_name, practice_readiness_text,
-  entrustment_num, entrustment_text,
+  assessorid, assessor_name, assessor_email,
+  submitted_by_assessor, submitted_by_student,
+  practice_readiness_code, practice_readiness_text,
+  entrustment_code, entrustment_num, entrustment_text,
   student_reflection, assessor_comments,
-  strengths, strengths_other, weaknesses, weaknesses_other,
-  clinical_incidents, additional_concerns, patient_data
+  clinical_incident_occurred, additional_concerns_occurred, clinical_incident_details,
+  strengths, strengths_other, strengths_list,
+  weaknesses, weaknesses_other, weaknesses_grouped,
+  clinical_incidents, clinical_incidents_list, additional_concerns, patient_data
 FROM agg;
 """
 
 INDIVIDUAL_MC_SQL = """
 SELECT b.assessmentid, b.student_name, kv.key AS "MC Code",
-  b.student_config->'checklists'->'checklist-caf-final-eval'->'fields'->> kv.key AS "Full MC Text",
-  kv.value AS "MC Rating",
-  CASE kv.value
+  COALESCE(
+    b.student_config->'checklists'->'selected'->'checklist-caf-final-eval'->'fields'->> kv.key,
+    b.student_config->'checklists'->'checklist-caf-final-eval'->'fields'->> kv.key
+  ) AS "Full MC Text",
+  COALESCE(kv.value->>'value', kv.value#>>'{}') AS "MC Rating",
+  CASE COALESCE(kv.value->>'value', kv.value#>>'{}')
     WHEN 'Done well' THEN 1.0 WHEN 'Done' THEN 0.8 WHEN 'Mostly done' THEN 0.6
     WHEN 'Sometimes done' THEN 0.4 WHEN 'Not done' THEN 0.0 ELSE NULL
   END AS "MC Score"
-FROM dds4_boh3_forms b,
-LATERAL jsonb_each_text(b.student_data->'checklists'->'checklist-caf-final-eval') kv
+FROM dds4_boh3_forms_v3 b,
+LATERAL jsonb_each(b.student_data->'checklists'->'checklist-caf-final-eval') kv
 WHERE b.assessmentid = :assessmentId;
 """
 
 STUDENT_ENTRIES_SQL = """
 WITH b AS (
-  SELECT * FROM dds4_boh3_forms WHERE student_number = :studentNumber
+  SELECT * FROM dds4_boh3_forms_v3 WHERE student_number = :studentNumber
 ),
 student AS (
   SELECT
-    b.assessmentid, b.form_code, b.cohort, b.subject, b.type,
+    b.assessmentid, b.form_code, b.cohort, b.subject, b.type, b.version,
     b.createdat::date AS created_date, b.updatedat::date AS updated_date,
+    b.createdat AS created_ts, b.updatedat AS updated_ts,
     b.clinic, b.rotation,
     b.student_number, b.student_name, b.student_email,
-    b.assessorid, b.assessor_name, b.submitted_by_assessor, b.submitted_by_student,
+    b.assessorid, b.assessor_name, b.assessor_email,
+    b.submitted_by_assessor, b.submitted_by_student,
     NULLIF(b.student_data->'texts'->>'reflection','') AS student_reflection,
-    b.student_data->'scales'->'scale-practice-readiness'->>'scale' AS practice_readiness_code,
+    b.student_data->'scales'->'scale-practice-readiness'->>'key' AS practice_readiness_code,
     b.student_config->'scales'->'scale-practice-readiness'->'fields'
-      -> (b.student_data->'scales'->'scale-practice-readiness'->>'scale') AS practice_readiness_text,
-    b.assessor_data->'scales'->'scale-entrustment'->>'scale' AS entrustment_code,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC1' AS mc1,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC2' AS mc2,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC3' AS mc3,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC4' AS mc4,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC5' AS mc5,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC6' AS mc6,
-    b.student_data->'checklists'->'checklist-caf-final-eval'->>'MC7' AS mc7,
-    CASE b.assessor_data->'scales'->'scale-entrustment'->>'scale'
+      -> (b.student_data->'scales'->'scale-practice-readiness'->>'key') AS practice_readiness_text,
+    b.assessor_data->'scales'->'scale-entrustment'->>'key' AS entrustment_code,
+    CASE b.assessor_data->'scales'->'scale-entrustment'->>'key'
       WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4 ELSE NULL
     END AS entrustment_num,
     b.assessor_config->'scales'->'scale-entrustment'->'fields'
-      -> (b.assessor_data->'scales'->'scale-entrustment'->>'scale') AS entrustment_text,
+      -> (b.assessor_data->'scales'->'scale-entrustment'->>'key') AS entrustment_text,
     NULLIF(b.assessor_data->'texts'->>'additional_comments','') AS assessor_comments,
+    b.assessor_data->'radio'->>'clinical-incident-occurred' AS clinical_incident_occurred,
+    b.assessor_data->'radio'->>'additional-concerns-occurred' AS additional_concerns_occurred,
+    NULLIF(b.assessor_data->'texts'->>'clinical-incident-additional-details','') AS clinical_incident_details,
     NULLIF(b.additional_concerns,'') AS additional_concerns,
     b.patient_data, b.assessor_data
   FROM b
@@ -1815,45 +3697,65 @@ agg AS (
   SELECT s.*,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
-     WHERE COALESCE(e->>'name','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths,
+     WHERE COALESCE(e->>'key','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e
-     WHERE COALESCE(e->>'name','') = 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths_other,
+     WHERE COALESCE(e->>'key','') = 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS strengths_other,
+    (SELECT COALESCE(jsonb_agg(trim(e->>'value'))
+              FILTER (WHERE COALESCE(e->>'key','') <> 'Other' AND NULLIF(trim(e->>'value'), '') IS NOT NULL),
+              '[]'::jsonb)
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'strengths','[]'::jsonb)) e) AS strengths_list,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_each(COALESCE(s.assessor_data->'multi-select','{}'::jsonb)) kv(key, arr)
      JOIN LATERAL jsonb_array_elements(COALESCE(kv.arr,'[]'::jsonb)) e ON TRUE
      WHERE kv.key LIKE 'weakness-%%%%' AND kv.key <> 'weakness-other'
        AND NULLIF(trim(e->>'value'), '') IS NOT NULL) AS weaknesses,
+    (SELECT COALESCE(jsonb_agg(jsonb_build_object('group', kv.key, 'value', trim(e->>'value')))
+              FILTER (WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL), '[]'::jsonb)
+     FROM jsonb_each(COALESCE(s.assessor_data->'multi-select','{}'::jsonb)) kv(key, arr)
+     JOIN LATERAL jsonb_array_elements(COALESCE(kv.arr,'[]'::jsonb)) e ON TRUE
+     WHERE kv.key LIKE 'weakness-%%%%' AND kv.key <> 'weakness-other') AS weaknesses_grouped,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'weakness-other','[]'::jsonb)) e
      WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS weaknesses_other,
     (SELECT NULLIF(string_agg(DISTINCT trim(e->>'value'), ', '), '')
      FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) e
-     WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS clinical_incidents
+     WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL) AS clinical_incidents,
+    (SELECT COALESCE(jsonb_agg(trim(e->>'value'))
+              FILTER (WHERE NULLIF(trim(e->>'value'), '') IS NOT NULL), '[]'::jsonb)
+     FROM jsonb_array_elements(COALESCE(s.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) e) AS clinical_incidents_list
   FROM student s
 )
 SELECT
-  assessmentid, form_code, cohort, subject, type, created_date, updated_date, clinic, rotation,
+  assessmentid, form_code, cohort, subject, type, version,
+  created_date, updated_date, created_ts, updated_ts, clinic, rotation,
   student_number, student_name, student_email,
-  assessorid, assessor_name, practice_readiness_text,
-  entrustment_num, entrustment_text,
+  assessorid, assessor_name, assessor_email,
+  submitted_by_assessor, submitted_by_student,
+  practice_readiness_code, practice_readiness_text,
+  entrustment_code, entrustment_num, entrustment_text,
   student_reflection, assessor_comments,
-  strengths, strengths_other, weaknesses, weaknesses_other,
-  clinical_incidents, additional_concerns, patient_data, submitted_by_assessor, submitted_by_student
+  clinical_incident_occurred, additional_concerns_occurred, clinical_incident_details,
+  strengths, strengths_other, strengths_list,
+  weaknesses, weaknesses_other, weaknesses_grouped,
+  clinical_incidents, clinical_incidents_list, additional_concerns, patient_data
 FROM agg
 ORDER BY created_date;
 """
 
 STUDENT_MC_SQL = """
 SELECT b.assessmentid, b.student_name, kv.key AS "MC Code",
-  b.student_config->'checklists'->'checklist-caf-final-eval'->'fields'->> kv.key AS "Full MC Text",
-  kv.value AS "MC Rating",
-  CASE kv.value
+  COALESCE(
+    b.student_config->'checklists'->'selected'->'checklist-caf-final-eval'->'fields'->> kv.key,
+    b.student_config->'checklists'->'checklist-caf-final-eval'->'fields'->> kv.key
+  ) AS "Full MC Text",
+  COALESCE(kv.value->>'value', kv.value#>>'{}') AS "MC Rating",
+  CASE COALESCE(kv.value->>'value', kv.value#>>'{}')
     WHEN 'Done well' THEN 1.0 WHEN 'Done' THEN 0.8 WHEN 'Mostly done' THEN 0.6
     WHEN 'Sometimes done' THEN 0.4 WHEN 'Not done' THEN 0.0 ELSE NULL
   END AS "MC Score"
-FROM dds4_boh3_forms b,
-LATERAL jsonb_each_text(b.student_data->'checklists'->'checklist-caf-final-eval') kv
+FROM dds4_boh3_forms_v3 b,
+LATERAL jsonb_each(b.student_data->'checklists'->'checklist-caf-final-eval') kv
 WHERE b.student_number = :studentNumber;
 """
 
@@ -1900,57 +3802,3041 @@ class _BookmarkAnchor(Flowable):
     def draw(self):
         self.canv.bookmarkPage(self.anchor)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# DDS4 / BOH3 — Clinical Assessment Report (individual detailed entry)
+# Rich reportlab layout matching the "Student report PDF" design.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Fixed CAF final-evaluation domain titles (student_config.extra_config.headers,
+# stable across the cohort's forms — see memory: dds4-boh3-checklist-config-path).
+_CAF_MC_DOMAINS = {
+    "MC1": "Knowledge & Clinical Reasoning",
+    "MC2": "Technical Skills",
+    "MC3": "Person-Centered Care",
+    "MC4": "Timeliness",
+    "MC5": "Communication",
+    "MC6": "Professional Behaviour and Ethical Conduct",
+    "MC7": "Risk Management & Safety",
+}
+
+# weakness-* multi-select group key -> short domain title (for "Areas for Improvement")
+_CAF_WEAKNESS_DOMAINS = {
+    "weakness-knowledge-clinical-reasoning": "Knowledge & Clinical Reasoning",
+    "weakness-technical-skills":             "Technical Skills",
+    "weakness-person-centered-care":         "Person-Centered Care",
+    "weakness-timeliness":                   "Timeliness",
+    "weakness-communication":                "Communication",
+    "weakness-professional-behaviour":       "Professional Behaviour and Ethical Conduct",
+    "weakness-risk-management":              "Risk Management & Safety",
+}
+
+# priority_group code -> label (patients group multiselect options)
+_CAF_PRIORITY_LABELS = {
+    "mhd":      "Registered with mental health or disability services",
+    "atsi":     "Aboriginal or Torres Strait Islander",
+    "refugee":  "Refugees and asylum seekers",
+    "homeless": "Homeless/risk of homelessness",
+    "pregnant": "Pregnant person",
+}
+
+# self-evaluation rating -> text colour
+_CAF_RATING_COLORS = {
+    "Done well":       "#1a7a3c",
+    "Done":            "#1f2937",
+    "Mostly done":     "#b7791f",
+    "Sometimes done":  "#c2410c",
+    "Not done":        "#b3261e",
+}
+# ratings that get the pale highlight row (anything below "Done")
+_CAF_RATING_HIGHLIGHT = {"Mostly done", "Sometimes done", "Not done"}
+
+# O-code answers (some form versions store "O2" instead of the label)
+_CAF_OCODE_LABELS = {"O1": "Done well", "O2": "Done", "O3": "Mostly done",
+                     "O4": "Sometimes done", "O5": "Not done"}
+
+# entrustment level -> short supervision phrase (session-outcome tile subtitle)
+_CAF_ENTRUST_SUB = {
+    1: "Cannot yet be trusted",
+    2: "With direct supervision",
+    3: "With indirect supervision",
+    4: "Manages independently",
+}
+
+# palette
+_CAF_NAVY    = "#010d44"   # == variableUtils.uniColor
+_CAF_RED     = "#b3261e"
+_CAF_MUTED   = "#6b7280"
+_CAF_INK     = "#1a1a1a"
+_CAF_LABELBG = "#eef1f7"
+_CAF_HEADBG  = "#f3f4f6"
+_CAF_GRID    = "#d4d9e6"
+_CAF_CREAM   = "#fbf4e2"
+_CAF_REDBG   = "#fbeceb"
+_CAF_BOXBG   = "#f7f8fc"
+
+
+def _cafStyles():
+    """Cached ParagraphStyle bundle for the CAF report."""
+    cache = getattr(_cafStyles, "_cache", None)
+    if cache is not None:
+        return cache
+    base = "Helvetica"
+    bold = "Helvetica-Bold"
+    s = {
+        "band":      ParagraphStyle("cafBand", fontName=bold, fontSize=12,
+                                    textColor=colors.white, leading=15),
+        "title":     ParagraphStyle("cafTitle", fontName=bold, fontSize=20,
+                                    textColor=colors.HexColor(_CAF_NAVY), leading=24),
+        "subtitle":  ParagraphStyle("cafSub", fontName=base, fontSize=10,
+                                    textColor=colors.HexColor(_CAF_MUTED), leading=14),
+        "label":     ParagraphStyle("cafLabel", fontName=bold, fontSize=8.5,
+                                    textColor=colors.HexColor(_CAF_NAVY), leading=11),
+        "value":     ParagraphStyle("cafValue", fontName=base, fontSize=9,
+                                    textColor=colors.HexColor(_CAF_INK), leading=12),
+        "th":        ParagraphStyle("cafTh", fontName=bold, fontSize=8.5,
+                                    textColor=colors.HexColor(_CAF_NAVY), leading=11),
+        "cell":      ParagraphStyle("cafCell", fontName=base, fontSize=8.5,
+                                    textColor=colors.HexColor(_CAF_INK), leading=11.5),
+        "cellItems": ParagraphStyle("cafItems", fontName=base, fontSize=8.5,
+                                    textColor=colors.HexColor(_CAF_INK), leading=13),
+        "tileLbl":   ParagraphStyle("cafTileLbl", fontName=bold, fontSize=7.5,
+                                    textColor=colors.HexColor(_CAF_NAVY), leading=10),
+        "tileVal":   ParagraphStyle("cafTileVal", fontName=bold, fontSize=15,
+                                    textColor=colors.HexColor(_CAF_NAVY), leading=18),
+        "tileSub":   ParagraphStyle("cafTileSub", fontName=base, fontSize=7.5,
+                                    textColor=colors.HexColor(_CAF_MUTED), leading=10),
+        "boxHead":   ParagraphStyle("cafBoxHead", fontName=bold, fontSize=10,
+                                    textColor=colors.HexColor(_CAF_NAVY), leading=13),
+        "body":      ParagraphStyle("cafBody", fontName=base, fontSize=9,
+                                    textColor=colors.HexColor(_CAF_INK), leading=13),
+        "note":      ParagraphStyle("cafNote", fontName=base, fontSize=8,
+                                    textColor=colors.HexColor(_CAF_MUTED), leading=11),
+    }
+    _cafStyles._cache = s
+    return s
+
+
+def _cafAvailWidth():
+    return variableUtils.pageSize[0] - variableUtils.leftMargin - variableUtils.rightMargin
+
+
+def _cafText(v, dash="—"):
+    if v is None:
+        return dash
+    try:
+        if isinstance(v, float) and pd.isna(v):
+            return dash
+    except Exception:
+        pass
+    s = str(v).strip()
+    return s if s else dash
+
+
+def _cafPara(v, style, dash="—"):
+    txt = _cafText(v, dash=dash)
+    # escape then restore intentional <br/>
+    return Paragraph(escape(txt).replace("\n", "<br/>"), style)
+
+
+def _cafJson(v, default):
+    if v is None:
+        return default
+    if isinstance(v, (list, dict)):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return default
+
+
+def _cafBand(text, color=_CAF_NAVY):
+    """Full-width coloured section band."""
+    st = _cafStyles()
+    t = Table([[Paragraph(escape(text), st["band"])]], colWidths=[_cafAvailWidth()])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor(color)),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 7),
+    ]))
+    return t
+
+
+def _cafAccentBox(headingHtml, bodyFlowables, accent=_CAF_NAVY, bg=_CAF_BOXBG):
+    """Light box with a thick coloured left border."""
+    st = _cafStyles()
+    inner = [Paragraph(headingHtml, st["boxHead"]), Spacer(1, 4)] + list(bodyFlowables)
+    t = Table([[inner]], colWidths=[_cafAvailWidth()])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), colors.HexColor(bg)),
+        ("LINEBEFORE",   (0, 0), (0, -1), 3, colors.HexColor(accent)),
+        ("BOX",          (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 12),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING",   (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 9),
+    ]))
+    return t
+
+
+def _cafLevelNum(text):
+    """Pull the integer from a 'Level N: ...' string."""
+    if not text:
+        return None
+    m = re.search(r"Level\s+(\d)", str(text))
+    return int(m.group(1)) if m else None
+
+
+def _cafSplitLevel(text):
+    """'Level 2: Student can be trusted...' -> ('Level 2', 'Student can be trusted...')."""
+    s = _cafText(text, dash="")
+    if not s:
+        return ("", "")
+    if ":" in s:
+        head, _, tail = s.partition(":")
+        return (head.strip(), tail.strip())
+    return (s, "")
+
+
+def _cafLevelColor(n, positiveHigh=True):
+    if n is None:
+        return _CAF_NAVY
+    if positiveHigh:
+        return {1: _CAF_RED, 2: _CAF_RED, 3: _CAF_NAVY, 4: "#1a7a3c"}.get(n, _CAF_NAVY)
+    return _CAF_NAVY
+
+
+def _cafTile(label, value, valueColor, sub):
+    st = _cafStyles()
+    valStyle = ParagraphStyle("t", parent=st["tileVal"], textColor=colors.HexColor(valueColor))
+    return [
+        Paragraph(escape(label), st["tileLbl"]),
+        Spacer(1, 3),
+        Paragraph(escape(value), valStyle),
+        Spacer(1, 2),
+        Paragraph(escape(sub), st["tileSub"]),
+    ]
+
+
 def buildIndividualEntryPage(elements, row, mcDf,
                              uniColor=None, subheadingStyle=None,
-                             tableTextStyleSmall=None, i=None):
-    """Build reportlab elements for a single assessment entry."""
-    infoData = [
-        ("Creation Date", row["created_date"]),
-        ("Updated Date", row["updated_date"]),
-        ("Assessor", row["assessor_name"]),
-        ("Clinic", row["clinic"]),
-        ("Rotation", row["rotation"]),
-        ("Submitted by Assessor", row["submitted_by_assessor"] if "submitted_by_assessor" in row else "N/A"),
-        ("Submitted by Student", row["submitted_by_student"] if "submitted_by_student" in row else "N/A"),
-    ]
-    print(row.index)
-    if i is not None:
-        elements.append(Paragraph(f"Form: {i + 1}", variableUtils.subheadingStyleL))
-        elements.append(Spacer(1, 12))
+                             tableTextStyleSmall=None, i=None,
+                             itemDescMap=None, pageState=None):
+    """Build reportlab flowables for a single DDS4/BOH3 assessment entry.
 
-    infoTable = createTable(
-        pd.DataFrame(infoData, columns=["Field", "Value"]),
-        colRatio=[1, 2], customTextCols=[0, 1], bottomPadding=4, topPadding=4,
-        headerColor=uniColor, tableTextStyle=tableTextStyleSmall,
-        title="Entry Information", titleStyle=subheadingStyle,
-    )
+    Renders the "Clinical Assessment Report" layout: info grid, session-outcome
+    tiles, patients & item codes, colour-coded self-evaluation, readiness &
+    reflection, assessor evaluation, and (when present) clinical-incident and
+    staff-only additional-concerns bands. Appends everything onto `elements`.
+
+    itemDescMap : {item_code: description} (from getItemCodeDescriptionMap).
+    Legacy kwargs (uniColor/subheadingStyle/tableTextStyleSmall/i) are accepted
+    for call-site compatibility and otherwise unused.
+    """
+    st = _cafStyles()
+    aw = _cafAvailWidth()
+    itemDescMap = itemDescMap or {}
+
+    def g(key, default=None):
+        try:
+            v = row[key]
+        except Exception:
+            return default
+        try:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return default
+        except Exception:
+            pass
+        return v
+
+    def fmtDate(v):
+        try:
+            return pd.to_datetime(v).strftime("%A %-d %B %Y")
+        except Exception:
+            return _cafText(v)
+
+    def fmtStamp(v):
+        try:
+            return pd.to_datetime(v).strftime("%-d %b %Y, %H:%M") + " AEST"
+        except Exception:
+            return _cafText(v, dash="")
+
+    def yesno(v):
+        if v is True:
+            return "Yes"
+        if v is False:
+            return "No"
+        s = _cafText(v, dash="")
+        return {"true": "Yes", "false": "No", "yes": "Yes", "no": "No"}.get(s.lower(), s or "—")
+
+    # ── header title ──────────────────────────────────────────────────────────
+    subject   = _cafText(g("subject"), dash="")
+    cohort    = _cafText(g("cohort"), dash="")
+    student   = _cafText(g("student_name"))
+    sid       = _cafText(g("student_number"), dash="")
+    assessor  = _cafText(g("assessor_name"))
+    clinic    = _cafText(g("clinic"))
+    sessDate  = fmtDate(g("created_date"))
+    titleTxt  = f"{subject} — Clinical Assessment Report" if subject else "Clinical Assessment Report"
+    subBits   = " · ".join([b for b in [student, cohort, sessDate, clinic] if b and b != "—"])
+    elements.append(Paragraph(escape(titleTxt), st["title"]))
+    elements.append(Spacer(1, 2))
+    elements.append(Paragraph(escape(subBits), st["subtitle"]))
+    elements.append(Spacer(1, 10))
+
+    # ── info grid (paired label/value) ────────────────────────────────────────
+    aid     = _cafText(g("assessmentid"), dash="")
+    fcode   = _cafText(g("form_code"), dash="")
+    version = _cafText(g("version"), dash="")
+    aidCell = aid + (f"  (form {fcode}, v{version})" if fcode != "—" and fcode else "")
+    subLine = f"{subject} · {cohort}".strip(" ·") if (subject or cohort) else "—"
+    submission = (f"Student: {yesno(g('submitted_by_student'))}"
+                  f"  ·  Assessor: {yesno(g('submitted_by_assessor'))}")
+    lastUpd = fmtStamp(g("updated_ts", g("updated_date")))
+
+    infoRows = [
+        ("Student", f"{student}  ({sid})" if sid != "—" else student, "Assessor", assessor),
+        ("Subject / cohort", subLine, "Rotation", _cafText(g("rotation"))),
+        ("Clinic", clinic, "Form type", _cafText(g("type"))),
+        ("Session date", sessDate, "Assessment ID", aidCell),
+        ("Submission", submission, "Last updated", lastUpd),
+    ]
+    infoData = [[Paragraph(escape(a), st["label"]), _cafPara(b, st["value"]),
+                 Paragraph(escape(c), st["label"]), _cafPara(d, st["value"])]
+                for (a, b, c, d) in infoRows]
+    infoTable = Table(infoData, colWidths=[aw*0.15, aw*0.35, aw*0.16, aw*0.34])
+    infoTable.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (0, -1), colors.HexColor(_CAF_LABELBG)),
+        ("BACKGROUND",   (2, 0), (2, -1), colors.HexColor(_CAF_LABELBG)),
+        ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING",   (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 5),
+    ]))
     elements.append(infoTable)
+    elements.append(Spacer(1, 14))
 
-    if not mcDf.empty:
-        mcTable = createTable(
-            mcDf[["MC Code", "Full MC Text", "MC Rating"]],
-            colRatio=[1, 4, 1], customTextCols=[0, 1, 2], bottomPadding=4, topPadding=4,
-            headerColor=uniColor, tableTextStyle=tableTextStyleSmall,
-            title="CAF Checklist", titleStyle=subheadingStyle,
-        )
-        elements.append(Spacer(1, 12))
-        elements.append(mcTable)
+    # ── patient / item-code parse (needed for session-outcome tiles) ──────────
+    patients = _cafJson(g("patient_data"), [])
+    if not isinstance(patients, list):
+        patients = []
+    attended = [p for p in patients if isinstance(p, dict) and p.get("patient_attended") is not False]
+    totalItems = 0
+    for p in patients:
+        for ic in (p.get("item_codes") or []) if isinstance(p, dict) else []:
+            try:
+                totalItems += int(ic.get("quantity", 1) or 1)
+            except Exception:
+                totalItems += 1
 
-    reflectionsData = [
-        ("Student Reflection", row["student_reflection"]),
-        ("Assessor Comments", row["assessor_comments"]),
-        ("Strengths Noted", row["strengths"]),
-        ("Other Strengths", row["strengths_other"]),
-        ("Weaknesses Noted", row["weaknesses"]),
-        ("Other Weaknesses", row["weaknesses_other"]),
-        ("Clinical Incidents", row["clinical_incidents"]),
-        ("Additional Concerns", row["additional_concerns"]),
+    incidentList = _cafJson(g("clinical_incidents_list"), None)
+    if incidentList is None:
+        raw = _cafText(g("clinical_incidents"), dash="")
+        incidentList = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+    incidentOccurred = yesno(g("clinical_incident_occurred")) == "Yes" or bool(incidentList)
+
+    # ── session outcome tiles ─────────────────────────────────────────────────
+    entrNum   = g("entrustment_num")
+    try:
+        entrNum = int(entrNum) if entrNum is not None and not (isinstance(entrNum, float) and pd.isna(entrNum)) else None
+    except Exception:
+        entrNum = None
+    entrHead, entrBody = _cafSplitLevel(g("entrustment_text"))
+    prHead, prBody = _cafSplitLevel(g("practice_readiness_text"))
+    prNum = _cafLevelNum(g("practice_readiness_text"))
+
+    tiles = [
+        _cafTile("ENTRUSTMENT (ASSESSOR)",
+                 f"Level {entrNum}" if entrNum else "—",
+                 _cafLevelColor(entrNum),
+                 _CAF_ENTRUST_SUB.get(entrNum, "Assessor rating")),
+        _cafTile("READINESS (STUDENT)",
+                 prHead or "—", _CAF_NAVY, "Student's own rating"),
+        _cafTile("CLINICAL INCIDENT",
+                 "Yes" if incidentOccurred else "No",
+                 _CAF_RED if incidentOccurred else "#1a7a3c",
+                 (f"{len(incidentList)} categor" + ("y" if len(incidentList) == 1 else "ies")) if incidentOccurred else "None reported"),
+        _cafTile("PATIENTS SEEN",
+                 str(len(attended)), _CAF_NAVY,
+                 f"{totalItems} item codes recorded"),
     ]
-    reflectionsTable = createTable(
-        pd.DataFrame(reflectionsData, columns=["Field", "Content"]),
-        colRatio=[1, 3], customTextCols=[0, 1], bottomPadding=4, topPadding=4,
-        headerColor=uniColor, tableTextStyle=tableTextStyleSmall,
-        title="Reflections & Comments", titleStyle=subheadingStyle,
+    elements.append(_cafBand("Session Outcome"))
+    tileTable = Table([tiles], colWidths=[aw*0.25]*4)
+    tileTable.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, -1), colors.white),
+        ("BOX",          (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+        ("LINEAFTER",    (0, 0), (-2, -1), 0.5, colors.HexColor(_CAF_GRID)),
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING",   (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 9),
+    ]))
+    elements.append(tileTable)
+    elements.append(Spacer(1, 14))
+
+    # ── patients & item codes ─────────────────────────────────────────────────
+    elements.append(_cafBand("Patients and Item Codes"))
+    patHeader = [Paragraph("Pt", st["th"]), Paragraph("Age", st["th"]),
+                 Paragraph("Visit", st["th"]), Paragraph("Priority group", st["th"]),
+                 Paragraph("Item codes", st["th"])]
+    patData = [patHeader]
+    highlightRows = []
+    for idx, p in enumerate(patients, start=1):
+        p = p if isinstance(p, dict) else {}
+        attendedFlag = p.get("patient_attended") is not False
+        if not attendedFlag:
+            patData.append([Paragraph(str(idx), st["cell"]), Paragraph("—", st["cell"]),
+                            Paragraph("—", st["cell"]), Paragraph("—", st["cell"]),
+                            Paragraph("<i>Patient did not attend</i>", st["cell"])])
+            continue
+        codes = p.get("item_codes") or []
+        lines = []
+        for ic in codes:
+            code = str(ic.get("code", "")).strip()
+            qty  = ic.get("quantity", 1)
+            try:
+                qty = int(qty)
+            except Exception:
+                qty = 1
+            qtyStr = f" &#215;{qty}" if qty and qty > 1 else ""
+            desc = itemDescMap.get(code) or ""
+            descStr = f" — {escape(desc)}" if desc else ""
+            lines.append(f"<b>{escape(code)}</b>{qtyStr}{descStr}")
+        itemsPara = Paragraph("<br/>".join(lines) if lines else "—", st["cellItems"])
+
+        prGroups = p.get("priority_group")
+        if p.get("priority_present") == "yes" and prGroups:
+            if isinstance(prGroups, str):
+                prGroups = [prGroups]
+            prTxt = ", ".join(_CAF_PRIORITY_LABELS.get(x, x) for x in prGroups)
+            highlightRows.append(len(patData))
+        else:
+            prTxt = "—"
+        patData.append([
+            Paragraph(str(idx), st["cell"]),
+            Paragraph(_cafText(p.get("patient_age")), st["cell"]),
+            Paragraph(_cafText(p.get("visit_number")), st["cell"]),
+            Paragraph(escape(prTxt), st["cell"]),
+            itemsPara,
+        ])
+    patTable = Table(patData, colWidths=[aw*0.05, aw*0.06, aw*0.07, aw*0.24, aw*0.58], repeatRows=1)
+    patStyle = [
+        ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor(_CAF_HEADBG)),
+        ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING",   (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+    ]
+    for r in highlightRows:
+        patStyle.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor(_CAF_CREAM)))
+    patTable.setStyle(TableStyle(patStyle))
+    elements.append(patTable)
+    elements.append(Spacer(1, 14))
+
+    # ── student self-evaluation ───────────────────────────────────────────────
+    if mcDf is not None and not mcDf.empty:
+        elements.append(_cafBand("Student Self-Evaluation"))
+        seHeader = [Paragraph("Domain", st["th"]), Paragraph("Criterion", st["th"]),
+                    Paragraph("Rating", st["th"])]
+        seData = [seHeader]
+        seHi = []
+        mcSorted = mcDf.copy()
+        if "MC Code" in mcSorted.columns:
+            mcSorted = mcSorted.sort_values("MC Code")
+        for _, mrow in mcSorted.iterrows():
+            code   = str(mrow.get("MC Code", "")).strip()
+            domain = _CAF_MC_DOMAINS.get(code) or _cafText(mrow.get("Full MC Text"))
+            crit   = _cafText(mrow.get("Full MC Text"))
+            rating = _cafText(mrow.get("MC Rating"), dash="—")
+            rating = _CAF_OCODE_LABELS.get(rating, rating)
+            rColor = _CAF_RATING_COLORS.get(rating, _CAF_INK)
+            rStyle = ParagraphStyle("r", parent=st["cell"], fontName="Helvetica-Bold",
+                                    textColor=colors.HexColor(rColor), alignment=1)
+            seData.append([
+                Paragraph(f"<b>{escape(domain)}</b>", st["cell"]),
+                Paragraph(escape(crit), st["cell"]),
+                Paragraph(escape(rating), rStyle),
+            ])
+            if rating in _CAF_RATING_HIGHLIGHT:
+                seHi.append(len(seData) - 1)
+        seTable = Table(seData, colWidths=[aw*0.24, aw*0.58, aw*0.18], repeatRows=1)
+        seStyle = [
+            ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor(_CAF_HEADBG)),
+            ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+            ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN",        (2, 0), (2, -1), "CENTER"),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 7),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]
+        for r in seHi:
+            seStyle.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor(_CAF_CREAM)))
+        seTable.setStyle(TableStyle(seStyle))
+        elements.append(seTable)
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(
+            "Self-rated by the student. Scale: Done well · Done · Mostly done · "
+            "Sometimes done · Not done.", st["note"]))
+        elements.append(Spacer(1, 14))
+
+    # ── readiness to practise ─────────────────────────────────────────────────
+    if prHead or prBody:
+        elements.append(_cafBand("Readiness to Practise (student)"))
+        elements.append(_cafAccentBox(
+            escape(prHead or "—"),
+            [Paragraph(escape(prBody), st["body"])] if prBody else [],
+            accent=_cafLevelColor(prNum)))
+        elements.append(Spacer(1, 14))
+
+    # ── student reflection ────────────────────────────────────────────────────
+    reflection = _cafText(g("student_reflection"), dash="")
+    if reflection:
+        elements.append(_cafBand("Student Reflection"))
+        elements.append(_cafAccentBox(
+            f"Reflection — {escape(student)}",
+            [_cafPara(reflection, st["body"])]))
+        elements.append(Spacer(1, 14))
+
+    # ── assessor evaluation ───────────────────────────────────────────────────
+    elements.append(_cafBand("Assessor Evaluation"))
+    elements.append(_cafAccentBox(
+        f"Entrustment — {escape(entrHead)}" if entrHead else "Entrustment",
+        [Paragraph(escape(entrBody), st["body"])] if entrBody else [],
+        accent=_cafLevelColor(entrNum)))
+    elements.append(Spacer(1, 8))
+
+    # commendations / improvements two-column table
+    strengths = _cafJson(g("strengths_list"), None)
+    if strengths is None:
+        raw = _cafText(g("strengths"), dash="")
+        strengths = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+    strOther = _cafText(g("strengths_other"), dash="")
+    if strOther and strOther != "—":
+        strengths = list(strengths) + [strOther]
+
+    weakGrouped = _cafJson(g("weaknesses_grouped"), None)
+    weakItems = []
+    if weakGrouped:
+        for w in weakGrouped:
+            if not isinstance(w, dict):
+                continue
+            dom = _CAF_WEAKNESS_DOMAINS.get(w.get("group", ""), "")
+            val = _cafText(w.get("value"), dash="")
+            if val:
+                weakItems.append((dom, val))
+    else:
+        raw = _cafText(g("weaknesses"), dash="")
+        weakItems = [("", x.strip()) for x in raw.split(",") if x.strip()] if raw else []
+    weakOther = _cafText(g("weaknesses_other"), dash="")
+    if weakOther and weakOther != "—":
+        weakItems.append(("Other", weakOther))
+
+    if strengths:
+        commHtml = "<br/>".join(f"• {escape(s)}" for s in strengths)
+    else:
+        commHtml = "<i>None selected</i>"
+    if weakItems:
+        impHtml = "<br/>".join(
+            (f"• <b>{escape(dom)}</b> — {escape(val)}" if dom else f"• {escape(val)}")
+            for dom, val in weakItems)
+    else:
+        impHtml = "<i>None selected</i>"
+
+    ciData = [
+        [Paragraph("Areas for Commendation", st["th"]), Paragraph("Areas for Improvement", st["th"])],
+        [Paragraph(commHtml, st["cell"]), Paragraph(impHtml, st["cell"])],
+    ]
+    ciTable = Table(ciData, colWidths=[aw*0.5, aw*0.5])
+    ciTable.setStyle(TableStyle([
+        ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor(_CAF_HEADBG)),
+        ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+        ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING",   (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING",(0, 0), (-1, -1), 7),
+    ]))
+    elements.append(ciTable)
+    elements.append(Spacer(1, 8))
+
+    # assessor feedback
+    feedback = _cafText(g("assessor_comments"), dash="")
+    elements.append(_cafAccentBox(
+        f"Assessor Feedback — {escape(assessor)}",
+        [_cafPara(feedback, st["body"])] if feedback else
+        [Paragraph("<i>No further comments were recorded on this form.</i>", st["body"])],
+        accent="#1a7a3c"))
+    elements.append(Spacer(1, 14))
+
+    # ── clinical incident (red) ───────────────────────────────────────────────
+    incidentDetails = _cafText(g("clinical_incident_details"), dash="")
+    if incidentOccurred or incidentDetails:
+        elements.append(_cafBand("Clinical Incident", color=_CAF_RED))
+        catHtml = "<br/>".join(f"• {escape(c)}" for c in incidentList) if incidentList else "—"
+        rows = [
+            (Paragraph("Did a clinical incident occur?", st["label"]),
+             Paragraph("Yes", ParagraphStyle("y", parent=st["value"], fontName="Helvetica-Bold",
+                                              textColor=colors.HexColor(_CAF_RED)))),
+            (Paragraph("Incident categories", st["label"]), Paragraph(catHtml, st["value"])),
+        ]
+        if incidentDetails:
+            rows.append((Paragraph("Additional details", st["label"]),
+                         _cafPara(incidentDetails, st["value"])))
+        ciTbl = Table([[a, b] for a, b in rows], colWidths=[aw*0.24, aw*0.76])
+        ciTbl.setStyle(TableStyle([
+            ("BACKGROUND",   (0, 0), (0, -1), colors.HexColor(_CAF_REDBG)),
+            ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor("#e3b7b4")),
+            ("VALIGN",       (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING",  (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING",   (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
+        ]))
+        elements.append(ciTbl)
+        elements.append(Spacer(1, 14))
+
+    # ── additional concerns — STAFF ONLY (red) ────────────────────────────────
+    concerns = _cafText(g("additional_concerns"), dash="")
+    if concerns:
+        elements.append(_cafBand("Additional Concerns — STAFF ONLY", color=_CAF_RED))
+        elements.append(Spacer(1, 4))
+        elements.append(Paragraph(
+            "This section is marked <b>assessor / staff only</b> in the form configuration "
+            "(visibility: assessor_only). It records concerns beyond what was communicated to "
+            "the student during the session, and is not part of the student-facing feedback.",
+            st["note"]))
+        elements.append(Spacer(1, 6))
+        paras = [p.strip() for p in re.split(r"\n\s*\n", concerns) if p.strip()]
+        body = []
+        for pi, ptxt in enumerate(paras):
+            body.append(Paragraph(escape(ptxt).replace("\n", "<br/>"), st["body"]))
+            if pi != len(paras) - 1:
+                body.append(Spacer(1, 6))
+        elements.append(_cafAccentBox(f"Recorded by {escape(assessor)}", body, accent=_CAF_RED,
+                                      bg=_CAF_REDBG))
+        elements.append(Spacer(1, 14))
+
+    # ── record-source footnote ────────────────────────────────────────────────
+    createdStamp = fmtStamp(g("created_ts", g("created_date")))
+    elements.append(Paragraph(
+        f"Record source: Unimelb DASH assessment ID {escape(aid)} "
+        f"(form {escape(fcode)}, version {escape(version)}). "
+        f"Created {escape(createdStamp)}, last updated {escape(lastUpd)}. "
+        f"Student section submitted: {yesno(g('submitted_by_student')).lower()}. "
+        f"Assessor section submitted: {yesno(g('submitted_by_assessor')).lower()}. "
+        f"This report is a transcription of the submitted form data.", st["note"]))
+
+
+# ── CAF page header / footer decorator ────────────────────────────────────────
+def cafHeaderFooterFields(row):
+    """Build the {header_right, footer_left} dict a CAF page decorator reads."""
+    def gv(k, d=""):
+        try:
+            v = row[k]
+        except Exception:
+            return d
+        try:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return d
+        except Exception:
+            pass
+        return v
+    try:
+        dt = pd.to_datetime(gv("created_date")).strftime("%d %b %Y").upper()
+    except Exception:
+        dt = str(gv("created_date"))
+    subject = str(gv("subject"))
+    aid     = str(gv("assessmentid"))
+    student = str(gv("student_name"))
+    sid     = str(gv("student_number"))
+    assessor= str(gv("assessor_name"))
+    clinic  = str(gv("clinic"))
+    header_right = "  ·  ".join([b for b in [subject, dt, f"ID {aid}" if aid else ""] if b])
+    footer_left  = "   |   ".join([b for b in [
+        f"{student} ({sid})" if sid else student,
+        f"Assessor: {assessor}" if assessor else "",
+        clinic] if b])
+    return {"header_right": header_right, "footer_left": footer_left}
+
+
+def getCafPageDecorator(pageState):
+    """onPage callback: navy top band + muted footer, reading live from pageState."""
+    def draw(canvas, doc):
+        w, h = doc.pagesize
+        bandH = 26
+        canvas.saveState()
+        # top navy band
+        canvas.setFillColor(colors.HexColor(_CAF_NAVY))
+        canvas.rect(0, h - bandH, w, bandH, fill=1, stroke=0)
+        canvas.setFillColor(colors.white)
+        canvas.setFont("Helvetica-Bold", 9)
+        canvas.drawString(variableUtils.leftMargin, h - bandH + 9,
+                          "UNIMELB DASH   ·   CLINICAL ASSESSMENT FORM")
+        canvas.drawRightString(w - variableUtils.rightMargin, h - bandH + 9,
+                               str(pageState.get("header_right", "")))
+        # footer
+        fy = variableUtils.bottomMargin - 20
+        canvas.setStrokeColor(colors.HexColor("#c9d1e6"))
+        canvas.setLineWidth(0.7)
+        canvas.line(variableUtils.leftMargin, fy + 10, w - variableUtils.rightMargin, fy + 10)
+        canvas.setFillColor(colors.HexColor(_CAF_MUTED))
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(variableUtils.leftMargin, fy, str(pageState.get("footer_left", "")))
+        canvas.drawRightString(w - variableUtils.rightMargin, fy, f"Page {doc.page}")
+        canvas.restoreState()
+    return draw
+
+
+class CafHeaderMarker(Flowable):
+    """Zero-size flowable that pushes this entry's header/footer fields into
+    pageState at draw time. Place BEFORE a PageBreak so the next page's
+    onLaterPages callback reads the updated values (mirrors _BannerMarker)."""
+    def __init__(self, fields, pageState):
+        super().__init__()
+        self.fields = fields
+        self._pageState = pageState
+        self.width = self.height = 0
+
+    def draw(self):
+        self._pageState.update(self.fields)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DDS4 / BOH3 — Conditional combined report
+# One PDF of a student's assessments filtered to only the forms that meet chosen
+# conditions (low entrustment / clinical incident / additional concern).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cafEntryMatches(row, *, entrustmentMax=None, entrustmentLevels=None,
+                    clinicalIncident=False, additionalConcern=False,
+                    predicate=None, match="any"):
+    """Return True if a STUDENT_ENTRIES_SQL row meets the chosen condition(s).
+
+    Conditions (only the ones you enable are evaluated):
+      entrustmentMax     : include when entrustment_num <= this (e.g. 2)
+      entrustmentLevels  : include when entrustment_num in this set/list (e.g. [1, 2])
+      clinicalIncident   : include when a clinical incident is recorded
+      additionalConcern  : include when a staff-only additional concern is recorded
+      predicate          : a callable(row) -> bool for anything custom
+    match : "any" (OR across enabled conditions) or "all" (AND). No conditions
+            enabled -> always True (include every form).
+    """
+    def val(key):
+        try:
+            v = row[key]
+        except Exception:
+            return None
+        try:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return None
+        except Exception:
+            pass
+        return v
+
+    def entrustNum():
+        v = val("entrustment_num")
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    def hasIncident():
+        occ = str(val("clinical_incident_occurred") or "").strip().lower() == "yes"
+        lst = _cafJson(val("clinical_incidents_list"), None)
+        if lst is None:
+            lst = [x for x in str(val("clinical_incidents") or "").split(",") if x.strip()]
+        return occ or bool(lst)
+
+    def hasConcern():
+        occ = str(val("additional_concerns_occurred") or "").strip().lower() == "yes"
+        return occ or bool(str(val("additional_concerns") or "").strip())
+
+    checks = []
+    if entrustmentMax is not None:
+        n = entrustNum()
+        checks.append(n is not None and n <= entrustmentMax)
+    if entrustmentLevels is not None:
+        n = entrustNum()
+        checks.append(n is not None and n in set(entrustmentLevels))
+    if clinicalIncident:
+        checks.append(hasIncident())
+    if additionalConcern:
+        checks.append(hasConcern())
+    if predicate is not None:
+        checks.append(bool(predicate(row)))
+
+    if not checks:
+        return True
+    return all(checks) if match == "all" else any(checks)
+
+
+def _cafEntryFlags(row, *, entrustmentMax=None, entrustmentLevels=None,
+                   clinicalIncident=False, additionalConcern=False):
+    """Short labels explaining why a row was included (for the cover TOC)."""
+    flags = []
+    n = row.get("entrustment_num")
+    try:
+        n = int(n) if n is not None and not (isinstance(n, float) and pd.isna(n)) else None
+    except Exception:
+        n = None
+    if (entrustmentMax is not None and n is not None and n <= entrustmentMax) or \
+       (entrustmentLevels is not None and n is not None and n in set(entrustmentLevels)):
+        flags.append(f"Entrustment L{n}")
+    if clinicalIncident and cafEntryMatches(row, clinicalIncident=True):
+        flags.append("Clinical incident")
+    if additionalConcern and cafEntryMatches(row, additionalConcern=True):
+        flags.append("Additional concern")
+    return flags
+
+
+def buildStudentConditionalReport(engine, studentNumbers, outPath, *,
+                                  entrustmentMax=None, entrustmentLevels=None,
+                                  clinicalIncident=False, additionalConcern=False,
+                                  predicate=None, match="any",
+                                  title="Flagged Assessments",
+                                  includeToc=True, includeEmpty=False,
+                                  itemDescMap=None):
+    """Build ONE PDF containing only the assessments that meet the given
+    condition(s), across one or more students, each preceded by a cover + index.
+
+    studentNumbers : a single student number or an iterable of them.
+    Filtering/condition args are passed straight to cafEntryMatches (see it).
+    itemDescMap    : optional {code: description}; if omitted it is fetched once
+                     per distinct cohort via getItemCodeDescriptionMap.
+    Returns dict: {"outPath", "matched": {studentNumber: n}, "total": n}.
+    """
+    if isinstance(studentNumbers, (int, float, str)):
+        studentNumbers = [studentNumbers]
+    studentNumbers = [int(s) for s in studentNumbers]
+
+    st = _cafStyles()
+    aw = _cafAvailWidth()
+    condKwargs = dict(entrustmentMax=entrustmentMax, entrustmentLevels=entrustmentLevels,
+                      clinicalIncident=clinicalIncident, additionalConcern=additionalConcern,
+                      predicate=predicate, match=match)
+
+    # human-readable description of the active filter
+    bits = []
+    if entrustmentMax is not None:
+        bits.append(f"entrustment ≤ {entrustmentMax}")
+    if entrustmentLevels is not None:
+        bits.append("entrustment level " + "/".join(str(x) for x in entrustmentLevels))
+    if clinicalIncident:
+        bits.append("clinical incident")
+    if additionalConcern:
+        bits.append("additional concern")
+    if predicate is not None:
+        bits.append("custom rule")
+    filterDesc = (f"Forms matching {match.upper()} of: " + ", ".join(bits)) if bits \
+        else "All forms (no condition set)"
+
+    descCache = dict(itemDescMap) if itemDescMap else None
+    descByCohort = {}
+
+    def descFor(cohort):
+        if descCache is not None:
+            return descCache
+        if cohort not in descByCohort:
+            try:
+                descByCohort[cohort] = getItemCodeDescriptionMap(engine, cohort)
+            except Exception:
+                descByCohort[cohort] = {}
+        return descByCohort[cohort]
+
+    styleTitle = ParagraphStyle("condTitle", parent=st["title"], fontSize=18, leading=22)
+    linkStyle = ParagraphStyle("condLink", parent=st["cell"],
+                               textColor=colors.HexColor("#1155CC"))
+
+    elements = []
+    page_state = {}
+    matched_counts = {}
+    total = 0
+    first = True
+
+    for sNum in studentNumbers:
+        entryDf = readDf(engine, STUDENT_ENTRIES_SQL, {"studentNumber": sNum})
+        allMcDf = readDf(engine, STUDENT_MC_SQL,      {"studentNumber": sNum})
+        if entryDf.empty:
+            matched_counts[sNum] = 0
+            continue
+
+        studentName = entryDf.iloc[0]["student_name"]
+        cohort      = entryDf.iloc[0]["cohort"]
+        subject     = entryDf.iloc[0]["subject"]
+        descMap     = descFor(cohort)
+
+        keep = [(i, r) for i, (_, r) in enumerate(entryDf.iterrows())
+                if cafEntryMatches(r, **condKwargs)]
+        matched_counts[sNum] = len(keep)
+        total += len(keep)
+        if not keep and not includeEmpty:
+            continue
+
+        coverFields = {
+            "header_right": "  ·  ".join([b for b in [subject, f"{studentName}"] if b]),
+            "footer_left":  f"{studentName} ({sNum})",
+        }
+        if first:
+            page_state.update(coverFields)
+            first = False
+        else:
+            elements.append(CafHeaderMarker(coverFields, page_state))
+            elements.append(PageBreak())
+        elements.append(_BookmarkAnchor(f"student_{sNum}"))
+
+        # ── cover ──
+        elements.append(Paragraph(escape(title), styleTitle))
+        elements.append(Spacer(1, 2))
+        elements.append(Paragraph(escape(f"{studentName} ({sNum}) · {subject} · {cohort}"),
+                                  st["subtitle"]))
+        elements.append(Spacer(1, 6))
+        elements.append(Paragraph(
+            escape(f"{filterDesc}.  {len(keep)} of {len(entryDf)} assessments matched."),
+            st["note"]))
+        elements.append(Spacer(1, 10))
+
+        if not keep:
+            elements.append(_cafBand("No matching assessments", color=_CAF_MUTED))
+            elements.append(Spacer(1, 6))
+            continue
+
+        # ── index of matched forms (with reason flags) ──
+        if includeToc:
+            head = [Paragraph(f"<b>{h}</b>", st["th"]) for h in
+                    ["Form", "Date", "Clinic", "Rotation", "Entrustment", "Included because"]]
+            toc = [head]
+            for order, (i, r) in enumerate(keep, start=1):
+                try:
+                    dstr = pd.to_datetime(r["created_date"]).strftime("%-d %b %Y")
+                except Exception:
+                    dstr = _cafText(r.get("created_date"))
+                n = r.get("entrustment_num")
+                try:
+                    n = int(n) if n is not None and not (isinstance(n, float) and pd.isna(n)) else None
+                except Exception:
+                    n = None
+                flags = _cafEntryFlags(r, entrustmentMax=entrustmentMax,
+                                       entrustmentLevels=entrustmentLevels,
+                                       clinicalIncident=clinicalIncident,
+                                       additionalConcern=additionalConcern)
+                toc.append([
+                    Paragraph(f'<link href="#s{sNum}_form{i}"><u>Form {order}</u></link>', linkStyle),
+                    Paragraph(escape(dstr), st["cell"]),
+                    Paragraph(escape(_cafText(r.get("clinic"))), st["cell"]),
+                    Paragraph(escape(_cafText(r.get("rotation"))), st["cell"]),
+                    Paragraph(f"Level {n}" if n else "—", st["cell"]),
+                    Paragraph(escape(", ".join(flags) or "—"), st["cell"]),
+                ])
+            tocTable = Table(toc, colWidths=[aw*0.09, aw*0.13, aw*0.24, aw*0.13, aw*0.14, aw*0.27],
+                             repeatRows=1)
+            tocTable.setStyle(TableStyle([
+                ("BACKGROUND",   (0, 0), (-1, 0), colors.HexColor(_CAF_HEADBG)),
+                ("GRID",         (0, 0), (-1, -1), 0.5, colors.HexColor(_CAF_GRID)),
+                ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING",  (0, 0), (-1, -1), 7),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ("TOPPADDING",   (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING",(0, 0), (-1, -1), 5),
+            ]))
+            elements.append(tocTable)
+
+        # ── each matched form ──
+        for i, r in keep:
+            mcDf = allMcDf[allMcDf["assessmentid"] == r["assessmentid"]].reset_index(drop=True)
+            elements.append(CafHeaderMarker(cafHeaderFooterFields(r), page_state))  # before PageBreak
+            elements.append(PageBreak())
+            elements.append(_BookmarkAnchor(f"s{sNum}_form{i}"))
+            elements.append(Spacer(1, 2))
+            buildIndividualEntryPage(elements, r, mcDf, itemDescMap=descMap)
+
+    if not elements:
+        elements = [Paragraph("No assessments matched the given conditions.", st["body"])]
+
+    doc = SimpleDocTemplate(
+        outPath,
+        pagesize=variableUtils.pageSize,
+        rightMargin=variableUtils.rightMargin, leftMargin=variableUtils.leftMargin,
+        topMargin=variableUtils.topMargin, bottomMargin=variableUtils.bottomMargin,
     )
-    elements.append(Spacer(1, 12))
-    elements.append(reflectionsTable)
+    decorator = getCafPageDecorator(page_state)
+    doc.build(elements, onFirstPage=decorator, onLaterPages=decorator)
+    return {"outPath": outPath, "matched": matched_counts, "total": total}
+
+# ── Per-student interactive HTML (single chart, simple date slider) ────────────
+_STUDENT_TS_HTML_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>__TITLE__</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.0/plotly.min.js"></script>
+<style>
+*{box-sizing:border-box;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+body{margin:0;color:#1a1a1a;background:#fff;}
+header{background:#010d44;color:#fff;padding:14px 20px;}
+header h1{margin:0;font-size:18px;} header .sub{opacity:.85;font-size:12px;margin-top:2px;}
+#chart{width:100%;height:calc(100vh - 70px);}
+</style></head><body>
+<header><h1>__TITLE__</h1><div class="sub">__SUB__ · hover for values · drag the date slider below the chart</div></header>
+<div id="chart"></div>
+<script>
+const D=__DATA__;
+const lvl1x=[],lvl1y=[];
+D.dates.forEach((dt,i)=>{ if(D.entrustment[i]===1){lvl1x.push(dt);lvl1y.push(1);} });
+const traces=[
+ {x:D.dates,y:D.entrustment,mode:'lines+markers',name:'Entrustment (Assessor)',
+  connectgaps:true,line:{color:'steelblue',width:1.8},marker:{size:6},
+  hovertemplate:'%{x|%d %b %Y}<br>Entrustment: <b>%{y}</b><extra></extra>'},
+ {x:D.dates,y:D.readiness,mode:'lines+markers',name:'Practice Readiness (Student)',
+  connectgaps:true,line:{color:'darkorange',width:1.8},marker:{size:6,symbol:'square'},
+  hovertemplate:'%{x|%d %b %Y}<br>Readiness: <b>%{y}</b><extra></extra>'},
+ {x:lvl1x,y:lvl1y,mode:'markers',name:'Level 1 (flag)',
+  marker:{color:'#d32f2f',size:13,symbol:'x',line:{color:'#fff',width:1}},
+  hovertemplate:'%{x|%d %b %Y}<br><b>Level 1</b><extra></extra>'}
+];
+const shapes=[];
+// alternating rotation shading + dashed division lines
+(D.rotSpans||[]).forEach((s,i)=>{
+  if(i%2===0) shapes.push({type:'rect',xref:'x',x0:s[0],x1:s[1],yref:'paper',y0:0,y1:1,
+    fillcolor:'#f4f6fb',opacity:1,line:{width:0},layer:'below'});
+});
+(D.rotEdges||[]).forEach(x=>shapes.push({type:'line',xref:'x',x0:x,x1:x,yref:'paper',y0:0,y1:1,
+  line:{color:'#b7c0da',width:0.9,dash:'dash'},layer:'below'}));
+Plotly.newPlot('chart',traces,{
+  margin:{l:48,r:24,t:14,b:20},
+  yaxis:{range:[0.5,4.5],tickvals:[1,2,3,4],ticktext:['1','2','3','4'],title:'Level'},
+  xaxis:{type:'date',rangeslider:{visible:true,thickness:0.06,bgcolor:'#eef1f8',
+         bordercolor:'#c9d1e6',borderwidth:1}},
+  hovermode:'x unified',shapes:shapes,plot_bgcolor:'#fff',
+  legend:{orientation:'h',yanchor:'bottom',y:1.02,xanchor:'left',x:0}
+},{responsive:true,displayModeBar:true,displaylogo:false});
+</script></body></html>"""
+
+
+def buildStudentEntrustmentHtml(engine, cohort, studentNumber, studentName, outPath,
+                                formsTable="dds4_boh3_forms_v3"):
+    """Self-contained single-student interactive entrustment/readiness chart.
+    Hover tooltips, a simple date range-slider, rotation shading + division lines.
+    Plotly is loaded from CDN; all data is embedded so the file works offline."""
+    ts = getStudentTimeSeries(engine, cohort, studentNumber, formsTable)
+    ts = ts.copy()
+    ts["date"] = pd.to_datetime(ts["date"])
+    ts.sort_values("date", inplace=True)
+
+    dates = ts["date"].dt.strftime("%Y-%m-%d").tolist()
+    ent = [None if pd.isna(v) else int(v) for v in ts["entrustment"]]
+    rd = [None if pd.isna(v) else int(v) for v in ts["practice_readiness"]]
+
+    # rotation division edges + alternating shading spans
+    rotEdges, rotSpans = [], []
+    if "rotation" in ts.columns and ts["rotation"].notna().any():
+        seq = list(zip(ts["date"].dt.strftime("%Y-%m-%d"), ts["rotation"]))
+        spanStart, prevRot, idx = seq[0][0], seq[0][1], 0
+        for d, r in seq[1:]:
+            if r != prevRot:
+                rotEdges.append(d)
+                rotSpans.append([spanStart, d, idx])
+                spanStart, prevRot, idx = d, r, idx + 1
+        rotSpans.append([spanStart, seq[-1][0], idx])
+
+    data = {"dates": dates, "entrustment": ent, "readiness": rd,
+            "rotEdges": rotEdges, "rotSpans": rotSpans}
+    title = f"Entrustment & Practice Readiness — {studentName} ({studentNumber})"
+    sub = f"{cohort} · {int(ts.shape[0])} forms"
+    html = (_STUDENT_TS_HTML_TEMPLATE
+            .replace("__TITLE__", title)
+            .replace("__SUB__", sub)
+            .replace("__DATA__", json.dumps(data)))
+    with open(outPath, "w", encoding="utf-8") as f:
+        f.write(html)
+    return outPath
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. Student Excel reports — per-form export + interactive dashboard workbook
+# ═══════════════════════════════════════════════════════════════════════════
+# Two deliverables, both per student, both driven by the SAME query functions
+# that build the PDF report (so the numbers always agree):
+#
+#   buildStudentFormExport(...)     → "one row per form" comparison workbook
+#                                     (the flat file students ask for so they can
+#                                     compare feedback across all their forms)
+#   buildStudentExcelReport(...)    → Excel mirror of the PDF student report:
+#                                     KPI cards, native (editable) Excel charts,
+#                                     and every supporting table on its own sheet
+#   buildCohortStudentExcelReports(...) → loops a cohort, like buildCohortStudentReports
+#
+# Design rules:
+#   • Only curated, human-readable columns are exported. Raw JSON blobs
+#     (patient_data / student_data / assessor_data), *_config, schema snapshots,
+#     assessmentId / formId / assessorId and e-mail addresses are NEVER written —
+#     see _EXPORT_FORBIDDEN_COLS, which is asserted before each save.
+#   • Charts are NATIVE Excel charts bound to worksheet ranges, so if the student
+#     filters, sorts or edits the data the charts follow.
+#   • openpyxl Tables (ListObjects) give every sheet an autofilter + banded rows.
+
+# NOTE: openpyxl's Table is aliased — boh3_dds4_utils is star-imported into the
+# notebook, and an unaliased `Table` would shadow reportlab.platypus.Table there.
+from openpyxl.worksheet.table import Table as _XlTable, TableStyleInfo as _XlTableStyleInfo
+from openpyxl.worksheet.properties import PageSetupProperties
+from openpyxl.chart import BarChart, LineChart, DoughnutChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.drawing.line import LineProperties
+# NOTE: aliased for the same reason as _XlTable above — an unaliased `Paragraph`
+# shadows reportlab.platypus.Paragraph both in this module and in the notebook.
+from openpyxl.chart.text import RichText as _XlRichText
+from openpyxl.drawing.text import (Paragraph as _XlParagraph,
+                                   ParagraphProperties as _XlParagraphProperties,
+                                   CharacterProperties as _XlCharacterProperties,
+                                   RichTextProperties as _XlRichTextProperties)
+
+# ── 9.1 Palette (matches the PDF banner navy in variableUtils.uniColor) ──────
+XL_NAVY = "010D44"          # headers / titles
+XL_NAVY_SOFT = "2A3A7A"     # sub-headers
+XL_BAND = "F4F6FB"          # KPI card + banded row fill
+XL_BORDER = "D3D9E8"
+XL_ACCENT = "E8792B"        # orange — "class average" / secondary series
+XL_BLUE = "1F77B4"          # primary series
+XL_MUTED = "6B7280"
+XL_GOOD_FILL = "C8E6C9"
+XL_WARN_FILL = "FFE0B2"
+XL_BAD_FILL = "FFCDD2"
+# darker versions of the same three, for white text in the grouped header band
+XL_GOOD_BAND = "2E7D32"
+XL_WARN_BAND = "B26500"
+XL_BAD_BAND = "B3261E"
+
+# assessor_data->'multi-select' keys → friendly labels (same buckets the PDF pie uses)
+WEAKNESS_KEY_LABELS = {
+    "weakness-timeliness": "Time Management",
+    "weakness-communication": "Communication",
+    "weakness-technical-skills": "Technical Skills",
+    "weakness-person-centered-care": "Person-Centred Care",
+    "weakness-professional-behaviour": "Professional Behaviour",
+    "weakness-risk-management": "Risk Management",
+    "weakness-knowledge-clinical-reasoning": "Knowledge & Clinical Reasoning",
+}
+
+# Anything matching these (case-insensitive) must never reach a student workbook.
+_EXPORT_FORBIDDEN_COLS = (
+    "patient_data", "student_data", "assessor_data", "student_config",
+    "assessor_config", "context_schema_snapshot", "assessmentid", "formid",
+    "assessorid", "student_email", "assessor_email", "insertedat",
+)
+
+CAF_RATING_SCORES = {
+    "Done well": 1.0, "Done": 0.8, "Mostly done": 0.6,
+    "Sometimes done": 0.4, "Not done": 0.0,
+}
+
+
+# ── 9.2 Low-level Excel helpers ─────────────────────────────────────────────
+_ILLEGAL_XL_CHARS = re.compile(r"[\000-\010\013\014\016-\037]")
+
+
+def _xlValue(v):
+    """Coerce any pandas/numpy/JSON value into something openpyxl can write."""
+    if v is None:
+        return None
+    if isinstance(v, float) and np.isnan(v):
+        return None
+    if v is pd.NaT:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, (dict, list, tuple, set)):
+        v = json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, dict) else \
+            ", ".join(str(x) for x in v)
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    if isinstance(v, str):
+        v = _ILLEGAL_XL_CHARS.sub("", v.replace("<br/>", "\n").replace("<br>", "\n"))
+        return v[:32000]
+    return v
+
+
+def _xlTableName(*parts):
+    """Excel table names: letters/digits/underscore only, must not start with a digit."""
+    raw = "_".join(str(p) for p in parts if p not in (None, ""))
+    name = re.sub(r"[^0-9A-Za-z_]", "_", raw).strip("_") or "Table"
+    if name[0].isdigit():
+        name = "T_" + name
+    return name[:250]
+
+
+def _xlTitle(ws, row, text, col=1, size=16, color=XL_NAVY, span=None):
+    """Big section/report title. Returns the next free row."""
+    c = ws.cell(row=row, column=col, value=_xlValue(text))
+    c.font = Font(bold=True, size=size, color=color)
+    c.alignment = Alignment(vertical="center")
+    if span and span > 1:
+        ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + span - 1)
+    ws.row_dimensions[row].height = max(ws.row_dimensions[row].height or 0, size + 8)
+    return row + 1
+
+
+def _xlNote(ws, row, text, col=1, span=8, italic=True, color=XL_MUTED):
+    """Small explanatory line under a title. Returns the next free row."""
+    c = ws.cell(row=row, column=col, value=_xlValue(text))
+    c.font = Font(size=9, italic=italic, color=color)
+    c.alignment = Alignment(vertical="top", wrap_text=True)
+    if span > 1:
+        ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + span - 1)
+    return row + 1
+
+
+def _xlKpiCards(ws, kpis, row, startCol=1, cardWidth=2, gap=1, perRow=5):
+    """Dashboard KPI tiles: big value over a small label.
+
+    kpis: list of (label, value) — value may be str/int/float/None.
+    Returns the next free row (leaves one blank row after the last card row).
+    """
+    if not kpis:
+        return row
+    thin = Side(style="thin", color=XL_BORDER)
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill = PatternFill("solid", fgColor=XL_BAND)
+    r = row
+    for i, (label, value) in enumerate(kpis):
+        if i and i % perRow == 0:
+            r += 4
+        col = startCol + (i % perRow) * (cardWidth + gap)
+        ws.merge_cells(start_row=r, start_column=col, end_row=r + 1, end_column=col + cardWidth - 1)
+        ws.merge_cells(start_row=r + 2, start_column=col, end_row=r + 2, end_column=col + cardWidth - 1)
+        vCell = ws.cell(row=r, column=col, value=_xlValue(value if value is not None else "—"))
+        vCell.font = Font(bold=True, size=20, color=XL_NAVY)
+        vCell.alignment = Alignment(horizontal="center", vertical="center")
+        lCell = ws.cell(row=r + 2, column=col, value=_xlValue(label))
+        lCell.font = Font(size=9, bold=True, color=XL_MUTED)
+        lCell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for rr in range(r, r + 3):
+            for cc in range(col, col + cardWidth):
+                cell = ws.cell(row=rr, column=cc)
+                cell.fill = fill
+                cell.border = border
+        ws.row_dimensions[r].height = 20
+        ws.row_dimensions[r + 2].height = 24
+    return r + 4
+
+
+def _xlWriteDf(ws, df, startRow=1, startCol=1, title=None, tableName=None,
+               widths=None, wrapCols=(), numFmts=None, dateCols=(),
+               maxWidth=60, minWidth=10, wrapWidth=45, rowHeight=None,
+               emptyText="No records for this student.", banded=True):
+    """Write a DataFrame as a formatted, filterable Excel table.
+
+    widths   : {column name: width} override
+    wrapCols : column names rendered as wrapped free text (comments etc.)
+    numFmts  : {column name: number format string}
+    Returns the next free row (two blank rows after the block).
+    """
+    numFmts = numFmts or {}
+    widths = widths or {}
+    r = startRow
+    if title:
+        c = ws.cell(row=r, column=startCol, value=_xlValue(title))
+        c.font = Font(bold=True, size=12, color=XL_NAVY_SOFT)
+        r += 1
+
+    if df is None or df.empty:
+        c = ws.cell(row=r, column=startCol, value=emptyText)
+        c.font = Font(italic=True, size=9, color=XL_MUTED)
+        return r + 2
+
+    df = df.copy()
+    # Guard: never let raw/PII columns into a student-facing workbook.
+    bad = [c for c in df.columns if str(c).strip().lower() in _EXPORT_FORBIDDEN_COLS]
+    if bad:
+        df.drop(columns=bad, inplace=True)
+    df.columns = [str(c) for c in df.columns]
+    # Excel tables reject duplicate headers.
+    seen, cols = {}, []
+    for c in df.columns:
+        if c in seen:
+            seen[c] += 1
+            c = f"{c} ({seen[c]})"
+        else:
+            seen[c] = 0
+        cols.append(c)
+    df.columns = cols
+
+    headerRow = r
+    thin = Side(style="thin", color=XL_BORDER)
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for j, col in enumerate(df.columns, start=startCol):
+        c = ws.cell(row=headerRow, column=j, value=_xlValue(col))
+        c.font = Font(bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", fgColor=XL_NAVY)
+        c.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        c.border = border
+    ws.row_dimensions[headerRow].height = 30
+
+    for i, (_, rowData) in enumerate(df.iterrows()):
+        rr = headerRow + 1 + i
+        for j, col in enumerate(df.columns, start=startCol):
+            c = ws.cell(row=rr, column=j, value=_xlValue(rowData[col]))
+            c.alignment = Alignment(wrap_text=col in wrapCols, vertical="top",
+                                    horizontal="left" if col in wrapCols else None)
+            c.font = Font(size=10)
+            c.border = border
+            if col in numFmts:
+                c.number_format = numFmts[col]
+            elif col in dateCols:
+                c.number_format = "dd mmm yyyy"
+        if rowHeight:
+            ws.row_dimensions[rr].height = rowHeight
+    lastRow = headerRow + len(df)
+
+    # Column widths: wrapped text columns get a fixed generous width, the rest autofit.
+    for j, col in enumerate(df.columns, start=startCol):
+        letter = get_column_letter(j)
+        if col in widths:
+            ws.column_dimensions[letter].width = widths[col]
+        elif col in wrapCols:
+            ws.column_dimensions[letter].width = wrapWidth
+        else:
+            longest = max([len(str(col))] + [len(str(_xlValue(v) or "")) for v in df[col]])
+            ws.column_dimensions[letter].width = max(minWidth, min(maxWidth, longest + 3))
+
+    if tableName:
+        ref = (f"{get_column_letter(startCol)}{headerRow}:"
+               f"{get_column_letter(startCol + len(df.columns) - 1)}{lastRow}")
+        tbl = _XlTable(displayName=_xlTableName(tableName), ref=ref)
+        tbl.tableStyleInfo = _XlTableStyleInfo(
+            name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False,
+            showRowStripes=banded, showColumnStripes=False)
+        try:
+            ws.add_table(tbl)
+        except ValueError:
+            pass  # duplicate name / overlapping range — formatting already applied
+    return lastRow + 2
+
+
+def _xlChartFont(size=900, bold=False, color=XL_NAVY):
+    """size is in hundredths of a point — 900 = 9pt."""
+    return _XlCharacterProperties(sz=size, b=bold, solidFill=color)
+
+
+def _xlStyleTitleObj(titleObj, charProps):
+    """openpyxl turns a plain string title into rich text; restyle those runs in place."""
+    try:
+        for para in titleObj.tx.rich.p:
+            para.pPr = _XlParagraphProperties(defRPr=charProps)
+            for run in (para.r or []):
+                run.rPr = charProps
+    except AttributeError:
+        pass
+
+
+def _xlAxisLabels(size=800, rotationDeg=None, color=XL_MUTED):
+    """Tick-label formatting. rotationDeg=-45 keeps long category labels readable."""
+    bodyPr = _XlRichTextProperties(vert="horz")
+    if rotationDeg is not None:
+        bodyPr.rot = int(rotationDeg * 60000)      # OOXML uses 1/60000 of a degree
+    cp = _xlChartFont(size=size, color=color)
+    return _XlRichText(bodyPr=bodyPr,
+                       p=[_XlParagraph(pPr=_XlParagraphProperties(defRPr=cp),
+                                       endParaRPr=cp)])
+
+
+def _xlChartSize(nCategories, perCategory=0.75, minWidth=20, maxWidth=55,
+                 height=12, baseWidth=7):
+    """Scale a chart to how much it has to show.
+
+    A fixed-width chart with 50 item codes is unreadable and with 4 is mostly
+    whitespace, so width grows with the category count and clamps at both ends.
+    Returns (width, height) in centimetres, openpyxl's units.
+    """
+    width = max(minWidth, min(maxWidth, baseWidth + perCategory * max(nCategories, 1)))
+    return round(width, 1), height
+
+
+def _xlClusteredOffset(chart, gapWidth=60, overlap=-12):
+    """Side-by-side bars with a small gap, matching the PDF's offset bar pairs.
+
+    Without an explicit overlap Excel draws clustered series on top of each other
+    (overlap defaults to 100 in several renderers), which reads as one series.
+    Negative overlap = a gap between the two bars within each category.
+    """
+    chart.gapWidth = gapWidth
+    chart.overlap = overlap
+    return chart
+
+
+def _xlDataLabels(showPercent=False):
+    """Explicit label flags — leaving them unset makes Excel/LibreOffice print the
+    category and series name too, which clutters the chart."""
+    dl = DataLabelList()
+    dl.showVal = not showPercent
+    dl.showPercent = showPercent
+    dl.showCatName = False
+    dl.showSerName = False
+    dl.showLegendKey = False
+    dl.showBubbleSize = False
+    return dl
+
+
+def _xlStyleChart(chart, title, xTitle=None, yTitle=None, width=24, height=11,
+                  titleSize=1300, axisTitleSize=900, tickSize=800, xTickRotation=None):
+    """One place for chart typography, so every chart in the workbook matches."""
+    chart.title = title
+    chart.style = 2
+    chart.width = width
+    chart.height = height
+    if xTitle:
+        chart.x_axis.title = xTitle
+    if yTitle:
+        chart.y_axis.title = yTitle
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+
+    _xlStyleTitleObj(chart.title, _xlChartFont(size=titleSize, bold=True, color=XL_NAVY))
+    axisFont = _xlChartFont(size=axisTitleSize, bold=True, color=XL_NAVY_SOFT)
+    _xlStyleTitleObj(chart.x_axis.title, axisFont)
+    _xlStyleTitleObj(chart.y_axis.title, axisFont)
+    chart.x_axis.txPr = _xlAxisLabels(size=tickSize, rotationDeg=xTickRotation)
+    chart.y_axis.txPr = _xlAxisLabels(size=tickSize)
+    # light horizontal gridlines only — vertical ones just add noise
+    if getattr(chart.x_axis, "majorGridlines", None) is not None:
+        chart.x_axis.majorGridlines = None
+    if chart.legend is not None:
+        chart.legend.position = "b"
+        chart.legend.overlay = False
+        chart.legend.txPr = _xlAxisLabels(size=850, color=XL_NAVY)
+    return chart
+
+
+def _xlPrintSetup(ws, landscape=True, titleRows=None):
+    """Sane printing: fit to one page wide, repeat the table header on every page."""
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.print_options.horizontalCentered = False
+    if titleRows:
+        ws.print_title_rows = titleRows      # e.g. "5:5"
+    return ws
+
+
+def _xlFreezeAndFilter(ws, cell="A2"):
+    ws.freeze_panes = cell
+    ws.sheet_view.showGridLines = False
+
+
+def _scaleText(v):
+    """scale config lookups come back as jsonb — normalise to a readable string."""
+    if v is None:
+        return None
+    if isinstance(v, float) and np.isnan(v):
+        return None
+    if isinstance(v, dict):
+        for k in ("label", "title", "text", "name", "value", "description"):
+            if v.get(k):
+                return str(v[k])
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return ", ".join(_scaleText(x) or "" for x in v).strip(", ")
+    s = str(v).strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    return s or None
+
+
+def _cleanHtmlBreaks(df, cols=None):
+    """PDF helpers embed <br/> for reportlab — turn those into real newlines."""
+    out = df.copy()
+    for c in (cols or out.columns):
+        if c in out.columns and out[c].dtype == object:
+            out[c] = out[c].apply(
+                lambda v: v.replace("<br/>", "\n").replace("<br>", "\n") if isinstance(v, str) else v)
+    return out
+
+
+# ── 9.3 Per-form export query (one row = one form) ──────────────────────────
+def _studentFormExportSql(formsTable="dds4_boh3_forms_v3"):
+    """One row per form for a single student, curated + human readable.
+
+    Deliberately excludes every raw JSON / config / internal-id column.
+    """
+    weaknessCols = "\n".join(
+        f"""    (SELECT NULLIF(string_agg(DISTINCT trim(x->>'value'), E'\\n'), '')
+     FROM jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'{key}','[]'::jsonb)) x
+     WHERE NULLIF(trim(x->>'value'),'') IS NOT NULL) AS "{label}","""
+        for key, label in WEAKNESS_KEY_LABELS.items())
+
+    cafCase = "\n".join(
+        f"          WHEN '{k}' THEN {v}" for k, v in CAF_RATING_SCORES.items())
+
+    return f"""
+    WITH b AS (
+      SELECT * FROM {formsTable}
+      WHERE cohort = :cohort AND student_number = :studentNumber
+    ),
+    caf AS (
+      SELECT b.assessmentid, b.form_code,
+             ROUND(AVG(
+               CASE COALESCE(kv.value->>'value', kv.value#>>'{{}}')
+{cafCase}
+                 ELSE NULL END::numeric), 3) AS caf_avg
+      FROM b
+      LEFT JOIN LATERAL jsonb_each(
+        COALESCE(b.student_data->'checklists'->'checklist-caf-final-eval','{{}}'::jsonb)) kv(key, value) ON TRUE
+      GROUP BY b.assessmentid, b.form_code
+    ),
+    pat AS (
+      SELECT b.assessmentid, b.form_code,
+             COUNT(*) FILTER (WHERE (pd->>'patient_attended')::boolean)::int       AS seen,
+             COUNT(*) FILTER (WHERE NOT (pd->>'patient_attended')::boolean)::int   AS fta,
+             string_agg(DISTINCT NULLIF(pd->>'patient_age',''), ', ')              AS ages
+      FROM b
+      LEFT JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(b.patient_data)='array' THEN b.patient_data ELSE '[]'::jsonb END) pd ON TRUE
+      GROUP BY b.assessmentid, b.form_code
+    ),
+    codes AS (
+      SELECT b.assessmentid, b.form_code,
+             string_agg(DISTINCT ic->>'code', ', ' ORDER BY ic->>'code') AS item_codes
+      FROM b
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(b.patient_data)='array' THEN b.patient_data ELSE '[]'::jsonb END) pd
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
+      WHERE ic ? 'code'
+      GROUP BY b.assessmentid, b.form_code
+    )
+    SELECT
+      ROW_NUMBER() OVER (ORDER BY b.datetimeutc, b.assessmentid)::int   AS "Form #",
+      b.datetimeutc::date                                              AS "Date",
+      b.rotation                                                       AS "Rotation",
+      COALESCE(NULLIF(b.external_clinic,''), b.clinic)                 AS "Clinic",
+      b.subject                                                        AS "Subject",
+      b.assessor_name                                                  AS "Supervisor",
+      CASE b.assessor_data->'scales'->'scale-entrustment'->>'key'
+        WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4 ELSE NULL
+      END::smallint                                                    AS "Entrustment (1-4)",
+      b.assessor_config->'scales'->'scale-entrustment'->'fields'
+        -> (b.assessor_data->'scales'->'scale-entrustment'->>'key')    AS "Entrustment Level",
+      CASE b.student_data->'scales'->'scale-practice-readiness'->>'key'
+        WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4 ELSE NULL
+      END::smallint                                                    AS "My Practice Readiness (1-4)",
+      b.student_config->'scales'->'scale-practice-readiness'->'fields'
+        -> (b.student_data->'scales'->'scale-practice-readiness'->>'key') AS "My Practice Readiness",
+      caf.caf_avg                                                      AS "My Checklist Score (0-1)",
+      COALESCE(pat.seen, 0)                                            AS "Patients Seen",
+      COALESCE(pat.fta, 0)                                             AS "Patients FTA",
+      pat.ages                                                         AS "Patient Ages",
+      codes.item_codes                                                 AS "Item Codes",
+      NULLIF(b.student_data->'texts'->>'reflection','')                AS "My Reflection",
+      NULLIF(b.assessor_data->'texts'->>'additional_comments','')      AS "Supervisor Comments",
+      (SELECT NULLIF(string_agg(DISTINCT trim(x->>'value'), E'\\n'), '')
+       FROM jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'strengths','[]'::jsonb)) x
+       WHERE COALESCE(x->>'key','') <> 'Other'
+         AND NULLIF(trim(x->>'value'),'') IS NOT NULL)                 AS "Commendations",
+      (SELECT NULLIF(string_agg(DISTINCT trim(x->>'value'), E'\\n'), '')
+       FROM jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'strengths','[]'::jsonb)) x
+       WHERE COALESCE(x->>'key','') = 'Other'
+         AND NULLIF(trim(x->>'value'),'') IS NOT NULL)                 AS "Commendations (Other)",
+{weaknessCols}
+      (SELECT NULLIF(string_agg(DISTINCT trim(x->>'value'), E'\\n'), '')
+       FROM jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'weakness-other','[]'::jsonb)) x
+       WHERE NULLIF(trim(x->>'value'),'') IS NOT NULL)                 AS "Other Feedback",
+      (SELECT NULLIF(string_agg(DISTINCT trim(x->>'value'), E'\\n'), '')
+       FROM jsonb_array_elements(COALESCE(b.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) x
+       WHERE NULLIF(trim(x->>'value'),'') IS NOT NULL)                 AS "Clinical Incidents",
+      NULLIF(b.additional_concerns,'')                                 AS "Additional Concerns",
+      CASE WHEN b.submitted_by_student  THEN 'Yes' ELSE 'No' END       AS "Submitted by Me",
+      CASE WHEN b.submitted_by_assessor THEN 'Yes' ELSE 'No' END       AS "Submitted by Supervisor"
+    FROM b
+    LEFT JOIN caf   ON caf.assessmentid   = b.assessmentid AND caf.form_code   = b.form_code
+    LEFT JOIN pat   ON pat.assessmentid   = b.assessmentid AND pat.form_code   = b.form_code
+    LEFT JOIN codes ON codes.assessmentid = b.assessmentid AND codes.form_code = b.form_code
+    ORDER BY b.datetimeutc, b.assessmentid;
+    """
+
+
+# Columns that hold free text and therefore get wrapped, wide cells.
+FORM_EXPORT_WRAP_COLS = (
+    "My Reflection", "Supervisor Comments", "Commendations", "Commendations (Other)",
+    "Other Feedback", "Clinical Incidents", "Additional Concerns", "Item Codes",
+    *WEAKNESS_KEY_LABELS.values(),
+)
+
+
+# Grouped "super header" band drawn above the My Forms header row. Students see column
+# names like "Time Management" with no context otherwise — the band spells out that those
+# seven are the improvement categories a supervisor can file a comment under.
+# Format: (band label, [column names], band fill colour).
+FORM_EXPORT_GROUPS = [
+    ("Form details", ["Form #", "Date", "Rotation", "Clinic", "Subject", "Supervisor"], XL_NAVY),
+    ("Ratings", ["Entrustment (1-4)", "Entrustment Level", "My Practice Readiness (1-4)",
+                 "My Practice Readiness", "My Checklist Score (0-1)"], XL_NAVY_SOFT),
+    ("Patients & procedures", ["Patients Seen", "Patients FTA", "Patient Ages",
+                               "Item Codes"], XL_NAVY),
+    ("Written comments", ["My Reflection", "Supervisor Comments"], XL_NAVY_SOFT),
+    ("What went well (commendations)", ["Commendations", "Commendations (Other)"], XL_GOOD_BAND),
+    ("Areas for improvement — supervisor comments by category",
+     list(WEAKNESS_KEY_LABELS.values()) + ["Other Feedback"], XL_WARN_BAND),
+    ("Flagged", ["Clinical Incidents", "Additional Concerns"], XL_BAD_BAND),
+    ("Submission", ["Submitted by Me", "Submitted by Supervisor"], XL_NAVY_SOFT),
+]
+
+
+def _xlGroupBand(ws, columns, groups, row, startCol=1):
+    """Merged 'super header' band above a table's header row.
+
+    Consecutive columns belonging to the same group are merged under one label.
+    Columns not in any group get a plain spacer cell, so the band never misaligns
+    if the underlying query gains or loses a column.
+    """
+    lookup = {}
+    for label, cols, color in groups:
+        for c in cols:
+            lookup[c] = (label, color)
+    thin = Side(style="thin", color="FFFFFF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    i = 0
+    while i < len(columns):
+        label, color = lookup.get(columns[i], (None, None))
+        j = i
+        while j + 1 < len(columns) and lookup.get(columns[j + 1], (None, None))[0] == label:
+            j += 1
+        first, last = startCol + i, startCol + j
+        if last > first:
+            ws.merge_cells(start_row=row, start_column=first, end_row=row, end_column=last)
+        cell = ws.cell(row=row, column=first, value=label or "")
+        cell.font = Font(bold=True, size=10, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for cc in range(first, last + 1):
+            c = ws.cell(row=row, column=cc)
+            c.fill = PatternFill("solid", fgColor=color or XL_MUTED)
+            c.border = border
+        i = j + 1
+    ws.row_dimensions[row].height = 26
+    return row + 1
+
+
+# Column widths for the "My Forms" sheet — free-text columns stay readable without
+# making the sheet impossible to scroll sideways.
+FORM_EXPORT_WIDTHS = {
+    "Form #": 7, "Date": 13, "Rotation": 10, "Clinic": 20, "Subject": 12, "Supervisor": 20,
+    "Entrustment (1-4)": 11, "Entrustment Level": 30, "My Practice Readiness (1-4)": 12,
+    "My Practice Readiness": 26, "My Checklist Score (0-1)": 12,
+    "Patients Seen": 9, "Patients FTA": 9, "Patient Ages": 14, "Item Codes": 20,
+    "My Reflection": 55, "Supervisor Comments": 55,
+    "Commendations": 32, "Commendations (Other)": 28,
+    "Other Feedback": 40, "Clinical Incidents": 32, "Additional Concerns": 32,
+    "Submitted by Me": 12, "Submitted by Supervisor": 14,
+    **{label: 24 for label in WEAKNESS_KEY_LABELS.values()},
+}
+
+
+def getStudentFormExport(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
+    """One row per form for a student — the flat 'compare all my feedback' table."""
+    df = readDf(engine, _studentFormExportSql(formsTable),
+                {"cohort": cohort, "studentNumber": studentNumber})
+    if df.empty:
+        return df
+    for col in ("Entrustment Level", "My Practice Readiness"):
+        if col in df.columns:
+            df[col] = df[col].apply(_scaleText)
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    return df
+
+
+def getStudentSelfChecklist(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
+    """Self-evaluation checklist (checklist-caf-final-eval) per form.
+
+    IMPORTANT — config path: the checklist definition lives at
+        student_config -> 'checklists' -> 'selected' -> 'checklist-caf-final-eval'
+    i.e. one level deeper than the bare `->'checklists'->'checklist-caf-final-eval'`
+    used elsewhere in this file ('checklists' itself is {mode, selected}). Reading the
+    bare path returns NULL, which is why the question text came back blank. Both paths
+    are COALESCEd here so either shape works.
+
+    That config block also carries:
+      • fields        MC1..MC7 → the full criterion wording
+      • extra_config.headers  MC1..MC7 → a short domain title ("Technical Skills")
+      • extra_config.options.student  O1..O5 → "Done well" … "Not done"
+    The last one matters because the stored answer may be either the O-code or the
+    literal text depending on form version — it is resolved below rather than assumed.
+
+    Returns (wideDf, legendDf, itemAvgDf):
+      wideDf    — Form # / Date / Supervisor + one column per checklist domain + row average
+      legendDf  — Code · Domain · Question
+      itemAvgDf — Code · Domain · Question · average score across the student's forms (0–1)
+    """
+    sql = f"""
+    WITH b AS (
+      SELECT assessmentid, form_code, datetimeutc, assessor_name, student_data,
+             COALESCE(
+               student_config->'checklists'->'selected'->'checklist-caf-final-eval',
+               student_config->'checklists'->'checklist-caf-final-eval'
+             ) AS cfg,
+             ROW_NUMBER() OVER (ORDER BY datetimeutc, assessmentid)::int AS form_no
+      FROM {formsTable}
+      WHERE cohort = :cohort AND student_number = :studentNumber
+    )
+    SELECT b.form_no                                              AS "Form #",
+           b.datetimeutc::date                                    AS "Date",
+           b.assessor_name                                        AS "Supervisor",
+           kv.key                                                 AS "Code",
+           b.cfg->'extra_config'->'headers'->kv.key->0->>'title'  AS "Domain",
+           b.cfg->'fields'->>kv.key                               AS "Question",
+           COALESCE(kv.value->>'value', kv.value#>>'{{}}')        AS "RawRating",
+           b.cfg->'extra_config'->'options'->'student'            AS "OptionMap"
+    FROM b
+    CROSS JOIN LATERAL jsonb_each(COALESCE(
+      b.student_data->'checklists'->'checklist-caf-final-eval',
+      b.student_data->'checklists'->'selected'->'checklist-caf-final-eval',
+      '{{}}'::jsonb)) kv(key, value)
+    ORDER BY b.form_no, kv.key;
+    """
+    longDf = readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
+    empty = pd.DataFrame()
+    if longDf.empty:
+        return empty, empty, empty
+
+    longDf["Date"] = pd.to_datetime(longDf["Date"]).dt.date
+
+    # O-code → label, taken from the form's own config (later forms win); the stored
+    # answer is sometimes the code ("O2") and sometimes the label ("Done") — accept both.
+    optionMap = {}
+    if "OptionMap" in longDf.columns:
+        for raw in longDf["OptionMap"]:
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+            if isinstance(raw, dict):
+                optionMap.update({str(k): str(v) for k, v in raw.items()})
+    longDf["Rating"] = longDf["RawRating"].apply(
+        lambda v: optionMap.get(str(v).strip(), v) if pd.notna(v) else None)
+    longDf["Score"] = longDf["Rating"].map(
+        lambda v: CAF_RATING_SCORES.get(str(v).strip()) if pd.notna(v) else None)
+
+    # Domain is the readable label; fall back to the raw code where a form lacks headers.
+    longDf["Domain"] = longDf.apply(
+        lambda r: r["Domain"] if isinstance(r.get("Domain"), str) and r["Domain"].strip()
+        else r["Code"], axis=1)
+
+    legendDf = (longDf[["Code", "Domain", "Question"]].dropna(subset=["Code"])
+                .drop_duplicates(subset=["Code"]).sort_values("Code").reset_index(drop=True))
+
+    wideDf = longDf.pivot_table(index=["Form #", "Date", "Supervisor"], columns="Domain",
+                                values="Rating", aggfunc="first").reset_index()
+    wideDf.columns.name = None
+    # keep the checklist columns in MC order rather than alphabetical
+    domainOrder = [d for d in legendDf["Domain"] if d in wideDf.columns]
+    wideDf = wideDf[["Form #", "Date", "Supervisor"] + domainOrder]
+    scoreDf = (longDf.groupby(["Form #"])["Score"].mean().round(3).reset_index()
+               .rename(columns={"Score": "Form Average (0-1)"}))
+    wideDf = wideDf.merge(scoreDf, on="Form #", how="left").sort_values("Form #")
+
+    itemAvgDf = (longDf.dropna(subset=["Score"]).groupby("Code")["Score"].mean().round(3)
+                 .reset_index().rename(columns={"Score": "Average Score (0-1)"}))
+    itemAvgDf = itemAvgDf.merge(legendDf, on="Code", how="left").sort_values("Code")
+    itemAvgDf = itemAvgDf[["Code", "Domain", "Question", "Average Score (0-1)"]]
+    return wideDf, legendDf, itemAvgDf
+
+
+# ── 9.4 Sheet builders ──────────────────────────────────────────────────────
+def _sheetReadMe(wb, cohort, studentNumber, studentName, generatedOn, kind="export"):
+    ws = wb.create_sheet("Read Me")
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 95
+    r = _xlTitle(ws, 1, f"{studentName} — {cohort} clinical feedback", size=18, span=2)
+    r = _xlNote(ws, r, f"Student ID {studentNumber} · generated {generatedOn} · "
+                       "source: DASH clinical assessment forms", span=2)
+    r += 1
+    rows = [
+        ("What this file is",
+         "An Excel companion to your PDF feedback report. Every number here comes from the same "
+         "queries that build the PDF, so the two always agree."),
+        ("My Forms",
+         "One row per form. Use the filter arrows in the header to compare feedback across "
+         "rotations, supervisors or entrustment levels."),
+        ("Entrustment (1-4)",
+         "Your supervisor's judgement of how much supervision you needed — 1 = most supervision, "
+         "4 = least. 'Entrustment Level' spells out the wording shown on the form."),
+        ("My Practice Readiness (1-4)",
+         "Your OWN judgement on the same 1–4 scale, so you can see where your self-assessment "
+         "and your supervisor's assessment agree or diverge."),
+        ("My Checklist Score (0-1)",
+         "Average of your self-evaluation checklist for that form "
+         "(Done well = 1.0, Done = 0.8, Mostly done = 0.6, Sometimes done = 0.4, Not done = 0)."),
+        ("Commendations",
+         "Positive feedback your supervisor recorded — the things they wanted to note you did "
+         "well on that form."),
+        ("Areas for improvement",
+         "On My Forms these sit under one coloured band: Time Management, Communication, "
+         "Technical Skills, Person-Centred Care, Professional Behaviour, Risk Management, "
+         "Knowledge & Clinical Reasoning, and Other Feedback. Each is a category your "
+         "supervisor could file a comment under — a blank column means nothing was raised in "
+         "that category, not that you scored zero."),
+        ("Blank cells",
+         "A blank cell means that field was not filled in on that form — it is not a zero."),
+    ]
+    if kind == "dashboard":
+        rows.insert(1, ("Dashboard",
+                        "Headline numbers and charts. The charts are live Excel charts bound to the "
+                        "data sheets — filter or edit the data and the charts follow."))
+    for label, text in rows:
+        c = ws.cell(row=r, column=1, value=label)
+        c.font = Font(bold=True, size=10, color=XL_NAVY)
+        c.alignment = Alignment(vertical="top", wrap_text=True)
+        c2 = ws.cell(row=r, column=2, value=text)
+        c2.font = Font(size=10)
+        c2.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.row_dimensions[r].height = 30
+        r += 1
+    r += 1
+    _xlNote(ws, r, "Questions about anything in this file? Contact the Melbourne Dental School "
+                   "clinical assessment team.", span=2)
+    _xlPrintSetup(ws, landscape=False)
+    return ws
+
+
+def _sheetForms(wb, formDf, sheetName="My Forms"):
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "Every form, one row each", size=14)
+    r = _xlNote(ws, r, "Click the arrow in any header cell to filter or sort. The coloured band "
+                       "above the headers groups the columns — the seven columns under "
+                       "\"Areas for improvement\" are the categories your supervisor could file a "
+                       "comment under, so a blank one simply means nothing was raised there.",
+                span=10)
+    r += 1
+    groupRow = r if (formDf is not None and not formDf.empty) else None
+    headerRow = r + 1 if groupRow else r
+    if groupRow:
+        _xlGroupBand(ws, list(formDf.columns), FORM_EXPORT_GROUPS, groupRow)
+    nextRow = _xlWriteDf(
+        ws, formDf, startRow=headerRow, tableName="tblForms",
+        wrapCols=FORM_EXPORT_WRAP_COLS, dateCols=("Date",),
+        numFmts={"My Checklist Score (0-1)": "0.00"},
+        widths=FORM_EXPORT_WIDTHS, wrapWidth=30,
+        rowHeight=42, emptyText="No forms found for this student.")
+    if formDf is not None and not formDf.empty:
+        ws.freeze_panes = ws.cell(row=headerRow + 1, column=3)
+        cols = list(formDf.columns)
+        if "Entrustment (1-4)" in cols:
+            letter = get_column_letter(cols.index("Entrustment (1-4)") + 1)
+            rng = f"{letter}{headerRow + 1}:{letter}{headerRow + len(formDf)}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type="num", start_value=1, start_color=XL_BAD_FILL,
+                mid_type="num", mid_value=2.5, mid_color=XL_WARN_FILL,
+                end_type="num", end_value=4, end_color=XL_GOOD_FILL))
+        _xlPrintSetup(ws, titleRows=f"{groupRow}:{headerRow}")
+    return ws, nextRow
+
+
+def _sheetSelfChecklist(wb, itemAvgDf, sheetName="Self-Evaluation"):
+    """Per-checklist-item averages across all of the student's forms + bar chart."""
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "My self-evaluation checklist", size=14)
+    r = _xlNote(ws, r, "Your average rating for each checklist item across every form. "
+                       "Scores: Done well = 1.0 · Done = 0.8 · Mostly done = 0.6 · "
+                       "Sometimes done = 0.4 · Not done = 0. The lowest bars are the items "
+                       "worth focusing on.", span=8)
+    r += 1
+    avgStart = r
+    r = _xlWriteDf(ws, itemAvgDf, startRow=avgStart, title="Average per item (all forms)",
+                   tableName="tblChecklistAvg", wrapCols=("Question",), wrapWidth=70,
+                   numFmts={"Average Score (0-1)": "0.00"},
+                   emptyText="No self-evaluation checklist was completed.")
+    if itemAvgDf is not None and not itemAvgDf.empty:
+        chart = BarChart()
+        chart.type = "bar"
+        headerRow = avgStart + 1
+        n = len(itemAvgDf)
+        cols = list(itemAvgDf.columns)
+        # resolve by NAME — the table gained a Domain column, and index-based
+        # references silently plot the wrong column when the shape changes
+        valCol = cols.index("Average Score (0-1)") + 1
+        catCol = cols.index("Domain") + 1 if "Domain" in cols else 1
+        chart.add_data(Reference(ws, min_col=valCol, min_row=headerRow,
+                                 max_row=headerRow + n), titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=catCol, min_row=headerRow + 1,
+                                       max_row=headerRow + n))
+        chart.series[0].graphicalProperties.solidFill = XL_BLUE
+        chart.dLbls = _xlDataLabels()
+        chart.legend = None
+        chart.y_axis.scaling.min = 0
+        chart.y_axis.scaling.max = 1
+        chart.gapWidth = 55
+        _xlStyleChart(chart, "Average self-rating per checklist item",
+                      xTitle="Checklist item", yTitle="Average score (0–1)",
+                      width=24, height=max(9, min(28, 1.5 * n + 4)))
+        ws.add_chart(chart, f"F{avgStart}")
+    _xlPrintSetup(ws)
+    return ws
+
+
+def _sheetChecklistByForm(wb, wideDf, sheetName="Ratings by Form"):
+    """Wide checklist matrix: one row per form, one column per checklist item."""
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "My self-ratings, form by form", size=14)
+    r = _xlNote(ws, r, "One row per form, one column per checklist domain — the "
+                       "Self-Evaluation sheet lists the full wording behind each domain.",
+                span=10)
+    r += 1
+    startRow = r
+    _xlWriteDf(ws, wideDf, startRow=startRow, tableName="tblChecklistWide", dateCols=("Date",),
+               numFmts={"Form Average (0-1)": "0.00"},
+               widths={"Form #": 8, "Date": 13, "Supervisor": 20},
+               wrapCols=tuple(c for c in (wideDf.columns if wideDf is not None and
+                                          not wideDf.empty else [])
+                              if c not in ("Form #", "Date", "Supervisor",
+                                           "Form Average (0-1)")),
+               wrapWidth=17, rowHeight=32,
+               emptyText="No self-evaluation checklist was completed.")
+    if wideDf is not None and not wideDf.empty:
+        ws.freeze_panes = ws.cell(row=startRow + 1, column=2)
+        _xlPrintSetup(ws, titleRows=f"{startRow}:{startRow}")
+    return ws
+
+
+def _sheetSummary(wb, metricsDf, entrustmentDf, readinessDf, sheetName="Summary"):
+    """Summary metrics + the two rating distributions. Returns anchor info so the
+    Dashboard sheet can point its charts at these ranges."""
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    anchors = {"ws": ws}
+    r = _xlTitle(ws, 1, "Summary", size=14)
+    r = _xlNote(ws, r, "The same figures shown on your PDF report. The distributions below feed "
+                       "the charts on the Dashboard sheet.", span=4)
+    r += 1
+    r = _xlWriteDf(ws, metricsDf, startRow=r, title="Headline numbers", tableName="tblSummary",
+                   wrapCols=("Value",), emptyText="No summary metrics available.")
+
+    if entrustmentDf is not None and not entrustmentDf.empty:
+        anchors["entrustHeader"] = r + 1          # +1 for the title line inside _xlWriteDf
+        anchors["entrustRows"] = len(entrustmentDf)
+        r = _xlWriteDf(ws, entrustmentDf, startRow=r,
+                       title="Supervisor judgement: entrustment distribution",
+                       tableName="tblEntrustDist", wrapCols=("Entrustment",))
+    if readinessDf is not None and not readinessDf.empty:
+        anchors["readyHeader"] = r + 1
+        anchors["readyRows"] = len(readinessDf)
+        r = _xlWriteDf(ws, readinessDf, startRow=r,
+                       title="My judgement: practice readiness distribution",
+                       tableName="tblReadinessDist", wrapCols=("Practice Readiness",))
+    # all tables here share one 2-column shape — pin widths so the last write can't
+    # squash the wrapped text of the first
+    ws.column_dimensions["A"].width = 42
+    ws.column_dimensions["B"].width = 30
+    _xlPrintSetup(ws, landscape=False)
+    return anchors
+
+
+def _buildTrendChart(sourceWs, anchors, title, subtitleParts=None):
+    """The entrustment-vs-readiness line chart, built once and reused by the Trend
+    sheet and the Dashboard (Excel is happy for a chart to reference another sheet).
+
+    What each piece is doing:
+      • categories are the composite Label column, so Excel's own hover tooltip shows
+        form number, date, clinic, supervisor and rotation — native charts have no
+        custom-tooltip API, the category text IS the tooltip
+      • the two lines are plotted from nudged helper columns (±TREND_PLOT_OFFSET) so
+        equal ratings don't hide one line under the other
+      • rotation dividers are a hairline bar series with a dashed outline and no fill,
+        combined into the line chart — the standard way to fake a vertical rule in Excel
+      • visible_cells_only=False so the hidden helper columns still plot
+    """
+    cols, headerRow, nRows = anchors["cols"], anchors["headerRow"], anchors["rows"]
+    if not nRows:
+        return None
+
+    line = LineChart()
+    for name, colorHex, dash in ((TREND_ENT_PLOT, XL_BLUE, None),
+                                 (TREND_RD_PLOT, XL_ACCENT, "sysDot")):
+        if name not in cols:
+            continue
+        idx = cols.index(name) + 1
+        line.add_data(Reference(sourceWs, min_col=idx, min_row=headerRow,
+                                max_row=headerRow + nRows), titles_from_data=True)
+        ser = line.series[-1]
+        ser.graphicalProperties.line.solidFill = colorHex
+        ser.graphicalProperties.line.width = 22000
+        if dash:
+            ser.graphicalProperties.line.dashStyle = dash
+        ser.marker = Marker(symbol="circle" if dash is None else "square", size=7)
+        ser.marker.graphicalProperties = GraphicalProperties(solidFill=colorHex)
+        ser.smooth = False
+
+    catIdx = (cols.index(TREND_LABEL_COL) + 1) if TREND_LABEL_COL in cols else 1
+    line.set_categories(Reference(sourceWs, min_col=catIdx, min_row=headerRow + 1,
+                                  max_row=headerRow + nRows))
+
+    # ── rotation dividers ───────────────────────────────────────────────────
+    if TREND_DIVIDER_COL in cols:
+        idx = cols.index(TREND_DIVIDER_COL) + 1
+        bar = BarChart()
+        bar.type = "col"
+        bar.add_data(Reference(sourceWs, min_col=idx, min_row=headerRow,
+                               max_row=headerRow + nRows), titles_from_data=True)
+        divider = bar.series[0]
+        gp = GraphicalProperties(noFill=True)
+        gp.line = LineProperties(solidFill=XL_MUTED, prstDash="sysDash", w=9525)
+        divider.graphicalProperties = gp
+        bar.gapWidth = 500            # Excel's maximum — makes the bar a hairline
+        bar.overlap = 100
+        line += bar                   # combined onto the same value axis
+
+    line.y_axis.scaling.min = 0.5
+    line.y_axis.scaling.max = 4.5
+    line.y_axis.majorUnit = 1
+    line.y_axis.numFmt = "0"
+    # every point still carries its full label for hover, but only ~8 are drawn on the
+    # axis — otherwise 97 forms produce an unreadable smear
+    line.x_axis.tickLblSkip = max(2, -(-nRows // 8)) if nRows > 8 else 1
+    line.x_axis.tickMarkSkip = 1
+    # NB: the attribute is visible_cells_only, NOT plotVisOnly (that name silently
+    # does nothing and the chart comes out empty when the source columns are hidden).
+    line.visible_cells_only = False
+    line.display_blanks = "gap"       # missing ratings leave a gap, not a drop to zero
+
+    xTitle = "Form — hover any point for date, clinic, supervisor and rotation"
+    if subtitleParts:
+        xTitle = f"{xTitle}   ({' · '.join(str(x) for x in subtitleParts if x)})"
+    w, h = _xlChartSize(nRows, perCategory=0.85, minWidth=26, maxWidth=58, height=12.5)
+    _xlStyleChart(line, title, xTitle=xTitle,
+                  yTitle="Rating 1–4  (1 = needs most supervision, 4 = most independent)",
+                  width=w, height=h, xTickRotation=-45)
+    return line
+
+
+def _sheetTrend(wb, trendDf, sheetName="Trend", studentName=None, cohort=None):
+    """Entrustment vs self practice-readiness over time, as a native line chart."""
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "Entrustment & practice readiness over time", size=14)
+    r = _xlNote(ws, r, "Solid blue = your SUPERVISOR's entrustment rating. Dotted orange = "
+                       "YOUR OWN practice-readiness rating. Both use the same 1–4 scale, so "
+                       "where the lines sit apart your view and your supervisor's differ. "
+                       "Hover any point for the date, clinic, supervisor and rotation. "
+                       "Grey dashed verticals mark a change of rotation. The two lines are "
+                       f"drawn {TREND_PLOT_OFFSET * 2:.2f} apart on purpose so an exact match "
+                       "doesn't hide one behind the other — the table below holds the true "
+                       "values.", span=10)
+    r += 1
+    startRow = r
+    r = _xlWriteDf(ws, trendDf, startRow=startRow, tableName="tblTrend", dateCols=("Date",),
+                   widths={"Form #": 8, "Date": 13, "Rotation": 12, "Clinic": 22,
+                           "Supervisor": 22, TREND_ENT_COL: 14, TREND_RD_COL: 14},
+                   emptyText="No forms with both a supervisor and a self rating yet.")
+    anchors = {"ws": ws, "headerRow": startRow,
+               "rows": 0 if trendDf is None or trendDf.empty else len(trendDf),
+               "cols": [] if trendDf is None or trendDf.empty else list(trendDf.columns)}
+    if trendDf is None or trendDf.empty:
+        return anchors
+
+    cols, nRows = anchors["cols"], anchors["rows"]
+    # helper columns are plumbing, not content — hide them but keep them plotting
+    for helper in (TREND_LABEL_COL, TREND_ENT_PLOT, TREND_RD_PLOT, TREND_DIVIDER_COL):
+        if helper in cols:
+            ws.column_dimensions[get_column_letter(cols.index(helper) + 1)].hidden = True
+
+    title = "Entrustment (supervisor) vs practice readiness (self)"
+    if studentName:
+        title = f"{title} — {studentName}" + (f" · {cohort}" if cohort else "")
+    chart = _buildTrendChart(ws, anchors, title)
+    if chart is not None:
+        ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}{startRow}")
+
+    if TREND_ENT_COL in cols:
+        letter = get_column_letter(cols.index(TREND_ENT_COL) + 1)
+        ws.conditional_formatting.add(
+            f"{letter}{startRow + 1}:{letter}{startRow + nRows}",
+            ColorScaleRule(start_type="num", start_value=1, start_color=XL_BAD_FILL,
+                           mid_type="num", mid_value=2.5, mid_color=XL_WARN_FILL,
+                           end_type="num", end_value=4, end_color=XL_GOOD_FILL))
+    ws.freeze_panes = ws.cell(row=startRow + 1, column=2)
+    _xlPrintSetup(ws, titleRows=f"{startRow}:{startRow}")
+    return anchors
+
+
+def _sheetProcedures(wb, itemsDf, sheetName="Procedures"):
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "Procedures performed", size=14)
+    r = _xlNote(ws, r, "Your item-code counts next to the class average, so you can see where you "
+                       "are ahead of or behind the cohort. 'Difference' is your count minus the "
+                       "class average.", span=10)
+    r += 1
+    startRow = r
+    r = _xlWriteDf(ws, itemsDf, startRow=startRow, tableName="tblProcedures",
+                   wrapCols=("Description",), wrapWidth=45,
+                   numFmts={"Class Average": "0.0", "Difference": "0.0"},
+                   emptyText="No item codes recorded yet.")
+    if itemsDf is None or itemsDf.empty:
+        return ws
+    cols = list(itemsDf.columns)
+    nRows = len(itemsDf)
+    chart = BarChart()
+    chart.type = "col"
+    chart.grouping = "clustered"
+    for name, colorHex in (("Your Count", XL_BLUE), ("Class Average", XL_ACCENT)):
+        if name not in cols:
+            continue
+        idx = cols.index(name) + 1
+        chart.add_data(Reference(ws, min_col=idx, min_row=startRow, max_row=startRow + nRows),
+                       titles_from_data=True)
+        chart.series[-1].graphicalProperties.solidFill = colorHex
+    catIdx = cols.index("Item Code") + 1 if "Item Code" in cols else 1
+    chart.set_categories(Reference(ws, min_col=catIdx, min_row=startRow + 1,
+                                   max_row=startRow + nRows))
+    _xlClusteredOffset(chart, gapWidth=60, overlap=-12)
+    if nRows <= 22:                      # labels on 50 bars are noise, not information
+        chart.dLbls = _xlDataLabels()
+    w, h = _xlChartSize(nRows, perCategory=0.9, minWidth=24, maxWidth=60, height=13)
+    _xlStyleChart(chart, "Procedures performed — your count vs class average",
+                  xTitle="Item code", yTitle="Number performed", width=w, height=h,
+                  xTickRotation=-45 if nRows > 12 else None)
+    ws.add_chart(chart, f"{get_column_letter(len(cols) + 2)}{startRow}")
+    if "Difference" in cols:
+        letter = get_column_letter(cols.index("Difference") + 1)
+        rng = f"{letter}{startRow + 1}:{letter}{startRow + nRows}"
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator="lessThan", formula=["0"],
+            fill=PatternFill("solid", fgColor=XL_BAD_FILL)))
+        ws.conditional_formatting.add(rng, CellIsRule(
+            operator="greaterThanOrEqual", formula=["0"],
+            fill=PatternFill("solid", fgColor=XL_GOOD_FILL)))
+    _xlPrintSetup(ws, titleRows=f"{startRow}:{startRow}")
+    return ws
+
+
+def _sheetFeedback(wb, strengthsDf, weaknessCountsDf, sheetName="Feedback"):
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "Commendations & areas for improvement", size=14)
+    r = _xlNote(ws, r, "Counts are across all of your forms. Categories with no entries are "
+                       "omitted.", span=10)
+    r += 1
+    wStart = r
+    r = _xlWriteDf(ws, weaknessCountsDf, startRow=wStart,
+                   title="Areas for improvement by category",
+                   tableName="tblWeakness", wrapCols=("Area",), wrapWidth=35,
+                   emptyText="No areas for improvement were recorded.")
+    if weaknessCountsDf is not None and not weaknessCountsDf.empty:
+        pie = DoughnutChart(holeSize=55)
+        headerRow = wStart + 1
+        n = len(weaknessCountsDf)
+        pie.add_data(Reference(ws, min_col=2, min_row=headerRow, max_row=headerRow + n),
+                     titles_from_data=True)
+        pie.set_categories(Reference(ws, min_col=1, min_row=headerRow + 1, max_row=headerRow + n))
+        pie.dLbls = _xlDataLabels(showPercent=True)
+        pie.title = "Areas for improvement — share by category"
+        pie.height, pie.width = 11, 15
+        _xlStyleTitleObj(pie.title, _xlChartFont(size=1200, bold=True, color=XL_NAVY))
+        if pie.legend is not None:
+            pie.legend.position = "b"
+            pie.legend.txPr = _xlAxisLabels(size=850, color=XL_NAVY)
+        ws.add_chart(pie, f"E{wStart}")
+        r = max(r, wStart + n + 21)
+
+    sStart = r
+    r = _xlWriteDf(ws, strengthsDf, startRow=sStart, title="Top commendations",
+                   tableName="tblStrengths", wrapCols=("Commendation",), wrapWidth=60,
+                   emptyText="No commendations were recorded.")
+    if strengthsDf is not None and not strengthsDf.empty:
+        bar = BarChart()
+        bar.type = "bar"
+        headerRow = sStart + 1
+        n = len(strengthsDf)
+        bar.add_data(Reference(ws, min_col=2, min_row=headerRow, max_row=headerRow + n),
+                     titles_from_data=True)
+        bar.set_categories(Reference(ws, min_col=1, min_row=headerRow + 1, max_row=headerRow + n))
+        bar.series[0].graphicalProperties.solidFill = XL_BLUE
+        bar.legend = None
+        bar.dLbls = _xlDataLabels()
+        bar.gapWidth = 55
+        _xlStyleChart(bar, "Most frequent commendations", xTitle="Commendation",
+                      yTitle="Times recorded", width=24, height=max(9, min(28, 1.2 * n + 4)))
+        ws.add_chart(bar, f"E{sStart}")
+    _xlPrintSetup(ws)
+    return ws
+
+
+def _sheetComments(wb, commentsDf, sheetName="All Comments"):
+    """Every written comment — supervisor and student, every text field — in one
+    filterable table."""
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "All written feedback in one place", size=14)
+    r = _xlNote(ws, r, "Every comment on your forms — supervisor overall comments, written "
+                       "feedback, commendations, concerns and incidents, plus your own "
+                       "reflections — in date order. Filter 'From' for supervisor vs you, or "
+                       "'Type' for one kind of comment.", span=9)
+    r += 1
+    startRow = r
+    _xlWriteDf(ws, commentsDf, startRow=startRow, tableName="tblComments",
+               wrapCols=("Detail", "Item Codes"), wrapWidth=85, rowHeight=48,
+               dateCols=("Date",),
+               widths={"Date": 13, "From": 11, "Type": 20, "Supervisor": 18, "Rotation": 10},
+               emptyText="No written feedback, incidents or reflections were recorded.")
+    if commentsDf is not None and not commentsDf.empty:
+        ws.freeze_panes = ws.cell(row=startRow + 1, column=1)
+        _xlPrintSetup(ws, titleRows=f"{startRow}:{startRow}")
+    return ws
+
+
+def _dashboardDoughnut(sourceWs, headerRow, nRows, title):
+    """Doughnut over a 2-column (label, count) block that lives on another sheet."""
+    pie = DoughnutChart(holeSize=55)
+    pie.add_data(Reference(sourceWs, min_col=2, min_row=headerRow, max_row=headerRow + nRows),
+                 titles_from_data=True)
+    pie.set_categories(Reference(sourceWs, min_col=1, min_row=headerRow + 1,
+                                 max_row=headerRow + nRows))
+    pie.dLbls = _xlDataLabels(showPercent=True)
+    pie.title = title
+    pie.height, pie.width = 10.5, 14
+    pie.style = 2
+    _xlStyleTitleObj(pie.title, _xlChartFont(size=1200, bold=True, color=XL_NAVY))
+    if pie.legend is not None:
+        pie.legend.position = "b"
+        pie.legend.overlay = False
+        pie.legend.txPr = _xlAxisLabels(size=850, color=XL_NAVY)
+    return pie
+
+
+def _sheetDashboard(wb, cohort, studentNumber, studentName, generatedOn, kpis,
+                    summaryAnchors, trendAnchors, sheetName="Dashboard"):
+    """Landing page: KPI tiles + charts. All chart data lives on the tabs behind it,
+    so nothing here fights over column widths."""
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = XL_NAVY
+    for i in range(1, 17):
+        ws.column_dimensions[get_column_letter(i)].width = 15
+    r = _xlTitle(ws, 1, f"{studentName} — {cohort} clinical feedback dashboard", size=18, span=10)
+    r = _xlNote(ws, r, f"Student ID {studentNumber} · generated {generatedOn} · every figure here "
+                       "matches your PDF report. Data behind each chart is on the tabs to the "
+                       "right — edit or filter it and the charts follow.", span=10)
+    r += 1
+    r = _xlKpiCards(ws, kpis, r, startCol=1, cardWidth=2, gap=1, perRow=5)
+    r += 1
+
+    chartRow = r
+    trendWs = trendAnchors.get("ws")
+    if trendAnchors.get("rows"):
+        # exactly the chart from the Trend sheet, pointed at the same ranges
+        line = _buildTrendChart(trendWs, trendAnchors,
+                                f"Entrustment (supervisor) vs practice readiness (self) — "
+                                f"{studentName}")
+        if line is not None:
+            ws.add_chart(line, f"A{chartRow}")
+            chartRow += int(line.height / 0.53) + 2   # ~0.53 cm per default-height row
+
+    summaryWs = summaryAnchors.get("ws")
+    if summaryAnchors.get("entrustRows"):
+        ws.add_chart(_dashboardDoughnut(summaryWs, summaryAnchors["entrustHeader"],
+                                        summaryAnchors["entrustRows"],
+                                        "Entrustment levels (supervisor)"), f"A{chartRow}")
+    if summaryAnchors.get("readyRows"):
+        ws.add_chart(_dashboardDoughnut(summaryWs, summaryAnchors["readyHeader"],
+                                        summaryAnchors["readyRows"],
+                                        "Practice readiness (self)"), f"I{chartRow}")
+    _xlPrintSetup(ws)
+    return ws
+
+
+# ── 9.5 Data assembly (shared by both workbooks) ────────────────────────────
+# Each sheet declares which of these data groups it needs (see STUDENT_SHEETS), and
+# only the requested groups are queried — pick three sheets and you pay for three
+# sheets' worth of SQL, not the whole report.
+STUDENT_DATA_GROUPS = ("forms", "checklist", "summary", "trend",
+                       "procedures", "feedback", "comments", "weakness")
+
+
+def _collectStudentExcelData(engine, cohort, studentNumber, studentName,
+                             formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
+                             needs=None):
+    """Run the required queries once and return a dict of presentation-ready DataFrames.
+
+    needs: iterable of STUDENT_DATA_GROUPS names; None means "everything".
+    """
+    needs = set(STUDENT_DATA_GROUPS) if needs is None else set(needs)
+    data = {}
+
+    if "forms" in needs:
+        data["formDf"] = getStudentFormExport(engine, cohort, studentNumber, formsTable)
+    if "checklist" in needs:
+        wideDf, legendDf, itemAvgDf = getStudentSelfChecklist(
+            engine, cohort, studentNumber, formsTable)
+        data["checklistWide"] = wideDf
+        data["checklistLegend"] = legendDf
+        data["checklistItemAvg"] = itemAvgDf
+    if "summary" in needs:
+        _collectSummaryData(data, engine, cohort, studentNumber, studentName, formsTable)
+    if "trend" in needs:
+        _collectTrendData(data, engine, cohort, studentNumber, formsTable)
+    if "procedures" in needs:
+        _collectProcedureData(data, engine, cohort, studentNumber, formsTable, itemCodeLimit)
+    if "feedback" in needs:
+        _collectFeedbackData(data, engine, cohort, studentNumber, formsTable)
+    if "comments" in needs:
+        _collectCommentData(data, engine, cohort, studentNumber, formsTable)
+    if "weakness" in needs:
+        _collectWeaknessData(data, engine, cohort, studentNumber, formsTable)
+    return data
+
+
+def _assessorRollupCached(data, engine, cohort, studentNumber, formsTable):
+    """getAssessorRollup feeds both the Summary and Feedback groups — query it once."""
+    if "_assessorRollup" not in data:
+        data["_assessorRollup"] = getAssessorRollup(engine, cohort, studentNumber, formsTable)
+    return data["_assessorRollup"]
+
+
+def _collectSummaryData(data, engine, cohort, studentNumber, studentName, formsTable):
+    """Summary metrics table, the two rating distributions, and the KPI tiles."""
+    # Summary metrics — reuse the PDF's own builder so the numbers can't drift.
+    metricsDf, _selfDf, assessorDf = getStudentSummaryTable(
+        engine, cohort, studentNumber, studentName, formsTable)
+    data["metricsDf"] = _cleanHtmlBreaks(metricsDf)
+
+    metricLookup = {str(k): v for k, v in zip(metricsDf["Metric"], metricsDf["Value"])}
+    selfRoll, readinessDf = getStudentRollup(engine, cohort, studentNumber, formsTable)
+    assessorRoll, entrustmentDf = _assessorRollupCached(
+        data, engine, cohort, studentNumber, formsTable)
+    a = assessorRoll.iloc[0].to_dict() if not assessorRoll.empty else {}
+
+    if not readinessDf.empty:
+        readinessDf = readinessDf.copy()
+        readinessDf.columns = ["Practice Readiness", "Count"]
+        readinessDf["Practice Readiness"] = readinessDf["Practice Readiness"].apply(_scaleText)
+        readinessDf = readinessDf[readinessDf["Practice Readiness"].notna()
+                                  & (readinessDf["Practice Readiness"].astype(str).str.strip() != "")
+                                  & (readinessDf["Practice Readiness"].astype(str).str.lower() != "none")]
+    if not entrustmentDf.empty:
+        entrustmentDf = entrustmentDf.copy()
+        entrustmentDf.columns = ["Entrustment", "Count"]
+        entrustmentDf["Entrustment"] = entrustmentDf["Entrustment"].apply(_scaleText)
+        entrustmentDf = entrustmentDf[entrustmentDf["Entrustment"].notna()]
+    data["readinessDf"] = readinessDf
+    data["entrustmentDf"] = entrustmentDf
+
+    # KPI tiles
+    _formDf = data.get("formDf")
+    avgEnt = a.get("entrustment_avg")
+    avgEnt = None if avgEnt is None or pd.isna(avgEnt) else round(float(avgEnt), 2)
+    kpis = [
+        ("Forms", metricLookup.get("Total Forms")),
+        ("Patients attended", metricLookup.get("Patients Attended")),
+        ("Avg entrustment (1–4)", avgEnt),
+        ("Avg self checklist (0–1)", metricLookup.get("Avg Self CAF Score")),
+        ("Commendations", toInt(a.get("strengths_n"))),
+        ("Areas for improvement", sum(toInt(a.get(k)) for k in (
+            "weakness_timeliness_n", "weakness_communication_n", "weakness_technical_n",
+            "weakness_pcc_n", "weakness_professional_n", "weakness_risk_n",
+            "weakness_reasoning_n"))),
+        ("Clinical incidents", toInt(a.get("incidents_n"))),
+        ("Additional concerns", toInt(a.get("concerns_forms_n"))),
+        ("Forms with reflections", toInt(selfRoll.iloc[0].get("reflections_count"))
+         if not selfRoll.empty else 0),
+        # only present when the "forms" data group was collected too
+        ("Supervisors", int(_formDf["Supervisor"].dropna().nunique())
+         if _formDf is not None and not _formDf.empty
+         and "Supervisor" in _formDf.columns else None),
+    ]
+    # drop tiles whose data group wasn't collected (value None *and* not a real metric)
+    data["kpis"] = [(k, v) for k, v in kpis if not (k == "Supervisors" and v is None)]
+    return data
+
+
+# Trend chart columns. The three helper columns are hidden in the sheet and plotted
+# with plotVisOnly=False; the visible columns hold the true, unmodified values.
+TREND_LABEL_COL = "Label"
+TREND_ENT_COL = "Entrustment (supervisor)"
+TREND_RD_COL = "Practice readiness (self)"
+# these header cells become the chart legend, so they say WHO gave the rating
+TREND_ENT_PLOT = "Supervisor (assessor): entrustment"
+TREND_RD_PLOT = "Me (student): practice readiness"
+TREND_DIVIDER_COL = "Rotation change"
+# the two lines are nudged apart by this much so an exact match doesn't hide one
+# behind the other; the table keeps the true values.
+TREND_PLOT_OFFSET = 0.045
+
+
+def getStudentTrendDetail(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3"):
+    """Per-form ratings WITH the context needed for chart hover (clinic, supervisor, date).
+
+    getStudentTimeSeries() is left untouched because the PDF time-series report depends
+    on its exact shape; this is the richer version for the Excel trend chart. Same
+    submitted-by-both filter, so the two agree on which forms count.
+    """
+    sql = f"""
+    SELECT
+      datetimeutc::date                                    AS "Date",
+      rotation                                             AS "Rotation",
+      COALESCE(NULLIF(external_clinic,''), clinic)         AS "Clinic",
+      assessor_name                                        AS "Supervisor",
+      CASE NULLIF(assessor_data->'scales'->'scale-entrustment'->>'key','')
+        WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
+      END::smallint                                        AS "{TREND_ENT_COL}",
+      CASE NULLIF(student_data->'scales'->'scale-practice-readiness'->>'key','')
+        WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
+      END::smallint                                        AS "{TREND_RD_COL}"
+    FROM {formsTable}
+    WHERE cohort = :cohort AND student_number = :studentNumber
+      AND (submitted_by_student AND submitted_by_assessor)
+    ORDER BY datetimeutc, assessmentid;
+    """
+    return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
+
+
+def _collectTrendData(data, engine, cohort, studentNumber, formsTable):
+    """Per-form ratings + the helper columns the trend chart plots.
+
+    Adds, per form: a composite Label (what Excel shows on hover — form number, date,
+    clinic, supervisor, rotation), two nudged plotting columns so coincident lines stay
+    visible, and a Rotation change marker used to draw the dotted dividers.
+    """
+    tsDf = getStudentTrendDetail(engine, cohort, studentNumber, formsTable)
+    if tsDf is None or tsDf.empty:
+        data["trendDf"] = pd.DataFrame()
+        return data
+
+    tsDf = tsDf.copy()
+    tsDf["Date"] = pd.to_datetime(tsDf["Date"]).dt.date
+    tsDf.insert(0, "Form #", range(1, len(tsDf) + 1))
+
+    def _shortClinic(v):
+        # "Cohealth (Footscray)" -> "Cohealth"; the full name stays in the table
+        return str(v).split(" (")[0].strip() if isinstance(v, str) and v.strip() else None
+
+    def _shortName(v):
+        # "Prof. L. Moreau" -> "L. Moreau"; "Dr Amy Chen" -> "A. Chen"
+        if not isinstance(v, str) or not v.strip():
+            return None
+        parts = [w for w in v.replace(".", ". ").split()
+                 if w.lower().rstrip(".") not in ("dr", "prof", "a/prof", "assoc", "mr", "ms",
+                                                  "mrs", "miss")]
+        if len(parts) >= 2:
+            return f"{parts[0][0].upper()}. {parts[-1]}"
+        return parts[0] if parts else None
+
+    def _label(row):
+        # This string IS the Excel hover tooltip (native charts have no tooltip API),
+        # and it is also the axis tick label — so it has to stay short enough to read.
+        bits = [f"Form {row['Form #']}"]
+        if pd.notna(row.get("Date")):
+            bits.append(pd.Timestamp(row["Date"]).strftime("%d %b"))
+        for v in (_shortClinic(row.get("Clinic")), _shortName(row.get("Supervisor"))):
+            if v:
+                bits.append(v)
+        return " · ".join(bits)
+
+    tsDf[TREND_LABEL_COL] = tsDf.apply(_label, axis=1)
+    ent = pd.to_numeric(tsDf[TREND_ENT_COL], errors="coerce")
+    rd = pd.to_numeric(tsDf[TREND_RD_COL], errors="coerce")
+    tsDf[TREND_ENT_PLOT] = (ent - TREND_PLOT_OFFSET).round(3)
+    tsDf[TREND_RD_PLOT] = (rd + TREND_PLOT_OFFSET).round(3)
+
+    # divider sits on the FIRST form of each new rotation (never on form 1)
+    rot = tsDf["Rotation"].astype(object).where(tsDf["Rotation"].notna(), None)
+    changed = [False] + [rot.iloc[i] != rot.iloc[i - 1] for i in range(1, len(rot))]
+    tsDf[TREND_DIVIDER_COL] = [4.35 if c else None for c in changed]
+
+    data["trendDf"] = tsDf[["Form #", "Date", "Rotation", "Clinic", "Supervisor",
+                            TREND_ENT_COL, TREND_RD_COL, TREND_LABEL_COL,
+                            TREND_ENT_PLOT, TREND_RD_PLOT, TREND_DIVIDER_COL]]
+    return data
+
+
+def _collectProcedureData(data, engine, cohort, studentNumber, formsTable, itemCodeLimit):
+    """Item-code counts vs the cohort average."""
+    itemsDf = getStudentTopItemCodes(engine, cohort, studentNumber, limit=itemCodeLimit,
+                                     formsTable=formsTable)
+    if itemsDf is not None and not itemsDf.empty:
+        itemsDf = itemsDf.copy()
+        itemsDf.columns = [str(c).lower() for c in itemsDf.columns]
+        itemsDf = itemsDf.rename(columns={"itemcode": "Item Code", "description": "Description",
+                                          "totalqty": "Your Count", "cohortavg": "Class Average"})
+        for c in ("Your Count", "Class Average"):
+            if c in itemsDf.columns:
+                itemsDf[c] = pd.to_numeric(itemsDf[c], errors="coerce").fillna(0)
+        if {"Your Count", "Class Average"} <= set(itemsDf.columns):
+            itemsDf["Difference"] = (itemsDf["Your Count"] - itemsDf["Class Average"]).round(1)
+        keep = [c for c in ["Item Code", "Description", "Your Count", "Class Average", "Difference"]
+                if c in itemsDf.columns]
+        itemsDf = itemsDf[keep]
+    data["itemsDf"] = itemsDf if itemsDf is not None else pd.DataFrame()
+    return data
+
+
+def _collectFeedbackData(data, engine, cohort, studentNumber, formsTable):
+    """Commendation counts + areas-for-improvement counts by category."""
+    assessorRoll, _ = _assessorRollupCached(data, engine, cohort, studentNumber, formsTable)
+    a = assessorRoll.iloc[0].to_dict() if not assessorRoll.empty else {}
+    strengthsDf = getTopMultiSelectValues(engine, cohort, studentNumber, "strengths", 15, formsTable)
+    if strengthsDf is not None and not strengthsDf.empty:
+        strengthsDf = strengthsDf.copy()
+        strengthsDf.columns = ["Commendation", "Times Recorded"]
+    data["strengthsDf"] = strengthsDf if strengthsDf is not None else pd.DataFrame()
+
+    weaknessCounts = pd.DataFrame([
+        ("Time Management", toInt(a.get("weakness_timeliness_n"))),
+        ("Communication", toInt(a.get("weakness_communication_n"))),
+        ("Technical Skills", toInt(a.get("weakness_technical_n"))),
+        ("Person-Centred Care", toInt(a.get("weakness_pcc_n"))),
+        ("Professional Behaviour", toInt(a.get("weakness_professional_n"))),
+        ("Risk Management", toInt(a.get("weakness_risk_n"))),
+        ("Knowledge & Clinical Reasoning", toInt(a.get("weakness_reasoning_n"))),
+    ], columns=["Area", "Count"])
+    data["weaknessCountsDf"] = weaknessCounts[weaknessCounts["Count"] > 0].reset_index(drop=True)
+    return data
+
+
+def _collectCommentData(data, engine, cohort, studentNumber, formsTable):
+    """One unified, filterable log of EVERY written comment on the student's forms —
+    all assessor and student text fields plus the free-text multi-selects — via
+    getAllStudentComments. 'From' distinguishes supervisor vs student; 'Type' names the
+    field. This is what surfaces the assessor 'additional_comments' feedback missing
+    since ~July 2026."""
+    cols = ["Date", "From", "Type", "Supervisor", "Rotation", "Detail", "Item Codes"]
+    allc = getAllStudentComments(engine, cohort, studentNumber, formsTable)
+    if allc is None or allc.empty:
+        data["commentsDf"] = pd.DataFrame(columns=cols)
+        return data
+    df = allc.rename(columns={"Comment": "Detail"})
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[cols]
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df = (df.sort_values(["Date", "From", "Type"], na_position="last")
+            .reset_index(drop=True))
+    data["commentsDf"] = df
+    return data
+
+
+
+
+def _collectWeaknessData(data, engine, cohort, studentNumber, formsTable):
+    """Per-form weakness timeline (+ per-rotation rollup) and the per-(code,rotation)
+    detail used by the rotation-split item-code sheet."""
+    timelineDf = getStudentWeaknessTimeline(engine, cohort, studentNumber, formsTable)
+    data["weaknessTimelineDf"] = timelineDf if timelineDf is not None else pd.DataFrame()
+    data["weaknessByRotationDf"] = summariseWeaknessByRotation(timelineDf)
+    detail = getStudentWeaknessByCodeRotation(engine, cohort, studentNumber, formsTable)
+    data["weaknessByCodeDetailDf"] = detail if detail is not None else pd.DataFrame()
+    try:
+        descMap = getItemCodeDescriptionMap(engine, cohort, formsTable)
+    except Exception as ex:
+        print(f"[_collectWeaknessData] description map failed: {ex}")
+        descMap = {}
+    data["weaknessDescMap"] = descMap
+    present = (sorted(detail[WEAKNESS_ROTATION_COL].dropna().astype(int).unique().tolist())
+               if (detail is not None and not detail.empty
+                   and WEAKNESS_ROTATION_COL in detail.columns) else [])
+    data["weaknessRotationGroupsResolved"] = weaknessRotationGroups(present, None)
+    data["weaknessByCodeDf"] = aggregateWeaknessByCode(detail, None, descMap=descMap)
+    return data
+
+
+def _xlStackedWeaknessChart(ws, df, headerRow, catName, title, xTitle, yTitle,
+                            maxRows=None):
+    """A native stacked-column chart: one series per weakness category (coloured from
+    WEAKNESS_PALETTE), categories from `catName`. Reads columns by NAME so it survives
+    column reordering. Returns the chart (already styled) or None."""
+    labels = [l for l in WEAKNESS_KEY_LABELS.values() if l in df.columns]
+    if not labels or catName not in df.columns:
+        return None
+    nRows = len(df) if maxRows is None else min(len(df), maxRows)
+    if nRows == 0:
+        return None
+    chart = BarChart()
+    chart.type = "col"
+    chart.grouping = "stacked"
+    chart.overlap = 100
+    for lab, colorHex in zip(labels, WEAKNESS_PALETTE):
+        idx = df.columns.get_loc(lab) + 1
+        chart.add_data(Reference(ws, min_col=idx, min_row=headerRow, max_row=headerRow + nRows),
+                       titles_from_data=True)
+        chart.series[-1].graphicalProperties.solidFill = colorHex
+    catIdx = df.columns.get_loc(catName) + 1
+    chart.set_categories(Reference(ws, min_col=catIdx, min_row=headerRow + 1,
+                                   max_row=headerRow + nRows))
+    w, h = _xlChartSize(nRows, perCategory=0.85, minWidth=22, maxWidth=60, height=12)
+    _xlStyleChart(chart, title, xTitle=xTitle, yTitle=yTitle, width=w, height=h,
+                  xTickRotation=-45 if nRows > 10 else None)
+    return chart
+
+
+def _sheetWeaknessOverTime(wb, byRotationDf, timelineDf, sheetName="Weakness Over Time"):
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "Areas for improvement over time", size=14)
+    r = _xlNote(ws, r, "How many areas-for-improvement tags your supervisors recorded, by "
+                       "category — first summed per rotation (with your mean entrustment for "
+                       "context), then form by form (with the item codes on each form). Fewer / "
+                       "shorter bars later in the year is the trend to look for.", span=12)
+    r += 1
+
+    empty = (byRotationDf is None or byRotationDf.empty) and \
+            (timelineDf is None or timelineDf.empty)
+    if empty:
+        _xlNote(ws, r, "No areas for improvement were recorded.", italic=True)
+        _xlFreezeAndFilter(ws)
+        return ws
+
+    # --- per rotation ---
+    rotStart = r
+    r = _xlWriteDf(ws, byRotationDf, startRow=rotStart, title="By rotation",
+                   tableName="tblWeaknessRotation",
+                   numFmts={"Mean entrustment": "0.0"},
+                   emptyText="No areas for improvement were recorded.")
+    if byRotationDf is not None and not byRotationDf.empty:
+        chart = _xlStackedWeaknessChart(
+            ws, byRotationDf, rotStart + 1, "Rotation",
+            "Areas for improvement by rotation", "Rotation", "Tags")
+        if chart is not None:
+            chart.dLbls = _xlDataLabels()
+            anchorCol = get_column_letter(len(byRotationDf.columns) + 2)
+            ws.add_chart(chart, f"{anchorCol}{rotStart}")
+        r = max(r, rotStart + len(byRotationDf) + 20)
+
+    # --- per form (incl. item codes) ---
+    if timelineDf is not None and not timelineDf.empty:
+        labels = [l for l in WEAKNESS_KEY_LABELS.values() if l in timelineDf.columns]
+        keep = [c for c in (["Form #", "Date", "Rotation", "Entrustment"] + labels +
+                            [WEAKNESS_TOTAL_COL, WEAKNESS_INCIDENT_COL, "Concern flag",
+                             "Item Codes"])
+                if c in timelineDf.columns]
+        perForm = timelineDf[keep].copy()
+        formStart = r
+        r = _xlWriteDf(ws, perForm, startRow=formStart, title="Form by form",
+                       tableName="tblWeaknessForm", dateCols=("Date",),
+                       wrapCols=("Item Codes",), wrapWidth=28,
+                       numFmts={"Entrustment": "0"},
+                       emptyText="No forms recorded.")
+        chart = _xlStackedWeaknessChart(
+            ws, perForm, formStart + 1, "Form #",
+            "Areas for improvement per form", "Form #", "Tags")
+        if chart is not None:
+            anchorCol = get_column_letter(len(perForm.columns) + 2)
+            ws.add_chart(chart, f"{anchorCol}{formStart}")
+    _xlFreezeAndFilter(ws)
+    _xlPrintSetup(ws)
+    return ws
+
+
+def _weaknessCodeBlockXl(ws, df, startRow, label, tableTag):
+    """Write one rotation group's item-code table + stacked chart. Returns next row."""
+    r = _xlWriteDf(ws, df, startRow=startRow, title=f"By {label}",
+                   tableName=f"tblWeaknessCode_{tableTag}",
+                   wrapCols=("Description",), wrapWidth=40,
+                   numFmts={"Weakness rate %": "0"},
+                   emptyText=f"No item codes carried an area for improvement or flag in {label}.")
+    if df is None or df.empty:
+        return r
+    cols = list(df.columns)
+    nRows = len(df)
+    headerRow = startRow + 1
+    for flagCol in ("Low-entrustment forms", WEAKNESS_INCIDENT_COL, WEAKNESS_CONCERN_COL):
+        if flagCol in cols:
+            letter = get_column_letter(cols.index(flagCol) + 1)
+            rng = f"{letter}{headerRow + 1}:{letter}{headerRow + nRows}"
+            ws.conditional_formatting.add(rng, CellIsRule(
+                operator="greaterThan", formula=["0"],
+                fill=PatternFill("solid", fgColor=XL_BAD_FILL)))
+    if WEAKNESS_TOTAL_COL in cols:
+        letter = get_column_letter(cols.index(WEAKNESS_TOTAL_COL) + 1)
+        rng = f"{letter}{headerRow + 1}:{letter}{headerRow + nRows}"
+        ws.conditional_formatting.add(rng, ColorScaleRule(
+            start_type="num", start_value=0, start_color="FFFFFF",
+            end_type="max", end_color=XL_WARN_FILL))
+    chart = _xlStackedWeaknessChart(
+        ws, df, headerRow, "Item Code",
+        f"{label} — item codes with the most areas for improvement", "Item code", "Tags",
+        maxRows=WEAKNESS_CODE_TOPN)
+    if chart is not None:
+        anchorCol = get_column_letter(len(cols) + 2)
+        ws.add_chart(chart, f"{anchorCol}{startRow}")
+    return max(r, startRow + nRows + 22)
+
+
+def _sheetWeaknessByItemCode(wb, detailDf, descMap=None, groups=None,
+                             sheetName="Weakness by Item Code"):
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, "Areas for improvement by item code", size=14)
+    r = _xlNote(ws, r, "Which procedures carried your areas for improvement, split by rotation "
+                       "group. Feedback is recorded per FORM, not per procedure, so a code here "
+                       "appeared on a form that also noted a weakness/flag — an association, not "
+                       "a strict cause. Red cells flag low-entrustment (S1/S2), incident or "
+                       "concern forms.", span=12)
+    r += 1
+    if detailDf is None or detailDf.empty:
+        _xlNote(ws, r, "No item codes carried an area for improvement or flag.", italic=True)
+        _xlFreezeAndFilter(ws)
+        return ws
+    descMap = descMap or {}
+    if not groups:
+        present = sorted(detailDf[WEAKNESS_ROTATION_COL].dropna().astype(int).unique().tolist()) \
+            if WEAKNESS_ROTATION_COL in detailDf.columns else []
+        groups = weaknessRotationGroups(present, None)
+    for i, (label, nums) in enumerate(groups):
+        df = aggregateWeaknessByCode(detailDf, nums, descMap=descMap)
+        r = _weaknessCodeBlockXl(ws, df, r, label, tableTag=str(i))
+    _xlFreezeAndFilter(ws)
+    _xlPrintSetup(ws)
+    return ws
+
+
+def _buildSheetWeaknessOverTime(wb, ctx, sheetName):
+    return _sheetWeaknessOverTime(wb, ctx.get("weaknessByRotationDf"),
+                                  ctx.get("weaknessTimelineDf"), sheetName=sheetName)
+
+
+def _buildSheetWeaknessByItemCode(wb, ctx, sheetName):
+    return _sheetWeaknessByItemCode(wb, ctx.get("weaknessByCodeDetailDf"),
+                                    ctx.get("weaknessDescMap", {}),
+                                    ctx.get("weaknessRotationGroupsResolved"),
+                                    sheetName=sheetName)
+
+
+def _assertNoRawColumns(wb):
+    """Belt-and-braces: fail loudly if a raw/PII header ever reaches a workbook."""
+    offenders = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 400)):
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and v.strip().lower() in _EXPORT_FORBIDDEN_COLS:
+                    offenders.append(f"{ws.title}!{cell.coordinate}={v}")
+    if offenders:
+        raise ValueError("Raw/PII columns leaked into the workbook: " + "; ".join(offenders[:10]))
+
+
+def getStudentInfo(engine, studentNumber, cohort=None, formsTable="dds4_boh3_forms_v3"):
+    """Resolve a student number to (cohort, studentNumber, studentName).
+
+    Use this instead of filtering getStudentsInCohort() and taking .iloc[0]: when the
+    number isn't in that cohort the filter returns an empty Series and .iloc[0] raises
+    a bare IndexError that says nothing useful. This raises a LookupError naming the
+    cohort(s) the student IS in — the usual cause is a BOH3 student passed as DDS4.
+
+    cohort=None auto-detects (picks the cohort with the most forms if somehow both).
+    """
+    sql = f"""
+    SELECT cohort, student_number, student_name, COUNT(*)::int AS forms
+    FROM {formsTable}
+    WHERE student_number = :studentNumber
+      AND student_name IS NOT NULL AND student_name <> '' AND student_name <> 'Test Student'
+    GROUP BY cohort, student_number, student_name
+    ORDER BY forms DESC;
+    """
+    df = readDf(engine, sql, {"studentNumber": int(studentNumber)})
+    if df.empty:
+        raise LookupError(
+            f"Student {studentNumber} has no forms in {formsTable} "
+            f"(check the number, or the table has not been refreshed).")
+    if cohort is not None:
+        match = df[df["cohort"].astype(str).str.upper() == str(cohort).upper()]
+        if match.empty:
+            found = ", ".join(f"{r.cohort} ({r.forms} forms)" for r in df.itertuples())
+            raise LookupError(
+                f"Student {studentNumber} has no forms in cohort {cohort!r} — "
+                f"found in: {found}. Pass that cohort, or cohort=None to auto-detect.")
+        df = match
+    row = df.iloc[0]
+    return str(row["cohort"]), int(row["student_number"]), str(row["student_name"])
+
+
+# ── 9.6 Sheet registry ──────────────────────────────────────────────────────
+# Every sheet is one function, and this table is the only place that knows the
+# catalogue. To change what a workbook contains, pass a `sheets=[...]` list —
+# order in the list is the order of the tabs in the file.
+#
+#   buildStudentExcelReport(..., sheets=["Dashboard", "Summary", "My Forms"])
+#
+# Call listStudentSheets() for a printable table of what is available.
+#
+# Each entry: builder(wb, ctx, sheetName) · needs = data groups to query · desc.
+# `deferred` sheets are built last (the Dashboard's charts reference ranges that
+# must already exist on other sheets) and then moved back to their listed position.
+
+def _buildSheetReadMe(wb, ctx, sheetName):
+    m = ctx["meta"]
+    return _sheetReadMe(wb, m["cohort"], m["studentNumber"], m["studentName"],
+                        m["generatedOn"], kind="dashboard" if m["hasDashboard"] else "export")
+
+
+def _buildSheetForms(wb, ctx, sheetName):
+    return _sheetForms(wb, ctx.get("formDf"), sheetName=sheetName)
+
+
+def _buildSheetSummary(wb, ctx, sheetName):
+    anchors = _sheetSummary(wb, ctx.get("metricsDf"), ctx.get("entrustmentDf"),
+                            ctx.get("readinessDf"), sheetName=sheetName)
+    ctx["summaryAnchors"] = anchors
+    return anchors
+
+
+def _buildSheetTrend(wb, ctx, sheetName):
+    m = ctx["meta"]
+    anchors = _sheetTrend(wb, ctx.get("trendDf"), sheetName=sheetName,
+                          studentName=m["studentName"], cohort=m["cohort"])
+    ctx["trendAnchors"] = anchors
+    return anchors
+
+
+def _buildSheetProcedures(wb, ctx, sheetName):
+    return _sheetProcedures(wb, ctx.get("itemsDf"), sheetName=sheetName)
+
+
+def _buildSheetFeedback(wb, ctx, sheetName):
+    return _sheetFeedback(wb, ctx.get("strengthsDf"), ctx.get("weaknessCountsDf"),
+                          sheetName=sheetName)
+
+
+def _buildSheetSelfChecklist(wb, ctx, sheetName):
+    return _sheetSelfChecklist(wb, ctx.get("checklistItemAvg"), sheetName=sheetName)
+
+
+def _buildSheetChecklistByForm(wb, ctx, sheetName):
+    return _sheetChecklistByForm(wb, ctx.get("checklistWide"), sheetName=sheetName)
+
+
+def _buildSheetComments(wb, ctx, sheetName):
+    return _sheetComments(wb, ctx.get("commentsDf"), sheetName=sheetName)
+
+
+def _buildSheetDashboard(wb, ctx, sheetName):
+    m = ctx["meta"]
+    # empty anchors simply mean that chart's source sheet wasn't included — the
+    # Dashboard then renders without it rather than failing
+    return _sheetDashboard(wb, m["cohort"], m["studentNumber"], m["studentName"],
+                           m["generatedOn"], ctx.get("kpis", []),
+                           ctx.get("summaryAnchors", {}), ctx.get("trendAnchors", {}),
+                           sheetName=sheetName)
+
+
+STUDENT_SHEETS = {
+    "Dashboard": dict(
+        builder=_buildSheetDashboard, needs=("summary", "trend", "forms"), deferred=True,
+        desc="Landing page: KPI tiles + trend line + entrustment/readiness doughnuts. "
+             "Charts read from the Summary and Trend sheets, so include those too."),
+    "Summary": dict(
+        builder=_buildSheetSummary, needs=("summary",),
+        desc="Headline metrics table (same numbers as the PDF) + the two rating distributions."),
+    "Trend": dict(
+        builder=_buildSheetTrend, needs=("trend",),
+        desc="Entrustment vs practice readiness per form, with a line chart."),
+    "Procedures": dict(
+        builder=_buildSheetProcedures, needs=("procedures",),
+        desc="Item-code counts vs class average, with a clustered bar chart."),
+    "Feedback": dict(
+        builder=_buildSheetFeedback, needs=("feedback",),
+        desc="Commendation counts + areas-for-improvement by category, with charts."),
+    "Self-Evaluation": dict(
+        builder=_buildSheetSelfChecklist, needs=("checklist",),
+        desc="Average self-rating per checklist item across all forms, with a bar chart."),
+    "Ratings by Form": dict(
+        builder=_buildSheetChecklistByForm, needs=("checklist",),
+        desc="Wide checklist matrix: one row per form, one column per checklist item."),
+    "All Comments": dict(
+        builder=_buildSheetComments, needs=("comments",),
+        desc="Every written comment — all supervisor and student text fields plus "
+             "commendations/feedback/incidents — in one filterable table (From + Type)."),
+    "Weakness Over Time": dict(
+        builder=_buildSheetWeaknessOverTime, needs=("weakness",),
+        desc="Areas-for-improvement tag counts by category, summed per rotation and per "
+             "form, with stacked bar charts."),
+    "Weakness by Item Code": dict(
+        builder=_buildSheetWeaknessByItemCode, needs=("weakness",),
+        desc="Which item codes co-occur with areas for improvement / low-entrustment / "
+             "incident forms, with a stacked bar of the worst codes."),
+    "My Forms": dict(
+        builder=_buildSheetForms, needs=("forms",),
+        desc="One row per form — the flat comparison table, with the grouped header band."),
+    "Read Me": dict(
+        builder=_buildSheetReadMe, needs=(),
+        desc="Plain-English guide to the columns and scales. Cheap — always worth including."),
+}
+
+# Default tab orders. Edit these, or pass sheets=[...] per call.
+# "Comments & Incidents" is deliberately NOT in the default list — the sheet function
+# is still registered above, so adding it back is a one-word change.
+DASHBOARD_SHEETS = ["Read Me", "Dashboard", "Summary", "Trend", "Procedures", "Feedback",
+                    "Weakness Over Time", "Weakness by Item Code", "All Comments",
+                    "Self-Evaluation", "Ratings by Form", "My Forms"]
+FORM_EXPORT_SHEETS = ["Read Me", "My Forms", "Self-Evaluation", "Ratings by Form"]
+
+
+def listStudentSheets():
+    """What can go in a student workbook — name, data it queries, and what it shows."""
+    return pd.DataFrame(
+        [{"Sheet": name,
+          "In dashboard default": name in DASHBOARD_SHEETS,
+          "In export default": name in FORM_EXPORT_SHEETS,
+          "Data groups queried": ", ".join(spec["needs"]) or "—",
+          "What it shows": spec["desc"]}
+         for name, spec in STUDENT_SHEETS.items()])
+
+
+# ── 9.7 Public builders ─────────────────────────────────────────────────────
+def buildStudentWorkbook(engine, cohort, studentNumber, studentName, outPath,
+                         sheets=None, formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
+                         titleSuffix="clinical feedback"):
+    """Build a student workbook from a list of sheet names.
+
+    sheets : list of keys from STUDENT_SHEETS, in the tab order you want.
+             Defaults to DASHBOARD_SHEETS. Duplicates are ignored.
+             Only the data groups those sheets need are queried.
+
+    Pass studentName=None (or cohort=None) to look both up from the student number
+    via getStudentInfo — that also turns a wrong-cohort number into a clear error.
+
+    Both buildStudentExcelReport() and buildStudentFormExport() are thin wrappers
+    over this, differing only in their default sheet list.
+    """
+    if studentName in (None, "") or cohort in (None, ""):
+        cohort, studentNumber, studentName = getStudentInfo(
+            engine, studentNumber, cohort, formsTable)
+
+    sheetList = list(DASHBOARD_SHEETS if sheets is None else sheets)
+    unknown = [s for s in sheetList if s not in STUDENT_SHEETS]
+    if unknown:
+        raise ValueError(f"Unknown sheet(s): {unknown}. "
+                         f"Valid names: {list(STUDENT_SHEETS)}")
+    ordered, seen = [], set()
+    for name in sheetList:                      # de-duplicate, keep the caller's order
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    if not ordered:
+        raise ValueError("sheets is empty — a workbook needs at least one sheet.")
+
+    needs = set()
+    for name in ordered:
+        needs.update(STUDENT_SHEETS[name]["needs"])
+    ctx = _collectStudentExcelData(engine, cohort, studentNumber, studentName,
+                                   formsTable=formsTable, itemCodeLimit=itemCodeLimit,
+                                   needs=needs)
+    ctx["meta"] = {"cohort": cohort, "studentNumber": studentNumber,
+                   "studentName": studentName, "formsTable": formsTable,
+                   "generatedOn": pd.Timestamp.today().strftime("%d %B %Y"),
+                   "hasDashboard": "Dashboard" in ordered}
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    deferred = [n for n in ordered if STUDENT_SHEETS[n].get("deferred")]
+    for name in [n for n in ordered if n not in deferred]:
+        STUDENT_SHEETS[name]["builder"](wb, ctx, name)
+    for name in deferred:                       # built last, then moved into place
+        STUDENT_SHEETS[name]["builder"](wb, ctx, name)
+        wb.move_sheet(name, offset=ordered.index(name) - wb.sheetnames.index(name))
+    wb.active = 0
+
+    # built here, not in the wrappers — studentName/cohort may only exist after resolution
+    wb.properties.title = f"{studentName} — {cohort} {titleSuffix}"
+    wb.properties.creator = "Melbourne Dental School"
+    _assertNoRawColumns(wb)
+    Path(outPath).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(outPath)
+    return outPath
+
+
+def buildStudentExcelReport(engine, cohort, studentNumber, studentName, outPath,
+                            formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
+                            sheets=None):
+    """Excel mirror of the PDF student report, with live Excel charts.
+
+    Default sheets: DASHBOARD_SHEETS. Pass sheets=[...] to pick your own.
+    """
+    return buildStudentWorkbook(
+        engine, cohort, studentNumber, studentName, outPath,
+        sheets=DASHBOARD_SHEETS if sheets is None else sheets,
+        formsTable=formsTable, itemCodeLimit=itemCodeLimit,
+        titleSuffix="feedback dashboard")
+
+
+def buildStudentFormExport(engine, cohort, studentNumber, studentName, outPath,
+                           formsTable="dds4_boh3_forms_v3", includeChecklist=True,
+                           sheets=None):
+    """Flat 'one row per form' workbook — the file students ask for so they can
+    compare all of their DASH feedback side by side.
+
+    Default sheets: FORM_EXPORT_SHEETS (set includeChecklist=False for just
+    Read Me + My Forms). Pass sheets=[...] to pick your own.
+    """
+    if sheets is None:
+        sheets = list(FORM_EXPORT_SHEETS) if includeChecklist else ["Read Me", "My Forms"]
+    return buildStudentWorkbook(
+        engine, cohort, studentNumber, studentName, outPath, sheets=sheets,
+        formsTable=formsTable, titleSuffix="form-by-form feedback")
+
+
+def buildCohortStudentExcelReports(engine, cohort, outputDir, kind="both",
+                                   formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
+                                   studentNumbers=None, verbose=True,
+                                   dashboardSheets=None, exportSheets=None):
+    """Generate Excel reports for every student in a cohort.
+
+    kind            : "dashboard" | "export" | "both"
+    dashboardSheets : sheet list for the <id>.xlsx files (default DASHBOARD_SHEETS)
+    exportSheets    : sheet list for the <id>_forms.xlsx files (default FORM_EXPORT_SHEETS)
+
+    Files are named <studentNumber>.xlsx (dashboard) and <studentNumber>_forms.xlsx
+    (flat export), matching the <studentNumber>.pdf convention used by the mailer.
+    Returns a DataFrame log of what was written / skipped.
+    """
+    if kind not in ("dashboard", "export", "both"):
+        raise ValueError(f"kind must be 'dashboard', 'export' or 'both' — got {kind!r}")
+    outputDir = Path(outputDir)
+    outputDir.mkdir(parents=True, exist_ok=True)
+    studentsDf = getStudentsInCohort(engine, cohort, formsTable)
+    if studentNumbers is not None:
+        wanted = {int(s) for s in studentNumbers}
+        studentsDf = studentsDf[studentsDf["student_number"].astype(int).isin(wanted)]
+
+    log = []
+    for _, row in studentsDf.iterrows():
+        studentNumber, studentName = row["student_number"], row["student_name"]
+        safe = "".join(c for c in str(studentNumber) if c.isalnum() or c in (" ", "_", "-")).strip()
+        try:
+            if kind in ("dashboard", "both"):
+                p = outputDir / f"{safe}.xlsx"
+                buildStudentExcelReport(engine, cohort, studentNumber, studentName, p,
+                                        formsTable=formsTable, itemCodeLimit=itemCodeLimit,
+                                        sheets=dashboardSheets)
+                log.append({"student_number": studentNumber, "student_name": studentName,
+                            "file": str(p), "kind": "dashboard", "status": "ok"})
+            if kind in ("export", "both"):
+                p = outputDir / f"{safe}_forms.xlsx"
+                buildStudentFormExport(engine, cohort, studentNumber, studentName, p,
+                                       formsTable=formsTable, sheets=exportSheets)
+                log.append({"student_number": studentNumber, "student_name": studentName,
+                            "file": str(p), "kind": "export", "status": "ok"})
+            if verbose:
+                print(f"[excel] {cohort} {studentNumber} {studentName} ✓")
+        except Exception as ex:  # one bad student must not kill the batch
+            print(f"[excel] {cohort} {studentNumber} {studentName} FAILED: {ex}")
+            log.append({"student_number": studentNumber, "student_name": studentName,
+                        "file": None, "kind": kind, "status": f"error: {ex}"})
+    return pd.DataFrame(log)

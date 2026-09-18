@@ -1,0 +1,463 @@
+# MDS 2026 — Python codebase reference
+
+Documentation for the 20 Python modules at the root of
+`D folder/MDS Work/2026`. Generated 14 August 2026 from the source as it stood
+on that date.
+
+These modules support the Melbourne Dental School assessment workflow: they pull
+student assessment forms out of the **DASH** platform (API + Postgres), reshape
+them, and generate cohort and per-student feedback reports as PDF and Excel,
+plus at-risk flagging, assessor-bias analysis and two live Gradio dashboards.
+
+| | |
+|---|---|
+| **Modules documented** | 22 |
+| **Lines of Python** | 20,348 |
+| **Function definitions** | 537 (all documented) |
+| **Classes** | 15 |
+| **Module-level constants** | 409 |
+| **Resolved call edges** | 671 |
+| **Functions called from `main.ipynb`** | 77 |
+
+**Companion files**
+
+- **`MDS_2026_call_graph.html`** — interactive explorer. Module map, searchable
+  call graph (click any function to see its callers and callees), and a sortable
+  table of all 537 functions. Open it in a browser; no internet needed.
+- One `.md` per module, in this folder.
+
+---
+
+## 1. Reading order
+
+If you are new to this codebase, read in this order:
+
+1. **`variableUtils.md`** — configuration. Nearly everything else reads from it.
+2. **`Utils.md`** — the shared base layer. `readDf` (the single DB read path),
+   the ReportLab building blocks, the Excel helpers.
+3. **`general_utils.md`** — how data gets *in*: DASH API → Postgres.
+4. Then the reporting module for whichever cohort you care about
+   (`boh3_dds4_utils`, `boh2_dds2_dds3_utils`, `boh1_utils`).
+
+`main.ipynb` is the orchestrator — it is not a module, it is the thing you run.
+Nothing here executes on its own except the five standalone scripts and the two
+dashboards (see §4).
+
+---
+
+## 2. Module index
+
+Sorted by size. "Entry pts" = functions `main.ipynb` calls directly.
+**†** = counts refreshed 2026-08-18; the prose in that module's doc still describes the
+2026-08-14 snapshot except where a dated note says otherwise.
+
+| Module | Layer | LOC | Fns | Cls | Consts | Entry pts | Imports |
+|---|---|---:|---:|---:|---:|---:|---|
+| [`boh3_dds4_utils.py`](boh3_dds4_utils.md) | Cohort reporting | 4,902 | 156 | 5 | 64 | 22 | Utils, variableUtils |
+| [`general_utils.py`](general_utils.md) | Ingest & pipeline | 3,607 † | 85 | 1 | 67 | 26+ | Utils, variableUtils |
+| [`flagging_utils.py`](flagging_utils.md) | Flagging & risk | 3,412 † | 40 | 3 | 47 | 2 | Utils, variableUtils, **general_utils** † |
+| [`boh2_dds2_dds3_utils.py`](boh2_dds2_dds3_utils.md) | Cohort reporting | 3,336 † | 70 | 0 | 29 | 8 | Utils, variableUtils |
+| [`risk_report.py`](risk_report.md) | Flagging & risk | 1,205 | 37 | 1 | 4 | 1 | — |
+| [`viva_gradio.py`](viva_gradio.md) | Dashboards | 1,071 | 36 | 0 | 5 | — | gradio_utils |
+| [`writtenexam_utils.py`](writtenexam_utils.md) | Cohort reporting | 1,012 | 22 | 0 | 18 | 1 | — |
+| [`Utils.py`](Utils.md) | Shared core | 703 | 30 | 0 | 0 | 9 | variableUtils |
+| [`boh1_utils.py`](boh1_utils.md) | Cohort reporting | 692 | 15 | 0 | 8 | 2 | Utils, variableUtils |
+| [`scbd_gradio.py`](scbd_gradio.md) | Dashboards | 492 | 18 | 0 | 20 | — | — |
+| [`osce_pdfs.py`](osce_pdfs.md) | Cohort reporting | 466 | 9 | 0 | 20 | 2 | — |
+| [`osce_utils.py`](osce_utils.md) | OSCE station reports + standard-setting | 865 | 19 | 0 | 12 | 1 | osce_metrics |
+| [`osce_metrics.py`](osce_metrics.md) | OSCE AMEE-49 psychometrics | 285 | 9 | 0 | 0 | — | osce_utils |
+| [`assessor_confound.py`](assessor_confound.md) | Statistical analysis | 436 | 8 | 0 | 3 | 1 | — |
+| [`assessor_analysis.py`](assessor_analysis.md) | Statistical analysis | 414 | 12 | 0 | 4 | 3 | Utils |
+| [`generate_reports.py`](generate_reports.md) | Cohort reporting | 367 | 3 | 0 | 10 | — | — |
+| [`build_canned_comments.py`](build_canned_comments.md) | Statistical analysis | 366 | 12 | 0 | 16 | — | — |
+| [`generate_mcex_reports.py`](generate_mcex_reports.md) | Cohort reporting | 277 | 11 | 0 | 28 | — | — |
+| [`blr_analysis.py`](blr_analysis.md) | Statistical analysis | 275 | 7 | 0 | 4 | — | — |
+| [`variableUtils.py`](variableUtils.md) | Configuration | 262 | 9 | 5 | 71 | — | — |
+| [`dash_anonymize_pipeline.py`](dash_anonymize_pipeline.md) | Ingest & pipeline | 138 | 5 | 0 | 36 | — | — |
+| [`gradio_utils.py`](gradio_utils.md) | Configuration | 130 | 0 | 0 | 34 | — | — |
+
+---
+
+## 3. Architecture
+
+### 3.1 Layers
+
+```mermaid
+flowchart TD
+    subgraph CFG["Configuration"]
+        vu["variableUtils.py<br/>71 constants · styles · paths"]
+        gu["gradio_utils.py<br/>34 dashboard constants"]
+    end
+    subgraph CORE["Shared core"]
+        u["Utils.py<br/>readDf · createTable · addPlotImage<br/>getBannerDrawer · autoFitColumns"]
+    end
+    subgraph ING["Ingest & pipeline"]
+        genu["general_utils.py<br/>DASH API → Postgres"]
+        anon["dash_anonymize_pipeline.py<br/>de-identification"]
+    end
+    subgraph REP["Cohort reporting"]
+        b1["boh1_utils.py"]
+        b2["boh2_dds2_dds3_utils.py"]
+        b3["boh3_dds4_utils.py"]
+        we["writtenexam_utils.py"]
+        os["osce_pdfs.py"]
+        gr["generate_reports.py"]
+        gm["generate_mcex_reports.py"]
+    end
+    subgraph FLG["Flagging & risk"]
+        fl["flagging_utils.py"]
+        rr["risk_report.py"]
+    end
+    subgraph ANA["Statistical analysis"]
+        aa["assessor_analysis.py"]
+        ac["assessor_confound.py"]
+        bl["blr_analysis.py"]
+        bc["build_canned_comments.py"]
+    end
+    subgraph APP["Dashboards"]
+        vg["viva_gradio.py"]
+        sg["scbd_gradio.py"]
+    end
+
+    vu --> u
+    u --> b1 & b2 & b3 & fl & genu & aa
+    vu --> b1 & b2 & b3 & fl & genu
+    gu --> vg
+    genu -.->|"populates the tables<br/>everything else reads"| REP
+
+    NB["main.ipynb<br/>orchestrator — 69 code cells"]
+    b1 & b2 & b3 & we & os --> NB
+    fl & rr --> NB
+    aa & ac --> NB
+    genu --> NB
+
+    gr & gm & bc & bl & anon -.->|"standalone — not imported"| CLI["python x.py"]
+    vg & sg -.-> WEB["Gradio web app"]
+```
+
+**Reading the diagram.** Thirteen import edges exist between these modules: six
+point at `Utils`, six at `variableUtils`, one at `gradio_utils`. Every one of them
+is an edge into the config or shared-core layer — **no reporting module imports
+another reporting module**, and only the `Utils` edges carry actual function calls
+(the `variableUtils`/`gradio_utils` edges are constants only).
+
+Everything else is coupled through the **database**, not through imports:
+`general_utils` writes the tables and each reporting module queries them
+independently. That is why most modules can be changed in isolation — and also why
+a schema change in `rawform_forms_v3` breaks several files at once with no import
+graph to warn you.
+
+### 3.2 Cross-module call weight
+
+| From | To | Calls |
+|---|---|---:|
+| `boh3_dds4_utils` | `Utils` | 63 |
+| `boh2_dds2_dds3_utils` | `Utils` | 28 |
+| `flagging_utils` | `Utils` | 4 |
+| `general_utils` | `Utils` | 4 |
+| `boh1_utils` | `Utils` | 2 |
+| `assessor_analysis` | `Utils` | 1 |
+
+Those are *call* edges. The full **import** graph has 13 edges — the six above
+plus `Utils → variableUtils`, `boh1_utils`/`boh2_dds2_dds3_utils`/`boh3_dds4_utils`/
+`flagging_utils`/`general_utils` → `variableUtils`, and `viva_gradio → gradio_utils`.
+Those seven carry constants, not calls.
+
+`Utils.readDf` alone is called by 59 functions. Changing its signature or return
+shape is the single highest-blast-radius edit in this codebase.
+
+### 3.3 Data flow
+
+```mermaid
+flowchart LR
+    dash[("DASH platform<br/>api.unimelb-dash.com")]
+    pg[("Postgres<br/>rawforms<br/>rawform_forms_v3<br/>dds4_boh3_forms_v3<br/>scbd · osce")]
+    xl[/"Excel inputs<br/>Config.xlsx · item_section_mapping.xlsx<br/>student lists · leave · PBN"/]
+
+    dash -->|"fetchAllAssessments<br/>(general_utils)"| raw["JSON rows"]
+    raw -->|"toRows / toRowsScbd / toRowsOsce<br/>+ generated upsert SQL"| pg
+    pg -->|"Utils.readDf"| df["pandas DataFrames"]
+    xl --> df
+    df --> pdf["Per-student &<br/>cohort PDFs<br/>(ReportLab)"]
+    df --> xlsx["Cohort & student<br/>workbooks<br/>(openpyxl)"]
+    df --> flags["Flag / risk<br/>workbooks"]
+    df --> stats["Assessor-bias<br/>analysis + plots"]
+    dash -->|"live poll, 15–30 s"| dashb["Gradio dashboards<br/>viva · scbd"]
+```
+
+---
+
+## 4. How each module is run
+
+| Run how | Modules |
+|---|---|
+| **Imported by `main.ipynb`** (the normal path) | `Utils`, `variableUtils`, `general_utils`, `flagging_utils`, `boh1_utils`, `boh2_dds2_dds3_utils`, `boh3_dds4_utils`, `writtenexam_utils`, `risk_report`, `osce_pdfs`, `assessor_analysis`, `assessor_confound` |
+| **Standalone script** (`python x.py`) | `blr_analysis`, `generate_reports`, `generate_mcex_reports`, `build_canned_comments`, `dash_anonymize_pipeline` |
+| **Gradio web app** (`python x.py`, or `start.bat`) | `viva_gradio`, `scbd_gradio` |
+| **Config only** — never executed directly | `gradio_utils` |
+
+`generate_mcex_reports` and `build_canned_comments` each have a `__main__` guard
+and are **not** imported anywhere in `main.ipynb` — the notebook has its own
+`main()` and `getBannerDrawer()` that happen to share their names.
+`dash_anonymize_pipeline` has no guard at all: importing it runs the whole
+pipeline.
+
+Seven modules are star-imported, which means their names land in the notebook's
+global namespace and can shadow each other. Import order in `main.ipynb`
+(notebook lines 67–72) is:
+
+```python
+from boh2_dds2_dds3_utils import *
+from variableUtils import *
+from Utils import *
+from general_utils import *
+from flagging_utils import *
+from writtenexam_utils import *
+```
+
+and then, much later, at notebook line 2976:
+
+```python
+from boh3_dds4_utils import *
+```
+
+Later imports win. This matters — see §6.4.
+
+### `main.ipynb` section order
+
+`Initialize` → `URL to postgres` → `Separating forms` → `BOH1 BOH2 DDS2 DDS3
+general` → `Student Reports` → `PRP section` → `SCBD` → `Assessor Analysis` →
+`BOH1 for the date` → `OSCE` → `DDS2 / Weekly` → `Mini-CEx` → `DDS4 BOH3` (data
+processing → cohort reports → student PDFs → student Excel reports) → `Written
+Exam Feedback Reports` → `DDS3 Research Progress Summary` → `Send Emails`.
+
+---
+
+## 5. Where to find a thing
+
+| I want to… | Go to |
+|---|---|
+| Change how a report *looks* (fonts, navy, page size, styles) | [`variableUtils`](variableUtils.md) §3 |
+| Change a table/banner/chart building block used everywhere | [`Utils`](Utils.md) §5.5 |
+| Pull new data from DASH into Postgres | [`general_utils`](general_utils.md) §5 (ingest) |
+| Change what makes a student "flagged" | [`flagging_utils`](flagging_utils.md) — `FLAG_REGISTRY` and the threshold table |
+| Change the at-risk tiers on the risk workbook | [`risk_report`](risk_report.md) — the 9 flags and tier logic |
+| Edit a BOH3/DDS4 student PDF or Excel dashboard | [`boh3_dds4_utils`](boh3_dds4_utils.md) |
+| Edit a BOH2/DDS2/DDS3 cohort or student report | [`boh2_dds2_dds3_utils`](boh2_dds2_dds3_utils.md) |
+| Edit the BOH1 timed-session / item report | [`boh1_utils`](boh1_utils.md) |
+| Edit an OSCE station feedback PDF | [`osce_pdfs`](osce_pdfs.md) |
+| Edit written-exam feedback PDFs | [`writtenexam_utils`](writtenexam_utils.md) |
+| Edit the Mini-CEX PDFs | [`generate_mcex_reports`](generate_mcex_reports.md) |
+| Investigate assessor harshness / bias | [`assessor_analysis`](assessor_analysis.md), [`assessor_confound`](assessor_confound.md) |
+| Recompute the BLR cut score | [`general_utils`](general_utils.md) (live) — **not** `blr_analysis` (superseded) |
+| De-identify an export | [`dash_anonymize_pipeline`](dash_anonymize_pipeline.md) |
+| Change the live viva dashboard | [`viva_gradio`](viva_gradio.md) + [`gradio_utils`](gradio_utils.md) |
+| Change the live SCBD dashboard | [`scbd_gradio`](scbd_gradio.md) |
+
+---
+
+## 6. Cross-cutting issues
+
+Collected from the per-module docs. Each item links to the module doc where it is
+written up in full, with line numbers.
+
+### 6.1 Import-time failures and side effects
+
+| Issue | Where |
+|---|---|
+| `import Utils` evaluates `_mergeSection`'s default argument at import time, reading a **hard-coded Windows path** (`variableUtils.itemSectionMappingFile`). Without that file the whole codebase fails to import. | [`Utils`](Utils.md) L645 |
+| `boh3_dds4_utils` runs `pd.read_excel(variableUtils.itemSectionMappingFile)` at import — and never uses the result. | [`boh3_dds4_utils`](boh3_dds4_utils.md) L101 |
+| `variableUtils` does `print(pageSize)` on import, so every notebook run emits stray output. | [`variableUtils`](variableUtils.md) L36 |
+| Both `generate_reports` (L36) and `generate_mcex_reports` (L20) call `os.makedirs` at import; `generate_reports` additionally runs `assert len(FEEDBACK) == 20` at module level. | [`generate_reports`](generate_reports.md) L36, L167 · [`generate_mcex_reports`](generate_mcex_reports.md) L20 |
+
+### 6.2 Names that will raise on first call
+
+| Issue | Where |
+|---|---|
+| `getDfbyColumnValue`, `findMCColumns`, `getMCValueCounts` are called but never defined → `NameError`. | [`Utils`](Utils.md) L216, L241, L311 |
+| `Utils.getImportance` reads `variableUtils.rubricQues`, which does not exist → `AttributeError`. | [`Utils`](Utils.md) L231 |
+| `general_utils.runBlrAnalysis` uses `np.nan` but numpy is never imported → `NameError` when k ≤ 1. | [`general_utils`](general_utils.md) L1698 |
+| `HEADER_COLOR = uniColor` (L41) and `uniColor = '#010d44'` (L38) — the leading `#` makes openpyxl raise `Colors must be aRGB hex values`. No module in this folder uses it; it fires only through `main.ipynb`'s `PatternFill(start_color=HEADER_COLOR, …)`. | [`variableUtils`](variableUtils.md) L38, L41 |
+| `boh2_dds2_dds3_utils.buildStudentReport` subscripts `classAvgItemCounts['Simulation']` although the parameter defaults to `None` → `TypeError`. | [`boh2_dds2_dds3_utils`](boh2_dds2_dds3_utils.md) L2434 |
+| `general_utils.getDeleteSql` filters on `student_number is null`, a column `scbd`/`osce` do not have → `UndefinedColumn`. | [`general_utils`](general_utils.md) |
+| `blr_analysis` hard-codes column `global_rating`; current workbooks use `GR` → `KeyError`. | [`blr_analysis`](blr_analysis.md) |
+
+### 6.3 The year 2026 is hard-coded in at least a dozen places
+
+- **`boh3_dds4_utils`** — the v3 upsert's `datetimeUtc >= TIMESTAMPTZ '2026-01-01'`
+  (L461), `VIC_HOLIDAYS_2026` (L1017), five `year=2026` defaults (L1066, 1076,
+  1106, 1147, 1170), the student-PDF intro text (L2341), and a conditional format
+  keyed to the literal column name `"PBNs 2026"` (L1283) that will silently stop
+  matching in 2027.
+- **`boh2_dds2_dds3_utils`** — six independent places: two `dateFrom="2026-01-01"`
+  defaults (L66, L107), an inline SQL literal (L368), `getStudentsInCohort`'s
+  default (L761), `HALF_YEAR_DIVIDER_DATE = "2026-06-15"` (L1232), and the
+  student-PDF intro text (L2380).
+- **`general_utils`** — `TIMESTAMPTZ '2026-01-01'` four times (L173, L372, L560 in
+  insert-SQL builders, L1604 in `getChecklistBank`), plus further 2026 literals at
+  L779, L820, L884.
+- **`viva_gradio`** — `fetch_all(…, "2026")` (L708) and a startup date range
+  (L1042) that disagrees with the visible textboxes (L993–994).
+- **`build_canned_comments`** — the README sheet hard-codes both the input filename
+  and the year "2025" (L267, L282).
+
+**Rolling over to 2027 is not a one-line change.** Full list in each module's §7.
+
+### 6.4 Duplicated logic that can drift apart
+
+| Duplicate | Detail |
+|---|---|
+| `getBannerDrawer` | `Utils` vs `generate_mcex_reports` — same shape, different banner height, fonts and baselines; the mCEX one is A4-only. |
+| `getWhereStatement` / `_where` | `boh3_dds4_utils` L471–491 is character-for-character identical to `Utils` L605–624 (they differ only in line endings — `Utils.py` is CRLF). Which one wins depends on star-import order: the notebook does `from Utils import *` at line 69, then `from boh3_dds4_utils import *` at line 2976, so boh3's copy wins from that cell onward. |
+| `_itemCodeCounts` | Defined **twice inside `flagging_utils`** (L57 and L2385); the later silently shadows the first. |
+| `loadWeeklyFiles` / `runBlrAnalysis` | `blr_analysis` vs evolved copies in `general_utils` — fixes to the script never reach the pipeline. |
+| Dashboard constants | `scbd_gradio` re-declares 11 of `gradio_utils`' constants identically and **4 with different values** (`ALL_COHORTS`, `TABLE_MAX_HEIGHT`, `DEFAULT_INTERVAL`, `SORT_OPTIONS`). |
+| Removed-student lists | `boh2_dds2_dds3_utils` uses `variableUtils.REMOVE_STUDENTS_DICT` on the Excel path (L888) but per-cohort `if` chains covering only BOH2/DDS2 on the PDF paths (L2172/2174, L2519/2521) — so the BOH1 exclusion list applies to the Excel reports and not the PDFs. DDS1 has no exclusion list at all. |
+
+### 6.5 Silent-wrong-answer risks
+
+These produce output that looks fine and is not:
+
+- **`risk_report._buildAnalytics` joins three sheets positionally via `.values`,
+  with no key.** Any row-order difference silently misattributes every rating and
+  practice-readiness figure to the wrong student.
+- **`boh2_dds2_dds3_utils.getFlaggedFormDetails` reads `assessor_data->'scales'`
+  directly** instead of the student-fallback accessor, so BOH1/BOH2 and all Smile
+  Squad forms can never be flagged.
+- **`boh3_dds4_utils.addPbnLeaveColumns` catches bare `Exception` and fills 0s**,
+  making a missing input workbook indistinguishable from a clean cohort.
+- **`build_canned_comments` caches embeddings keyed only on register name**; if
+  the input changes, `zip(texts, labels)` truncates to the shorter list with no
+  error.
+- **`flagging_utils`: NaN never flags**, so single-form and missing-data students
+  read as clean; and `high_es_lvl2` can never fire at its default threshold.
+- ~~**`flagging_utils` matched `role` and `patient_details` by LABEL only**~~ —
+  FIXED 2026-08-18. `role_counts.get("Operator")` / `pd_counts.get("I saw a
+  patient")` never matched the v3 CODE spelling (`O`, `ISP`), so on a code-shaped
+  pull `operator_count`, `pct_operator` and `patient_seen` were **zero** and
+  `low_pt_seen` fired on the wrong students. `normalizeRole` /
+  `normalizePatientDetail` now fold both spellings.
+- ~~**`general_utils` built `clinical_incident` from the multi-select shape only**~~
+  — FIXED 2026-08-18 in the loader *and* at read time
+  (`boh2_dds2_dds3_utils.clinicalIncidentSqlExpr`). The 2026 form templates use a
+  radio plus a text field, so the column was NULL and **every** incident report —
+  flagging and cohort — showed zero. 159 incidents were invisible. Rows already in
+  `rawform_forms_v3` keep the NULL until a reload; the read-time path covers them.
+- **Two "score" numbers now coexist and legitimately differ** (2026-08-18).
+  `flagging_utils` Summary `Score` is form-weighted; the Section Score Pivot's
+  section cells and `Overall (per item)` are item-weighted. On DDS2 FHY the gap
+  reached 0.064 and moved one student 43 rank places. `FlaggingConfig.scoreWeighting`
+  chooses which one `avg_score` and `low_score` use; slopes stay per form.
+- **`general_utils`: all DDS2 date filters use `datetimeutc::date`**, correct only
+  while the Postgres session timezone is `Australia/Melbourne`. Nothing sets or
+  asserts it.
+- **Both Gradio dashboards mix naive and tz-aware datetimes** in date filtering —
+  off by 10–11 hours on a UTC host.
+- **`boh1_utils` does not handle student-only checklists** although `Config.xlsx`
+  records that BOH1 has them; the SQL hard-codes `submitted_by_assessor = true`,
+  so those items vanish silently.
+
+### 6.6 Broken by construction
+
+- **`flagging_utils._build_operator_by_clinic_sheet` is missing its tail.** It
+  stops at L1423 inside the FTA colour-coding branch: the `Operator` column never
+  gets a colour branch, and the `clinic_avg` "Cohort Avg" rows computed at
+  L1373–1377 are never written to the sheet. The file still parses — this is a
+  missing tail, not a syntax error.
+- **Both dashboards return 6 values on every `do_load` error path into 5 output
+  components**, so all error messaging is broken (`viva_gradio` L700,
+  `scbd_gradio` L349).
+- **`dash_anonymize_pipeline` is two concatenated scripts** with a visible seam at
+  L98, communicating via `artifacts.pkl` — whose required keys nothing in the repo
+  creates. It cannot be re-run from scratch.
+- **`risk_report` runs `eval()`** on a spreadsheet cell inside a bare
+  `except Exception`.
+
+### 6.7 Privacy
+
+- `dash_anonymize_pipeline` writes three files that are **re-identification keys**
+  — `dash_patient_drn_mapping.csv`, `dash_supervisor_mapping.csv` and
+  `dash_redaction_review_log.csv` — into `OUTDIR` (`/mnt/user-data/outputs`,
+  L102), the same directory as the anonymised workbook. The review log's
+  `original_text` column holds the full un-redacted text.
+- Both Gradio dashboards call `launch(share=True)`, publishing identifiable student
+  records over a public Gradio tunnel. `viva_gradio` additionally binds `0.0.0.0`
+  (L1070); `scbd_gradio` binds `localhost` (L492). In both, auth applies **only**
+  if both the username and password env vars are set.
+
+### 6.8 Dead code
+
+Substantial unused strata:
+
+- **`Utils`** — 11 of its 29 top-level functions are uncalled, all of them before
+  the `# New year functions` marker at L528 (live code exists before the marker
+  too, so it is not a clean split).
+- **`variableUtils`** — the entire `schema.yaml` access layer (L105–202; no
+  `schema.yaml` exists), ~45 commented-out lines, and 28 of 69 constants unused.
+- **`general_utils` / `boh3_dds4_utils`** — the v2 *ingest* builders (e.g.
+  `getInsertSqlRawform_forms`, L259) are uncalled. Note the `rawform_forms` **table**
+  is still live — the notebook's BOH1 section queries it.
+- **`blr_analysis`** — no reference anywhere in this folder or the notebook.
+- **`writtenexam_utils`** — the ~258-line oral-presentation section (L755–EOF).
+- **`boh1_utils`** — `scoreFromSampleData` (L572) and `buildReportFromDf` (L655).
+
+Per-module lists are in each doc's §7.
+
+---
+
+## 7. Conventions in this codebase
+
+- **Naming.** Report builders are `build*`; SQL builders are `get*Sql`; data
+  fetchers are `get*Df` / `readDf`; private helpers are `_`-prefixed. openpyxl
+  sheet writers in `boh3_dds4_utils` are `_sheet*` / `_xl*`.
+- **The single DB read path is `Utils.readDf(sql, engine)`.** Everything that
+  touches Postgres for reading goes through it.
+- **PDF = ReportLab, Excel = openpyxl, charts = matplotlib** rendered to an image
+  and embedded via `Utils.addPlotImage`. There is no other rendering stack.
+- **Cohort codes**: `BOH1`–`BOH3` (Bachelor of Oral Health years 1–3),
+  `DDS1`–`DDS4` (Doctor of Dental Surgery years 1–4). BOH3 and DDS4 are the final
+  years and share `boh3_dds4_utils`.
+- **`rawforms`** = raw Postgres JSON; **`rawform_forms`** = one row per form;
+  **`rawform_form_items`** = exploded to item level; **`_v3`** = the current
+  schema. (From the project `readme.md`.)
+- **Backups.** The convention in this folder is `x.py.bak_YYYYMMDD_HHMMSS`;
+  several exist for the large modules.
+
+---
+
+## 8. How this documentation was produced
+
+Every function signature, line number, constant value and call edge in these docs
+was extracted from the source with Python's `ast` module, not read off by eye. The
+call graph resolves a call to `f()` inside module *M* by checking, in order: a
+top-level `def f` in *M*; an explicit `from X import f`; then transitively
+star-imported modules. Attribute calls (`pd.read_sql`, `df.groupby`) into
+third-party libraries are excluded — 671 edges are within this codebase.
+
+Behaviour descriptions, gotchas and the "silent wrong answer" analysis come from
+reading the source. Where a doc states that something is broken, it cites the
+line.
+
+**Keeping it current.** The extraction has not been re-run since 2026-08-14, so
+line numbers and prose describe that snapshot. Later sessions amend the affected
+module doc in place with a **dated** note rather than silently editing the
+generated text, so it stays obvious which parts are original and which are
+patches. Amended so far: `flagging_utils.md` (§0 and §7),
+`boh2_dds2_dds3_utils.md` (`clinicalIncidentSqlExpr`, `getDataDf`,
+`getCriticalIncidentDf`), `general_utils.md` (`getInsertSqlRawform_forms_v3`
+item 6) — all 2026-08-18, see
+`_handover_docs/HANDOVER_dds2_clinic_flagging_fhy.md`. A full regeneration would
+replace all of them; §2 of `python-reference-docs` in project memory has the
+recipe.
+
+**Known limits.** Dynamic dispatch (`getattr`, dict-of-functions, registry
+lookups such as `flagging_utils.SHEET_REGISTRY`) is invisible to static analysis,
+so a few real call relationships are missing from the graph — the registry-driven
+sheet builders in `flagging_utils` and `boh3_dds4_utils` are the main case, and
+they are documented by hand in those modules' docs. `main.ipynb`'s own calls were
+found by parsing the notebook's `import` statements first and then name-matching
+**only within modules the notebook actually imports** — so notebook-local helpers
+sharing a module function's name (`main`, `getBannerDrawer`, `_hdr`) no longer
+register as entry points. The individual docs for `generate_reports`,
+`generate_mcex_reports`, `build_canned_comments` and `risk_report` note these
+collisions explicitly.

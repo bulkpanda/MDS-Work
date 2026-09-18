@@ -25,7 +25,7 @@ import variableUtils
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-BOH1_TABLE   = "rawform_forms"   # override per environment if needed
+BOH1_TABLE   = "rawform_forms_v3"   # 2026 data lives here; pass "rawform_forms" for pre-v3
 BOH1_COHORT  = "BOH1"
 
 # Scoring weights — O6 (N/A) is excluded from score AND from denominator
@@ -111,7 +111,8 @@ def _sectionTitle(ws, row: int, title: str, ncols: int = 1, fillHex="2E75B6"):
 # WHERE clause builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _where(cohort: str, dateFrom=None, dateTo=None, filters: dict = None):
+def _where(cohort: str, dateFrom=None, dateTo=None, filters: dict = None,
+           dates=None, studentNumbers=None):
     """
     Build WHERE clause + params for BOH1 queries.
 
@@ -131,6 +132,16 @@ def _where(cohort: str, dateFrom=None, dateTo=None, filters: dict = None):
     if dateTo:
         clauses.append("DATE(datetimeutc AT TIME ZONE 'Australia/Melbourne') <= :dateTo")
         params["dateTo"] = dateTo
+
+    # Discrete session dates (YYYY-MM-DD) — the whitelist counterpart of dateFrom/dateTo.
+    if dates:
+        clauses.append("DATE(datetimeutc AT TIME ZONE 'Australia/Melbourne') = ANY(:dates)")
+        params["dates"] = list(dates)
+    # Restrict to specific students. Cast to text so it works whether student_number is
+    # stored as text or as an integer.
+    if studentNumbers:
+        clauses.append("student_number::text = ANY(:student_numbers)")
+        params["student_numbers"] = [str(s) for s in studentNumbers]
 
     if filters:
         for key, val in filters.items():
@@ -155,6 +166,8 @@ def getChecklistScores(
     dateTo: str        = None,
     formsTable: str    = BOH1_TABLE,
     filters: dict      = None,
+    dates: list        = None,
+    studentNumbers: list = None,
 ) -> pd.DataFrame:
     """
     Return one row per (assessmentid, item_code) with score, %score and
@@ -180,7 +193,8 @@ def getChecklistScores(
         Score, Max Score, % Score,
         Assessor Comments, Student Reflection
     """
-    whereClause, params = _where(cohort, dateFrom, dateTo, filters)
+    whereClause, params = _where(cohort, dateFrom, dateTo, filters,
+                                 dates=dates, studentNumbers=studentNumbers)
     params["item_codes"] = itemCodes
 
     sql = f"""
@@ -191,12 +205,14 @@ def getChecklistScores(
             f.student_name,
             f.assessor_name,
             DATE(f.datetimeutc AT TIME ZONE 'Australia/Melbourne') AS session_date,
-            NULLIF(f.assessor_data->'scale-practice-readiness'->>'scale', '')::int  AS practice_readiness,
-            NULLIF(f.assessor_data->'scale-global-rating'->>'scale',       '')::int  AS global_rating,
-            NULLIF(f.assessor_data->'scale-time-mgmt'->>'scale',           '')::int  AS time_mgmt,
-            NULLIF(f.assessor_data->'scale-communication'->>'scale',       '')::int  AS communication,
-            NULLIF(f.assessor_data->'scale-professionalism'->>'scale',     '')::int  AS professionalism,
-            NULLIF(f.assessor_data->'scale-position-ergonomics'->>'scale', '')::int  AS position_ergonomics,
+            -- v3 nests scales under assessor_data->'scales' with the level under ->>'key';
+            -- pre-v3 kept them flat under assessor_data->'scale-...'->>'scale'. Read either.
+            NULLIF(COALESCE(f.assessor_data->'scales'->'scale-practice-readiness'->>'key', f.assessor_data->'scale-practice-readiness'->>'scale'), '')::int  AS practice_readiness,
+            NULLIF(COALESCE(f.assessor_data->'scales'->'scale-global-rating'->>'key',       f.assessor_data->'scale-global-rating'->>'scale'),       '')::int  AS global_rating,
+            NULLIF(COALESCE(f.assessor_data->'scales'->'scale-time-mgmt'->>'key',           f.assessor_data->'scale-time-mgmt'->>'scale'),           '')::int  AS time_mgmt,
+            NULLIF(COALESCE(f.assessor_data->'scales'->'scale-communication'->>'key',       f.assessor_data->'scale-communication'->>'scale'),       '')::int  AS communication,
+            NULLIF(COALESCE(f.assessor_data->'scales'->'scale-professionalism'->>'key',     f.assessor_data->'scale-professionalism'->>'scale'),     '')::int  AS professionalism,
+            NULLIF(COALESCE(f.assessor_data->'scales'->'scale-position-ergonomics'->>'key', f.assessor_data->'scale-position-ergonomics'->>'scale'), '')::int  AS position_ergonomics,
             f.assessor_reflection,
             f.student_reflection,
             f.assessor_data,
@@ -281,13 +297,16 @@ def getMcBreakdown(
     dateTo: str      = None,
     formsTable: str  = BOH1_TABLE,
     filters: dict    = None,
+    dates: list      = None,
+    studentNumbers: list = None,
 ) -> pd.DataFrame:
     """
     Return one row per (assessmentid, item_code, MC key) with assessor and
     student option selections and the resolved option label.
     Useful for drilling into which individual checklist items are weak.
     """
-    whereClause, params = _where(cohort, dateFrom, dateTo, filters)
+    whereClause, params = _where(cohort, dateFrom, dateTo, filters,
+                                 dates=dates, studentNumbers=studentNumbers)
     params["item_codes"] = itemCodes
 
     sql = f"""
@@ -428,6 +447,8 @@ def buildItemReport(
     dateFrom: str   = None,
     dateTo: str     = None,
     formsTable: str = BOH1_TABLE,
+    dates: list     = None,
+    studentNumbers: list = None,
 ):
     """
     Build an Excel report for a single item code across all dates.
@@ -452,10 +473,12 @@ def buildItemReport(
     scoreDf = getChecklistScores(
         engine, itemCodes=[itemCode], cohort=cohort,
         dateFrom=dateFrom, dateTo=dateTo, formsTable=formsTable,
+        dates=dates, studentNumbers=studentNumbers,
     )
     mcDf = getMcBreakdown(
         engine, itemCodes=[itemCode], cohort=cohort,
         dateFrom=dateFrom, dateTo=dateTo, formsTable=formsTable,
+        dates=dates, studentNumbers=studentNumbers,
     )
 
     wb = Workbook()
@@ -476,7 +499,18 @@ def buildItemReport(
     # Sheet 2: MC Breakdown
     _writeMcBreakdownSheet(wb, "MC Breakdown", mcDf)
 
-    # Sheet 3: By Assessor pivot
+    # Sheets: % Score by date and GR by date — one row per student, one column per session
+    # (mean across any repeat attempts that day; blank = student absent that session).
+    if not scoreDf.empty:
+        for valueCol, label in [("% Score", "% Score by date"), ("Global Rating", "GR by date")]:
+            piv = (scoreDf.pivot_table(index=["Student ID", "Student Name"],
+                                       columns="Date", values=valueCol, aggfunc="mean")
+                          .round(1).reset_index())
+            piv.columns = [str(c) for c in piv.columns]
+            _writeScoreSheet(wb, label, piv, list(piv.columns),
+                             f"Item {itemCode} — {label} (mean, blank = absent)")
+
+    # Sheet: By Assessor pivot
     if not scoreDf.empty and "Assessor" in scoreDf.columns:
         assessorPivot = (
             scoreDf.groupby("Assessor")

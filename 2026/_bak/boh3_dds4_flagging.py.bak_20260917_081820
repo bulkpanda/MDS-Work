@@ -1,0 +1,724 @@
+"""
+boh3_dds4_flagging.py
+Cohort-level "lagging student" flagging for the final-year cohorts (DDS4 / BOH3).
+
+STAGE 1: DATA LAYER + METRICS TABLE.
+STAGE 1b: SECTION-LEVEL entrustment / weakness, cohort-relative status + colour pivots
+          (buildSectionPerformance, pivotSectionPerformance, writeSectionPivotSheet).
+Count-metric flags + styled Summary workbook = stage 2 (not built yet).
+    getCohortFormFrame      one row per form   (SQL, 1 query)
+    getCohortItemFrame      one row per form x item code (SQL, 1 query)
+    buildMetricsLong        per-student metrics, Overall + every rotation group (pandas)
+    pivotMetrics            long -> wide (one row per student) for eyeballing
+    getExpectedSections     which sections / sub-sections the cohort actually does
+    cohortWindowStats       cohort mean / SD per metric+window and what each of the
+                            three threshold modes resolves to (for tuning defaults)
+    resolveThreshold        fixed | meanStd (mean - k*SD) | meanFrac (f*mean)
+    buildFlaggingMetrics    convenience: runs all of the above, returns a dict
+
+Reuses boh3_dds4_utils (weakness SQL fragments, entrustment CASE, rotationNumber,
+PBN / leave readers) and Utils (readDf, section mapping) so numbers agree with the
+existing PDFs / Summary_Details workbooks.
+
+Usage in notebook:
+    from boh3_dds4_flagging import *
+
+Naming: everything a notebook cell calls is PUBLIC (no leading underscore) because
+main.ipynb uses `from x import *`.
+"""
+
+import numpy as np
+import pandas as pd
+
+from Utils import readDf, _loadSectionMapping, _mergeSection
+from boh3_dds4_utils import (
+    WEAKNESS_KEY_LABELS, _weaknessCountSelect, _ENT_CASE_SQL, rotationNumber,
+    getLeaveDaysByStudent, getPbnCountByStudent,
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 0. Configuration defaults (all overridable per call)
+# ═══════════════════════════════════════════════════════════════════════════
+
+OVERALL_WINDOW = "Overall"
+
+# Count-type metrics (forms, patients, age bands, sections): overall + these groups.
+# Any number of groups; each is (label, [rotation numbers]).
+DEFAULT_ROTATION_GROUPS = [
+    ("R1-4", [1, 2, 3, 4]),
+    ("R5+", list(range(5, 21))),
+]
+
+# Entrustment / weakness trajectory windows (3 non-overlapping points judge
+# "consistent" better than 2). Used in stage 2; computed here so you can inspect.
+DEFAULT_TRAJECTORY_GROUPS = [
+    ("R1-3", [1, 2, 3]),
+    ("R4-6", [4, 5, 6]),
+    ("R7+", list(range(7, 21))),
+]
+
+# Students under this many forms (Overall) are left OUT of the cohort mean / SD so
+# one near-empty record (long leave, withdrawn) cannot inflate every SD.
+DEFAULT_MIN_FORMS_FLOOR = 20
+
+# A section is "expected" for the cohort when at least this share of students
+# (above the forms floor) have any activity in it.
+DEFAULT_EXPECTED_MIN_SHARE = 0.80
+
+# Never treated as expected / flaggable coverage buckets.
+NON_FLAG_SECTIONS = ("Unmapped", "Miscellaneous")
+
+WEAKNESS_LABELS = list(WEAKNESS_KEY_LABELS.values())
+
+# metric -> domain (drives sheet grouping + which threshold family applies later)
+DOMAIN_ACTIVITY = "Activity"
+DOMAIN_PATIENTS = "Patients"
+DOMAIN_AGE = "Age mix"
+DOMAIN_ENTRUSTMENT = "Entrustment"
+DOMAIN_WEAKNESS = "Weakness"
+DOMAIN_COVERAGE = "Coverage"
+DOMAIN_CONTEXT = "Context"
+
+SECTION_PREFIX = "Section: "
+SUBSECTION_PREFIX = "Sub-section: "
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. Data layer (two cohort-wide queries)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PATIENT_ARRAY_SQL = ("jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' "
+                      "THEN f.patient_data ELSE '[]'::jsonb END)")
+
+# safe int age: non-numeric ages become NULL instead of raising
+_AGE_SQL = "CASE WHEN pd->>'patient_age' ~ '^\\d+$' THEN (pd->>'patient_age')::int END"
+
+
+def getCohortFormFrame(engine, cohort, formsTable="dds4_boh3_forms_v3"):
+    """ONE ROW PER FORM for the whole cohort — the single source for every non-item metric.
+
+    Columns: assessmentId, studentNumber, studentName, date, rotation, rotationNum, clinic,
+    assessor, submittedByStudent, submittedByAssessor, entrustment (1-4), readiness (1-4, self),
+    one tag-count column per weakness category (WEAKNESS_LABELS), incidentTags, concernFlag,
+    commendationTags, patientsAttended, patientsFta, age0to6, age7to17, age18plus.
+    Patient / age counts follow getAgeCountsBatch / getPatientPerStudent (attended only for age).
+    """
+    sql = f"""
+    SELECT
+      f.assessmentid                                        AS "assessmentId",
+      f.student_number                                      AS "studentNumber",
+      f.student_name                                        AS "studentName",
+      f.datetimeutc::date                                   AS "date",
+      f.rotation                                            AS "rotation",
+      COALESCE(NULLIF(f.external_clinic,''), f.clinic)      AS "clinic",
+      f.assessor_name                                       AS "assessor",
+      COALESCE(f.submitted_by_student, false)               AS "submittedByStudent",
+      COALESCE(f.submitted_by_assessor, false)              AS "submittedByAssessor",
+      {_ENT_CASE_SQL}                                       AS "entrustment",
+      CASE NULLIF(f.student_data->'scales'->'scale-practice-readiness'->>'key','')
+        WHEN 'S1' THEN 1 WHEN 'S2' THEN 2 WHEN 'S3' THEN 3 WHEN 'S4' THEN 4
+      END::smallint                                         AS "readiness",
+      {_weaknessCountSelect()},
+      jsonb_array_length(COALESCE(f.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb))
+                                                            AS "incidentTags",
+      (NULLIF(TRIM(f.additional_concerns),'') IS NOT NULL)::int AS "concernFlag",
+      jsonb_array_length(COALESCE(f.assessor_data->'multi-select'->'strengths','[]'::jsonb))
+                                                            AS "commendationTags",
+      COALESCE(pt."patientsAttended", 0)                    AS "patientsAttended",
+      COALESCE(pt."patientsFta", 0)                         AS "patientsFta",
+      COALESCE(pt."age0to6", 0)                             AS "age0to6",
+      COALESCE(pt."age7to17", 0)                            AS "age7to17",
+      COALESCE(pt."age18plus", 0)                           AS "age18plus"
+    FROM {formsTable} f
+    LEFT JOIN LATERAL (
+      SELECT
+        COUNT(*) FILTER (WHERE (pd->>'patient_attended')::boolean)::int       AS "patientsAttended",
+        COUNT(*) FILTER (WHERE NOT (pd->>'patient_attended')::boolean)::int   AS "patientsFta",
+        COUNT(*) FILTER (WHERE (pd->>'patient_attended')::boolean AND {_AGE_SQL} BETWEEN 0 AND 6)::int  AS "age0to6",
+        COUNT(*) FILTER (WHERE (pd->>'patient_attended')::boolean AND {_AGE_SQL} BETWEEN 7 AND 17)::int AS "age7to17",
+        COUNT(*) FILTER (WHERE (pd->>'patient_attended')::boolean AND {_AGE_SQL} >= 18)::int            AS "age18plus"
+      FROM {_PATIENT_ARRAY_SQL} pd
+    ) pt ON TRUE
+    WHERE f.cohort = :cohort AND f.student_name IS NOT NULL
+    ORDER BY f.student_name, f.datetimeutc, f.assessmentid;
+    """
+    df = readDf(engine, sql, {"cohort": cohort})
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"])
+    df["rotationNum"] = df["rotation"].map(rotationNumber)
+    return df
+
+
+def getCohortItemFrame(engine, cohort, formsTable="dds4_boh3_forms_v3", mappingFile=None):
+    """ONE ROW PER form x item code (attended patients only; assessmentId kept so a form's
+    entrustment / weakness can be attributed to the sections it touched), with
+    Section / Sub-section merged from item_section_mapping.xlsx (Utils._mergeSection).
+    Same filters as getItemCodesPerStudentBatch, plus the rotation so it can be windowed.
+    """
+    sql = f"""
+    SELECT
+      f.assessmentid   AS "assessmentId",
+      f.student_number AS "studentNumber",
+      f.student_name   AS "studentName",
+      f.rotation       AS "rotation",
+      ic->>'code'      AS "Item Code",
+      SUM(COALESCE(NULLIF(ic->>'quantity','')::int, 1))::int AS "qty"
+    FROM {formsTable} f
+    CROSS JOIN LATERAL {_PATIENT_ARRAY_SQL} pd
+    CROSS JOIN LATERAL jsonb_array_elements(
+      CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
+    WHERE f.cohort = :cohort AND f.student_name IS NOT NULL
+      AND ic ? 'code' AND (pd->>'patient_attended')::boolean = true
+    GROUP BY f.assessmentid, f.student_number, f.student_name, f.rotation, ic->>'code';
+    """
+    df = readDf(engine, sql, {"cohort": cohort})
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["assessmentId", "studentNumber", "studentName", "rotation", "rotationNum",
+                                     "Item Code", "qty", "Section", "Sub-section"])
+    df["Item Code"] = df["Item Code"].astype(str).str.strip()
+    df = _mergeSection(df, _loadSectionMapping(mappingFile))
+    df["rotationNum"] = df["rotation"].map(rotationNumber)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. Windows
+# ═══════════════════════════════════════════════════════════════════════════
+
+def normaliseRotationGroups(groups):
+    """[(label, iterable of rotation numbers)] -> [(label, set)]; validates no rotation
+    sits in two groups (overlap would double-count)."""
+    out, seen = [], {}
+    for label, nums in (groups or []):
+        numSet = {int(n) for n in nums}
+        for n in numSet:
+            if n in seen:
+                raise ValueError(f"Rotation {n} is in both '{seen[n]}' and '{label}'")
+            seen[n] = label
+        out.append((str(label), numSet))
+    return out
+
+
+def windowMasks(df, groups, rotationCol="rotationNum"):
+    """{windowLabel: boolean mask} — Overall first, then each group in order."""
+    masks = {OVERALL_WINDOW: pd.Series(True, index=df.index)}
+    for label, numSet in normaliseRotationGroups(groups):
+        masks[label] = df[rotationCol].isin(numSet)
+    return masks
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. Metrics (long form: studentNumber, studentName, window, domain, metric, value)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _formMetricsOneWindow(sub, roster):
+    """All per-form-derived metrics for one window. `sub` = formDf rows in the window.
+    Returns wide DataFrame indexed by studentNumber (every roster student present)."""
+    idx = roster.index
+    g = sub.groupby("studentNumber")
+    assessed = sub[sub["submittedByAssessor"]]
+    ga = assessed.groupby("studentNumber")
+    rated = sub[sub["entrustment"].notna()]
+    gr = rated.groupby("studentNumber")
+
+    out = {}
+    # ── Activity ──
+    out[(DOMAIN_ACTIVITY, "Forms")] = g.size()
+    out[(DOMAIN_ACTIVITY, "Forms assessor-submitted")] = ga.size()
+    out[(DOMAIN_ACTIVITY, "Forms not assessor-submitted")] = g["submittedByAssessor"].apply(lambda s: int((~s).sum()))
+    out[(DOMAIN_ACTIVITY, "Forms not student-submitted")] = g["submittedByStudent"].apply(lambda s: int((~s).sum()))
+    out[(DOMAIN_ACTIVITY, "Active days")] = g["date"].nunique()
+    # ── Patients ──
+    out[(DOMAIN_PATIENTS, "Patients attended")] = g["patientsAttended"].sum()
+    out[(DOMAIN_PATIENTS, "Patients FTA")] = g["patientsFta"].sum()
+    out[(DOMAIN_PATIENTS, "Clinics")] = g["clinic"].nunique()
+    # ── Age mix ──
+    for col, label in (("age0to6", "Age 0-6"), ("age7to17", "Age 7-17"), ("age18plus", "Age 18+")):
+        out[(DOMAIN_AGE, label)] = g[col].sum()
+    # ── Context counts ──
+    out[(DOMAIN_CONTEXT, "Supervisors")] = ga["assessor"].nunique()
+    out[(DOMAIN_CONTEXT, "Incident forms")] = ga["incidentTags"].apply(lambda s: int((s > 0).sum()))
+    out[(DOMAIN_CONTEXT, "Concern forms")] = g["concernFlag"].sum()
+
+    wide = pd.DataFrame(out).reindex(idx).fillna(0)
+
+    # ── Rates (NaN when the denominator is 0 — never a fake zero) ──
+    nAssessed = wide[(DOMAIN_ACTIVITY, "Forms assessor-submitted")].replace(0, np.nan)
+    pts = (wide[(DOMAIN_PATIENTS, "Patients attended")] + wide[(DOMAIN_PATIENTS, "Patients FTA")]).replace(0, np.nan)
+    wide[(DOMAIN_PATIENTS, "FTA rate")] = wide[(DOMAIN_PATIENTS, "Patients FTA")] / pts
+
+    wide[(DOMAIN_ENTRUSTMENT, "Entrustment n")] = gr.size().reindex(idx).fillna(0)
+    wide[(DOMAIN_ENTRUSTMENT, "Entrustment avg")] = gr["entrustment"].mean().reindex(idx)
+    wide[(DOMAIN_ENTRUSTMENT, "Low share (L1-2)")] = gr["entrustment"].apply(lambda s: float((s <= 2).mean())).reindex(idx)
+    both = sub[sub["entrustment"].notna() & sub["readiness"].notna()]
+    wide[(DOMAIN_ENTRUSTMENT, "Self minus supervisor")] = (
+        (both["readiness"] - both["entrustment"]).groupby(both["studentNumber"]).mean().reindex(idx))
+
+    # weakness RATE = assessor-submitted forms carrying >=1 tag in the category / assessor-submitted forms
+    for label in WEAKNESS_LABELS:
+        tagged = (assessed[label] > 0).groupby(assessed["studentNumber"]).sum().reindex(idx).fillna(0)
+        wide[(DOMAIN_WEAKNESS, f"{label} rate")] = tagged / nAssessed
+        wide[(DOMAIN_WEAKNESS, f"{label} forms")] = tagged
+    anyTag = (assessed[WEAKNESS_LABELS].sum(axis=1) > 0).groupby(assessed["studentNumber"]).sum().reindex(idx).fillna(0)
+    wide[(DOMAIN_WEAKNESS, "Any weakness rate")] = anyTag / nAssessed
+    tagSum = assessed[WEAKNESS_LABELS].sum(axis=1).groupby(assessed["studentNumber"]).sum().reindex(idx).fillna(0)
+    wide[(DOMAIN_WEAKNESS, "Weakness tags per form")] = tagSum / nAssessed
+    comm = ga["commendationTags"].sum().reindex(idx).fillna(0)
+    wide[(DOMAIN_CONTEXT, "Commendations per form")] = comm / nAssessed
+    return wide
+
+
+def _itemMetricsOneWindow(sub, roster):
+    """Coverage metrics for one window: totals, distinct codes, per-Section and
+    per-Sub-section quantities. Indexed by studentNumber."""
+    idx = roster.index
+    out = {}
+    g = sub.groupby("studentNumber")
+    out[(DOMAIN_COVERAGE, "Items total")] = g["qty"].sum()
+    out[(DOMAIN_COVERAGE, "Distinct item codes")] = g["Item Code"].nunique()
+    wide = pd.DataFrame(out).reindex(idx).fillna(0)
+    if sub.empty:
+        return wide
+    sec = sub.pivot_table(index="studentNumber", columns="Section", values="qty", aggfunc="sum", fill_value=0)
+    sec.columns = pd.MultiIndex.from_tuples([(DOMAIN_COVERAGE, f"{SECTION_PREFIX}{c}") for c in sec.columns])
+    subKey = sub["Section"].astype(str) + " / " + sub["Sub-section"].astype(str)
+    ss = sub.assign(_ss=subKey).pivot_table(index="studentNumber", columns="_ss", values="qty",
+                                            aggfunc="sum", fill_value=0)
+    ss.columns = pd.MultiIndex.from_tuples([(DOMAIN_COVERAGE, f"{SUBSECTION_PREFIX}{c}") for c in ss.columns])
+    return pd.concat([wide, sec.reindex(idx).fillna(0), ss.reindex(idx).fillna(0)], axis=1)
+
+
+def buildMetricsLong(formDf, itemDf, rotationGroups=None, year=2026, addPbnLeave=True):
+    """Every metric x window x student in LONG form.
+
+    rotationGroups: [(label, [rotation numbers]), ...] — any number of groups. Overall is
+    always added. Returns columns: studentNumber, studentName, window, domain, metric, value.
+    Students with no forms in a window still get a row (counts 0, rates NaN) so a gap shows
+    as a gap, not as a missing student.
+    """
+    groups = DEFAULT_ROTATION_GROUPS if rotationGroups is None else rotationGroups
+    roster = (formDf.groupby("studentNumber")["studentName"].first().to_frame())
+    fMasks, iMasks = windowMasks(formDf, groups), windowMasks(itemDf, groups)
+
+    frames = []
+    for window in fMasks:
+        wide = pd.concat([_formMetricsOneWindow(formDf[fMasks[window]], roster),
+                          _itemMetricsOneWindow(itemDf[iMasks[window]], roster)], axis=1)
+        if window == OVERALL_WINDOW:
+            lastDate = formDf.groupby("studentNumber")["date"].max()
+            wide[(DOMAIN_ACTIVITY, "Days since last form")] = (formDf["date"].max() - lastDate).dt.days.reindex(roster.index)
+            wide[(DOMAIN_ACTIVITY, "Forms without rotation")] = (
+                formDf[formDf["rotationNum"].isna()].groupby("studentNumber").size().reindex(roster.index).fillna(0))
+            if addPbnLeave:
+                pbnMap, leaveMap = _pbnLeaveMaps(roster, year)
+                wide[(DOMAIN_CONTEXT, f"PBNs {year}")] = roster.index.map(lambda s: pbnMap.get(int(s), 0))
+                wide[(DOMAIN_CONTEXT, f"Leave days {year}")] = roster.index.map(lambda s: leaveMap.get(int(s), 0))
+        # wide -> long without DataFrame.stack (its behaviour differs across pandas versions)
+        wide.index.name = "studentNumber"
+        longDf = (pd.concat({col: wide[col] for col in wide.columns}, names=["domain", "metric"])
+                    .rename("value").reset_index())
+        longDf.insert(1, "window", window)
+        frames.append(longDf)
+
+    out = pd.concat(frames, ignore_index=True)
+    out.insert(1, "studentName", out["studentNumber"].map(roster["studentName"]))
+    return out[["studentNumber", "studentName", "window", "domain", "metric", "value"]]
+
+
+def _pbnLeaveMaps(roster, year):
+    """PBN + leave lookups via the existing readers; a missing file degrades to zeros."""
+    rosterDf = roster.reset_index().rename(columns={"studentNumber": "Student ID", "studentName": "Student Name"})
+    try:
+        pbnMap = getPbnCountByStudent(rosterDf, year)
+    except Exception as ex:
+        print(f"[flagging] PBN read failed ({ex}); filling 0")
+        pbnMap = {}
+    try:
+        leaveMap = getLeaveDaysByStudent(rosterDf["Student ID"].dropna().astype(int), year)
+    except Exception as ex:
+        print(f"[flagging] Leave read failed ({ex}); filling 0")
+        leaveMap = {}
+    return pbnMap, leaveMap
+
+
+def pivotMetrics(metricsLong, domains=None, windows=None, metrics=None):
+    """LONG -> WIDE, one row per student, columns '<metric> | <window>' (metric-major so
+    Overall / R1-4 / R5+ of the same metric sit side by side). Optional filters."""
+    df = metricsLong
+    if domains is not None:
+        df = df[df["domain"].isin(list(domains))]
+    if windows is not None:
+        df = df[df["window"].isin(list(windows))]
+    if metrics is not None:
+        df = df[df["metric"].isin(list(metrics))]
+    metricOrder = list(dict.fromkeys(df["metric"]))
+    windowOrder = list(dict.fromkeys(df["window"]))
+    # index on studentNumber only: dropna=False with a 2-level index would build the
+    # number x name cartesian product
+    nameMap = df.drop_duplicates("studentNumber").set_index("studentNumber")["studentName"]
+    wide = df.pivot_table(index="studentNumber", columns=["metric", "window"],
+                          values="value", aggfunc="first", dropna=False)
+    cols = [(m, w) for m in metricOrder for w in windowOrder if (m, w) in wide.columns]
+    wide = wide[cols].dropna(axis=1, how="all")   # Overall-only metrics have no group columns
+    wide.columns = [f"{m} | {w}" for m, w in wide.columns]
+    wide = wide.reset_index()
+    wide.insert(1, "studentName", wide["studentNumber"].map(nameMap))
+    return wide.sort_values("studentName", key=lambda s: s.astype(str).str.casefold()).reset_index(drop=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. Cohort reference: eligible students, expected sections, threshold preview
+# ═══════════════════════════════════════════════════════════════════════════
+
+def getEligibleStudents(metricsLong, minFormsFloor=DEFAULT_MIN_FORMS_FLOOR):
+    """Student numbers with >= minFormsFloor forms Overall — the population the cohort
+    mean / SD is computed over. Everyone else is reported as 'insufficient activity'."""
+    forms = metricsLong[(metricsLong["window"] == OVERALL_WINDOW) & (metricsLong["metric"] == "Forms")]
+    return set(forms.loc[forms["value"] >= minFormsFloor, "studentNumber"])
+
+
+def getExpectedSections(metricsLong, minShare=DEFAULT_EXPECTED_MIN_SHARE,
+                        minFormsFloor=DEFAULT_MIN_FORMS_FLOOR):
+    """Derive what the cohort is 'supposed' to do from what it actually does.
+    One row per Section / Sub-section x window: share of eligible students with any
+    activity, cohort median / mean, and `expected` (share >= minShare, not Unmapped/Misc)."""
+    eligible = getEligibleStudents(metricsLong, minFormsFloor)
+    cov = metricsLong[(metricsLong["domain"] == DOMAIN_COVERAGE)
+                      & metricsLong["metric"].str.startswith((SECTION_PREFIX, SUBSECTION_PREFIX))
+                      & metricsLong["studentNumber"].isin(eligible)]
+    if cov.empty:
+        return pd.DataFrame(columns=["metric", "window", "level", "shareWithActivity", "median", "mean", "expected"])
+    g = cov.groupby(["metric", "window"], sort=False)["value"]
+    out = pd.DataFrame({"shareWithActivity": g.apply(lambda s: float((s.fillna(0) > 0).mean())),
+                        "median": g.median(), "mean": g.mean()}).reset_index()
+    out["level"] = np.where(out["metric"].str.startswith(SECTION_PREFIX), "Section", "Sub-section")
+    nonFlag = out["metric"].apply(lambda m: any(n in m for n in NON_FLAG_SECTIONS))
+    out["expected"] = (out["shareWithActivity"] >= minShare) & ~nonFlag
+    return out[["metric", "window", "level", "shareWithActivity", "median", "mean", "expected"]].round(3)
+
+
+THRESHOLD_MODES = ("fixed", "meanStd", "meanFrac")
+
+
+def resolveThreshold(values, spec, window=OVERALL_WINDOW):
+    """Turn a threshold spec into a number for one metric+window.
+        {"mode": "fixed",    "value": 60}  or  {"mode": "fixed", "value": {"Overall": 60, "R1-4": 25}}
+        {"mode": "meanStd",  "k": 1.5}     -> mean - k*SD   (floored at 0)
+        {"mode": "meanFrac", "f": 0.5}     -> f * mean
+    `values` = the eligible students' values. Returns NaN when it cannot be resolved
+    (e.g. fixed dict with no entry for this window)."""
+    mode = spec.get("mode", "meanStd")
+    if mode not in THRESHOLD_MODES:
+        raise ValueError(f"Unknown threshold mode '{mode}'. Use one of {THRESHOLD_MODES}")
+    vals = pd.Series(values, dtype=float).dropna()
+    if mode == "fixed":
+        v = spec.get("value")
+        v = v.get(window) if isinstance(v, dict) else v
+        return float(v) if v is not None else np.nan
+    if vals.empty:
+        return np.nan
+    if mode == "meanStd":
+        return max(0.0, float(vals.mean() - spec.get("k", 1.5) * vals.std(ddof=1)))
+    return float(spec.get("f", 0.5) * vals.mean())
+
+
+def cohortWindowStats(metricsLong, domains=(DOMAIN_ACTIVITY, DOMAIN_PATIENTS, DOMAIN_AGE, DOMAIN_COVERAGE),
+                      k=1.5, f=0.5, minFormsFloor=DEFAULT_MIN_FORMS_FLOOR):
+    """TUNING AID. Per metric x window over eligible students: n, mean, SD, median, min, and —
+    for BOTH relative modes at the given k / f — the resolved threshold and how many students
+    would fall below it. 'meanStd usable' is False when mean - k*SD <= 0 (the rule can never
+    fire; pick meanFrac or fixed for that metric)."""
+    eligible = getEligibleStudents(metricsLong, minFormsFloor)
+    df = metricsLong[metricsLong["domain"].isin(list(domains)) & metricsLong["studentNumber"].isin(eligible)]
+    rows = []
+    for (domain, metric, window), s in df.groupby(["domain", "metric", "window"], sort=False)["value"]:
+        s = s.astype(float)
+        tStd = resolveThreshold(s, {"mode": "meanStd", "k": k})
+        tFrac = resolveThreshold(s, {"mode": "meanFrac", "f": f})
+        rows.append({"domain": domain, "metric": metric, "window": window, "n": int(s.notna().sum()),
+                     "mean": s.mean(), "sd": s.std(ddof=1), "median": s.median(), "min": s.min(),
+                     f"meanStd(k={k})": tStd, "below meanStd": int((s < tStd).sum()),
+                     "meanStd usable": bool(tStd > 0),
+                     f"meanFrac(f={f})": tFrac, "below meanFrac": int((s < tFrac).sum())})
+    return pd.DataFrame(rows).round(2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. Section-level entrustment & weakness (is the student strong THROUGHOUT?)
+# ═══════════════════════════════════════════════════════════════════════════
+# Attribution is CO-OCCURRENCE: entrustment / weakness are recorded once per form, so a
+# form counts toward EVERY section its item codes belong to (same convention as the
+# "weakness by item code" views). Sections on almost every form (e.g. Diagnostics)
+# therefore track the student's overall figure.
+# Flags are COHORT-RELATIVE PER SECTION + WINDOW, because sections differ in difficulty
+# (everyone scores lower in some) and the whole cohort improves through the year.
+
+DEFAULT_SECTION_MIN_FORMS = 5       # student needs this many rated forms in a cell to be judged
+DEFAULT_SECTION_MIN_STUDENTS = 8    # cell's cohort mean/SD needs this many judged students
+DEFAULT_SECTION_K = 1.0             # LOW  : z <= -k   (weakness: z >= +k)
+DEFAULT_SECTION_WATCH_K = 0.5       # WATCH: z <= -watchK
+
+STATUS_LOW, STATUS_WATCH, STATUS_OK, STATUS_NA = "low", "watch", "ok", "n/a"
+SECTION_STATUS_FILLS = {STATUS_LOW: "FFC7CE", STATUS_WATCH: "FFEB9C", STATUS_OK: "C6EFCE", STATUS_NA: "EDEDED"}
+
+
+def getFormSectionFrame(formDf, itemDf, level="Section"):
+    """One row per form x section (or 'Section / Sub-section' when level='Sub-section'),
+    carrying that form's entrustment + weakness columns. De-duplicated so a form with
+    three Restorative codes counts ONCE for Restorative."""
+    if level == "Sub-section":
+        key = itemDf["Section"].astype(str) + " / " + itemDf["Sub-section"].astype(str)
+    else:
+        key = itemDf["Section"].astype(str)
+    pairs = pd.DataFrame({"assessmentId": itemDf["assessmentId"], "section": key}).drop_duplicates()
+    cols = ["assessmentId", "studentNumber", "studentName", "rotationNum", "submittedByAssessor",
+            "entrustment"] + WEAKNESS_LABELS
+    return pairs.merge(formDf[cols], on="assessmentId", how="inner")
+
+
+def buildSectionPerformanceLong(formDf, itemDf, trajectoryGroups=None, level="Section"):
+    """Per student x section x window: forms, entrustmentN, entrustmentAvg, lowShare (L1-2),
+    weaknessRate (assessor forms with >=1 weakness tag / assessor forms), tagsPerForm,
+    topWeakness (most-tagged category). Windows = Overall + trajectoryGroups."""
+    groups = DEFAULT_TRAJECTORY_GROUPS if trajectoryGroups is None else trajectoryGroups
+    fs = getFormSectionFrame(formDf, itemDf, level)
+    frames = []
+    for window, mask in windowMasks(fs, groups).items():
+        sub = fs[mask]
+        if sub.empty:
+            continue
+        keys = ["studentNumber", "section"]
+        rated = sub[sub["entrustment"].notna()]
+        assessed = sub[sub["submittedByAssessor"]].copy()
+        assessed["_tags"] = assessed[WEAKNESS_LABELS].sum(axis=1)
+        out = pd.DataFrame({"forms": sub.groupby(keys).size()})
+        out["entrustmentN"] = rated.groupby(keys).size()
+        out["entrustmentAvg"] = rated.groupby(keys)["entrustment"].mean()
+        out["lowShare"] = rated.groupby(keys)["entrustment"].apply(lambda s: float((s <= 2).mean()))
+        ga = assessed.groupby(keys)
+        out["assessedForms"] = ga.size()
+        out["weaknessRate"] = ga["_tags"].apply(lambda s: float((s > 0).mean()))
+        out["tagsPerForm"] = ga["_tags"].mean()
+        catSums = ga[WEAKNESS_LABELS].sum()
+        out["topWeakness"] = catSums.idxmax(axis=1).where(catSums.sum(axis=1) > 0)
+        out = out.reset_index()
+        out.insert(2, "window", window)
+        frames.append(out)
+    if not frames:
+        return pd.DataFrame()
+    res = pd.concat(frames, ignore_index=True)
+    nameMap = formDf.drop_duplicates("studentNumber").set_index("studentNumber")["studentName"]
+    res.insert(1, "studentName", res["studentNumber"].map(nameMap))
+    res[["entrustmentN", "assessedForms"]] = res[["entrustmentN", "assessedForms"]].fillna(0).astype(int)
+    return res
+
+
+def flagSectionPerformance(sectionLong, eligibleStudents=None, k=DEFAULT_SECTION_K,
+                           watchK=DEFAULT_SECTION_WATCH_K, minForms=DEFAULT_SECTION_MIN_FORMS,
+                           minStudents=DEFAULT_SECTION_MIN_STUDENTS):
+    """Add cohort-relative z-scores + a status per cell.
+        entZ  = (student entrustmentAvg - cohort mean) / cohort SD   within section+window
+        weakZ = same on weaknessRate
+        entStatus : low (entZ <= -k) | watch (<= -watchK) | ok | n/a
+        weakStatus: low (weakZ >= +k) | watch (>= +watchK) | ok | n/a     ('low' = bad, both)
+    n/a when the student has < minForms in the cell, the cell has < minStudents judged
+    students, the cohort SD is 0, or the section is Unmapped / Miscellaneous.
+    Cohort mean/SD use only eligibleStudents (forms floor) with >= minForms in the cell."""
+    df = sectionLong.copy()
+    nonFlag = df["section"].apply(lambda s: any(n in str(s) for n in NON_FLAG_SECTIONS))
+    inPool = pd.Series(True, index=df.index) if eligibleStudents is None else df["studentNumber"].isin(eligibleStudents)
+
+    def _score(valueCol, nCol, sign):
+        judged = (df[nCol] >= minForms) & df[valueCol].notna() & ~nonFlag
+        pool = df[judged & inPool].groupby(["section", "window"])[valueCol]
+        stats = pd.DataFrame({"mean": pool.mean(), "sd": pool.std(ddof=1), "n": pool.size()})
+        merged = df[["section", "window"]].merge(stats, left_on=["section", "window"], right_index=True, how="left")
+        merged.index = df.index
+        usable = judged & (merged["n"] >= minStudents) & (merged["sd"] > 0)
+        z = ((df[valueCol] - merged["mean"]) / merged["sd"]).where(usable)
+        bad = sign * z                                # >0 means worse than cohort
+        status = pd.Series(STATUS_NA, index=df.index)
+        status[usable] = STATUS_OK
+        status[usable & (bad >= watchK)] = STATUS_WATCH
+        status[usable & (bad >= k)] = STATUS_LOW
+        return merged["mean"], z, status
+
+    df["cohortEntrustmentAvg"], df["entZ"], df["entStatus"] = _score("entrustmentAvg", "entrustmentN", -1)
+    df["cohortWeaknessRate"], df["weakZ"], df["weakStatus"] = _score("weaknessRate", "assessedForms", +1)
+    return df
+
+
+def summariseSectionFlags(sectionFlagged, prefix="Sections"):
+    """One row per student — the columns that go into the Summary:
+        '<prefix> low entrustment'      sections LOW on the Overall window
+        '<prefix> persistently low ent' LOW in every judged group window (>= 2 judged)
+        '<prefix> high weakness' / '<prefix> persistently high weakness'   same for weakness
+        '<prefix> judged'               sections with an Overall verdict
+        'Strong throughout (<prefix>)'  True when NO cell (any window) is LOW on either measure
+                                        and at least one section was judged."""
+    rows = []
+    for sn, g in sectionFlagged.groupby("studentNumber"):
+        overall, grp = g[g["window"] == OVERALL_WINDOW], g[g["window"] != OVERALL_WINDOW]
+        row = {"studentNumber": sn}
+        for col, label in (("entStatus", "low entrustment"), ("weakStatus", "high weakness")):
+            lowOverall = sorted(overall.loc[overall[col] == STATUS_LOW, "section"])
+            judged = grp[grp[col] != STATUS_NA]
+            agg = judged.groupby("section")[col].agg(n="size", low=lambda s: int((s == STATUS_LOW).sum()))
+            persistent = sorted(agg.index[(agg["n"] >= 2) & (agg["low"] == agg["n"])]) if len(agg) else []
+            row[f"{prefix} {label}"] = "; ".join(lowOverall)
+            row[f"{prefix} {label} (n)"] = len(lowOverall)
+            row[f"{prefix} persistently {label}"] = "; ".join(persistent)
+        nJudged = int((overall["entStatus"] != STATUS_NA).sum())
+        anyLow = bool(((g["entStatus"] == STATUS_LOW) | (g["weakStatus"] == STATUS_LOW)).any())
+        row[f"{prefix} judged"] = nJudged
+        row[f"Strong throughout ({prefix})"] = (nJudged > 0) and not anyLow
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def pivotSectionPerformance(sectionFlagged, valueCol="entrustmentAvg", statusCol="entStatus"):
+    """(valuesWide, statusWide): one row per student, columns '<section> | <window>'
+    (Overall first, then each group), sections ordered A-Z. statusWide has the same shape
+    and drives the cell colours."""
+    df = sectionFlagged
+    windowOrder = list(dict.fromkeys(df["window"]))
+    sections = sorted(df["section"].unique(), key=lambda s: (any(n in s for n in NON_FLAG_SECTIONS), s))
+    nameMap = df.drop_duplicates("studentNumber").set_index("studentNumber")["studentName"]
+
+    def _wide(col):
+        w = df.pivot(index="studentNumber", columns=["section", "window"], values=col)
+        cols = [(s, x) for s in sections for x in windowOrder if (s, x) in w.columns]
+        w = w[cols]
+        w.columns = [f"{s} | {x}" for s, x in cols]
+        w = w.reset_index()
+        w.insert(1, "studentName", w["studentNumber"].map(nameMap))
+        return w.sort_values("studentName", key=lambda s: s.astype(str).str.casefold()).reset_index(drop=True)
+
+    return _wide(valueCol), _wide(statusCol).fillna(STATUS_NA)
+
+
+def writeSectionPivotSheet(writer, valuesWide, statusWide, sheetName, title, numberFormat="0.00"):
+    """Colour-coded pivot: red = LOW vs cohort for that section+window, amber = WATCH,
+    green = OK, grey = not enough forms to judge. Row 1 = title/legend, row 2 = headers."""
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.utils import get_column_letter
+    valuesWide.to_excel(writer, sheet_name=sheetName, index=False, startrow=1)
+    ws = writer.sheets[sheetName]
+    ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=12, color="010D44")
+    for i, (status, text) in enumerate(((STATUS_LOW, "Low vs cohort"), (STATUS_WATCH, "Watch"),
+                                        (STATUS_OK, "OK"), (STATUS_NA, "Too few forms"))):
+        c = ws.cell(row=1, column=4 + i, value=text)
+        c.fill = PatternFill("solid", fgColor=SECTION_STATUS_FILLS[status])
+        c.alignment = Alignment(horizontal="center")
+    fills = {s: PatternFill("solid", fgColor=hexCol) for s, hexCol in SECTION_STATUS_FILLS.items()}
+    headerFill, headerFont = PatternFill("solid", fgColor="010D44"), Font(bold=True, color="FFFFFF", size=9)
+    for j, colName in enumerate(valuesWide.columns, start=1):
+        h = ws.cell(row=2, column=j)
+        h.value = str(colName).replace(" | ", "\n")
+        h.fill, h.font = headerFill, headerFont
+        h.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(j)].width = 12 if j == 1 else (26 if j == 2 else 11)
+        if j <= 2:
+            continue
+        statusCol = statusWide[colName]
+        for i in range(len(valuesWide)):
+            cell = ws.cell(row=3 + i, column=j)
+            cell.fill = fills.get(statusCol.iloc[i], fills[STATUS_NA])
+            cell.number_format = numberFormat
+    ws.row_dimensions[2].height = 48
+    ws.freeze_panes = "C3"
+
+
+def buildSectionPerformance(formDf, itemDf, eligibleStudents=None, trajectoryGroups=None, level="Section",
+                            k=DEFAULT_SECTION_K, watchK=DEFAULT_SECTION_WATCH_K,
+                            minForms=DEFAULT_SECTION_MIN_FORMS, minStudents=DEFAULT_SECTION_MIN_STUDENTS):
+    """Long + flagged + per-student summary for one level. Returns (flaggedLong, summaryDf)."""
+    longDf = buildSectionPerformanceLong(formDf, itemDf, trajectoryGroups, level)
+    if longDf.empty:
+        return longDf, pd.DataFrame(columns=["studentNumber"])
+    flagged = flagSectionPerformance(longDf, eligibleStudents, k, watchK, minForms, minStudents)
+    prefix = "Sections" if level == "Section" else "Sub-sections"
+    return flagged, summariseSectionFlags(flagged, prefix)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. Convenience driver (stage 1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def buildFlaggingMetrics(engine, cohort, formsTable="dds4_boh3_forms_v3", rotationGroups=None,
+                         trajectoryGroups=None, excludeStudentNumbers=None,
+                         minFormsFloor=DEFAULT_MIN_FORMS_FLOOR, expectedMinShare=DEFAULT_EXPECTED_MIN_SHARE,
+                         k=1.5, f=0.5, year=2026, outPath=None,
+                         sectionK=DEFAULT_SECTION_K, sectionWatchK=DEFAULT_SECTION_WATCH_K,
+                         sectionMinForms=DEFAULT_SECTION_MIN_FORMS,
+                         sectionMinStudents=DEFAULT_SECTION_MIN_STUDENTS):
+    """Run the whole of stage 1 for one cohort. Returns a dict of DataFrames:
+        formDf, itemDf            raw frames
+        metricsLong               counts windows (rotationGroups)
+        trajectoryLong            entrustment + weakness on trajectoryGroups (for stage 2)
+        metricsWide               one row per student, non-coverage metrics
+        coverageWide              one row per student, Section / Sub-section quantities
+        expectedSections          derived cohort structure
+        windowStats               threshold tuning table
+        insufficient              students under the forms floor
+    outPath: optional .xlsx — dumps the review tables (plain, unstyled) for eyeballing."""
+    formDf = getCohortFormFrame(engine, cohort, formsTable)
+    if formDf.empty:
+        raise LookupError(f"No forms found for cohort '{cohort}' in {formsTable}")
+    itemDf = getCohortItemFrame(engine, cohort, formsTable)
+    if excludeStudentNumbers:
+        drop = {int(s) for s in excludeStudentNumbers}
+        formDf = formDf[~formDf["studentNumber"].isin(drop)]
+        itemDf = itemDf[~itemDf["studentNumber"].isin(drop)]
+
+    metricsLong = buildMetricsLong(formDf, itemDf, rotationGroups, year=year)
+    trajGroups = DEFAULT_TRAJECTORY_GROUPS if trajectoryGroups is None else trajectoryGroups
+    trajectoryLong = buildMetricsLong(formDf, itemDf, trajGroups, year=year, addPbnLeave=False)
+    trajectoryLong = trajectoryLong[trajectoryLong["domain"].isin([DOMAIN_ENTRUSTMENT, DOMAIN_WEAKNESS])
+                                    | (trajectoryLong["metric"] == "Forms assessor-submitted")]
+
+    isCoverageSplit = metricsLong["metric"].str.startswith((SECTION_PREFIX, SUBSECTION_PREFIX))
+    eligible = getEligibleStudents(metricsLong, minFormsFloor)
+    overallForms = metricsLong[(metricsLong["window"] == OVERALL_WINDOW) & (metricsLong["metric"] == "Forms")]
+    result = {
+        "formDf": formDf, "itemDf": itemDf,
+        "metricsLong": metricsLong, "trajectoryLong": trajectoryLong,
+        "metricsWide": pivotMetrics(metricsLong[~isCoverageSplit]),
+        "coverageWide": pivotMetrics(metricsLong[isCoverageSplit]),
+        "trajectoryWide": pivotMetrics(trajectoryLong),
+        "expectedSections": getExpectedSections(metricsLong, expectedMinShare, minFormsFloor),
+        "windowStats": cohortWindowStats(metricsLong, k=k, f=f, minFormsFloor=minFormsFloor),
+        "insufficient": overallForms.loc[~overallForms["studentNumber"].isin(eligible),
+                                         ["studentNumber", "studentName", "value"]].rename(columns={"value": "Forms"}),
+    }
+    # section-level entrustment / weakness (cohort-relative, colour-coded pivots + summary columns)
+    secArgs = dict(eligibleStudents=eligible, trajectoryGroups=trajGroups, k=sectionK, watchK=sectionWatchK,
+                   minForms=sectionMinForms, minStudents=sectionMinStudents)
+    result["sectionPerf"], secSummary = buildSectionPerformance(formDf, itemDf, level="Section", **secArgs)
+    result["subSectionPerf"], subSummary = buildSectionPerformance(formDf, itemDf, level="Sub-section", **secArgs)
+    result["sectionSummary"] = secSummary.merge(subSummary, on="studentNumber", how="outer")
+    result["metricsWide"] = result["metricsWide"].merge(result["sectionSummary"], on="studentNumber", how="left")
+
+    print(f"[{cohort}] {formDf['studentNumber'].nunique()} students, {len(formDf)} forms, "
+          f"{int(formDf['rotationNum'].isna().sum())} forms without a rotation, "
+          f"{len(result['insufficient'])} under the {minFormsFloor}-form floor")
+    if outPath:
+        with pd.ExcelWriter(outPath, engine="openpyxl") as writer:
+            for sheet in ("metricsWide", "trajectoryWide", "coverageWide", "expectedSections",
+                          "windowStats", "insufficient"):
+                result[sheet].to_excel(writer, sheet_name=sheet, index=False)
+            for key, tag in (("sectionPerf", "Sec"), ("subSectionPerf", "SubSec")):
+                perf = result[key]
+                if perf.empty:
+                    continue
+                for valueCol, statusCol, name, title, fmt in (
+                        ("entrustmentAvg", "entStatus", f"{tag} Entrustment",
+                         "Mean entrustment by section x window — colour = vs cohort in the SAME section+window", "0.00"),
+                        ("weaknessRate", "weakStatus", f"{tag} Weakness",
+                         "Share of forms with >=1 weakness tag by section x window — colour = vs cohort", "0%")):
+                    vals, stat = pivotSectionPerformance(perf, valueCol, statusCol)
+                    writeSectionPivotSheet(writer, vals, stat, name, title, fmt)
+                perf.to_excel(writer, sheet_name=f"{tag} detail", index=False)
+        print(f"[{cohort}] review workbook -> {outPath}")
+    return result

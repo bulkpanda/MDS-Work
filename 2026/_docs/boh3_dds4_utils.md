@@ -1,0 +1,2464 @@
+# `boh3_dds4_utils.py`
+
+> The final-year (BOH3 / DDS4) reporting engine: SQL constants and query helpers over the `dds4_boh3_forms_v3` table, cohort and per-student PDF reports, and an openpyxl student workbook/dashboard system.
+
+| | |
+|---|---|
+| **Lines of code** | 4902 † (6842 as of 2026-09-16) |
+| **Top-level functions** | 134 † (181 top-level `def` as of 2026-09-16) |
+| **Classes** | 5 † (8 as of 2026-09-16 — adds `_StudentTocMark`, `_StudentTocDoc`, and one more) |
+| **Module constants** | 64 † (93 as of 2026-09-16) |
+| **Imports from this codebase** | `Utils` (9 names: `createTable`, `addPlotImage`, `getBannerDrawer`, `getmodeArgs`, `readDf`, `runDdl`, `toInt`, `autoFitColumns`, `autopct`), `variableUtils` (whole module) |
+| **Imported by** | No other module in this codebase imports it. `main.ipynb` does `from boh3_dds4_utils import _EntryMarker, _BannerMarker, _BookmarkAnchor` followed by `from boh3_dds4_utils import *` |
+| **Run how** | Imported by `main.ipynb` via `from boh3_dds4_utils import *`. Not a CLI script — no `if __name__ == "__main__"` block. |
+
+*† Counts are from the 2026-08-14 AST snapshot; the parenthetical is the current value after later patches (see §0).*
+
+## 0. Changes since this document was generated
+
+> The AST extraction was last run 2026-08-14. The additions below (all in this file, cohort-generic for BOH3/DDS4) are documented by hand; line numbers elsewhere in this doc still refer to the 2026-08-14 snapshot. Full detail: `_handover_docs/HANDOVER_student_report_weakness_comments_and_toc.md`.
+
+**Added 2026-09-16 — weakness analytics, all-comments, PDF cover/contents + page numbers.**
+
+- **Weakness over time & by item code (queries, §5-area).** `getStudentWeaknessTimeline` (per-form category counts + `Item Codes`), `summariseWeaknessByRotation`, `getStudentWeaknessByCodeRotation` (per code×rotation detail), `aggregateWeaknessByCode(detail, rotationNums, descMap, minWeaknessForms)`, `getStudentWeaknessByItemCode` (wrapper), plus `rotationSortKey`, `rotationNumber`, `weaknessRotationGroups`. Weaknesses = the 7 `assessor_data->'multi-select'->'weakness-*'` buckets; item-code figures are **co-occurrence** (feedback is per-form, not per-procedure).
+- **Weakness PDF (§6-area).** `plotWeaknessOverTime(timelineDf, byRotationDf, uniColor, figWidth)` (by-rotation + per-form stacked panels), `plotWeaknessByItemCodeGroups(groupTables, uniColor, topN)`, `buildStudentWeaknessSection(...)` — wired into `buildStudentPdf` after Procedures. `buildEntrustmentTimeSeriesPdf` now also embeds each student's `plotWeaknessOverTime` panels.
+- **Weakness Excel (§9-area).** New data group `"weakness"` (`STUDENT_DATA_GROUPS`), `_collectWeaknessData`, `_xlStackedWeaknessChart`, `_sheetWeaknessOverTime`, `_sheetWeaknessByItemCode` (+ `_weaknessCodeBlockXl`). New sheets **"Weakness Over Time"**, **"Weakness by Item Code"** added to `DASHBOARD_SHEETS`.
+- **Rotation-split knob.** `WEAKNESS_ROTATION_GROUPS` (None → 1–3 / 4+) + setter `setWeaknessRotationGroups(groups)`; how-many-codes cap `WEAKNESS_CODE_TOPN` (20) + `setWeaknessCodeTopN(n)`. **Use the setters, not bare reassignment** (star-import gotcha). `WEAKNESS_PALETTE` = shared 7-colour palette (PDF+Excel).
+- **All comments.** `getAllStudentComments(...)` unions every `assessor_data.texts.*`, `student_data.texts.*`, and the free-text multi-selects into one table (`Date·Rotation·From·Type·Comment·Item Codes·Supervisor`); label maps `COMMENT_TEXT_LABELS`/`COMMENT_MULTISELECT_LABELS` (title-cased fallback → new fields appear automatically). Data-structure finding: assessor free text moved from `multi-select.weakness-other` (0 from **July 2026**) to `texts.additional_comments` — the old report tables read only `weakness-other`, so comments looked missing.
+  - PDF: `buildStudentCommentsTables` (supervisor + student tables; supervisor filtered to `PDF_SUPERVISOR_COMMENT_TYPES`; long text truncated to `PDF_COMMENT_MAXCHARS`, default 500).
+  - Excel: `_collectCommentData` now uses `getAllStudentComments`; sheet renamed **"All Comments"** (in `DASHBOARD_SHEETS`), full untruncated text.
+- **PDF cover — clickable contents + page numbers.** `class _StudentTocMark`, `class _StudentTocDoc(SimpleDocTemplate)` (afterFlowable → `notify('TOCEntry', …)`), `_makeStudentToc` (2 level styles), `_studentPageDecorators`. `buildStudentPdf` now opens with a two-level clickable `TableOfContents` (section headers + per-table/chart sub-entries incl. the weakness pie, and **separate** supervisor/student comment entries) and prints a page number on every content page via `doc.multiBuild`. New import: `reportlab.platypus.tableofcontents.TableOfContents`.
+- **`LayoutError` fix.** A single over-tall comment row could raise `LayoutError` (a table row can't split across pages by default; `createTable` wraps its `Table` in `KeepTogether`). `_enableRowSplit(flowable)` sets `splitInRow=1`/`repeatRows=1` on the inner table (used for the weakness by-item-code tables); the comment tables instead **truncate** (`PDF_COMMENT_MAXCHARS`). `Utils.py` was **not** modified.
+
+**Registry note (static-analysis blind spot).** The sheet registry `STUDENT_SHEETS` now includes `"Weakness Over Time"`, `"Weakness by Item Code"`, `"All Comments"` (was `"Comments & Incidents"`), dispatched by builder — invisible to the call graph.
+
+## 1. Purpose and role in the pipeline
+
+This module is the largest file in the codebase and covers the whole reporting life-cycle for the two final-year cohorts — **BOH3** (Bachelor of Oral Health, year 3) and **DDS4** (Doctor of Dental Surgery, year 4). Both cohorts fill in the same DASH clinical assessment form during external clinical placements, so they share one pipeline and one table.
+
+**What it consumes.** The upstream `rawforms` table holds one row per assessment with a `forms` JSONB blob straight out of DASH. `getBoh3Dds4FormsV3ProcessSql` returns the DDL plus an upsert that shreds that blob into the flat, typed table `dds4_boh3_forms_v3` (one row per `(assessmentId, form_code)` pair). Every other query function in the module reads that table. Two external Excel workbooks are also read at report time — the PBN (Professional Behaviour Notification) form export and a raw Qualtrics student-leave export — and an item-code→section mapping workbook is read from `variableUtils.itemSectionMappingFile`.
+
+**What it produces.**
+- **Cohort PDF** — `buildCohortSummaryPdf` writes a single A3-ish landscape PDF per cohort with a front-page metric table, item-code frequency charts by age band, one page per clinic with ≥5 patients, additional-concerns and clinical-incident tables, and a patients-per-student table.
+- **Cohort "super" Excel** — the same call optionally writes an 8-sheet `*_Summary_Details.xlsx` (age counts, three entrustment breakdowns, incidents, concerns, item↔section merge, section pivot) and then re-opens it through `formatSummaryExcel` for navy branding and conditional highlights.
+- **Per-student PDF** — `buildCohortStudentReports` loops the cohort and calls `buildStudentPdf` for each, writing `<studentNumber>.pdf`.
+- **Entrustment time-series PDF / HTML** — `buildEntrustmentTimeSeriesPdf` and `buildEntrustmentTimeSeriesHtml` produce a worst-first review document of every student's entrustment trajectory.
+- **Per-student Excel workbooks** — a registry-driven system (`STUDENT_SHEETS` → `buildStudentWorkbook`) that emits either a *dashboard* workbook (KPI tiles + native Excel charts) or a flat *one-row-per-form* export, both from the same queries the PDF uses so the numbers cannot drift apart.
+- **Textual workbook** — `exportStudentTextWorkbook` writes one plain sheet per student with reflections, weakness/strength counts and concerns.
+
+**Vocabulary used throughout.** *Cohort* = `"BOH3"` or `"DDS4"`. *Rotation* = a placement block, stored as `'Rotation 6'` or sometimes the code `'R6'`. *Entrustment* = the assessor's 1–4 judgement of how much supervision the student needed, stored as the scale key `S1`…`S4`. *Practice readiness* = the student's own rating on the same 1–4 scale. *CAF final eval* = the `checklist-caf-final-eval` self-evaluation checklist whose `MC1`…`MC7` items are scored `Done well`=1.0 … `Not done`=0.0. *Commendation* = an entry in `assessor_data->'multi-select'->'strengths'`. *Additional concerns* and *clinical incidents* are the two escalation channels. *PBN* = Professional Behaviour Notification. *Flag* = a student who ever received entrustment Level 1.
+
+**Who calls it.** Only `main.ipynb`. Twenty-two of its functions are notebook entry points; the rest are internal helpers reached through those.
+
+## 2. External dependencies
+
+| Library / resource | What it is used for here |
+|---|---|
+| `pandas` (`pd`) | Every query returns a DataFrame; pivots, merges, `ExcelWriter` output |
+| `numpy` (`np`) | `np.busday_count` for VIC working days, `np.nan` fills, dtype checks in `_xlValue` |
+| `matplotlib.pyplot` (`plt`) | All PDF figures (item-code bars, entrustment time series, weakness pie) |
+| `seaborn` (`sns`) | `Set2` palette for the weakness pie chart only |
+| `matplotlib.dates` (`mdates`) | **Imported but never used** (line 30) |
+| `openpyxl` | `Workbook`, `Font`/`Alignment`/`PatternFill`/`Border`/`Side`, `ColorScaleRule`/`CellIsRule`, `Table`/`TableStyleInfo` (aliased `_XlTable`), `BarChart`/`LineChart`/`DoughnutChart`/`Reference`, `DataLabelList`, `Marker`, `GraphicalProperties`, `LineProperties`, `RichText` and the `drawing.text` paragraph classes |
+| `reportlab` | `SimpleDocTemplate`, `PageBreak`, `Paragraph`, `Spacer`, `Flowable`, `KeepTogether`, `A4`, `inch` |
+| `sqlalchemy` | `text` imported at line 18 but **never used in this module** — SQL strings are handed to `Utils.readDf`, which wraps them |
+| `pathlib.Path` | Output directory creation in the cohort loops and `buildStudentWorkbook` |
+| `re`, `json` | Sheet-name sanitising, illegal-XML-char stripping, JSONB payloads returned as strings |
+| `os`, `collections.defaultdict`, `xml.sax.saxutils.escape` | **Imported but never used** |
+| `itables`, `dtale` | **Imported but never used** (lines 37–38); both are heavy interactive-table packages |
+| `Utils` | `readDf` (all DB reads), `createTable` (reportlab table flowable), `addPlotImage` (matplotlib fig → reportlab image), `getBannerDrawer` (PDF banner callback), `getmodeArgs` (append-vs-write kwargs for `pd.ExcelWriter`), `toInt`, `autopct`. `runDdl` and `autoFitColumns` are imported but not used here (the module defines its own `_autoFitColumns`) |
+| `variableUtils` | `uniColor` (`#010d44` navy), `figSize`, `pageSize`, `subheadingStyleL`, `itemSectionMappingFile` |
+| **Database** | PostgreSQL via a SQLAlchemy `engine` passed in by the caller. Tables read: `rawforms` (source), `dds4_boh3_forms_v3` (default `formsTable`), legacy `dds4_boh3_forms`. All JSON access uses Postgres `jsonb` operators, `jsonb_array_elements`, `jsonb_each` and `LATERAL` joins |
+| **Filesystem** | Reads `variableUtils.itemSectionMappingFile` **at import time**, plus `PBN_FILE` and `LEAVE_FILE` (relative paths) at report time. Writes PDFs, `.xlsx` and `.html` to caller-supplied paths, and two hard-coded relative paths under `BOH3_DDS4/` |
+| **Network** | Only indirectly: the two generated HTML templates load Plotly 2.27.0 from `cdnjs.cloudflare.com` |
+| **Env vars** | None read directly by this module |
+
+## 3. Module-level constants and variables
+
+### 3.1 Clinic and item-code reference data
+
+| Name | Type | Value / shape | Purpose |
+|---|---|---|---|
+| `CLINIC_DICT` (L41) | `dict[str, str]` | 17 entries, clinic code → readable name | Maps the v3 `external_clinic` codes to display names. Default argument of `getClinicCodeStandardizationSql` |
+| `itemSectionDf` (L101) | `pd.DataFrame` | `pd.read_excel(variableUtils.itemSectionMappingFile)` — columns *Item Code*, *Section*, *Sub-section* | **Executed at import time.** Never referenced again anywhere in the module (`buildCohortSummaryPdf` re-reads the same file at L1572) |
+
+```python
+CLINIC_DICT = {
+    "EC01": "Holstep (Banyule)",
+    "EC02": "Cobram District CHC",
+    "EC04": "DTC",
+    ...  # EC03, EC05–EC17
+}
+```
+
+### 3.2 SQL constants
+
+| Name | Type | Value / shape | Purpose |
+|---|---|---|---|
+| `_CREATE_TABLE_SQL` (L106) | `str` | ~40-line DDL | `CREATE TABLE IF NOT EXISTS dds4_boh3_forms` (v2 schema) + 3 indexes. PK `(assessmentId, form_code)` |
+| `_CREATE_TABLE_V3_SQL` (L318) | `str` | ~45-line DDL | v3 schema — adds `assessor_email`, `context_schema_snapshot`, `additional_concerns_occurred` |
+| `_MAIN_SQL` (L2642) | `str` | CTE query | Per-form reflection + "other notes" for one student. **Table name hard-coded** to `dds4_boh3_forms_v3` |
+| `_WEAKNESS_SQL` (L2665) | `str` | CTE query | Weakness value counts for one student, excluding `weakness-other`. Table hard-coded |
+| `_STRENGTH_SQL` (L2678) | `str` | CTE query | Commendation value counts, excluding `key = 'Other'`. Table hard-coded |
+| `_CONCERNS_SQL` (L2689) | `str` | CTE query | Additional concerns + clinical incidents per form. Table hard-coded |
+| `INDIVIDUAL_ENTRY_SQL` (L2762) | `str` | 3-CTE query, param `:assessmentId` | Everything about ONE assessment, flattened. Used directly from the notebook |
+| `INDIVIDUAL_MC_SQL` (L2827) | `str` | query, param `:assessmentId` | The CAF checklist rows for one assessment: MC Code, Full MC Text, MC Rating, MC Score |
+| `STUDENT_ENTRIES_SQL` (L2840) | `str` | 3-CTE query, param `:studentNumber` | Same shape as `INDIVIDUAL_ENTRY_SQL` but for every form of one student, plus the two `submitted_by_*` flags |
+| `STUDENT_MC_SQL` (L2906) | `str` | query, param `:studentNumber` | CAF checklist rows for every form of one student |
+
+### 3.3 HTML templates
+
+| Name | Type | Value / shape | Purpose |
+|---|---|---|---|
+| `_TS_HTML_TEMPLATE` (L2497) | `str` (raw) | ~95-line self-contained HTML page | Cohort entrustment explorer: searchable student sidebar, "only students with ES1 ≥ 1" checkbox, Plotly chart. Placeholders `__TITLE__`, `__DATA__`, `__ORDER__` |
+| `_STUDENT_TS_HTML_TEMPLATE` (L3019) | `str` (raw) | ~45-line HTML page | Single-student chart with a date range-slider and rotation shading. Placeholders `__TITLE__`, `__SUB__`, `__DATA__` |
+
+Both load `plotly.min.js` from `cdnjs.cloudflare.com`.
+
+### 3.4 External workbook paths and the leave/PBN calendar
+
+| Name | Type | Value | Purpose |
+|---|---|---|---|
+| `PBN_FILE` (L1010) | `str` | `"MDS Professional Behaviour Notification Form.xlsx"` | Default `pbnFile` for `getPbnCountByStudent` / `addPbnLeaveColumns`. Relative path — resolved against the notebook's cwd |
+| `LEAVE_FILE` (L1013) | `str` | `"Melbourne Dental School Student Leave Form_July 31, 2026_13.05.xlsx"` | Raw Qualtrics leave export: row 0 = question codes, row 1 = human headers, data from row 2. The export date is baked into the filename |
+| `VIC_HOLIDAYS_2026` (L1017) | `list[str]` | 10 ISO dates | Victorian public holidays for 2026, fed to `np.busday_count` |
+
+```python
+VIC_HOLIDAYS_2026 = [
+    "2026-01-01",  # New Year's Day
+    "2026-03-09",  # Labour Day
+    "2026-11-03",  # Melbourne Cup
+    ...
+]
+```
+
+### 3.5 Summary-workbook formatting palette (`_FMT_*`)
+
+All defined at L1195–L1214 and consumed only by `_fmtSheet` / `_fmtEntrustmentHighlights`.
+
+| Name | Type | Value | Purpose |
+|---|---|---|---|
+| `_FMT_NAVY` | `str` | `"010D44"` | Header fill (matches `variableUtils.uniColor`) |
+| `_FMT_BAND` | `str` | `"EEF1F8"` | Zebra band tint |
+| `_FMT_WHITE` | `str` | `"FFFFFF"` | Header font colour |
+| `_FMT_GRID` | `str` | `"D9D9D9"` | Border grey |
+| `_FMT_SIDE` | `Side` | thin, `_FMT_GRID` | Border edge |
+| `_FMT_BORDER` | `Border` | all four sides `_FMT_SIDE` | Applied to every cell |
+| `_FMT_HEADER_FILL` | `PatternFill` | solid `_FMT_NAVY` | Row 1 fill |
+| `_FMT_BAND_FILL` | `PatternFill` | solid `_FMT_BAND` | Even data rows |
+| `_FMT_HEADER_FONT` | `Font` | Calibri 11 bold white | Row 1 font |
+| `_FMT_DATA_FONT` | `Font` | Calibri 11 | Data rows |
+| `_FMT_INCIDENT_FILL` / `_FMT_INCIDENT_FONT` | `PatternFill` / `Font` | `bgColor="FFC7CE"` red / `9C0006` bold | Conditional flag for incidents and PBNs. **`bgColor` (not `fgColor`) is required** for a differential style to render |
+| `_FMT_CONCERN_FILL` / `_FMT_CONCERN_FONT` | `PatternFill` / `Font` | `bgColor="FFEB9C"` amber / `9C6500` bold | Conditional flag for concerns |
+| `_FMT_TEXT_COLS` | `set[str]` | `{"Clinical Incidents", "Additional Concerns", "Description", "Item Codes"}` | Columns left-aligned and widened to 60 |
+| `_FMT_NUMFMT` | `dict[str, str]` | `{"Entrustment Avg": "0.00"}` | Per-column number formats |
+
+### 3.6 Student-workbook palette and configuration (`XL_*`, section 9)
+
+| Name | Type | Value | Purpose |
+|---|---|---|---|
+| `XL_NAVY` (L3140) | `str` | `"010D44"` | Headers, titles, tab colour |
+| `XL_NAVY_SOFT` (L3141) | `str` | `"2A3A7A"` | Sub-headers, axis titles |
+| `XL_BAND` (L3142) | `str` | `"F4F6FB"` | KPI card fill |
+| `XL_BORDER` (L3143) | `str` | `"D3D9E8"` | Table borders |
+| `XL_ACCENT` (L3144) | `str` | `"E8792B"` | Orange — "class average" / self-rating series |
+| `XL_BLUE` (L3145) | `str` | `"1F77B4"` | Primary series |
+| `XL_MUTED` (L3146) | `str` | `"6B7280"` | Note text, tick labels |
+| `XL_GOOD_FILL` / `XL_WARN_FILL` / `XL_BAD_FILL` (L3147–3149) | `str` | `C8E6C9` / `FFE0B2` / `FFCDD2` | Conditional-format fills |
+| `XL_GOOD_BAND` / `XL_WARN_BAND` / `XL_BAD_BAND` (L3151–3153) | `str` | `2E7D32` / `B26500` / `B3261E` | Darker variants for white text in the grouped header band |
+| `WEAKNESS_KEY_LABELS` (L3156) | `dict[str, str]` | 7 entries | `assessor_data->'multi-select'` key → friendly label. Drives the per-form export columns, `FORM_EXPORT_GROUPS` and `FORM_EXPORT_WIDTHS` |
+| `_EXPORT_FORBIDDEN_COLS` (L3167) | `tuple[str, ...]` | 12 lower-case names | Raw-JSON / internal-id / e-mail columns that must never reach a student workbook. Enforced in `_xlWriteDf` and asserted in `_assertNoRawColumns` |
+| `CAF_RATING_SCORES` (L3173) | `dict[str, float]` | 5 entries | `Done well`=1.0, `Done`=0.8, `Mostly done`=0.6, `Sometimes done`=0.4, `Not done`=0.0 |
+| `_ILLEGAL_XL_CHARS` (L3180) | `re.Pattern` | `[\000-\010\013\014\016-\037]` | Control chars openpyxl refuses to write |
+| `FORM_EXPORT_WRAP_COLS` (L3612) | `tuple[str, ...]` | 8 fixed names + the 7 weakness labels | Free-text columns rendered wrapped and wide on the *My Forms* sheet |
+| `FORM_EXPORT_GROUPS` (L3623) | `list[tuple[str, list[str], str]]` | 8 groups | The merged "super header" band above *My Forms*: label, member columns, fill colour |
+| `FORM_EXPORT_WIDTHS` (L3675) | `dict[str, int]` | ~24 explicit + 7 generated | Column widths for *My Forms* |
+| `STUDENT_DATA_GROUPS` (L4306) | `tuple[str, ...]` | `("forms", "checklist", "summary", "trend", "procedures", "feedback", "comments")` | The seven query groups; a sheet declares which it needs so only those run |
+| `TREND_LABEL_COL` (L4406) | `str` | `"Label"` | Composite hover/axis label column |
+| `TREND_ENT_COL` (L4407) | `str` | `"Entrustment (supervisor)"` | True entrustment value column |
+| `TREND_RD_COL` (L4408) | `str` | `"Practice readiness (self)"` | True readiness value column |
+| `TREND_ENT_PLOT` (L4410) | `str` | `"Supervisor (assessor): entrustment"` | Hidden nudged plotting column; the header text becomes the chart legend |
+| `TREND_RD_PLOT` (L4411) | `str` | `"Me (student): practice readiness"` | Hidden nudged plotting column |
+| `TREND_DIVIDER_COL` (L4412) | `str` | `"Rotation change"` | Hidden hairline-bar column that fakes vertical rotation dividers |
+| `TREND_PLOT_OFFSET` (L4415) | `float` | `0.045` | The two lines are nudged ±this so an exact match doesn't hide one behind the other |
+| `STUDENT_SHEETS` (L4708) | `dict[str, dict]` | 10 entries | The sheet registry — the only place that knows the catalogue |
+| `DASHBOARD_SHEETS` (L4746) | `list[str]` | 9 names | Default tab order for `buildStudentExcelReport` |
+| `FORM_EXPORT_SHEETS` (L4748) | `list[str]` | `["Read Me", "My Forms", "Self-Evaluation", "Ratings by Form"]` | Default tab order for `buildStudentFormExport` |
+
+```python
+WEAKNESS_KEY_LABELS = {
+    "weakness-timeliness": "Time Management",
+    "weakness-communication": "Communication",
+    "weakness-knowledge-clinical-reasoning": "Knowledge & Clinical Reasoning",
+    ...  # 7 total
+}
+
+STUDENT_SHEETS = {
+    "Dashboard": dict(builder=_buildSheetDashboard, needs=("summary", "trend", "forms"),
+                      deferred=True, desc="Landing page: KPI tiles + trend line + ..."),
+    "Summary":   dict(builder=_buildSheetSummary,   needs=("summary",),  desc="..."),
+    ...  # 10 total
+}
+```
+
+## 4. Classes
+
+All five are reportlab `Flowable` subclasses or a `SimpleDocTemplate` subclass; none holds data beyond what its constructor is given.
+
+### `_OutlineBookmark(Flowable)`
+
+*Lines 2418–2431.* Zero-size flowable that registers a clickable PDF outline (bookmark) entry at its position, giving the generated PDF a navigable student sidebar.
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `title` | `str` | Text shown in the PDF outline |
+| `key` | `str` | Named destination key (callers use `f"stu-{studentNumber}"`) |
+| `level` | `int` | Outline nesting level, default `0` |
+| `width`, `height` | `int` | Both forced to `0` so the flowable occupies no space |
+
+| Method | Signature | Description |
+|---|---|---|
+| `__init__` | `(self, title, key, level=0)` | Stores the three fields, zeroes the size |
+| `draw` | `(self)` | Calls `self.canv.bookmarkPage(self.key)` then `self.canv.addOutlineEntry(self.title, self.key, level=self.level, closed=False)` |
+
+Used by `buildEntrustmentTimeSeriesPdf` only.
+
+### `_EntryMarker(Flowable)`
+
+*Lines 2919–2928.* Zero-size sentinel that updates a shared `page_state` dict at draw time, so a later-page banner callback can print the label of whatever entry is on the page.
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `label` | `str` | Text to publish into `page_state["label"]` |
+| `_page_state` | `dict` | The caller's mutable state dict |
+| `width`, `height` | `int` | Both `0` |
+
+| Method | Signature | Description |
+|---|---|---|
+| `__init__` | `(self, label, page_state)` | Stores label and the shared dict |
+| `draw` | `(self)` | Sets `self._page_state["label"] = self.label` |
+
+Imported explicitly by `main.ipynb` (line 2975) but not actually used there — the notebook uses `_BannerMarker` instead.
+
+### `TrackedStudentDoc(SimpleDocTemplate)`
+
+*Lines 2930–2938.* A `SimpleDocTemplate` that updates `page_state` whenever an `_EntryMarker` is placed, using reportlab's `afterFlowable` hook rather than draw time.
+
+| Attribute | Type | Purpose |
+|---|---|---|
+| `_page_state` | `dict` | Shared state dict |
+
+| Method | Signature | Description |
+|---|---|---|
+| `__init__` | `(self, *args, page_state, **kwargs)` | Keyword-only `page_state`; everything else forwarded to `SimpleDocTemplate` |
+| `afterFlowable` | `(self, flowable)` | If the flowable is an `_EntryMarker`, copies its label into `_page_state` |
+
+**Never instantiated anywhere** — in this module or in `main.ipynb`.
+
+### `_BannerMarker(Flowable)`
+
+*Lines 2940–2949.* Identical in behaviour to `_EntryMarker`; the docstring adds the placement rule: **place BEFORE `PageBreak`**, so the state is already correct when the later-page banner callback fires.
+
+| Method | Signature | Description |
+|---|---|---|
+| `__init__` | `(self, label, page_state)` | Stores label and shared dict; zero size |
+| `draw` | `(self)` | Sets `self._page_state["label"] = self.label` |
+
+Used by `main.ipynb` when assembling the per-student "all entries" report.
+
+### `_BookmarkAnchor(Flowable)`
+
+*Lines 2952–2960.* Creates a named PDF destination so a table-of-contents `<link href="#anchor">` resolves. **Place AFTER `PageBreak`** so the bookmark lands on the right page.
+
+| Method | Signature | Description |
+|---|---|---|
+| `__init__` | `(self, anchor)` | Stores the anchor name; zero size |
+| `draw` | `(self)` | Calls `self.canv.bookmarkPage(self.anchor)` |
+
+Used by `main.ipynb` alongside `_BannerMarker`.
+## 5. Function reference
+
+Sections below follow the file's own `# ═══ N. ... ═══` banner comments, in source order.
+
+> **Shared parameter convention.** Most query functions in sections 3, 5 and 9 share the same leading parameters. They are described once here and only *deviations* are tabulated per function.
+>
+> | Name | Type | Default | Description |
+> |---|---|---|---|
+> | `engine` | SQLAlchemy `Engine` | — | Live connection to the Postgres warehouse; passed straight to `Utils.readDf` |
+> | `cohort` | `str` | — | `"BOH3"` or `"DDS4"`; bound as `:cohort` |
+> | `studentNumber` | `int` | — | Student ID; bound as `:studentNumber` |
+> | `formsTable` | `str` | `"dds4_boh3_forms_v3"` | Table name, **interpolated into the SQL via an f-string** (not bound) |
+> | `filters` | `dict \| None` | `None` | Extra equality/`IN` predicates; see `getWhereStatement`. Keys ending `_min`/`_max` are skipped by the WHERE builder but still bound |
+> | `attended` | `bool` | `True` | Bound as `:attended`; selects patients whose `patient_attended` flag matches |
+>
+> Unless stated otherwise, a query function's only **side effect** is a `SELECT` against the database.
+
+### 5.1 Section 1 — Excel/PDF low-level helpers (L60–L99)
+
+#### `_sanitizeSheetName(name)`
+
+*Lines 63–65.* Strips characters Excel forbids in a worksheet title and truncates to 31 chars.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `name` | any | — | Coerced with `str(name or '')` |
+
+**Returns** — `str`, at most 31 characters, or `"Sheet"` if the result would be empty.
+
+**Behaviour** — removes `[ ] : * ? / \` via regex, `.strip()`s, slices `[:31]`.
+
+**Called by** — `buildStudentSheet`.
+
+#### `_autoFitColumns(ws, minWidth=10, maxWidth=60)`
+
+*Lines 68–75.* Sets every column width on a worksheet from the longest rendered cell value.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `ws` | openpyxl `Worksheet` | — | Mutated in place |
+| `minWidth` | `int` | `10` | Lower clamp |
+| `maxWidth` | `int` | `60` | Upper clamp |
+
+**Returns** — `None`.
+
+**Behaviour** — iterates `ws.columns`, takes `max(len(str(value)))` over non-`None` cells, sets `column_dimensions[letter].width = max(minWidth, min(maxWidth, maxLen + 2))`.
+
+**Side effects** — mutates the worksheet. Note this shadows the separately-imported `Utils.autoFitColumns`, which has different defaults (`minWidth=5, maxWidth=30, padding=2`).
+
+**Called by** — `buildStudentSheet`.
+
+#### `_writeTitle(ws, row, title)`
+
+*Lines 78–81.* Writes a bold size-14 title into column A.
+
+**Parameters** — `ws` (worksheet, mutated), `row` (`int`, 1-based), `title` (`str`).
+
+**Returns** — `int`, `row + 2` (one blank row after the title).
+
+**Side effects** — writes a cell.
+
+**Called by** — `buildStudentSheet`.
+
+#### `_writeTable(ws, df, startRow, startCol=1, title=None)`
+
+*Lines 84–99.* Writes a DataFrame as a plain bold-header block with wrapped, top-aligned cells.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `ws` | `Worksheet` | — | Mutated in place |
+| `df` | `pd.DataFrame` | — | Written as-is; no value coercion |
+| `startRow` | `int` | — | First row to write |
+| `startCol` | `int` | `1` | First column |
+| `title` | `str \| None` | `None` | Bold size-12 line above the header row |
+
+**Returns** — `int`, the next free row (`r + 2`, i.e. two blank rows after the block).
+
+**Behaviour** — 1. optional title row; 2. header row of `str(col)` in bold with `wrap_text`; 3. one row per `df.iterrows()`, each cell wrapped and top-aligned.
+
+**Side effects** — mutates the worksheet.
+
+**Called by** — `buildStudentSheet`.
+
+### 5.2 Section 2 / 2b — DDL, upsert and clinic standardisation (L102–L464)
+
+#### `getStandardizationSql(fromNames: list[str], toName: str, tableName: str = "dds4_boh3_forms_v3", colName = "external_clinic")`
+
+*Lines 148–155.* Builds a single `UPDATE … SET col = 'toName' WHERE col IN (…)` statement that collapses a list of spelling variants onto one canonical value.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `fromNames` | `list[str]` | — | Variants to replace |
+| `toName` | `str` | — | Canonical value |
+| `tableName` | `str` | `"dds4_boh3_forms_v3"` | Target table |
+| `colName` | `str` | `"external_clinic"` | Target column — the notebook also passes `'rotation'` |
+
+**Returns** — `str`, one SQL statement (no parameters — every value is inlined).
+
+**Behaviour** — joins `fromNames` into a quoted comma list with an f-string; **no quote escaping is performed**, so a value containing an apostrophe produces invalid SQL.
+
+**Called by** — `main.ipynb` (20 call sites — the highest count of any function in the module).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+rdhmSql = getStandardizationSql(
+    fromNames=['RDHM PC', 'RDHM PC Emergency', 'PC', 'Primary Care RDHM', 'pc'],
+    toName='RDHM PC', tableName=stdTable)
+conn.execute(text(rdhmSql))
+
+rotationSql = getStandardizationSql(fromNames=['R5'], toName='Rotation 5',
+                                    tableName=stdTable, colName='rotation')
+```
+
+#### `getClinicCodeStandardizationSql(clinicDict: dict = None, tableName: str = "dds4_boh3_forms_v3", columns=("external_clinic", "clinic"))`
+
+*Lines 158–192.* Maps raw clinic **codes** (`EC02`) to readable names (`Cobram District CHC`) in both clinic columns at once.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `clinicDict` | `dict \| None` | `None` → `CLINIC_DICT` | code → display name |
+| `tableName` | `str` | `"dds4_boh3_forms_v3"` | Target table |
+| `columns` | `tuple[str, ...]` | `("external_clinic", "clinic")` | Columns to remap |
+
+**Returns** — `str`, one `UPDATE` with an independent `CASE` per column so a column is remapped from its own value; unknown codes fall through `ELSE`. Returns `""` when `clinicDict` is empty.
+
+**Behaviour** — 1. defaults `clinicDict` to `CLINIC_DICT`; 2. builds a quoted code list for the `WHERE`; 3. per column, builds `CASE col WHEN 'EC02' THEN 'Cobram District CHC' … ELSE col END`; 4. `WHERE` is the OR of `col IN (codes)` for each column. Must be run **before** the free-text `getStandardizationSql` updates.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `esc` | `esc(s)` | Doubles single quotes (`'` → `''`) — the quote escaping `getStandardizationSql` lacks |
+
+**Example** (`main_notebook_code.py`)
+
+```python
+clinicCodeSql = getClinicCodeStandardizationSql(clinicDict=CLINIC_DICT, tableName=stdTable)
+if clinicCodeSql:
+    conn.execute(text(clinicCodeSql))
+```
+
+#### `smartTitleCaseClinic(name)`
+
+*Lines 194–223.* Title-cases a clinic name while leaving acronyms intact.
+
+**Parameters** — `name` (any; `None` returns `None`, whitespace-only returns unchanged).
+
+**Returns** — `str | None`.
+
+**Behaviour** — splits on whitespace; a token whose alphabetic characters are **all** uppercase and number ≥2 is kept verbatim (`DTC`, `CHC`, `MDC`, `GV`, `VAHS`, `IPC`, `EACH`); otherwise the first alphabetic char is upper-cased and the rest lower-cased, leaving punctuation and brackets in place. `'gv health (shepparton)'` → `'GV Health (Shepparton)'`.
+
+**Called by** — `main.ipynb`, applied row-by-row over `SELECT DISTINCT external_clinic`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+for orig in distinctClinics:
+    titled = smartTitleCaseClinic(orig)
+    if titled != orig:
+        conn.execute(text(f"UPDATE {stdTable} SET external_clinic = :titled "
+                          "WHERE external_clinic = :orig"),
+                     {"titled": titled, "orig": orig})
+```
+
+#### `getBoh3Dds4FormsProcessSql(replace=False, tableName="dds4_boh3_forms")`
+
+*Lines 226–308.* Returns `(createTableSql, upsertSql)` for the **v2** pipeline.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `replace` | `bool` | `False` | `True` → `ON CONFLICT … DO UPDATE SET` every column; `False` → `DO NOTHING` |
+| `tableName` | `str` | `"dds4_boh3_forms"` | Substituted into `_CREATE_TABLE_SQL` by string replace and into the INSERT |
+
+**Returns** — `tuple[str, str]`.
+
+**Behaviour** — the upsert shreds `rawforms.forms` with a `CROSS JOIN LATERAL` that handles both a JSON **array** and a JSON **object** shape (`jsonb_array_elements` UNION ALL `jsonb_each`), keeps rows where `r.cohort = ANY(:targetCohorts)` and the element has a `form_key`. v2 reads `form_value->>'external_clinic'` and `->>'rotation'` from the top level of the form.
+
+**Called by** — nothing. Superseded by the v3 variant; kept for the legacy table.
+
+#### `getBoh3Dds4FormsV3ProcessSql(replace=False, tableName="dds4_boh3_forms_v3")`
+
+*Lines 365–464.* Returns `(createTableSql, upsertSql)` for the **v3** pipeline — the one actually run.
+
+**Parameters** — as above but defaulting to the v3 table.
+
+**Returns** — `tuple[str, str]`.
+
+**Behaviour** — same LATERAL array/object trick, but the JSON paths move: `form_context->'placement'->>'external_clinic'` (into both `clinic` and `external_clinic`), `form_context->'placement'->>'rotation'`, `form_context->'patients'` (into `patient_data`). New columns: `assessor_email`, `context_schema_snapshot`, and `additional_concerns_occurred` derived from `assessor_data->'radio'->>'additional-concerns-occurred'` (`'yes'`→`true`, `'no'`→`false`, else `NULL`). `additional_concerns` now comes from `assessor_data->'texts'->>'additional-concerns'`. Column names deliberately match v2 so downstream reporting is unchanged. The `replace=True` branch also refreshes `insertedAt = now()`.
+
+**Magic constant** — the WHERE clause hard-codes `AND r.datetimeUtc >= TIMESTAMPTZ '2026-01-01'` (line 461).
+
+**Called by** — `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+def processDds4BohForms():
+    with engine.begin() as conn:
+        createTableSql, upsertSql = getBoh3Dds4FormsV3ProcessSql(replaceExisting)
+        runDdl(conn, createTableSql)
+        conn.execute(text(upsertSql), {"targetCohorts": targetCohorts})
+```
+
+### 5.3 Section 3 — Cohort-level query functions (L467–L1002)
+
+#### `getWhereStatement(cohort, filters: dict = None)`
+
+*Lines 471–484.* Builds a `WHERE` fragment and its params dict from a cohort plus optional filters.
+
+**Parameters** — `cohort` (`str`), `filters` (`dict | None`).
+
+**Returns** — `tuple[str, dict]` — e.g. `("cohort = :cohort AND rotation = :rotation", {...})`.
+
+**Behaviour** — always starts with `cohort = :cohort`. Per filter key: a `list` value emits `key IN :key`; a key ending `_min`/`_max` is **skipped** in the clause (callers such as `getTopItemCodes` build their own comparison) but still lands in `params` via `params.update(filters)`; anything else emits `key = :key`.
+
+**Called by** — `_where`.
+
+> This function and `_where` are **byte-identical duplicates** of `Utils.getWhereStatement` / `Utils._where` (Utils.py L605–L624).
+
+#### `_where(cohort, filters)`
+
+*Lines 487–491.* Shorthand wrapper.
+
+**Returns** — `tuple[str, dict]`. Delegates to `getWhereStatement` when `filters` is truthy, otherwise returns the bare `("cohort = :cohort", {"cohort": cohort})` pair.
+
+**Called by** — 20 query functions (every one that accepts `filters`).
+
+#### `getFullDf(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 494–497.* `SELECT *` from the forms table for a cohort. **Returns** the raw DataFrame including all JSONB blobs. **Called by** — nothing in this module or the notebook.
+
+#### `getTotalForms(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 500–503.* One-row DataFrame with `totalforms` (`COUNT(*)::bigint`). **Called by** — `getFrontPageSummaryTable`.
+
+#### `getAgeCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 506–521.* Patient age-band counts for the cohort.
+
+**Returns** — one-row DataFrame: `age0to6`, `age7to17`, `age18plus`.
+
+**Behaviour** — unnests `patient_data` with a `jsonb_typeof(...)='array'` guard (non-array payloads become `'[]'`), keeps only `patient_attended = true`, then three `COUNT(*) FILTER` expressions over `NULLIF(pd->>'patient_age','')::int`.
+
+**Called by** — `getFrontPageSummaryTable`.
+
+#### `getAgeCountsBatch(engine, cohort, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 524–544.* One query for **all** students, replacing an N+1 loop.
+
+**Returns** — DataFrame `student_number, student_name, age0to6, age7to17, age18plus`, ordered by name.
+
+**Behaviour** — same unnest and attended filter, grouped by `(student_number, student_name)` with `student_name IS NOT NULL`. Note it takes no `filters`.
+
+**Called by** — `buildCohortSummaryPdf`.
+
+#### `getAgeList(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None, paramsAdd=None)`
+
+*Lines 547–558.* Flat list of every numeric patient age.
+
+**Parameters** — extra: `paramsAdd` (`dict | None`) merged into the bound params before executing.
+
+**Returns** — DataFrame with a single `age` column; the SQL guards with `~ '^\d+$'`.
+
+**Called by** — nothing.
+
+#### `getAvgAge(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 561–576.* Mean patient age, rounded to 2 dp.
+
+**Returns** — one-row DataFrame with `avgage`.
+
+**Behaviour** — only counts ages matching `^\s*\d+\s*$` **and** between 0 and 120; everything else is `NULL`. Unlike `getAgeCounts` it does **not** filter on `patient_attended`.
+
+**Called by** — `getFrontPageSummaryTable`.
+
+#### `getPatientsPerStudentStats(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None)`
+
+*Lines 579–598.* Cohort-level avg/min/max of patients per student.
+
+**Returns** — one-row DataFrame `avgpatientsperstudent, minpatientsperstudent, maxpatientsperstudent` from a `perStudent` CTE.
+
+**Called by** — `getFrontPageSummaryTable`.
+
+#### `getPatientPerStudent(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None)`
+
+*Lines 601–621.* Patient count per student, descending.
+
+**Returns** — DataFrame `student_name, patients`.
+
+**Behaviour** — uses a `LEFT JOIN LATERAL … ON TRUE` (not `CROSS JOIN`) so students with **zero** matching patients still appear with `COUNT(pd) = 0`.
+
+**Called by** — `main.ipynb` (4 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+patientperstudentBOH3 = getPatientPerStudent(engine, "BOH3").merge(
+    getPatientPerStudent(engine, "BOH3", attended=False),
+    how='left', on='student_name', suffixes=('_attended', '_fta'))
+```
+
+#### `getClinicForStudent(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 624–632.* One row per form: `student_name`, `clinic` (blank/`NULL` → `'(unknown)'`), ordered by name then most-recent form. **Called by** — nothing.
+
+#### `getClinicPatientCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None)`
+
+*Lines 635–649.* Patients per clinic, descending.
+
+**Returns** — DataFrame `clinic, patients`; empty/`NULL` clinic becomes `'(unknown)'`.
+
+**Called by** — `getFrontPageSummaryTable`, `buildCohortSummaryPdf` (which uses it to decide which clinics get their own page).
+
+#### `getSubmittedCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 652–661.* Two `COUNT(*) FILTER` totals. **Returns** — one-row DataFrame; because Postgres lower-cases unquoted aliases, the columns come back as `submitted_by_student` / `submitted_by_assessor`. **Called by** — `getFrontPageSummaryTable`.
+
+#### `getTopItemCodes(engine, cohort, formsTable="dds4_boh3_forms_v3", limit=5, filters=None)`
+
+*Lines 664–685.* Most-frequent MBS-style item codes across the cohort.
+
+**Parameters** — extra: `limit` (`int`, default `5`), coerced with `int()` and bound as `:limit`.
+
+**Returns** — DataFrame `itemcode, freq`, ordered by frequency then code.
+
+**Behaviour** — double unnest (`patient_data` → `item_codes`), summing `COALESCE(NULLIF(ic->>'quantity','')::int, 1)` so a missing quantity counts as 1. If `filters` contains `age_min` / `age_max`, an extra `AND NULLIF(pd->>'patient_age','')::int >= / <= …` clause is appended — this is the special handling `getWhereStatement` defers to callers.
+
+**Called by** — `getFrontPageSummaryTable` (limit 5), `buildFrontPage` (limit 25), `buildCohortSummaryPdf` (limit 20 per age band).
+
+#### `getItemCodeDescriptionMap(engine, cohort, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 688–726.* Recovers item-code descriptions from a form's `context_schema_snapshot`.
+
+**Returns** — `dict[str, str]` mapping stripped code → description; `{}` if no snapshot exists.
+
+**Behaviour** — 1. reads the single most recent non-null `context_schema_snapshot` for the cohort; 2. `json.loads` it if it came back as a string; 3. walks the field tree, harvesting every `item_code_picker` field (or one whose `key == "item_codes"`) and flattening each category array in its `options`. v3 `item_codes` rows carry only `{code, quantity}`, so this is the only source of descriptions.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `harvest` | `harvest(field)` | Recursive: adds `code → description` for picker fields, then recurses into `field["fields"]` |
+
+**Called by** — `getItemCodesPerStudentBatch`, `getStudentTopItemCodes`.
+
+#### `getItemCodesPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 729–755.* All item codes for all students in one query.
+
+**Returns** — DataFrame `Student ID, Student Name, Item Code, Description, Total Qty` (note the quoted, title-case aliases). `Description` is inserted at position 3 in pandas, mapped through `getItemCodeDescriptionMap`.
+
+**Behaviour** — attended-only, grouped by student and code, ordered by name then quantity descending.
+
+**Called by** — `buildCohortSummaryPdf`.
+
+#### `getCafFinalEvalScoreStudent(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 758–783.* Cohort average of the student self-evaluation checklist.
+
+**Returns** — DataFrame `cohort, avgstudentchecklistscore` (numeric(6,4)), or empty if no scored items.
+
+**Behaviour** — unnests `student_data->'checklists'->'checklist-caf-final-eval'` with `jsonb_each`, then scores each answer via `CASE COALESCE(kv.value->>'value', kv.value#>>'{}')`. **The `COALESCE` is the v2/v3 compatibility shim**: v3 stores each checklist value as an object `{"key":"O1","value":"Done well"}`, v2 stored a bare string.
+
+**Called by** — `getFrontPageSummaryTable`.
+
+#### `getAdditionalConcerns(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 786–800.* Every form with a non-blank `additional_concerns`.
+
+**Returns** — DataFrame with presentation column names: `Cohort, Student Name, Student ID, Rotation, Date, Assessor Name, Additional Concerns`. `Date` is post-processed to `datetime.date` in pandas.
+
+**Called by** — `_collectCommentData`; `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+dds4concerns = getAdditionalConcerns(engine, "DDS4")
+boh3concerns = getAdditionalConcerns(engine, "BOH3")
+```
+
+#### `getClinicalIncidentSummary(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None, extractValue='clinical-incident', colName='Clinical Incidents')`
+
+*Lines 803–831.* Generic extractor for any `assessor_data->'multi-select'` array — despite the name it is reused for `weakness-other`.
+
+**Parameters** — extra:
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `extractValue` | `str` | `'clinical-incident'` | The multi-select key to unnest. **Interpolated directly into the SQL** |
+| `colName` | `str` | `'Clinical Incidents'` | Output column name. Also interpolated |
+
+**Returns** — DataFrame `Cohort, Date, Assessor Name, Student Name, Student ID, Rotation, Item Codes, <colName>`, one row per (form-day, assessor, student), with values `STRING_AGG`-ed by `'; '`.
+
+**Behaviour** — `LEFT JOIN LATERAL` over the selected multi-select array plus a second lateral that aggregates distinct item codes for the form; `WHERE … AND ci IS NOT NULL` turns the outer join into an effective inner one. `Date` is converted to `datetime.date` afterwards.
+
+**Called by** — `buildStudentVsAssessorSection` (twice: incidents and `weakness-other`), `_collectCommentData` (twice); `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+dds4incidents = getClinicalIncidentSummary(engine, "DDS4")
+```
+
+#### `getPatientCountPerRow(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None)`
+
+*Lines 834–850.* Patient count per **form row**.
+
+**Returns** — DataFrame `assessmentid, form_code, student_name, external_clinic, rotation, patients`.
+
+**Behaviour** — `LEFT JOIN LATERAL` so forms with no attended patients still appear with `patients = 0`. `GROUP BY assessmentid, form_code, student_name` relies on `(assessmentid, form_code)` being the primary key for the other selected columns to be functionally dependent.
+
+**Called by** — `createPatientStatsPerClinic`; `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+for cohort in targetCohorts:
+    countsDf = getPatientCountPerRow(engine, cohort)
+    print(f"{cohort} avg patients per row: {countsDf['patients'].mean():.2f}")
+```
+
+#### `getEntrustmentSummary(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 853–867.* Count of forms at each entrustment level.
+
+**Returns** — DataFrame `entrustment` (smallint 1–4), `cnt`. `S1`…`S4` are mapped to 1…4 via `CASE`; forms without one of those four keys are excluded.
+
+**Called by** — `getFrontPageSummaryTable`.
+
+#### `getAvgEntrustment(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 870–881.* One-row DataFrame `avgentrustment`, `AVG` of the 1–4 mapping rounded to 2 dp. Unlike `getEntrustmentSummary` there is no `WHERE` on the scale key — non-`S*` rows contribute `NULL`. **Called by** — `getFrontPageSummaryTable`.
+
+#### `getEntrustmentPerStudentBatch(engine, cohort, formsTable="dds4_boh3_forms_v3", rotationRange=None)`
+
+*Lines 884–939.* The wide per-student entrustment + weakness + flag breakdown that becomes the *Entrustment* sheets of the cohort workbook.
+
+**Parameters** — extra: `rotationRange` (`tuple[int, int] | None`) — inclusive `(lo, hi)` rotation numbers, bound as `:rotLo` / `:rotHi`.
+
+**Returns** — DataFrame with columns `Student ID`, `Student Name`, `Entrustment Lvl 1`…`Lvl 4`, `Entrustment Avg`, eight `Weakness *` counts, `Commendations`, `Total Forms`, `Clinical Incidents`, `Additional Concerns`.
+
+**Behaviour** — 1. a `base` CTE maps the entrustment key to 1–4, keeps `assessor_data->'multi-select'` as `multi` and trims `additional_concerns`; 2. the rotation filter parses the number out of `rotation` with `regexp_replace(…, '[^0-9]', '', 'g')`, so it works with both `'Rotation 6'` and `'R6'`; 3. weakness counts are `SUM(jsonb_array_length(...))` per key, commendations from `strengths`; 4. `Clinical Incidents` counts *forms* with ≥1 incident (not incidents); 5. `Additional Concerns` counts forms with non-blank text. A commented-out `AND submitted_by_assessor` sits at line 907 — the query deliberately counts **all** forms, submitted or not.
+
+**Called by** — `buildCohortSummaryPdf` (three times: all rotations, R1–3, R4–6).
+
+#### `getNotSubmitted(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 942–952.* Forms missing either signature: `WHERE NOT submitted_by_student OR NOT submitted_by_assessor`. **Returns** — DataFrame with ids, names, date, both flags, clinic and rotation. **Called by** — nothing.
+
+#### `createPatientStatsPerClinic(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True, filters=None)`
+
+*Lines 955–973.* Aggregates `getPatientCountPerRow` into per-clinic patient statistics.
+
+**Returns** — `tuple[pd.DataFrame, pd.DataFrame]`:
+- `clinicStats[["external_clinic", "patientsSummary"]]` where `patientsSummary` is the string `"avg (min-max)"`;
+- `studentClinicDf` — `external_clinic, student_name, totalPatients`.
+
+**Behaviour** — groups rows to (clinic, student) totals, then per clinic takes `mean`/`min`/`max`; the mean is cast to `int` (truncating) before string-formatting.
+
+**Calls** — `boh3_dds4_utils:getPatientCountPerRow`.
+
+**Called by** — `createPatientStatsPerClinicPerRotation`.
+
+#### `createPatientStatsPerClinicPerRotation(engine, cohort, formsTable="dds4_boh3_forms_v3", attended=True)`
+
+*Lines 976–989.* Writes two multi-sheet Excel files — one sheet per rotation.
+
+**Returns** — `None`.
+
+**Behaviour** — loops the **hard-coded** list `["Rotation 1" … "Rotation 5"]`; for each, calls `Utils.getmodeArgs(filepath)` (which decides `mode='w'` vs `mode='a'` + `if_sheet_exists`) and writes the two DataFrames from `createPatientStatsPerClinic` to a sheet named after the rotation.
+
+**Side effects** — writes `BOH3_DDS4/patient_stats_by_clinic_{cohort}.xlsx` and `BOH3_DDS4/patient_stats_by_clinic_{cohort}_detailed.xlsx`. Both paths are hard-coded relative paths; the `BOH3_DDS4/` directory must already exist.
+
+**Calls** — `Utils:getmodeArgs`, `boh3_dds4_utils:createPatientStatsPerClinic`.
+
+**Called by** — `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+createPatientStatsPerClinicPerRotation(engine, "DDS4")
+createPatientStatsPerClinicPerRotation(engine, "BOH3")
+```
+
+#### `getCounts(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 992–1002.* Total forms plus both submission counts in one row.
+
+**Returns** — one-row DataFrame `totalforms`, `Submitted By Student`, `Submitted By Assessor` (the last two are quoted aliases, so they keep their casing).
+
+**Called by** — `getStudentSummaryTable` (with `filters={"student_number": studentNumber}`).
+### 5.4 Section 3a — PBN and leave columns from external workbooks (L1006–L1187)
+
+These seven functions are the only ones in the module that read data from outside the database.
+
+#### `_normName(x)`
+
+*Lines 1031–1032.* Normalises a person's name for fuzzy matching: collapses internal whitespace, strips, lower-cases. Returns `""` for `NaN`/`None`.
+
+**Called by** — `getPbnCountByStudent`.
+
+#### `_parseLeaveDate(v)`
+
+*Lines 1035–1063.* Parses one leave-date cell out of the raw Qualtrics export.
+
+**Parameters** — `v` (any cell value).
+
+**Returns** — `pd.Timestamp | None`.
+
+**Behaviour** — 1. `None`/`NaN` → `None`; 2. a genuine `datetime`/`Timestamp`/`date` is trusted and normalised; 3. otherwise the string is searched for a `d/m/y`-shaped substring so `"(02/04/2026)"` still parses; 4. a bare 8-digit string is treated as a `ddmmyyyy` typo (`20052026`); 5. the extracted substring is tried against `%d/%m/%Y`, `%d/%m/%y`, `%Y-%m-%d`, `%d-%m-%Y`, `%d.%m.%Y` in order, falling back to `pd.to_datetime(..., dayfirst=True)`; 6. anything else (`"test"`, blanks) returns `None`. `datetime`/`date` are imported **inside** the function body.
+
+**Called by** — `leaveWorkingDays`.
+
+#### `_vicBusinessDays(a, b, year=2026, holidays=None)`
+
+*Lines 1066–1073.* Inclusive Victorian working days between two timestamps, clamped to a calendar year.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `a`, `b` | `pd.Timestamp` | — | Range start/end (inclusive) |
+| `year` | `int` | `2026` | Range is clamped to `[year-01-01, year-12-31]` |
+| `holidays` | `list[str] \| None` | `None` → `VIC_HOLIDAYS_2026` | Passed to `np.busday_count` |
+
+**Returns** — `int`; `0` when the clamped range is empty. The end date is bumped by one day because `np.busday_count` is end-exclusive.
+
+**Called by** — `leaveWorkingDays`.
+
+#### `leaveWorkingDays(planned, start, end, year=2026)`
+
+*Lines 1076–1103.* Category-guided working-day count for one leave row.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `planned` | `str` | — | The Qualtrics "how many days" answer |
+| `start`, `end` | any | — | Raw cells, parsed by `_parseLeaveDate` |
+| `year` | `int` | `2026` | Clamp year |
+
+**Returns** — `int` working days.
+
+**Behaviour** — 1. `'Hours …'` or `'half day'` → `0` (partial days don't count); 2. `'1 day'` → the working-day count of the start date alone, so a weekend/holiday start yields `0`; 3. missing start or end falls back to the single date that exists; 4. a **year-typo guard** rewrites an end date whose year isn't `year` when the start year is (and vice versa); 5. a reversed range is swapped; 6. everything else (`'2 or more days'`, `'Other'`) is the inclusive working-day span.
+
+**Calls** — `_parseLeaveDate`, `_vicBusinessDays`.
+
+**Called by** — `getLeaveDaysByStudent`.
+
+#### `getLeaveDaysByStudent(ids, year=2026, leaveFile=LEAVE_FILE)`
+
+*Lines 1106–1144.* Total working days of leave per student for the given IDs.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `ids` | iterable of int-able | — | Converted to `set(int(i) ...)` |
+| `year` | `int` | `2026` | Forwarded to `leaveWorkingDays` |
+| `leaveFile` | `str` | `LEAVE_FILE` | Excel path, read with `header=1` (headers on the 2nd row) |
+
+**Returns** — `dict[int, int]` student ID → days; `{}` if nothing matches.
+
+**Behaviour** — 1. `pd.read_excel(leaveFile, sheet_name=0, header=1)`; 2. columns are located by **predicate search**, not fixed position: exact `"Student ID"`, prefix `"Absence Start Date"` / `"Absence End Date"`, a column containing both `"How many days"` and `"Selected Choice"`, plus `"Finished"` and `"Response Type"`; 3. keeps only `Finished == "true"` and drops `"Survey Preview"` responses; 4. digits are pulled out of the student-ID cell; 5. `.apply` per row through `leaveWorkingDays`; 6. groups and sums.
+
+**Side effects** — reads an Excel file from disk.
+
+**Calls** — `leaveWorkingDays`.
+
+**Called by** — `addPbnLeaveColumns`.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `_find` | `_find(pred)` | Returns the first column whose `str(name)` satisfies `pred`, else `None` |
+| `_digits` | `_digits(x)` | Strips non-digits and returns `int`, or `None` when empty |
+
+#### `getPbnCountByStudent(rosterDf, year=2026, pbnFile=PBN_FILE)`
+
+*Lines 1147–1167.* Number of Professional Behaviour Notifications per student in a year.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `rosterDf` | `pd.DataFrame` | — | Must have `Student ID` and `Student Name` columns |
+| `year` | `int` | `2026` | Filter on `Date of incident` |
+| `pbnFile` | `str` | `PBN_FILE` | Read from `sheet_name="Sheet1"` |
+
+**Returns** — `dict[int, int]` student ID → PBN count.
+
+**Behaviour** — builds `id→name` and `normalised-name→id` maps from the roster, then resolves each PBN row by `Student ID (if known)` **falling back to a normalised name match** (many PBN rows have no ID). Rows are kept when the incident year matches `year` **or the date is unparseable** (`yr.isna()`).
+
+**Side effects** — reads an Excel file.
+
+**Calls** — `_normName`.
+
+**Called by** — `addPbnLeaveColumns`.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `_digits` | `_digits(x)` | Same digit-extraction helper as in `getLeaveDaysByStudent` (duplicated, not shared) |
+
+#### `addPbnLeaveColumns(entrustmentDf, year=2026, pbnFile=PBN_FILE, leaveFile=LEAVE_FILE)`
+
+*Lines 1170–1187.* Appends `PBNs {year}` and `Leave Days {year}` to an entrustment DataFrame.
+
+**Parameters** — `entrustmentDf` (must have `Student ID`, `Student Name`), plus the year and the two file paths.
+
+**Returns** — the **same** DataFrame object with two new trailing int columns.
+
+**Behaviour** — each external read is wrapped in `try/except Exception`; on failure it prints `[addPbnLeaveColumns] PBN read failed (…); filling 0` and substitutes an empty map, so a missing workbook silently produces all-zero columns.
+
+**Side effects** — **mutates `entrustmentDf` in place**; prints on failure; reads two Excel files.
+
+**Calls** — `getPbnCountByStudent`, `getLeaveDaysByStudent`.
+
+**Called by** — `buildCohortSummaryPdf` (with `year=2026`).
+
+### 5.5 Section 3b — Summary workbook professional formatting (L1190–L1323)
+
+#### `_fmtColWidth(header, values, isText)`
+
+*Lines 1217–1221.* Returns `60` for free-text columns, otherwise `max(9, min(28, longestValue + 2))`.
+
+**Called by** — `_fmtSheet`.
+
+#### `_fmtSheet(ws)`
+
+*Lines 1224–1259.* Foundational styling for one worksheet of the cohort summary workbook.
+
+**Returns** — `None` (returns early if the sheet is empty).
+
+**Behaviour** — 1. freezes at `C2` when both `Student ID` and `Student Name` are present, else `A2`; 2. row 1 height 30, navy fill, white bold Calibri, centred and wrapped, bordered; 3. data rows get zebra banding on even row numbers, borders, `_FMT_DATA_FONT`, left alignment for columns matching `_FMT_TEXT_COLS` and centred otherwise, and a number format from `_FMT_NUMFMT`; 4. column widths are computed from the **first 59 data rows only** (`range(1, min(len(rows), 60))`).
+
+**Side effects** — mutates the worksheet.
+
+**Calls** — `_fmtColWidth`.
+
+**Called by** — `formatSummaryExcel`.
+
+#### `_fmtEntrustmentHighlights(ws)`
+
+*Lines 1262–1296.* Conditional formatting for sheets whose title starts with `Entrustment`.
+
+**Behaviour** — 1. `Entrustment Avg` gets a 3-colour scale red(1) → amber(2.5) → green(4); 2. `Clinical Incidents`, **`PBNs 2026`** and `Additional Concerns` get a `CellIsRule` "greater than 0" fill (red / red / amber) — note the PBN column name is hard-coded with the year; 3. every header starting with `Weakness` **except** `Weakness Other` gets a white→`F4B183` orange heatmap scale.
+
+**Side effects** — mutates the worksheet.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `colOf` | `colOf(name)` | Column letter for a header name, or `None` when absent |
+
+**Called by** — `formatSummaryExcel`.
+
+#### `formatSummaryExcel(path, cohort, sheetOrder=None)`
+
+*Lines 1299–1323.* Re-opens an already-written `*_Summary_Details.xlsx` and applies branding, conditional highlights and sheet ordering.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `path` | `str` | — | Workbook to re-open and overwrite |
+| `cohort` | `str` | — | Used to build the default sheet-name list |
+| `sheetOrder` | `list[str] \| None` | `None` | Explicit tab order; the default is the 8 cohort sheet names |
+
+**Returns** — `path`.
+
+**Behaviour** — 1. `import openpyxl` **inside the function**; 2. default `sheetOrder` is `[f"Age Counts {cohort}", f"Entrustment {cohort}", f"Entrustment R1-3 {cohort}", f"Entrustment R4-6 {cohort}", f"Incidents {cohort}", f"Concerns {cohort}", f"Merged Item-Section {cohort}", f"Section Pivot {cohort}"]`; 3. reorders by assigning to the **private** `wb._sheets` list — listed sheets first, everything else after; 4. `_fmtSheet` on every sheet, `_fmtEntrustmentHighlights` on titles starting with `Entrustment`; 5. saves in place.
+
+**Side effects** — reads and overwrites the workbook at `path`.
+
+**Calls** — `_fmtSheet`, `_fmtEntrustmentHighlights`.
+
+**Called by** — `buildCohortSummaryPdf`.
+
+### 5.6 Section 4 — Cohort summary report, PDF (L1326–L1643)
+
+#### `getFrontPageSummaryTable(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None)`
+
+*Lines 1330–1379.* Runs nine cohort queries and folds them into a single-row DataFrame of display strings.
+
+**Returns** — a 1×11 `pd.DataFrame` whose columns are the metric labels: *Total forms, Submitted by students, Submitted by assessors, Patient age distribution, Average patient age, Patients per student (avg/min/max), Clinic patient counts, Top item codes, Avg CAF final eval score (student), Entrustment levels, Avg Entrustment*.
+
+**Behaviour** — 1. calls `getTotalForms`, `getAgeCounts`, `getAvgAge`, `getPatientsPerStudentStats`, `getClinicPatientCounts`, `getSubmittedCounts`, `getTopItemCodes(limit=5)`, `getCafFinalEvalScoreStudent`, `getEntrustmentSummary`, and finally `getAvgEntrustment` inline in the dict literal; 2. multi-line values are joined with the literal `"<br/>"` because reportlab paragraphs render that as a line break — `_cleanHtmlBreaks` and `_xlValue` later undo it for Excel; 3. `avgAge` and the CAF score fall back to the string `"NA"` when their frames are empty; 4. `avgPts`/`minPts`/`maxPts` are cast with bare `int()` — an all-empty cohort would raise.
+
+**Calls** — the ten query functions above.
+
+**Called by** — `buildFrontPage`.
+
+#### `plotItemCodeFrequencies(itemCodesDf, ax, uniColor=None)`
+
+*Lines 1382–1392.* Draws a labelled item-code frequency bar chart onto an existing axis.
+
+**Parameters** — `itemCodesDf` (needs `itemcode` and `freq`), `ax` (matplotlib axis, mutated), `uniColor` (`None` → `variableUtils.uniColor`).
+
+**Returns** — `None`.
+
+**Behaviour** — bars, title *"Top Item Codes"*, y-limit at `freq.max() * 1.2`, x-labels rotated 90°, and a value label above each bar at font size 6. Uses the deprecated `ax.set_xticklabels(...)` without a matching `set_xticks`.
+
+**Called by** — `buildFrontPage`, `buildCohortSummaryPdf`.
+
+#### `buildFrontPage(engine, cohort, filters, elements, subheadingColor, subheadingStyle, tableTextStyleSmall, uniColor, figSize)`
+
+*Lines 1395–1415.* Appends the metric table and the top-25 item-code chart for one filter slice to a reportlab element list.
+
+**Parameters** — all positional; `elements` is the reportlab flowable list (mutated), the remaining four are style objects from `variableUtils`.
+
+**Returns** — `metrics`, the transposed two-column (`Metric`, `Value`) DataFrame, so the caller can collect per-clinic metrics.
+
+**Behaviour** — 1. `getFrontPageSummaryTable(...).transpose().reset_index()` renamed to `["Metric", "Value"]`; 2. `Utils.createTable` with `colRatio=[2, 1]`; 3. a `figSize[1] / 4`-tall figure at dpi 200 of `getTopItemCodes(limit=25)`; 4. `plt.close(fig)` is called **before** `Utils.addPlotImage(fig, 0.9)` — this works because reportlab renders from the figure object, not the pyplot state; 5. appends a 24pt spacer then the image.
+
+**Side effects** — mutates `elements`; creates and closes a matplotlib figure.
+
+**Calls** — `getFrontPageSummaryTable`, `getTopItemCodes`, `plotItemCodeFrequencies`, `Utils:createTable`, `Utils:addPlotImage`.
+
+**Called by** — `buildCohortSummaryPdf` (once for the cohort, then once per qualifying clinic).
+
+#### `getRotationRange(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None, minForms=20)`
+
+*Lines 1418–1451.* Determines the `(min, max)` rotation numbers a cohort has actually completed.
+
+**Parameters** — extra: `minForms` (`int`, default `20`) — the evidence threshold for the maximum.
+
+**Returns** — `tuple[int, int]`, or `(None, None)` when no rotations exist.
+
+**Behaviour** — 1. parses the rotation number with `regexp_replace(rotation, '[^0-9]', '', 'g')` so `'Rotation 6'` and `'R6'` both work; 2. the MAX is taken only over rotations backed by ≥ `minForms` forms, so one stray form logged against a far-future rotation cannot inflate the range; 3. if nothing clears the threshold it falls back to the raw max; 4. the MIN is the earliest rotation, clamped so it never exceeds the chosen max.
+
+**Called by** — `buildBannerSubtitle`.
+
+#### `buildBannerSubtitle(engine, cohort, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1454–1462.* Builds the PDF banner subtitle string.
+
+**Returns** — `str`, e.g. `"Rotations 1 to 6   •   Generated 31 July 2026"`, collapsing to `"Rotation 3   •   …"` when min == max, or just `"Generated …"` when no rotations are found.
+
+**Behaviour** — the generation date comes from `pd.Timestamp.now()` formatted `%d %B %Y`, so output is not reproducible across days.
+
+**Calls** — `getRotationRange`.
+
+**Called by** — `buildCohortSummaryPdf`.
+
+#### `buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle, subheadingStyle, subheadingColor, concernsDf, incidentsDf, patientPerStudentDf, pageSize, rightMargin, leftMargin, topMargin, bottomMargin, tableTextStyleSmall, uniColor, figSize, superExcelPath=None)`
+
+*Lines 1465–1643.* The cohort report orchestrator — 179 lines, entirely keyword-only. Writes the cohort PDF and, optionally, the 8-sheet cohort workbook.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `engine`, `cohort` | — | — | Standard |
+| `outPath` | `str` | — | PDF destination |
+| `bannerTitle` | `str` | — | First banner line |
+| `subheadingStyle`, `subheadingColor`, `tableTextStyleSmall`, `uniColor`, `figSize`, `pageSize`, `*Margin` | reportlab styles / numbers | — | Passed through from `variableUtils` by the notebook |
+| `concernsDf` | `pd.DataFrame` | — | Output of `getAdditionalConcerns` |
+| `incidentsDf` | `pd.DataFrame` | — | Output of `getClinicalIncidentSummary` |
+| `patientPerStudentDf` | `pd.DataFrame` | — | Merged attended/FTA counts per student |
+| `superExcelPath` | `str \| None` | `None` | When set, also writes and formats the cohort workbook |
+
+**Returns** — `None`.
+
+**Behaviour**
+
+1. Opens a `SimpleDocTemplate` and seeds `elements` with a 72pt spacer.
+2. `buildFrontPage(filters=None)` → cohort-wide metric table + top-25 item codes; page break.
+3. Three stacked subplots of `getTopItemCodes(limit=20)` for age bands **0-6 / 7-17 / 18+** (`age_min`/`age_max` filters), titled *Top Item Codes by Age Group*; page break.
+4. Per-rotation summaries are **commented out** (L1497–1502).
+5. For every clinic from `getClinicPatientCounts` with `patients >= 5`, a heading `Clinic: X (n=…)` and a full `buildFrontPage` slice; the returned metric frame is stored in `clinicMetrics`.
+6. `functools.reduce` (imported inline at L1518) outer-merges all clinic metric frames on `Metric`, converts `<br/>` back to newlines, and writes `BOH3_DDS4/clinic_metrics_{cohort}.xlsx` — **an unconditional hard-coded path**.
+7. If either `concernsDf` or `incidentsDf` is non-empty, adds the *Additional Concerns* table (dropping `Student ID`/`Rotation`) and the *Clinical Incidents* table (dropping `Cohort`/`Student ID`/`Rotation`), both at `colRatio=[1,1,1,1,3]`.
+8. Batch data: `getAgeCountsBatch` (plus a computed `Total Patients`), `getEntrustmentPerStudentBatch` for all rotations then `addPbnLeaveColumns(year=2026)`, then two more calls for `rotationRange=(1,3)` and `(4,6)`; each sorted descending.
+9. `getItemCodesPerStudentBatch` is merged against `variableUtils.itemSectionMappingFile`; the join key is the **first** code of a slashed pair (`"022/024"` → `"022"`); unmatched sections become `"Unmapped"`; a `sectionPivot` is built with `Total`.
+10. When `superExcelPath` is set: writes the eight sheets (`Age Counts`, `Entrustment`, `Entrustment R1-3`, `Entrustment R4-6`, `Incidents`, `Concerns`, `Merged Item-Section`, `Section Pivot`, each suffixed with the cohort) through `Utils.getmodeArgs` + `pd.ExcelWriter`, then calls `formatSummaryExcel`.
+11. Builds a `<br/>`-joined `Age Count` string, merges it and `Entrustment Avg` onto `patientPerStudentDf`, renames the columns to *Student Name / Patient Count / Attended / FTA / Average ES*, and appends the *Patient Count per Student* table after a page break.
+12. `doc.build(elements, onFirstPage=getBannerDrawer(bannerTitle, buildBannerSubtitle(...)))`.
+
+**Side effects** — writes the PDF at `outPath`; **always** writes `BOH3_DDS4/clinic_metrics_{cohort}.xlsx`; optionally writes and re-formats `superExcelPath`; **mutates `patientPerStudentDf` in place** (`sort_values(inplace=True)`, `drop(columns=..., inplace=True)`, `rename(inplace=True)`); creates matplotlib figures.
+
+**Calls** — `buildFrontPage`, `getTopItemCodes`, `plotItemCodeFrequencies`, `getClinicPatientCounts`, `getAgeCountsBatch`, `getEntrustmentPerStudentBatch`, `addPbnLeaveColumns`, `getItemCodesPerStudentBatch`, `formatSummaryExcel`, `buildBannerSubtitle`, `Utils:createTable`, `Utils:addPlotImage`, `Utils:getmodeArgs`, `Utils:getBannerDrawer`.
+
+**Called by** — `main.ipynb` (2 call sites, one commented out).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+pdfArgs = dict(
+    pageSize=pageSize, rightMargin=rightMargin, leftMargin=leftMargin,
+    topMargin=topMargin, bottomMargin=bottomMargin,
+    subheadingStyle=subheadingStyle, subheadingColor=uniColor,
+    tableTextStyleSmall=tableTextStyleSmall, uniColor=uniColor, figSize=figSize,
+)
+
+buildCohortSummaryPdf(
+    engine=engine, cohort="BOH3", outPath=f"BOH3_DDS4/Summary_BOH3 {today}.pdf",
+    bannerTitle="Summary till date - BOH3",
+    concernsDf=boh3concerns, incidentsDf=boh3incidents,
+    patientPerStudentDf=patientperstudentBOH3, **pdfArgs,
+    superExcelPath=superExcelPathBOH3)
+```
+### 5.7 Section 5 — Student-level query functions (L1646–L1996)
+
+#### `getStudentTopItemCodes(engine, cohort, studentNumber, limit=10, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1650–1695.* One student's item codes with the cohort average per code.
+
+**Parameters** — extra: `limit` (`int`, default `10`; callers pass `55`).
+
+**Returns** — DataFrame `itemcode, description, totalqty, cohortavg`.
+
+**Behaviour** — three CTEs: `student_codes` (this student's totals, with `description` selected as a literal `NULL::text` placeholder), `cohort_codes` (cohort totals), and `n_students` (`COUNT(DISTINCT student_number)` excluding blank names and `'Test Student'`). `cohortAvg = cohortTotal / n` rounded to 1 dp. After the query, `description` is filled from `getItemCodeDescriptionMap`, wrapped in `try/except Exception` that prints `[getStudentTopItemCodes] description map failed: …` and leaves the column `NULL`.
+
+**Note** — the quantity expression here is `SUM(COALESCE(NULLIF((ic->>'quantity')::int, NULL), 1))`. `NULLIF(x, NULL)` is a no-op, and the cast is unguarded, unlike the `NULLIF(ic->>'quantity','')::int` form used by `getTopItemCodes` / `getItemCodesPerStudentBatch`.
+
+**Calls** — `Utils:readDf`, `getItemCodeDescriptionMap`.
+
+**Called by** — `buildStudentPdf`, `_collectProcedureData`.
+
+#### `getStudentsInCohort(engine, cohort, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1698–1706.* `SELECT DISTINCT student_number, student_name` for the cohort, excluding `NULL`, `''` and the literal `'Test Student'`, ordered by name. This is the roster every cohort loop iterates.
+
+**Called by** — `buildCohortStudentReports`, `buildEntrustmentTimeSeriesPdf`, `buildEntrustmentTimeSeriesHtml`, `buildCohortStudentExcelReports`.
+
+#### `getStudentPatientSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1709–1727.* One-row patient counts for a student: `totalattended`, `totalnotattended`, `age0to6`, `age7to17`, `age18plus` (age bands are attended-only).
+
+**Called by** — `getStudentSummaryTable`.
+
+#### `getStudentSelfSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1730–1759.* Per-form student-side view, **restricted to `submitted_by_student`**.
+
+**Returns** — DataFrame `assessmentid, form_code, datetimeutc, subject, clinic, assessor_name, practice_readiness, student_reflection, caf_avg_score`, ordered by date.
+
+**Behaviour** — a `base` CTE pulls the reflection text, the practice-readiness key and the raw CAF checklist; `cafRows` explodes the checklist with `LEFT JOIN LATERAL jsonb_each` and scores it with the same v2/v3 `COALESCE(kv.value->>'value', kv.value#>>'{}')` shim; the outer select averages to `caf_avg_score` per form.
+
+**Called by** — `getStudentSummaryTable`.
+
+#### `getStudentAssessorSummary(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1762–1792.* Per-form assessor-side view, **restricted to `submitted_by_assessor`**.
+
+**Returns** — DataFrame `assessmentid, form_code, datetimeutc, subject, clinic, assessor_name, entrustment_numeric, additional_concerns, clinical_incident_count, strengths_text, weakness_other_text, clinical_incident_text`.
+
+**Behaviour** — the `extracted` CTE `string_agg`s the `strengths`, `weakness-other` and `clinical-incident` arrays into newline-joined text and counts the incident array length.
+
+**Called by** — `getStudentSummaryTable`.
+
+#### `getStudentSummaryTable(engine, cohort, studentNumber, studentName, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1795–1846.* The headline metric table shared by the student PDF and the Excel dashboard.
+
+**Parameters** — `studentName` is accepted but **never used** in the body.
+
+**Returns** — `tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]` = `(metricsDf, selfDf, assessorDf)`. `metricsDf` has columns `Metric`, `Value` with 12 rows: *Total Forms, Submitted by Student, Submitted by Assessor, Patients Attended, Patients FTA, Patients Age 0–6, Patients Age 7–17, Patients Age 18+, Avg Self CAF Score, Avg Assessor Entrustment (1–4), Entrustment Distribution (1–4), Additional Concerns*.
+
+**Behaviour** — 1. calls `getStudentPatientSummary`, `getStudentSelfSummary`, `getStudentAssessorSummary` and `getCounts(filters={"student_number": …})`; 2. averages `entrustment_numeric` and `caf_avg_score` in pandas; 3. builds the entrustment distribution as a `<br/>`-joined `Lvl n: count` string; 4. issues an **extra ad-hoc query** for `totalIncidents` (summing incident array lengths across *all* the student's forms, submitted or not) — the comment at L1817–1820 explains this was to make the number agree with `getClinicalIncidentSummary`, but the corresponding metric row is **commented out at L1844**, so the query result is discarded; 5. numeric values go through `Utils.toInt`; the two averages are `None` when `NaN`.
+
+**Calls** — `getStudentPatientSummary`, `getStudentSelfSummary`, `getStudentAssessorSummary`, `getCounts`, `Utils:readDf`, `Utils:toInt`.
+
+**Called by** — `buildStudentPdf`, `_collectSummaryData`.
+
+#### `getStudentTimeSeries(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1849–1866.* Per-form entrustment and practice readiness over time.
+
+**Returns** — DataFrame `date` (date), `rotation`, `entrustment` (1–4), `practice_readiness` (1–4), ordered by `datetimeutc`.
+
+**Behaviour** — filtered to forms where **both** parties submitted (`submitted_by_student AND submitted_by_assessor`), so the two lines are always comparable.
+
+**Called by** — `buildStudentPdf`, `buildEntrustmentTimeSeriesPdf`, `buildEntrustmentTimeSeriesHtml`, `buildStudentEntrustmentHtml`. Deliberately left untouched by `getStudentTrendDetail` (see its docstring) because the PDF depends on this exact shape.
+
+#### `getStudentRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1869–1905.* Two-query student-side rollup.
+
+**Returns** — `tuple[pd.DataFrame, pd.DataFrame]`:
+- `roll` — one row: `forms_count`, `reflections_count`, `caf_avg`, `caf_median` (`PERCENTILE_CONT(0.5)`);
+- `readinessDf` — the practice-readiness **label** (resolved through `student_config->'scales'->'scale-practice-readiness'->'fields'` keyed by the stored answer) and its count.
+
+**Behaviour** — unlike `getStudentSelfSummary` there is no `submitted_by_student` filter, so `forms_count` counts every form.
+
+**Called by** — `buildStudentVsAssessorSection`, `_collectSummaryData`.
+
+#### `getAssessorRollup(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1908–1965.* Single-query assessor-side rollup, plus the entrustment distribution.
+
+**Returns** — `tuple[pd.DataFrame, pd.DataFrame]`:
+- the rollup row: `forms_count`, `concerns_forms_n`, `entrustment_avg`, `entrustment_median`, `strengths_n`, and nine `weakness_*_n` / `incidents_n` counts;
+- the distribution: `Entrustment` (the config-resolved label), `Count`.
+
+**Behaviour** — three CTEs (`base`, `ent`, `counts`) so everything is one round trip. **Both queries filter on `submitted_by_assessor`.**
+
+**Called by** — `buildStudentVsAssessorSection`, `_assessorRollupCached`.
+
+#### `getTopMultiSelectValues(engine, cohort, studentNumber, key, limit=6, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1968–1978.* Value-frequency table for any `assessor_data->'multi-select'` key.
+
+**Parameters** — `key` (`str`) is **bound** as `:key` (unlike `getClinicalIncidentSummary`, which interpolates); `limit` (`int`, default `6`).
+
+**Returns** — DataFrame `value, n`, most frequent first. No submitted-by filter.
+
+**Called by** — `buildStudentVsAssessorSection` (`"strengths"` limit 10, `"weakness-other"` limit 30), `_collectFeedbackData` (`"strengths"` limit 15).
+
+#### `getSelfReflections(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 1981–1996.* Every non-blank student reflection with the form's item codes.
+
+**Returns** — DataFrame `datetimeutc` (date), `self_reflection`, `item_codes` (comma-joined distinct codes), ordered by date. Filtered to `submitted_by_student` and a non-empty reflection.
+
+**Called by** — `buildStudentVsAssessorSection`, `_collectCommentData`.
+
+### 5.8 Section 6 — Student PDF report builder (L1999–L2635)
+
+#### `weaknessPiePlot(weaknessCounts, totalWeaknesses, uniColor)`
+
+*Lines 2003–2031.* Renders the weakness-category doughnut/pie as a reportlab image.
+
+**Parameters** — `weaknessCounts` (DataFrame with `Weakness Type`, `Count`), `totalWeaknesses` (`int`, used by `Utils.autopct` to turn a percentage back into a count), `uniColor`.
+
+**Returns** — the reportlab image flowable from `Utils.addPlotImage(fig, 0.8)`.
+
+**Behaviour** — figure sized `variableUtils.figSize * (0.55, 0.32)` at dpi 200, seaborn `Set2` palette, white wedge edges, 5pt bold white percentage labels, legend moved outside to the right showing `"Label (count)"`, suptitle *Weaknesses*. The figure is **not** closed.
+
+**Calls** — `Utils:addPlotImage`, `Utils:autopct`.
+
+**Called by** — `buildStudentVsAssessorSection`.
+
+#### `buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, styles, formsTable="dds4_boh3_forms_v3", subheadingStyle=None, uniColor=None, tableTextStyleSmall=None)`
+
+*Lines 2034–2158.* Appends the whole "student judgement vs assessor judgement" block to a student PDF.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `elements` | `list` | — | reportlab flowables, mutated |
+| `styles` | `dict`-like | — | Fallback source for `subheadingStyle` via `styles.get("subheadingStyle")` |
+| `subheadingStyle`, `uniColor`, `tableTextStyleSmall` | — | `None` | `uniColor` falls back to `variableUtils.uniColor` |
+
+**Returns** — `None`.
+
+**Behaviour**
+
+1. Queries `getStudentRollup`, `getAssessorRollup`, `getTopMultiSelectValues("strengths", 10)`, `getTopMultiSelectValues("weakness-other", 30)`, `getClinicalIncidentSummary`, and a second `getClinicalIncidentSummary` with `extractValue='weakness-other', colName='Weakness/Strength'`.
+2. Drops the columns each PDF table doesn't show (incidents keep Date / Assessor Name / value; the weakness table keeps Date / Item Codes / value).
+3. Page break, then the *Student Judgement: Practice Readiness Distribution* table (rows with blank/`"none"` labels are filtered out).
+4. *Assessor Judgement: Entrustment level distribution* table, then a three-row metric table (**# Additional concerns, # Clinical incidents, # Commendations given** — forms-assessed and average-entrustment rows are commented out at L2078–2079).
+5. Builds the seven-category `weaknessCounts` frame from the rollup, drops zero rows, and appends `weaknessPiePlot`.
+6. `renderTopDf(topStrengths, "Top commendations", "Commendation")`.
+7. *Other weaknesses/strengths* table, *Clinical Incidents* table.
+8. `getSelfReflections` → *Student Judgement: Self Reflections* table with `\n` replaced by `<br/>`.
+
+`topWeaknessOther` is queried (30 rows) but the `renderTopDf` call that would use it is **commented out at L2133**, so the query result is discarded.
+
+**Side effects** — mutates `elements`; mutates the incident/weakness frames with `inplace=True` drops.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `renderTopDf` | `renderTopDf(df, title, valuename, showCounts=True)` | Renames a two-column frame to `[valuename, "Count"]`, converts newlines to `<br/>`, optionally drops the count column, appends a `createTable` plus a 12pt spacer. No-op on an empty frame |
+
+**Calls** — `getStudentRollup`, `getAssessorRollup`, `getTopMultiSelectValues`, `getClinicalIncidentSummary`, `getSelfReflections`, `weaknessPiePlot`, `Utils:createTable`, `Utils:toInt`.
+
+**Called by** — `buildStudentPdf`.
+
+#### `plotEntrustmentReadinessTimeSeries(df, title, uniColor=None, useDateAxis=False, subtitle=None, figWidth=None)`
+
+*Lines 2161–2252.* The entrustment/readiness time-series matplotlib figure.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `df` | `pd.DataFrame` | — | Needs `date`, `entrustment`, `practice_readiness`; `rotation` is optional |
+| `title` | `str` | — | Axis title; may be `""` |
+| `uniColor` | `str \| None` | `None` → `variableUtils.uniColor` | Text colour |
+| `useDateAxis` | `bool` | `False` | **Accepted and documented but never referenced in the body** |
+| `subtitle` | `str \| None` | `None` | Appended under the title on its own line |
+| `figWidth` | `float \| None` | `None` → `variableUtils.figSize[0]` | Figure width in inches |
+
+**Returns** — the matplotlib `Figure` (already `plt.close()`d).
+
+**Behaviour**
+
+1. Copies `df`, coerces `date`, sorts.
+2. Averages multiple forms on the same day per series.
+3. Plots against **integer positions** rather than dates, so every date is evenly spaced — this is what makes rotation division lines and every-other-label ticking possible.
+4. If a `rotation` column is present, draws a dashed grey vertical at each rotation change and a centred bold `R<n>` band label at y = 4.38.
+5. The two series are drawn ±0.05 apart (`offset`) so identical ratings don't overlap; entrustment is steelblue circles, readiness darkorange squares.
+6. Every Level-1 entrustment form is additionally marked with a red `X` at y ≈ 1 labelled *Level 1 (flag)*.
+7. Fixed y-limits 0.5–4.5 with ticks 1–4, x-labels every second date rotated 90° at 6pt, top/right spines hidden, legend bottom-left.
+
+The docstring also mentions "shaded risk zones (Level 1 red, Level 2 amber)" and "the student's mean entrustment as a dashed reference line" — neither is drawn in the matplotlib version; both exist only in the Plotly HTML templates.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `_shortRot` | `_shortRot(r)` | `'Rotation 3'` → `'R3'`; returns `str(r)` when there are no digits |
+
+**Called by** — `buildStudentPdf`, `buildEntrustmentTimeSeriesPdf`.
+
+#### `_addProceduresBarChart(elements, topItemsDf, subheadingStyle, uniColor=None, maxCodesPerSubplot=25)`
+
+*Lines 2255–2324.* Appends the "your count vs class average" item-code chart to a student PDF.
+
+**Parameters** — `elements` (mutated), `topItemsDf` (output of `getStudentTopItemCodes`), `subheadingStyle`, `uniColor` (**accepted but unused**), `maxCodesPerSubplot` (`int`, default `25`).
+
+**Returns** — `None`; returns early when `topItemsDf` is `None`/empty or when every code is filtered out.
+
+**Behaviour** — 1. lower-cases the columns; 2. builds `studentCounts` and `classAvg` dicts; 3. drops codes where the student did nothing **and** the class average is < 1; 4. splits the survivors into `ceil(n / 25)` roughly equal chunks, one subplot each, figure height `5 * nSubplots` at width 14; 5. per subplot the y-limit is that row's own max × 1.15 + 1 (so the subplots do *not* share a scale, despite `sharey=False` and the docstring's "shared y-axis"); 6. paired bars at ±0.2 with value labels when a class average exists, single bars otherwise; 7. legend only on the first subplot; 8. suptitle switches between *Item Code Counts vs Class Average* and *Item Code Counts*; 9. appends an 18pt spacer, a *Procedures Performed* paragraph and the image.
+
+**Side effects** — mutates `elements`; creates and closes a figure.
+
+**Calls** — `Utils:addPlotImage`.
+
+**Called by** — `buildStudentPdf`.
+
+#### `buildStudentPdf(engine, cohort, studentNumber, studentName, outputPath, formsTable="dds4_boh3_forms_v3", pageSize=None, leftMargin=36, rightMargin=36, topMargin=48, bottomMargin=36, styles=None, subheadingStyle=None, subsubheadingStyleL=None, uniColor=None, tableTextStyleSmall=None)`
+
+*Lines 2327–2388.* Builds one student's PDF feedback report.
+
+**Returns** — `None`.
+
+**Behaviour** — 1. `getStudentSummaryTable` (only `metricsDf` is used; `selfDf`/`assessorDf` are unpacked and discarded); 2. opens the document, adds a 72pt spacer and a fixed intro paragraph that hard-codes *"your clinical activity so far in **2026**"* and mentions a future interactive dashboard; 3. the *Summary* table; 4. `getStudentTimeSeries` → `plotEntrustmentReadinessTimeSeries` → image + page break (the "interactive companion HTML" block at L2359–2371 is commented out); 5. `getStudentTopItemCodes(limit=55)` → `_addProceduresBarChart`; 6. `buildStudentVsAssessorSection`; 7. builds with banner `f"Student Summary - {cohort}"` / `f"{studentName} ({studentNumber})"`.
+
+**Side effects** — writes a PDF to `outputPath`.
+
+**Calls** — `getStudentSummaryTable`, `getStudentTimeSeries`, `plotEntrustmentReadinessTimeSeries`, `getStudentTopItemCodes`, `_addProceduresBarChart`, `buildStudentVsAssessorSection`, `Utils:createTable`, `Utils:addPlotImage`, `Utils:getBannerDrawer`.
+
+**Called by** — `buildCohortStudentReports`.
+
+#### `buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_forms_v3", pageSize=None, leftMargin=36, rightMargin=36, topMargin=48, bottomMargin=36, styles=None, subheadingStyle=None, subsubheadingStyleL=None, uniColor=None, tableTextStyleSmall=None)`
+
+*Lines 2391–2414.* Loops the cohort and writes one PDF per student.
+
+**Returns** — `None`.
+
+**Behaviour** — creates `outputDir` (`parents=True, exist_ok=True`), iterates `getStudentsInCohort`, sanitises the **student number** (not the name) into `safeName` by keeping alphanumerics, spaces, `_` and `-`, and writes `<studentNumber>.pdf`. There is **no `try/except`** — one failing student aborts the whole cohort. Two commented-out testing shortcuts remain at L2403–2404 and L2415.
+
+**Side effects** — creates a directory and writes one PDF per student.
+
+**Calls** — `getStudentsInCohort`, `buildStudentPdf`.
+
+**Called by** — `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+studentPdfArgs = dict(
+    formsTable="dds4_boh3_forms_v3", pageSize=pageSize,
+    leftMargin=leftMargin, rightMargin=rightMargin,
+    topMargin=topMargin, bottomMargin=bottomMargin,
+    styles=styles, subheadingStyle=subheadingStyle,
+    subsubheadingStyleL=subsubheadingStyleL,
+    uniColor=uniColor, tableTextStyleSmall=tableTextStyleSmall,
+)
+buildCohortStudentReports(engine, cohort="DDS4",
+    outputDir="BOH3_DDS4/DDS4_StudentReports", **studentPdfArgs)
+```
+
+#### `buildEntrustmentTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle, subheadingStyle, uniColor, formsTable="dds4_boh3_forms_v3", pageSize=None, rightMargin=36, leftMargin=36, topMargin=48, bottomMargin=36, onlyLevel1=True)`
+
+*Lines 2434–2492.* Worst-first per-student entrustment review document. Keyword-only.
+
+**Parameters** — extra: `onlyLevel1` (`bool`, default `True`) — restrict to students who ever received entrustment Level 1.
+
+**Returns** — `None`.
+
+**Behaviour**
+
+1. When `pageSize is None`, defaults to `(15 * inch, variableUtils.pageSize[1])` — deliberately wider than A3 so the string-date x-axis has room. `chartWidthInch` is derived from the page width minus margins.
+2. **Pass 1** — for every student in the cohort, fetch `getStudentTimeSeries`; skip empty frames; skip students with zero Level-1 forms when `onlyLevel1`; record name, number, frame, form count, mean entrustment and Level-1 count.
+3. Sorts **worst-first**: most Level-1 forms, then lowest average (`NaN` sorts last via the `99` sentinel).
+4. **Pass 2** — one `KeepTogether` block per student: an `_OutlineBookmark` (key `stu-<number>`), a heading, the chart with a stats subtitle `Forms: n • Avg entrustment: x.xx • Level-1 forms: n`, and a 20pt spacer. Charts flow to pack the page rather than one per page, despite the docstring saying "one chart per page".
+5. Builds with `getBannerDrawer(bannerTitle, "")`.
+
+**Side effects** — writes a PDF at `outPath`.
+
+**Calls** — `getStudentsInCohort`, `getStudentTimeSeries`, `plotEntrustmentReadinessTimeSeries`, `Utils:addPlotImage`, `Utils:getBannerDrawer`.
+
+**Called by** — `main.ipynb` (2 call sites, both with `onlyLevel1=False`).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+buildEntrustmentTimeSeriesPdf(
+    engine=engine, cohort="DDS4",
+    outPath="BOH3_DDS4/DDS4_Entrustment_TimeSeries.pdf",
+    bannerTitle="Entrustment & Practice Readiness - DDS4",
+    subheadingStyle=subheadingStyle, uniColor=uniColor,
+    onlyLevel1=False,
+)
+```
+
+#### `buildEntrustmentTimeSeriesHtml(engine, cohort, outPath, title=None, formsTable="dds4_boh3_forms_v3", onlyLevel1=False)`
+
+*Lines 2596–2635.* The interactive cohort-wide counterpart: a single self-contained HTML page.
+
+**Parameters** — `title` defaults to `f"Entrustment & Practice Readiness — {cohort}"`; `onlyLevel1` only sets the sidebar checkbox's default — **every** student is embedded so the toggle works client-side.
+
+**Returns** — `outPath`.
+
+**Behaviour** — builds a `dict` keyed by student number string with `name`, `dates`, `entrustment`, `readiness`, `forms`, `avg`, `nLvl1`; orders the sidebar worst-first; substitutes `__TITLE__`, `__DATA__` (`json.dumps`) and `__ORDER__` into `_TS_HTML_TEMPLATE`; writes UTF-8.
+
+**Side effects** — writes an HTML file. The docstring says "the file works offline", but Plotly is fetched from a CDN at page load.
+
+**Calls** — `getStudentsInCohort`, `getStudentTimeSeries`.
+
+**Called by** — nothing in this module or the notebook.
+
+### 5.9 Section 7 — Excel textual report, one sheet per student (L2638–L2755)
+
+#### `buildStudentSheet(engine, wb, cohort, studentName)`
+
+*Lines 2708–2739.* Adds one student's sheet to an open workbook.
+
+**Parameters** — `wb` (openpyxl `Workbook`, mutated), `studentName` (`str`, bound as `:studentName` — this is the only student-facing query set keyed by **name** rather than number).
+
+**Returns** — `None`.
+
+**Behaviour** — 1. creates a sheet named `_sanitizeSheetName(studentName)`; 2. runs `_MAIN_SQL`, `_WEAKNESS_SQL`, `_STRENGTH_SQL`, `_CONCERNS_SQL`; 3. lower-cases every non-empty frame's columns; 4. writes a title then four `_writeTable` blocks — *Entries (Reflection + Other Notes)*, *Weaknesses (Counts)*, *Strengths (Counts)*, and *Additional Concerns & Critical Incidents* (only when non-empty); empty weakness/strength frames are replaced with correctly-shaped empty frames so the headers still appear; 5. `_autoFitColumns`.
+
+**Calls** — `Utils:readDf`, `_sanitizeSheetName`, `_writeTitle`, `_writeTable`, `_autoFitColumns`.
+
+**Called by** — `exportStudentTextWorkbook`.
+
+#### `exportStudentTextWorkbook(engine, cohort, outPath)`
+
+*Lines 2742–2755.* Builds the whole textual workbook.
+
+**Returns** — `None`.
+
+**Behaviour** — runs its own inline `SELECT DISTINCT student_name` (with the table name hard-coded to `dds4_boh3_forms_v3` and `'Test Student'` excluded — but **not** blank names, unlike `getStudentsInCohort`), creates a `Workbook`, removes the default sheet, loops `buildStudentSheet`, saves.
+
+**Side effects** — writes an `.xlsx` at `outPath`.
+
+**Calls** — `Utils:readDf`, `buildStudentSheet`.
+
+**Called by** — `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+exportStudentTextWorkbook(engine, cohort="DDS4", outPath="BOH3_DDS4/DDS4_Textual_Report.xlsx")
+exportStudentTextWorkbook(engine, cohort="BOH3", outPath="BOH3_DDS4/BOH3_Textual_Report.xlsx")
+```
+
+### 5.10 Section 8 — Individual detailed entry report (L2758–L3101)
+
+The four marker/anchor classes in this section are documented in §4.
+
+#### `buildIndividualEntryPage(elements, row, mcDf, uniColor=None, subheadingStyle=None, tableTextStyleSmall=None, i=None)`
+
+*Lines 2962–3015.* Builds the reportlab elements for a **single assessment entry** — used by the notebook both for a one-off entry PDF and, in a loop, for a per-student "all forms" PDF.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `elements` | `list` | — | Mutated |
+| `row` | `pd.Series` | — | One row of `INDIVIDUAL_ENTRY_SQL` or `STUDENT_ENTRIES_SQL` |
+| `mcDf` | `pd.DataFrame` | — | The CAF checklist rows for that assessment |
+| `uniColor`, `subheadingStyle`, `tableTextStyleSmall` | — | `None` | Style pass-throughs |
+| `i` | `int \| None` | `None` | When set, prefixes a `Form: {i+1}` heading using `variableUtils.subheadingStyleL` |
+
+**Returns** — `None`.
+
+**Behaviour** — 1. builds *Entry Information* (creation/updated date, assessor, clinic, rotation, and both submission flags, each defaulting to the string `"N/A"` when the column is absent); 2. **executes `print(row.index)` at line 2975** — an unconditional debug print on every call; 3. when `mcDf` is non-empty, a *CAF Checklist* table of `MC Code / Full MC Text / MC Rating`; 4. a *Reflections & Comments* table of the eight free-text fields (student reflection, assessor comments, strengths, other strengths, weaknesses, other weaknesses, clinical incidents, additional concerns).
+
+**Side effects** — mutates `elements`; prints.
+
+**Calls** — `Utils:createTable`.
+
+**Called by** — `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+row  = readDf(engine, INDIVIDUAL_ENTRY_SQL, {"assessmentId": assessmentId}).iloc[0]
+mcDf = readDf(engine, INDIVIDUAL_MC_SQL,    {"assessmentId": assessmentId})
+buildIndividualEntryPage(elements, row, mcDf,
+    uniColor=uniColor, subheadingStyle=subheadingStyle,
+    tableTextStyleSmall=tableTextStyleSmall)
+```
+
+#### `buildStudentEntrustmentHtml(engine, cohort, studentNumber, studentName, outPath, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 3065–3101.* Single-student interactive entrustment/readiness chart.
+
+**Returns** — `outPath`.
+
+**Behaviour** — 1. `getStudentTimeSeries`, coerce and sort dates; 2. build `dates`, `entrustment`, `readiness` lists with `None` for `NaN`; 3. compute `rotEdges` (the date at each rotation change) and `rotSpans` (`[start, end, index]` bands) so the template can shade alternating rotations and draw dashed dividers; 4. substitute `__TITLE__`, `__SUB__` (`f"{cohort} · {n} forms"`) and `__DATA__` into `_STUDENT_TS_HTML_TEMPLATE`; 5. write UTF-8.
+
+**Side effects** — writes an HTML file.
+
+**Calls** — `getStudentTimeSeries`.
+
+**Called by** — nothing live: the only call site is the commented-out block inside `buildStudentPdf` (L2362–2364).
+### 5.11 Section 9.2 — Low-level Excel helpers (L3179–L3506)
+
+The file's own header comment (L3103–3124) states the design rules for this section: only curated human-readable columns are exported (enforced by `_EXPORT_FORBIDDEN_COLS`); charts are **native** Excel charts bound to worksheet ranges so they follow the student's own filtering and edits; and every table is an openpyxl `Table` (ListObject) so it gets an autofilter and banded rows. `openpyxl.worksheet.table.Table` is imported **aliased** as `_XlTable` (L3128) precisely because this module is star-imported into the notebook and an unaliased `Table` would shadow `reportlab.platypus.Table`.
+
+#### `_xlValue(v)`
+
+*Lines 3183–3210.* Coerces any pandas / numpy / JSON value into something openpyxl can write.
+
+**Returns** — `None`, `int`, `float`, `bool`, `datetime`, or a `str` of at most 32000 characters.
+
+**Behaviour** — in order: `None`, `float('nan')`, `pd.NaT`, then a guarded `pd.isna(v)` (wrapped in `try/except (TypeError, ValueError)` because `pd.isna` on an array raises); numpy scalars are unboxed to Python types; a `dict` becomes `json.dumps(..., default=str)` while `list`/`tuple`/`set` become a `", "`-joined string; `pd.Timestamp` → `datetime`; strings have `<br/>` and `<br>` replaced by real newlines, control characters stripped via `_ILLEGAL_XL_CHARS`, and are truncated to 32000 chars.
+
+**Called by** — `_xlTitle`, `_xlNote`, `_xlKpiCards`, `_xlWriteDf`.
+
+#### `_xlTableName(*parts)`
+
+*Lines 3213–3219.* Builds a legal Excel table (ListObject) name: joins parts with `_`, replaces anything outside `[0-9A-Za-z_]`, strips leading/trailing underscores, prefixes `T_` if the result starts with a digit, falls back to `"Table"`, truncates to 250 chars.
+
+**Called by** — `_xlWriteDf`.
+
+#### `_xlTitle(ws, row, text, col=1, size=16, color=XL_NAVY, span=None)`
+
+*Lines 3222–3230.* Writes a big bold section title, optionally merged across `span` columns, and raises the row height to `size + 8`.
+
+**Returns** — `int`, `row + 1`. **Side effects** — mutates the worksheet.
+
+**Called by** — all ten `_sheet*` builders.
+
+#### `_xlNote(ws, row, text, col=1, span=8, italic=True, color=XL_MUTED)`
+
+*Lines 3233–3240.* Writes a small explanatory line under a title, merged across `span` columns, 9pt italic muted, wrapped.
+
+**Returns** — `int`, `row + 1`. **Side effects** — mutates the worksheet.
+
+**Called by** — all ten `_sheet*` builders.
+
+#### `_xlKpiCards(ws, kpis, row, startCol=1, cardWidth=2, gap=1, perRow=5)`
+
+*Lines 3243–3274.* Draws the dashboard KPI tiles — a big value over a small label.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `ws` | `Worksheet` | — | Mutated |
+| `kpis` | `list[tuple[str, Any]]` | — | `(label, value)` pairs; a `None` value renders as an em dash |
+| `row` | `int` | — | First row |
+| `cardWidth` | `int` | `2` | Columns per card |
+| `gap` | `int` | `1` | Blank columns between cards |
+| `perRow` | `int` | `5` | Cards per row; a new row of cards starts every 4 sheet rows |
+
+**Returns** — `int`, `r + 4` (one blank row after the last card row); returns `row` unchanged when `kpis` is empty.
+
+**Behaviour** — each card merges a 2-row value block (bold 20pt navy, centred) and a 1-row label block (9pt bold muted, wrapped), fills all cells with `XL_BAND` and applies a thin `XL_BORDER` box.
+
+**Called by** — `_sheetDashboard`.
+
+#### `_xlWriteDf(ws, df, startRow=1, startCol=1, title=None, tableName=None, widths=None, wrapCols=(), numFmts=None, dateCols=(), maxWidth=60, minWidth=10, wrapWidth=45, rowHeight=None, emptyText="No records for this student.", banded=True)`
+
+*Lines 3277–3367.* The workhorse: writes a DataFrame as a formatted, filterable Excel table. Every student-facing sheet goes through it.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `ws`, `df` | — | — | Worksheet (mutated) and source frame (copied, not mutated) |
+| `startRow`, `startCol` | `int` | `1`, `1` | Anchor |
+| `title` | `str \| None` | `None` | Bold 12pt `XL_NAVY_SOFT` line above the header |
+| `tableName` | `str \| None` | `None` | When set, the range is registered as an openpyxl `Table` |
+| `widths` | `dict \| None` | `None` | Explicit `{column: width}` overrides |
+| `wrapCols` | `tuple` | `()` | Columns rendered wrapped and left-aligned at `wrapWidth` |
+| `numFmts` | `dict \| None` | `None` | `{column: number format}` |
+| `dateCols` | `tuple` | `()` | Columns formatted `"dd mmm yyyy"` |
+| `maxWidth`, `minWidth`, `wrapWidth` | `int` | `60`, `10`, `45` | Autofit clamps |
+| `rowHeight` | `int \| None` | `None` | Fixed data-row height |
+| `emptyText` | `str` | `"No records for this student."` | Italic placeholder for an empty frame |
+| `banded` | `bool` | `True` | Row stripes on the table style |
+
+**Returns** — `int`, the next free row (`lastRow + 2`, or `r + 2` for an empty frame).
+
+**Behaviour**
+
+1. Optional title row.
+2. Empty/`None` frame → writes `emptyText` in italic and returns early.
+3. **Privacy guard**: any column whose stripped lower-cased name is in `_EXPORT_FORBIDDEN_COLS` is silently dropped.
+4. Duplicate headers are de-duplicated by appending ` (1)`, ` (2)` — Excel tables reject duplicates.
+5. Header row: white bold 10pt on `XL_NAVY`, wrapped, centred, bordered, height 30.
+6. Data rows: values through `_xlValue`, wrapping only for `wrapCols`, 10pt, bordered, with `numFmts` taking precedence over `dateCols`.
+7. Column widths: explicit `widths` → `wrapWidth` for wrap columns → autofit from the longest rendered value clamped to `[minWidth, maxWidth]`.
+8. When `tableName` is given, adds an `_XlTable` with `TableStyleMedium2`; `ws.add_table` is wrapped in `try/except ValueError: pass` so a duplicate name or overlapping range degrades to "formatting applied, no autofilter" rather than raising.
+
+**Side effects** — mutates the worksheet.
+
+**Calls** — `_xlValue`, `_xlTableName`.
+
+**Called by** — eight `_sheet*` builders (all but `_sheetReadMe` and `_sheetDashboard`).
+
+#### `_xlChartFont(size=900, bold=False, color=XL_NAVY)`
+
+*Lines 3370–3372.* Returns an openpyxl `CharacterProperties`. **`size` is in hundredths of a point** — `900` = 9pt.
+
+**Called by** — `_xlAxisLabels`, `_xlStyleChart`, `_sheetFeedback`, `_dashboardDoughnut`.
+
+#### `_xlStyleTitleObj(titleObj, charProps)`
+
+*Lines 3375–3383.* Restyles a chart title in place. openpyxl converts a plain string title into a rich-text structure, so this walks `titleObj.tx.rich.p`, sets each paragraph's `defRPr` and each run's `rPr`. Wrapped in `try/except AttributeError: pass` for titles that aren't rich text.
+
+**Called by** — `_xlStyleChart`, `_sheetFeedback`, `_dashboardDoughnut`.
+
+#### `_xlAxisLabels(size=800, rotationDeg=None, color=XL_MUTED)`
+
+*Lines 3386–3393.* Builds the `RichText` used for tick and legend labels. `rotationDeg` is converted with `int(rotationDeg * 60000)` because **OOXML measures rotation in 1/60000 of a degree**; `-45` keeps long category labels readable.
+
+**Called by** — `_xlStyleChart`, `_sheetFeedback`, `_dashboardDoughnut`.
+
+#### `_xlChartSize(nCategories, perCategory=0.75, minWidth=20, maxWidth=55, height=12, baseWidth=7)`
+
+*Lines 3396–3405.* Scales a chart to how much it has to show: `width = clamp(baseWidth + perCategory * n, minWidth, maxWidth)`.
+
+**Returns** — `tuple[float, float]` (width, height) in **centimetres**, openpyxl's chart unit.
+
+**Called by** — `_buildTrendChart`, `_sheetProcedures`.
+
+#### `_xlClusteredOffset(chart, gapWidth=60, overlap=-12)`
+
+*Lines 3408–3417.* Sets `gapWidth` and a **negative** `overlap` so clustered bars sit side by side with a small gap. Without an explicit overlap several renderers default to `100` and draw the two series on top of each other.
+
+**Returns** — the same chart. **Called by** — `_sheetProcedures`.
+
+#### `_xlDataLabels(showPercent=False)`
+
+*Lines 3420–3430.* Returns a `DataLabelList` with every flag set explicitly — leaving them unset makes Excel/LibreOffice also print the category and series name.
+
+**Called by** — `_sheetSelfChecklist`, `_sheetProcedures`, `_sheetFeedback`, `_dashboardDoughnut`.
+
+#### `_xlStyleChart(chart, title, xTitle=None, yTitle=None, width=24, height=11, titleSize=1300, axisTitleSize=900, tickSize=800, xTickRotation=None)`
+
+*Lines 3433–3460.* The single place chart typography is defined, so every chart in a workbook matches.
+
+**Returns** — the same chart.
+
+**Behaviour** — sets title, `style = 2`, size, axis titles, forces both axes visible (`delete = False`), restyles the title and axis titles through `_xlStyleTitleObj`, applies `_xlAxisLabels` to both axes' tick labels, removes the x-axis major gridlines ("vertical ones just add noise"), and positions the legend at the bottom, non-overlaying, at 850 (8.5pt).
+
+**Calls** — `_xlStyleTitleObj`, `_xlChartFont`, `_xlAxisLabels`.
+
+**Called by** — `_sheetSelfChecklist`, `_buildTrendChart`, `_sheetProcedures`, `_sheetFeedback`.
+
+#### `_xlPrintSetup(ws, landscape=True, titleRows=None)`
+
+*Lines 3463–3472.* Landscape (or portrait), fit-to-one-page-wide with unlimited height, and optional repeating header rows (`print_title_rows`, e.g. `"5:5"`).
+
+**Returns** — `ws`. **Called by** — all ten `_sheet*` builders.
+
+#### `_xlFreezeAndFilter(ws, cell="A2")`
+
+*Lines 3475–3477.* Sets `freeze_panes` and hides gridlines.
+
+**Called by** — **nothing**. Every sheet builder sets `freeze_panes` and `showGridLines` directly instead. Dead code.
+
+#### `_scaleText(v)`
+
+*Lines 3480–3496.* Normalises a scale-config lookup (which comes back as raw `jsonb`) into a readable string.
+
+**Returns** — `str | None`.
+
+**Behaviour** — `None`/`NaN` → `None`; a `dict` is probed for the first non-empty of `label, title, text, name, value, description`, falling back to `json.dumps`; a `list` is recursively mapped and comma-joined; anything else is stringified and has a wrapping pair of double quotes removed (JSONB string values arrive quoted); an empty result becomes `None`.
+
+**Calls** — itself (recursively, for lists).
+
+**Called by** — `getStudentFormExport`, `_collectSummaryData`.
+
+#### `_cleanHtmlBreaks(df, cols=None)`
+
+*Lines 3499–3506.* Returns a copy of `df` with `<br/>` / `<br>` replaced by real newlines in the given object-dtype columns (all columns when `cols` is `None`). This undoes the reportlab-oriented markup that `getFrontPageSummaryTable` / `getStudentSummaryTable` embed.
+
+**Called by** — `_collectSummaryData`.
+
+### 5.12 Section 9.3 — Per-form export query and grouped header (L3509–L3796)
+
+#### `_studentFormExportSql(formsTable="dds4_boh3_forms_v3")`
+
+*Lines 3510–3608.* Builds the "one row per form" SQL for a single student.
+
+**Returns** — `str`, a parameterised query taking `:cohort` and `:studentNumber`.
+
+**Behaviour** — 1. the seven weakness columns are **generated** from `WEAKNESS_KEY_LABELS`, so adding a category to that dict adds a column here, in `FORM_EXPORT_WRAP_COLS`, in `FORM_EXPORT_GROUPS` and in `FORM_EXPORT_WIDTHS` automatically; 2. the CAF `CASE` arms are generated from `CAF_RATING_SCORES`; 3. three CTEs — `caf` (per-form checklist average), `pat` (patients seen / FTA / distinct ages), `codes` (distinct item codes) — are left-joined onto the base rows; 4. output columns use student-facing names: `Form #` (a `ROW_NUMBER()` over date), `Date`, `Rotation`, `Clinic` (`COALESCE(NULLIF(external_clinic,''), clinic)`), `Subject`, `Supervisor`, `Entrustment (1-4)`, `Entrustment Level`, `My Practice Readiness (1-4)`, `My Practice Readiness`, `My Checklist Score (0-1)`, `Patients Seen`, `Patients FTA`, `Patient Ages`, `Item Codes`, `My Reflection`, `Supervisor Comments`, `Commendations`, `Commendations (Other)`, the seven weakness columns, `Other Feedback`, `Clinical Incidents`, `Additional Concerns`, `Submitted by Me`, `Submitted by Supervisor`; 5. **deliberately excludes** every raw JSON, config and internal-id column.
+
+**Called by** — `getStudentFormExport`.
+
+#### `_xlGroupBand(ws, columns, groups, row, startCol=1)`
+
+*Lines 3638–3670.* Draws the merged "super header" band above a table's header row.
+
+**Parameters** — `columns` (`list[str]`, the actual column order), `groups` (`FORM_EXPORT_GROUPS`-shaped list of `(label, cols, colour)`), `row`, `startCol`.
+
+**Returns** — `int`, `row + 1`.
+
+**Behaviour** — builds a `column → (label, colour)` lookup, then walks the real column list merging **consecutive** columns that share a label. A column in no group gets a plain `XL_MUTED` spacer cell, so the band never misaligns if the query gains or loses a column. Row height 26, white bold 10pt centred text, thin white borders.
+
+**Side effects** — mutates the worksheet.
+
+**Called by** — `_sheetForms`.
+
+#### `getStudentFormExport(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 3688–3699.* The flat "compare all my feedback" table for one student.
+
+**Returns** — DataFrame from `_studentFormExportSql`, or the empty frame unchanged.
+
+**Behaviour** — post-processes `Entrustment Level` and `My Practice Readiness` through `_scaleText` (they arrive as raw jsonb) and converts `Date` to `datetime.date`.
+
+**Calls** — `_studentFormExportSql`, `Utils:readDf`.
+
+**Called by** — `_collectStudentExcelData`; `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+formDf = getStudentFormExport(engine, testCohort, testStudent)
+print(f"{len(formDf)} forms · {formDf['Supervisor'].nunique()} supervisors")
+```
+
+#### `getStudentSelfChecklist(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 3702–3796.* The self-evaluation checklist per form, in three presentation shapes.
+
+**Returns** — `tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]`:
+
+| # | Name | Columns |
+|---|---|---|
+| 0 | `wideDf` | `Form #`, `Date`, `Supervisor`, one column per checklist **domain**, `Form Average (0-1)` |
+| 1 | `legendDf` | `Code`, `Domain`, `Question` |
+| 2 | `itemAvgDf` | `Code`, `Domain`, `Question`, `Average Score (0-1)` |
+
+All three are empty frames when the student has no checklist data.
+
+**Behaviour**
+
+1. **Config path shim** — the docstring documents the key discovery here: the checklist definition lives at `student_config->'checklists'->'selected'->'checklist-caf-final-eval'`, i.e. one level deeper than the bare `->'checklists'->'checklist-caf-final-eval'` used elsewhere in the file (`'checklists'` is itself `{mode, selected}`). Reading the bare path returns `NULL`, which is why the question wording came back blank. Both paths are `COALESCE`d, on the config side and on the answer side.
+2. The config block also supplies `fields` (`MC1`…`MC7` → full criterion wording), `extra_config.headers` (short domain titles such as *Technical Skills*), and `extra_config.options.student` (`O1`…`O5` → *Done well* … *Not done*).
+3. **Answer resolution** — the stored answer may be either the O-code or the literal label depending on form version, so an `optionMap` is accumulated across the student's forms (later forms overwrite earlier ones) and used to translate before scoring through `CAF_RATING_SCORES`.
+4. `Domain` falls back to the raw `Code` when a form lacks headers.
+5. `legendDf` de-duplicates on `Code`; `wideDf` pivots `Rating` by domain with `aggfunc="first"` and is **re-ordered to MC order** using the legend rather than pandas' alphabetical column sort; the per-form mean score is merged on as `Form Average (0-1)`.
+6. `itemAvgDf` averages `Score` per `Code`, rounded to 3 dp, joined back to the legend.
+
+**Calls** — `Utils:readDf`.
+
+**Called by** — `_collectStudentExcelData`; `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+display(getStudentSelfChecklist(engine, testCohort, testStudent)[2])  # checklist wording
+```
+
+### 5.13 Section 9.4 — Sheet builders (L3799–L4299)
+
+Each `_sheet*` function creates one worksheet, writes its tables and charts, and returns either the worksheet or an *anchors* dict describing where its data landed (so the Dashboard can point charts at it). None of them queries the database — they consume the frames assembled in §9.5.
+
+#### `_sheetReadMe(wb, cohort, studentNumber, studentName, generatedOn, kind="export")`
+
+*Lines 3800–3854.* The plain-English guide sheet.
+
+**Parameters** — `kind` (`"export"` or `"dashboard"`) — the dashboard variant inserts an extra *Dashboard* row explaining that the charts are live.
+
+**Returns** — the worksheet.
+
+**Behaviour** — hides gridlines, fixes column A at 26 and B at 95, writes an 18pt title and a provenance note (`Student ID … · generated … · source: DASH clinical assessment forms`), then eight (or nine) label/text rows covering *What this file is, My Forms, Entrustment (1-4), My Practice Readiness (1-4), My Checklist Score (0-1), Commendations, Areas for improvement, Blank cells*. The *Blank cells* row states explicitly that a blank is "not a zero", and the *Areas for improvement* row spells out that an empty weakness column means nothing was raised, not a score of zero. Ends with a contact line and portrait print setup.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlPrintSetup`.
+
+#### `_sheetForms(wb, formDf, sheetName="My Forms")`
+
+*Lines 3857–3888.* The flat one-row-per-form sheet.
+
+**Returns** — `tuple[Worksheet, int]` (the sheet and the next free row).
+
+**Behaviour** — title + note explaining the grouped band; `_xlGroupBand` above the header row when the frame is non-empty; `_xlWriteDf` with `FORM_EXPORT_WRAP_COLS`, `FORM_EXPORT_WIDTHS`, `wrapWidth=30`, `rowHeight=42` and a `0.00` format on the checklist score; freezes at column 3 of the row below the header; a red→amber→green `ColorScaleRule` on `Entrustment (1-4)`; print titles spanning the band and header rows.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlGroupBand`, `_xlWriteDf`, `_xlPrintSetup`.
+
+#### `_sheetSelfChecklist(wb, itemAvgDf, sheetName="Self-Evaluation")`
+
+*Lines 3891–3931.* Per-checklist-item averages plus a horizontal bar chart.
+
+**Behaviour** — writes `itemAvgDf` as *Average per item (all forms)* with the `Question` column wrapped at 70; then a `BarChart(type="bar")` whose value and category columns are resolved **by name** (`Average Score (0-1)` and `Domain`) rather than by index — the source comment notes that index-based references silently plot the wrong column once the table's shape changes. Y-axis pinned 0–1, no legend, data labels on, chart height scales as `max(9, min(28, 1.5 * n + 4))`, anchored at `F<startRow>`.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_xlDataLabels`, `_xlStyleChart`, `_xlPrintSetup`.
+
+#### `_sheetChecklistByForm(wb, wideDf, sheetName="Ratings by Form")`
+
+*Lines 3934–3956.* The wide checklist matrix — one row per form, one column per domain.
+
+**Behaviour** — every column other than `Form #`, `Date`, `Supervisor` and `Form Average (0-1)` is treated as a wrapped 17-wide column with a 32pt row height; freezes at column 2; repeats the header row when printing.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_xlPrintSetup`.
+
+#### `_sheetSummary(wb, metricsDf, entrustmentDf, readinessDf, sheetName="Summary")`
+
+*Lines 3959–3989.* Headline metrics plus the two rating distributions.
+
+**Returns** — an **anchors dict**: `{"ws": ws, "entrustHeader": int, "entrustRows": int, "readyHeader": int, "readyRows": int}` (the header/row keys only appear when the corresponding frame is non-empty).
+
+**Behaviour** — writes *Headline numbers*, then the entrustment and readiness distributions, recording each block's header row as `r + 1` (the `+1` accounts for the title line `_xlWriteDf` writes before the header). Column A is pinned to 42 and B to 30 **after** all three writes, so the last table's autofit cannot squash the first table's wrapped text.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_xlPrintSetup`.
+
+#### `_buildTrendChart(sourceWs, anchors, title, subtitleParts=None)`
+
+*Lines 3992–4066.* Builds the entrustment-vs-readiness line chart once so both the *Trend* sheet and the *Dashboard* can use it against the same ranges.
+
+**Parameters** — `sourceWs` (the sheet holding the data), `anchors` (needs `cols`, `headerRow`, `rows`), `title`, `subtitleParts` (optional iterable appended to the x-axis title in brackets).
+
+**Returns** — the `LineChart`, or `None` when `anchors["rows"]` is falsy.
+
+**Behaviour** — the docstring enumerates the four non-obvious techniques:
+1. **Categories are the composite `Label` column**, because native Excel charts have no custom-tooltip API — the category text *is* the tooltip, carrying form number, date, clinic and supervisor.
+2. The two lines are plotted from the **hidden nudged helper columns** (`TREND_ENT_PLOT`, `TREND_RD_PLOT`, ±`TREND_PLOT_OFFSET`) so equal ratings don't hide one line under the other. Entrustment is `XL_BLUE` solid with circle markers; readiness is `XL_ACCENT` with a `sysDot` dash and square markers; line width `22000` EMU.
+3. **Rotation dividers** are a `BarChart` series with `noFill`, a `sysDash` outline, `gapWidth = 500` (Excel's maximum, which makes the bar a hairline) and `overlap = 100`, combined onto the line chart with `line += bar`.
+4. `line.visible_cells_only = False` — the source comment warns that the plausible-looking `plotVisOnly` name silently does nothing and leaves the chart empty when the helper columns are hidden.
+
+Also: y-axis pinned 0.5–4.5 with `majorUnit = 1`; `x_axis.tickLblSkip = max(2, ceil(nRows / 8))` so 97 forms don't smear the axis while every point keeps its hover label; `display_blanks = "gap"` so a missing rating leaves a gap rather than dropping to zero; size from `_xlChartSize(nRows, perCategory=0.85, minWidth=26, maxWidth=58, height=12.5)` with `-45°` tick rotation.
+
+**Calls** — `_xlChartSize`, `_xlStyleChart`.
+
+**Called by** — `_sheetTrend`, `_sheetDashboard`.
+
+#### `_sheetTrend(wb, trendDf, sheetName="Trend", studentName=None, cohort=None)`
+
+*Lines 4069–4116.* The Trend sheet.
+
+**Returns** — an anchors dict `{"ws", "headerRow", "rows", "cols"}` (used by the Dashboard).
+
+**Behaviour** — a long explanatory note that names the two series' owners and states the `TREND_PLOT_OFFSET * 2` separation explicitly; `_xlWriteDf` with fixed widths; the four helper columns are **hidden** (`column_dimensions[...].hidden = True`) but still plot; the chart is anchored two columns past the table; a red→amber→green colour scale is applied to the true `TREND_ENT_COL`; freezes at column 2.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_buildTrendChart`, `_xlPrintSetup`.
+
+#### `_sheetProcedures(wb, itemsDf, sheetName="Procedures")`
+
+*Lines 4119–4167.* Item-code counts vs the class average.
+
+**Behaviour** — writes the table (with `Description` wrapped at 45 and `0.0` formats on `Class Average` / `Difference`), then a clustered `BarChart` of `Your Count` (`XL_BLUE`) and `Class Average` (`XL_ACCENT`) with categories from `Item Code`, offset via `_xlClusteredOffset`. **Data labels only when `nRows <= 22`** — "labels on 50 bars are noise, not information". Tick rotation switches to `-45°` above 12 categories. Finally, `Difference` gets two `CellIsRule`s: red below zero, green at or above zero.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_xlClusteredOffset`, `_xlDataLabels`, `_xlChartSize`, `_xlStyleChart`, `_xlPrintSetup`.
+
+#### `_sheetFeedback(wb, strengthsDf, weaknessCountsDf, sheetName="Feedback")`
+
+*Lines 4170–4219.* Commendations and areas for improvement, each with a chart.
+
+**Behaviour** — first the *Areas for improvement by category* table with a `DoughnutChart(holeSize=55)` showing percentage labels, anchored at `E<wStart>`; the cursor is then advanced with the magic `r = max(r, wStart + n + 21)` to clear the chart. Then *Top commendations* with a horizontal `BarChart` (height `max(9, min(28, 1.2 * n + 4))`) anchored at `E<sStart>`. Both charts address their source ranges by **hard-coded `min_col=1` / `min_col=2`**, so they assume a two-column table shape.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_xlDataLabels`, `_xlStyleTitleObj`, `_xlChartFont`, `_xlAxisLabels`, `_xlStyleChart`, `_xlPrintSetup`.
+
+#### `_sheetComments(wb, commentsDf, sheetName="Comments & Incidents")`
+
+*Lines 4222–4239.* Every written comment — supervisor and self — in one filterable table with a `Type` column, `Detail` and `Item Codes` wrapped at 85 with 48pt rows, `Date` formatted, freeze at the header row.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlWriteDf`, `_xlPrintSetup`.
+
+#### `_dashboardDoughnut(sourceWs, headerRow, nRows, title)`
+
+*Lines 4242–4258.* Builds a doughnut over a two-column `(label, count)` block that lives on **another** sheet — Excel is happy for a chart to reference a different worksheet.
+
+**Returns** — the `DoughnutChart` (hole 55, percentage labels, 10.5 × 14 cm, bottom legend). Also assumes `min_col=1`/`min_col=2`.
+
+**Calls** — `_xlDataLabels`, `_xlStyleTitleObj`, `_xlChartFont`, `_xlAxisLabels`.
+
+**Called by** — `_sheetDashboard`.
+
+#### `_sheetDashboard(wb, cohort, studentNumber, studentName, generatedOn, kpis, summaryAnchors, trendAnchors, sheetName="Dashboard")`
+
+*Lines 4261–4299.* The landing page: KPI tiles plus charts, with all chart data living on the tabs behind it so nothing fights over column widths.
+
+**Behaviour** — sets the tab colour to `XL_NAVY` and columns A–P to width 15; title, provenance note, then `_xlKpiCards(perRow=5)`. If `trendAnchors["rows"]`, re-builds **exactly** the Trend sheet's chart against the same ranges and anchors it at `A<chartRow>`, then advances `chartRow += int(line.height / 0.53) + 2` (≈0.53 cm per default-height row — a magic constant). The two doughnuts (entrustment at `A`, readiness at `I`) are added only when their anchors exist, so a workbook that omits the Summary sheet renders the Dashboard without them rather than failing.
+
+**Calls** — `_xlTitle`, `_xlNote`, `_xlKpiCards`, `_buildTrendChart`, `_dashboardDoughnut`, `_xlPrintSetup`.
+### 5.14 Section 9.5 — Data assembly shared by both workbooks (L4302–L4636)
+
+Each sheet declares the data groups it needs (`STUDENT_SHEETS[...]["needs"]`), and only those groups are queried — "pick three sheets and you pay for three sheets' worth of SQL, not the whole report."
+
+#### `_collectStudentExcelData(engine, cohort, studentNumber, studentName, formsTable="dds4_boh3_forms_v3", itemCodeLimit=55, needs=None)`
+
+*Lines 4310–4338.* Runs the required queries once and returns a dict of presentation-ready DataFrames.
+
+**Parameters** — extra: `itemCodeLimit` (`int`, default `55`) forwarded to `getStudentTopItemCodes`; `needs` (iterable of `STUDENT_DATA_GROUPS` names, `None` = everything).
+
+**Returns** — `dict` whose keys are consumed by the `_buildSheet*` adapters: `formDf`, `checklistWide`, `checklistLegend`, `checklistItemAvg`, `metricsDf`, `readinessDf`, `entrustmentDf`, `kpis`, `trendDf`, `itemsDf`, `strengthsDf`, `weaknessCountsDf`, `commentsDf`, plus the private cache key `_assessorRollup`.
+
+**Behaviour** — a straight seven-branch dispatch on `needs`.
+
+**Calls** — `getStudentFormExport`, `getStudentSelfChecklist`, `_collectSummaryData`, `_collectTrendData`, `_collectProcedureData`, `_collectFeedbackData`, `_collectCommentData`.
+
+**Called by** — `buildStudentWorkbook`.
+
+#### `_assessorRollupCached(data, engine, cohort, studentNumber, formsTable)`
+
+*Lines 4341–4345.* Memoises `getAssessorRollup` in the shared `data` dict under `_assessorRollup`, because both the Summary and Feedback groups need it.
+
+**Returns** — the `(assessorRoll, entrustmentDf)` tuple.
+
+**Side effects** — mutates `data`.
+
+**Called by** — `_collectSummaryData`, `_collectFeedbackData`.
+
+#### `_collectSummaryData(data, engine, cohort, studentNumber, studentName, formsTable)`
+
+*Lines 4348–4401.* Summary metrics table, the two rating distributions, and the KPI tiles.
+
+**Returns** — `data` (mutated in place).
+
+**Behaviour** — 1. reuses `getStudentSummaryTable` "so the numbers can't drift" from the PDF, storing `_cleanHtmlBreaks(metricsDf)` as `metricsDf`; 2. builds a `metricLookup` from `Metric` → `Value`; 3. `getStudentRollup` for readiness, `_assessorRollupCached` for entrustment; 4. both distribution frames are renamed to `[label, "Count"]`, passed through `_scaleText` and filtered — readiness additionally drops blank and literal `"none"` labels; 5. builds ten KPI tiles: *Forms, Patients attended, Avg entrustment (1–4), Avg self checklist (0–1), Commendations, Areas for improvement* (the sum of the seven weakness counts), *Clinical incidents, Additional concerns, Forms with reflections, Supervisors*; 6. the *Supervisors* tile is dropped entirely when the `forms` group wasn't collected (its value would be `None`).
+
+**Calls** — `getStudentSummaryTable`, `_cleanHtmlBreaks`, `getStudentRollup`, `_assessorRollupCached`, `Utils:toInt`.
+
+#### `getStudentTrendDetail(engine, cohort, studentNumber, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 4418–4442.* Per-form ratings **with** the context needed for chart hover.
+
+**Returns** — DataFrame `Date`, `Rotation`, `Clinic` (`COALESCE(NULLIF(external_clinic,''), clinic)`), `Supervisor`, `TREND_ENT_COL`, `TREND_RD_COL`.
+
+**Behaviour** — the two rating column names are interpolated from the `TREND_*` constants. Uses the same `submitted_by_student AND submitted_by_assessor` filter as `getStudentTimeSeries`, so the PDF and Excel charts agree on which forms count; the docstring explains `getStudentTimeSeries` is deliberately left untouched because the PDF depends on its exact shape.
+
+**Called by** — `_collectTrendData`.
+
+#### `_collectTrendData(data, engine, cohort, studentNumber, formsTable)`
+
+*Lines 4445–4501.* Per-form ratings plus the three helper columns the trend chart plots.
+
+**Returns** — `data` with `trendDf` set (an empty frame when there is nothing to plot).
+
+**Behaviour** — 1. coerces `Date`, inserts a 1-based `Form #`; 2. builds the composite `Label`; 3. writes the nudged plotting columns `ent - 0.045` and `rd + 0.045`, rounded to 3 dp, from `pd.to_numeric(..., errors="coerce")`; 4. builds `TREND_DIVIDER_COL` as `4.35` on the **first form of each new rotation** and `None` elsewhere (never on form 1, since `changed` starts `[False]`); 5. returns the columns in a fixed order — the four helper columns last, which is what lets `_sheetTrend` hide them by position.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `_shortClinic` | `_shortClinic(v)` | `"Cohealth (Footscray)"` → `"Cohealth"`; the full name stays in the table |
+| `_shortName` | `_shortName(v)` | Strips the titles `dr, prof, a/prof, assoc, mr, ms, mrs, miss` then renders `"Dr Amy Chen"` → `"A. Chen"`; a single remaining token is returned as-is |
+| `_label` | `_label(row)` | Joins `Form n`, the `%d %b` date, the short clinic and the short supervisor with ` · `. **This string is both the Excel hover tooltip and the axis tick label**, so it is deliberately kept short |
+
+**Calls** — `getStudentTrendDetail`.
+
+#### `_collectProcedureData(data, engine, cohort, studentNumber, formsTable, itemCodeLimit)`
+
+*Lines 4504–4522.* Item-code counts vs the cohort average.
+
+**Returns** — `data` with `itemsDf` set.
+
+**Behaviour** — lower-cases then renames `itemcode/description/totalqty/cohortavg` to `Item Code / Description / Your Count / Class Average`, coerces the two numeric columns with `fillna(0)`, computes `Difference = Your Count - Class Average` rounded to 1 dp, and keeps only those five columns in a fixed order.
+
+**Calls** — `getStudentTopItemCodes`.
+
+#### `_collectFeedbackData(data, engine, cohort, studentNumber, formsTable)`
+
+*Lines 4525–4545.* Commendation counts and area-for-improvement counts.
+
+**Returns** — `data` with `strengthsDf` (renamed to `Commendation`, `Times Recorded`) and `weaknessCountsDf` (`Area`, `Count`, zero rows dropped and the index reset).
+
+**Behaviour** — the seven `Area` labels are written out **literally** here (*Time Management, Communication, Technical Skills, Person-Centred Care, Professional Behaviour, Risk Management, Knowledge & Clinical Reasoning*) rather than read from `WEAKNESS_KEY_LABELS`, and they are mapped from the rollup's `weakness_*_n` column names.
+
+**Calls** — `_assessorRollupCached`, `getTopMultiSelectValues`, `Utils:toInt`.
+
+#### `_collectCommentData(data, engine, cohort, studentNumber, formsTable)`
+
+*Lines 4548–4588.* One unified, filterable comment log.
+
+**Returns** — `data` with `commentsDf` (`Date, Type, Supervisor, Rotation, Detail, Item Codes`).
+
+**Behaviour** — concatenates four sources, each tagged with a `Type`: *Clinical incident* (`getClinicalIncidentSummary`), *Additional concern* (`getAdditionalConcerns`), *Supervisor written feedback* (`getClinicalIncidentSummary` with `extractValue="weakness-other", colName="Comment"`), and *My reflection* (`getSelfReflections`, whose columns are first renamed to `Date, Self Reflection, Item Codes`). Sorted by `(Date, Type)` with `NaT` last.
+
+**Nested functions**
+
+| Name | Signature | Description |
+|---|---|---|
+| `_asComments` | `_asComments(df, typeLabel, detailCol, supervisorCol="Assessor Name")` | Renames the detail and supervisor columns, adds the `Type` tag, back-fills any of the six target columns that are missing with `None`, reorders, and drops rows whose `Detail` is null or whitespace. Returns a correctly-shaped empty frame when the input is empty or lacks `detailCol` |
+
+**Calls** — `getClinicalIncidentSummary`, `getAdditionalConcerns`, `getSelfReflections`.
+
+#### `_assertNoRawColumns(wb)`
+
+*Lines 4591–4601.* Belt-and-braces privacy check run just before every save.
+
+**Behaviour** — scans the **first 400 rows** of every worksheet for a cell whose stripped lower-cased string value is in `_EXPORT_FORBIDDEN_COLS`; raises `ValueError("Raw/PII columns leaked into the workbook: …")` listing up to 10 offenders.
+
+**Side effects** — raises on violation.
+
+**Called by** — `buildStudentWorkbook`.
+
+#### `getStudentInfo(engine, studentNumber, cohort=None, formsTable="dds4_boh3_forms_v3")`
+
+*Lines 4604–4636.* Resolves a student number to `(cohort, studentNumber, studentName)` with a useful error message.
+
+**Parameters** — `cohort` (`str | None`, `None` auto-detects by picking the cohort with the most forms).
+
+**Returns** — `tuple[str, int, str]`.
+
+**Raises** — `LookupError` when the number has no forms at all, or when it has forms but none in the requested cohort — the second message names the cohort(s) it *is* in ("the usual cause is a BOH3 student passed as DDS4"). The docstring explains this exists to replace the bare `IndexError` you get from filtering `getStudentsInCohort()` and taking `.iloc[0]`.
+
+**Behaviour** — groups by `(cohort, student_number, student_name)` ordered by form count descending, excluding blank names and `'Test Student'`; the cohort match is case-insensitive.
+
+**Called by** — `buildStudentWorkbook` (only when `cohort` or `studentName` is missing); `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+testCohort, testStudent, testName = getStudentInfo(engine, 1079984)
+outDir = f"BOH3_DDS4/{testCohort}_ExcelReports"
+```
+
+### 5.15 Section 9.6 — Sheet registry (L4639–L4759)
+
+Ten thin adapter functions map the registry's uniform `builder(wb, ctx, sheetName)` signature onto each `_sheet*` function's real signature, pulling what they need out of the `ctx` dict (which is `_collectStudentExcelData`'s output plus a `meta` key). Two of them also write their returned anchors back into `ctx` so the deferred Dashboard can use them.
+
+| Function | Lines | What it does |
+|---|---|---|
+| `_buildSheetReadMe(wb, ctx, sheetName)` | 4652–4655 | Calls `_sheetReadMe` with `ctx["meta"]`, choosing `kind="dashboard"` when `meta["hasDashboard"]` |
+| `_buildSheetForms(wb, ctx, sheetName)` | 4658–4659 | `_sheetForms(wb, ctx.get("formDf"), sheetName=sheetName)` |
+| `_buildSheetSummary(wb, ctx, sheetName)` | 4662–4666 | `_sheetSummary(...)`; stores the result in `ctx["summaryAnchors"]` |
+| `_buildSheetTrend(wb, ctx, sheetName)` | 4669–4674 | `_sheetTrend(...)` with student name and cohort; stores `ctx["trendAnchors"]` |
+| `_buildSheetProcedures(wb, ctx, sheetName)` | 4677–4678 | `_sheetProcedures(wb, ctx.get("itemsDf"), …)` |
+| `_buildSheetFeedback(wb, ctx, sheetName)` | 4681–4683 | `_sheetFeedback(wb, ctx.get("strengthsDf"), ctx.get("weaknessCountsDf"), …)` |
+| `_buildSheetSelfChecklist(wb, ctx, sheetName)` | 4686–4687 | `_sheetSelfChecklist(wb, ctx.get("checklistItemAvg"), …)` |
+| `_buildSheetChecklistByForm(wb, ctx, sheetName)` | 4690–4691 | `_sheetChecklistByForm(wb, ctx.get("checklistWide"), …)` |
+| `_buildSheetComments(wb, ctx, sheetName)` | 4694–4695 | `_sheetComments(wb, ctx.get("commentsDf"), …)` |
+| `_buildSheetDashboard(wb, ctx, sheetName)` | 4698–4705 | `_sheetDashboard(...)` with `ctx.get("kpis", [])` and both anchor dicts defaulting to `{}` — an empty anchors dict simply means that chart's source sheet wasn't included, so the Dashboard renders without it rather than failing |
+
+Note `ctx["checklistLegend"]` is collected by `_collectStudentExcelData` but no sheet builder consumes it.
+
+#### `listStudentSheets()`
+
+*Lines 4751–4759.* Returns a printable catalogue of the sheet registry.
+
+**Returns** — DataFrame with columns `Sheet`, `In dashboard default`, `In export default`, `Data groups queried`, `What it shows`, one row per `STUDENT_SHEETS` entry.
+
+**Called by** — `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+display(listStudentSheets())
+```
+
+### 5.16 Section 9.7 — Public workbook builders (L4762–L4902)
+
+#### `buildStudentWorkbook(engine, cohort, studentNumber, studentName, outPath, sheets=None, formsTable="dds4_boh3_forms_v3", itemCodeLimit=55, titleSuffix="clinical feedback")`
+
+*Lines 4763–4822.* The single implementation behind both public workbook builders.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `cohort`, `studentName` | `str \| None` | — | Either being `None`/`""` triggers a `getStudentInfo` lookup from the student number |
+| `outPath` | `str \| Path` | — | Parent directories are created |
+| `sheets` | `list[str] \| None` | `None` → `DASHBOARD_SHEETS` | Keys of `STUDENT_SHEETS`, **in tab order**; duplicates are ignored |
+| `itemCodeLimit` | `int` | `55` | Forwarded to the procedures query |
+| `titleSuffix` | `str` | `"clinical feedback"` | Ends the workbook's document title |
+
+**Returns** — `outPath`.
+
+**Raises** — `ValueError` listing the unknown sheet names, or when the resolved sheet list is empty.
+
+**Behaviour**
+
+1. Resolves cohort/name via `getStudentInfo` when either is missing.
+2. Validates every requested sheet against `STUDENT_SHEETS`, then de-duplicates while preserving caller order.
+3. Unions the `needs` of the chosen sheets and calls `_collectStudentExcelData` with exactly that set — a short sheet list runs proportionally fewer queries.
+4. Builds `ctx["meta"]` with cohort, student number/name, forms table, `generatedOn` (`pd.Timestamp.today()` formatted `%d %B %Y`) and `hasDashboard`.
+5. Creates a `Workbook`, removes the default sheet, builds all non-`deferred` sheets in order, then the `deferred` ones (currently only *Dashboard*, whose charts reference ranges that must already exist), moving each back to its listed position with `wb.move_sheet(name, offset=ordered.index(name) - wb.sheetnames.index(name))`.
+6. Sets `wb.active = 0`, the document title `f"{studentName} — {cohort} {titleSuffix}"` and creator *Melbourne Dental School*.
+7. `_assertNoRawColumns(wb)`, then `mkdir(parents=True, exist_ok=True)` and save.
+
+**Side effects** — creates directories and writes an `.xlsx`.
+
+**Calls** — `getStudentInfo`, `_collectStudentExcelData`, `_assertNoRawColumns`, plus every registered builder indirectly.
+
+**Called by** — `buildStudentExcelReport`, `buildStudentFormExport`; `main.ipynb` (commented-out example at L~3395 of the notebook).
+
+#### `buildStudentExcelReport(engine, cohort, studentNumber, studentName, outPath, formsTable="dds4_boh3_forms_v3", itemCodeLimit=55, sheets=None)`
+
+*Lines 4825–4836.* Thin wrapper: the Excel mirror of the PDF student report, with live Excel charts. Defaults to `DASHBOARD_SHEETS` and `titleSuffix="feedback dashboard"`.
+
+**Returns** — `outPath`. **Calls** — `buildStudentWorkbook`. **Called by** — `buildCohortStudentExcelReports`; `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+excelArgs = dict(formsTable="dds4_boh3_forms_v3", itemCodeLimit=55)
+buildStudentExcelReport(engine, testCohort, testStudent, testName,
+                        f"{outDir}/{testStudent}.xlsx", **excelArgs)
+```
+
+#### `buildStudentFormExport(engine, cohort, studentNumber, studentName, outPath, formsTable="dds4_boh3_forms_v3", includeChecklist=True, sheets=None)`
+
+*Lines 4839–4852.* Thin wrapper: the flat "one row per form" workbook students ask for.
+
+**Parameters** — extra: `includeChecklist` (`bool`, default `True`) — `False` narrows the default to `["Read Me", "My Forms"]`. An explicit `sheets` list overrides it entirely.
+
+**Returns** — `outPath`. `titleSuffix="form-by-form feedback"`. **Note** — it does **not** forward `itemCodeLimit`.
+
+**Called by** — `buildCohortStudentExcelReports`; `main.ipynb`.
+
+**Example** (`main_notebook_code.py`)
+
+```python
+buildStudentFormExport(engine, testCohort, testStudent, testName,
+                       f"{outDir}/{testStudent}_forms.xlsx",
+                       formsTable=excelArgs["formsTable"])
+```
+
+#### `buildCohortStudentExcelReports(engine, cohort, outputDir, kind="both", formsTable="dds4_boh3_forms_v3", itemCodeLimit=55, studentNumbers=None, verbose=True, dashboardSheets=None, exportSheets=None)`
+
+*Lines 4855–4902.* Generates Excel reports for every student in a cohort.
+
+**Parameters**
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `kind` | `str` | `"both"` | `"dashboard"`, `"export"` or `"both"`; anything else raises `ValueError` |
+| `studentNumbers` | iterable \| `None` | `None` | Restricts the roster to these IDs |
+| `verbose` | `bool` | `True` | Prints a `[excel] cohort id name ✓` line per student |
+| `dashboardSheets`, `exportSheets` | `list[str] \| None` | `None` | Per-file-type sheet overrides |
+
+**Returns** — a `pd.DataFrame` log with `student_number`, `student_name`, `file`, `kind`, `status` (`"ok"` or `"error: …"`).
+
+**Behaviour** — creates `outputDir`, iterates `getStudentsInCohort`, and per student writes `<studentNumber>.xlsx` (dashboard) and/or `<studentNumber>_forms.xlsx` (flat export) — matching the `<studentNumber>.pdf` convention the mailer expects. **Each student is wrapped in `try/except Exception`** so one bad student cannot kill the batch; the failure is printed and recorded in the log with `kind` set to the *requested* kind rather than the stage that failed. Note the exception handler catches failures from both writes, so a dashboard that succeeded before an export failure is logged twice — once `ok`, once `error`.
+
+**Side effects** — creates a directory, writes up to two files per student, prints.
+
+**Calls** — `getStudentsInCohort`, `buildStudentExcelReport`, `buildStudentFormExport`.
+
+**Called by** — `main.ipynb` (2 call sites).
+
+**Example** (`main_notebook_code.py`)
+
+```python
+cohortExcelArgs = dict(kind="both", verbose=False,
+                       dashboardSheets=None,   # None = DASHBOARD_SHEETS
+                       exportSheets=None,      # None = FORM_EXPORT_SHEETS
+                       **excelArgs)
+
+excelLogDDS4 = buildCohortStudentExcelReports(
+    engine, cohort="DDS4", outputDir="BOH3_DDS4/DDS4_ExcelReports", **cohortExcelArgs)
+excelLog = pd.concat([excelLogDDS4, excelLogBOH3], ignore_index=True)
+print(excelLog["status"].value_counts().to_string())
+```
+
+## 6. Call graph (this module)
+
+Split by section; only functions with at least one intra-module edge appear in a given diagram, and each function appears in the diagram for its own section.
+
+### 6.1 Cohort queries → cohort PDF/Excel (sections 2–4)
+
+```mermaid
+flowchart LR
+  getWhereStatement["getWhereStatement"] --> u_where["_where"]
+  u_where --> getFullDf["getFullDf"]
+  u_where --> getTotalForms["getTotalForms"]
+  u_where --> getAgeCounts["getAgeCounts"]
+  u_where --> getAgeList["getAgeList"]
+  u_where --> getAvgAge["getAvgAge"]
+  u_where --> getPatientsPerStudentStats["getPatientsPerStudentStats"]
+  u_where --> getPatientPerStudent["getPatientPerStudent"]
+  u_where --> getClinicForStudent["getClinicForStudent"]
+  u_where --> getClinicPatientCounts["getClinicPatientCounts"]
+  u_where --> getSubmittedCounts["getSubmittedCounts"]
+  u_where --> getTopItemCodes["getTopItemCodes"]
+  u_where --> getCafFinalEvalScoreStudent["getCafFinalEvalScoreStudent"]
+  u_where --> getAdditionalConcerns["getAdditionalConcerns"]
+  u_where --> getClinicalIncidentSummary["getClinicalIncidentSummary"]
+  u_where --> getPatientCountPerRow["getPatientCountPerRow"]
+  u_where --> getEntrustmentSummary["getEntrustmentSummary"]
+  u_where --> getAvgEntrustment["getAvgEntrustment"]
+  u_where --> getNotSubmitted["getNotSubmitted"]
+  u_where --> getCounts["getCounts"]
+  u_where --> getRotationRange["getRotationRange"]
+
+  getItemCodeDescriptionMap["getItemCodeDescriptionMap"] --> getItemCodesPerStudentBatch["getItemCodesPerStudentBatch"]
+  getPatientCountPerRow --> createPatientStatsPerClinic["createPatientStatsPerClinic"]
+  createPatientStatsPerClinic --> createPatientStatsPerClinicPerRotation["createPatientStatsPerClinicPerRotation"]
+
+  getTotalForms --> getFrontPageSummaryTable["getFrontPageSummaryTable"]
+  getAgeCounts --> getFrontPageSummaryTable
+  getAvgAge --> getFrontPageSummaryTable
+  getPatientsPerStudentStats --> getFrontPageSummaryTable
+  getClinicPatientCounts --> getFrontPageSummaryTable
+  getSubmittedCounts --> getFrontPageSummaryTable
+  getTopItemCodes --> getFrontPageSummaryTable
+  getCafFinalEvalScoreStudent --> getFrontPageSummaryTable
+  getEntrustmentSummary --> getFrontPageSummaryTable
+  getAvgEntrustment --> getFrontPageSummaryTable
+
+  getFrontPageSummaryTable --> buildFrontPage["buildFrontPage"]
+  getTopItemCodes --> buildFrontPage
+  plotItemCodeFrequencies["plotItemCodeFrequencies"] --> buildFrontPage
+  getRotationRange --> buildBannerSubtitle["buildBannerSubtitle"]
+
+  buildFrontPage --> buildCohortSummaryPdf["buildCohortSummaryPdf"]
+  buildBannerSubtitle --> buildCohortSummaryPdf
+  getTopItemCodes --> buildCohortSummaryPdf
+  plotItemCodeFrequencies --> buildCohortSummaryPdf
+  getClinicPatientCounts --> buildCohortSummaryPdf
+  getAgeCountsBatch["getAgeCountsBatch"] --> buildCohortSummaryPdf
+  getEntrustmentPerStudentBatch["getEntrustmentPerStudentBatch"] --> buildCohortSummaryPdf
+  getItemCodesPerStudentBatch --> buildCohortSummaryPdf
+  addPbnLeaveColumns["addPbnLeaveColumns"] --> buildCohortSummaryPdf
+  formatSummaryExcel["formatSummaryExcel"] --> buildCohortSummaryPdf
+```
+
+`getStandardizationSql`, `getClinicCodeStandardizationSql` (and its nested `esc`), `smartTitleCaseClinic`, `getBoh3Dds4FormsProcessSql` and `getBoh3Dds4FormsV3ProcessSql` have no intra-module edges — they are called only from `main.ipynb`. `getItemCodeDescriptionMap.harvest` is nested inside its parent.
+
+### 6.2 PBN/leave and workbook formatting (sections 3a–3b)
+
+```mermaid
+flowchart LR
+  u_parseLeaveDate["_parseLeaveDate"] --> leaveWorkingDays["leaveWorkingDays"]
+  u_vicBusinessDays["_vicBusinessDays"] --> leaveWorkingDays
+  leaveWorkingDays --> getLeaveDaysByStudent["getLeaveDaysByStudent"]
+  u_normName["_normName"] --> getPbnCountByStudent["getPbnCountByStudent"]
+  getLeaveDaysByStudent --> addPbnLeaveColumns["addPbnLeaveColumns"]
+  getPbnCountByStudent --> addPbnLeaveColumns
+  addPbnLeaveColumns --> buildCohortSummaryPdf["buildCohortSummaryPdf"]
+
+  u_fmtColWidth["_fmtColWidth"] --> u_fmtSheet["_fmtSheet"]
+  u_fmtSheet --> formatSummaryExcel["formatSummaryExcel"]
+  u_fmtEntrustmentHighlights["_fmtEntrustmentHighlights"] --> formatSummaryExcel
+  formatSummaryExcel --> buildCohortSummaryPdf
+```
+
+Nested helpers not shown as nodes: `getLeaveDaysByStudent._find`, `getLeaveDaysByStudent._digits`, `getPbnCountByStudent._digits`, `_fmtEntrustmentHighlights.colOf`.
+
+### 6.3 Student queries → student PDF and HTML (sections 5–8)
+
+```mermaid
+flowchart LR
+  getItemCodeDescriptionMap["getItemCodeDescriptionMap"] --> getStudentTopItemCodes["getStudentTopItemCodes"]
+  getStudentPatientSummary["getStudentPatientSummary"] --> getStudentSummaryTable["getStudentSummaryTable"]
+  getStudentSelfSummary["getStudentSelfSummary"] --> getStudentSummaryTable
+  getStudentAssessorSummary["getStudentAssessorSummary"] --> getStudentSummaryTable
+  getCounts["getCounts"] --> getStudentSummaryTable
+
+  getStudentRollup["getStudentRollup"] --> buildStudentVsAssessorSection["buildStudentVsAssessorSection"]
+  getAssessorRollup["getAssessorRollup"] --> buildStudentVsAssessorSection
+  getTopMultiSelectValues["getTopMultiSelectValues"] --> buildStudentVsAssessorSection
+  getClinicalIncidentSummary["getClinicalIncidentSummary"] --> buildStudentVsAssessorSection
+  getSelfReflections["getSelfReflections"] --> buildStudentVsAssessorSection
+  weaknessPiePlot["weaknessPiePlot"] --> buildStudentVsAssessorSection
+
+  getStudentSummaryTable --> buildStudentPdf["buildStudentPdf"]
+  getStudentTimeSeries["getStudentTimeSeries"] --> buildStudentPdf
+  plotEntrustmentReadinessTimeSeries["plotEntrustmentReadinessTimeSeries"] --> buildStudentPdf
+  getStudentTopItemCodes --> buildStudentPdf
+  u_addProceduresBarChart["_addProceduresBarChart"] --> buildStudentPdf
+  buildStudentVsAssessorSection --> buildStudentPdf
+
+  buildStudentPdf --> buildCohortStudentReports["buildCohortStudentReports"]
+  getStudentsInCohort["getStudentsInCohort"] --> buildCohortStudentReports
+
+  getStudentsInCohort --> buildEntrustmentTimeSeriesPdf["buildEntrustmentTimeSeriesPdf"]
+  getStudentTimeSeries --> buildEntrustmentTimeSeriesPdf
+  plotEntrustmentReadinessTimeSeries --> buildEntrustmentTimeSeriesPdf
+  getStudentsInCohort --> buildEntrustmentTimeSeriesHtml["buildEntrustmentTimeSeriesHtml"]
+  getStudentTimeSeries --> buildEntrustmentTimeSeriesHtml
+  getStudentTimeSeries --> buildStudentEntrustmentHtml["buildStudentEntrustmentHtml"]
+
+  u_sanitizeSheetName["_sanitizeSheetName"] --> buildStudentSheet["buildStudentSheet"]
+  u_writeTitle["_writeTitle"] --> buildStudentSheet
+  u_writeTable["_writeTable"] --> buildStudentSheet
+  u_autoFitColumns["_autoFitColumns"] --> buildStudentSheet
+  buildStudentSheet --> exportStudentTextWorkbook["exportStudentTextWorkbook"]
+```
+
+`buildIndividualEntryPage` has no intra-module callers or callees (it only calls `Utils.createTable`) and is invoked directly from `main.ipynb`. Nested helpers not shown: `buildStudentVsAssessorSection.renderTopDf`, `plotEntrustmentReadinessTimeSeries._shortRot`.
+
+### 6.4 Excel helpers → sheet builders (section 9.2–9.4)
+
+```mermaid
+flowchart LR
+  u_xlValue["_xlValue"] --> u_xlTitle["_xlTitle"]
+  u_xlValue --> u_xlNote["_xlNote"]
+  u_xlValue --> u_xlKpiCards["_xlKpiCards"]
+  u_xlValue --> u_xlWriteDf["_xlWriteDf"]
+  u_xlTableName["_xlTableName"] --> u_xlWriteDf
+  u_xlChartFont["_xlChartFont"] --> u_xlAxisLabels["_xlAxisLabels"]
+  u_xlChartFont --> u_xlStyleChart["_xlStyleChart"]
+  u_xlAxisLabels --> u_xlStyleChart
+  u_xlStyleTitleObj["_xlStyleTitleObj"] --> u_xlStyleChart
+
+  u_xlTitle --> u_sheetReadMe["_sheetReadMe"]
+  u_xlNote --> u_sheetReadMe
+  u_xlPrintSetup["_xlPrintSetup"] --> u_sheetReadMe
+  u_xlWriteDf --> u_sheetForms["_sheetForms"]
+  u_xlGroupBand["_xlGroupBand"] --> u_sheetForms
+  u_xlWriteDf --> u_sheetSelfChecklist["_sheetSelfChecklist"]
+  u_xlDataLabels["_xlDataLabels"] --> u_sheetSelfChecklist
+  u_xlStyleChart --> u_sheetSelfChecklist
+  u_xlWriteDf --> u_sheetChecklistByForm["_sheetChecklistByForm"]
+  u_xlWriteDf --> u_sheetSummary["_sheetSummary"]
+  u_xlWriteDf --> u_sheetTrend["_sheetTrend"]
+  u_xlWriteDf --> u_sheetProcedures["_sheetProcedures"]
+  u_xlClusteredOffset["_xlClusteredOffset"] --> u_sheetProcedures
+  u_xlChartSize["_xlChartSize"] --> u_sheetProcedures
+  u_xlStyleChart --> u_sheetProcedures
+  u_xlDataLabels --> u_sheetProcedures
+  u_xlWriteDf --> u_sheetFeedback["_sheetFeedback"]
+  u_xlStyleChart --> u_sheetFeedback
+  u_xlStyleTitleObj --> u_sheetFeedback
+  u_xlDataLabels --> u_sheetFeedback
+  u_xlAxisLabels --> u_sheetFeedback
+  u_xlChartFont --> u_sheetFeedback
+  u_xlWriteDf --> u_sheetComments["_sheetComments"]
+
+  u_xlChartSize --> u_buildTrendChart["_buildTrendChart"]
+  u_xlStyleChart --> u_buildTrendChart
+  u_buildTrendChart --> u_sheetTrend
+  u_buildTrendChart --> u_sheetDashboard["_sheetDashboard"]
+  u_xlDataLabels --> u_dashboardDoughnut["_dashboardDoughnut"]
+  u_xlStyleTitleObj --> u_dashboardDoughnut
+  u_xlAxisLabels --> u_dashboardDoughnut
+  u_xlChartFont --> u_dashboardDoughnut
+  u_dashboardDoughnut --> u_sheetDashboard
+  u_xlKpiCards --> u_sheetDashboard
+  u_xlPrintSetup --> u_sheetDashboard
+```
+
+`_xlFreezeAndFilter` has no edges at all. `_scaleText` calls only itself. `_cleanHtmlBreaks` feeds `_collectSummaryData` (next diagram).
+
+### 6.5 Data assembly → registry → public builders (section 9.5–9.7)
+
+```mermaid
+flowchart LR
+  getStudentSummaryTable["getStudentSummaryTable"] --> u_collectSummaryData["_collectSummaryData"]
+  getStudentRollup["getStudentRollup"] --> u_collectSummaryData
+  u_cleanHtmlBreaks["_cleanHtmlBreaks"] --> u_collectSummaryData
+  getAssessorRollup["getAssessorRollup"] --> u_assessorRollupCached["_assessorRollupCached"]
+  u_assessorRollupCached --> u_collectSummaryData
+  u_assessorRollupCached --> u_collectFeedbackData["_collectFeedbackData"]
+  getTopMultiSelectValues["getTopMultiSelectValues"] --> u_collectFeedbackData
+  getStudentTrendDetail["getStudentTrendDetail"] --> u_collectTrendData["_collectTrendData"]
+  getStudentTopItemCodes["getStudentTopItemCodes"] --> u_collectProcedureData["_collectProcedureData"]
+  getClinicalIncidentSummary["getClinicalIncidentSummary"] --> u_collectCommentData["_collectCommentData"]
+  getAdditionalConcerns["getAdditionalConcerns"] --> u_collectCommentData
+  getSelfReflections["getSelfReflections"] --> u_collectCommentData
+
+  u_studentFormExportSql["_studentFormExportSql"] --> getStudentFormExport["getStudentFormExport"]
+  getStudentFormExport --> u_collectStudentExcelData["_collectStudentExcelData"]
+  getStudentSelfChecklist["getStudentSelfChecklist"] --> u_collectStudentExcelData
+  u_collectSummaryData --> u_collectStudentExcelData
+  u_collectTrendData --> u_collectStudentExcelData
+  u_collectProcedureData --> u_collectStudentExcelData
+  u_collectFeedbackData --> u_collectStudentExcelData
+  u_collectCommentData --> u_collectStudentExcelData
+
+  u_sheetReadMe["_sheetReadMe"] --> u_buildSheetReadMe["_buildSheetReadMe"]
+  u_sheetForms["_sheetForms"] --> u_buildSheetForms["_buildSheetForms"]
+  u_sheetSummary["_sheetSummary"] --> u_buildSheetSummary["_buildSheetSummary"]
+  u_sheetTrend["_sheetTrend"] --> u_buildSheetTrend["_buildSheetTrend"]
+  u_sheetProcedures["_sheetProcedures"] --> u_buildSheetProcedures["_buildSheetProcedures"]
+  u_sheetFeedback["_sheetFeedback"] --> u_buildSheetFeedback["_buildSheetFeedback"]
+  u_sheetSelfChecklist["_sheetSelfChecklist"] --> u_buildSheetSelfChecklist["_buildSheetSelfChecklist"]
+  u_sheetChecklistByForm["_sheetChecklistByForm"] --> u_buildSheetChecklistByForm["_buildSheetChecklistByForm"]
+  u_sheetComments["_sheetComments"] --> u_buildSheetComments["_buildSheetComments"]
+  u_sheetDashboard["_sheetDashboard"] --> u_buildSheetDashboard["_buildSheetDashboard"]
+
+  u_buildSheetReadMe -.STUDENT_SHEETS.-> STUDENT_SHEETS{{"STUDENT_SHEETS registry"}}
+  u_buildSheetForms -.-> STUDENT_SHEETS
+  u_buildSheetSummary -.-> STUDENT_SHEETS
+  u_buildSheetTrend -.-> STUDENT_SHEETS
+  u_buildSheetProcedures -.-> STUDENT_SHEETS
+  u_buildSheetFeedback -.-> STUDENT_SHEETS
+  u_buildSheetSelfChecklist -.-> STUDENT_SHEETS
+  u_buildSheetChecklistByForm -.-> STUDENT_SHEETS
+  u_buildSheetComments -.-> STUDENT_SHEETS
+  u_buildSheetDashboard -.-> STUDENT_SHEETS
+  STUDENT_SHEETS -.-> buildStudentWorkbook["buildStudentWorkbook"]
+
+  u_collectStudentExcelData --> buildStudentWorkbook
+  getStudentInfo["getStudentInfo"] --> buildStudentWorkbook
+  u_assertNoRawColumns["_assertNoRawColumns"] --> buildStudentWorkbook
+  buildStudentWorkbook --> buildStudentExcelReport["buildStudentExcelReport"]
+  buildStudentWorkbook --> buildStudentFormExport["buildStudentFormExport"]
+  buildStudentExcelReport --> buildCohortStudentExcelReports["buildCohortStudentExcelReports"]
+  buildStudentFormExport --> buildCohortStudentExcelReports
+  getStudentsInCohort["getStudentsInCohort"] --> buildCohortStudentExcelReports
+```
+
+`listStudentSheets` reads `STUDENT_SHEETS`, `DASHBOARD_SHEETS` and `FORM_EXPORT_SHEETS` but calls nothing. Nested helpers not shown: `_collectTrendData._shortClinic`, `_collectTrendData._shortName`, `_collectTrendData._label`, `_collectCommentData._asComments`.
+
+## 7. Gotchas and known issues
+
+**Import-time side effects and unused imports**
+
+- **L101** — `itemSectionDf = pd.read_excel(variableUtils.itemSectionMappingFile)` runs at **import time**. `variableUtils.itemSectionMappingFile` is an absolute Windows path (`C:\Users\Kunal Patel\D folder\MDS Work\2026\item_section_mapping.xlsx`), so importing this module on any other machine raises `FileNotFoundError` before a single function is defined. Worse, `itemSectionDf` is **never referenced again** — `buildCohortSummaryPdf` re-reads the same file at L1572.
+- **L9, L16, L17, L18, L30, L34, L37–38** — `os`, `defaultdict`, `escape`, `sqlalchemy.text`, `mdates`, and the imported-but-unused `runDdl`/`autoFitColumns`, plus `itables` and `dtale` (two heavy interactive-table packages), are all imported and never used. `import dtale` in particular is slow and can start background processes.
+
+**Hard-coded dates, years and paths**
+
+- **L461** — the v3 upsert hard-codes `AND r.datetimeUtc >= TIMESTAMPTZ '2026-01-01'`. Running this in 2027 silently ingests 2026 data too; running it for a 2025 backfill silently ingests nothing.
+- **L1017 `VIC_HOLIDAYS_2026`, and `year=2026` defaults at L1066, L1076, L1106, L1147, L1170** — the whole leave calculation is pinned to 2026. `buildCohortSummaryPdf` also passes `year=2026` explicitly at L1562.
+- **L1283** — `_fmtEntrustmentHighlights` conditionally formats a column literally named `"PBNs 2026"`. In 2027 `addPbnLeaveColumns` will emit `"PBNs 2027"` and the red highlight will silently stop appearing, with no error.
+- **L2341** — the student PDF intro paragraph hard-codes *"your clinical activity so far in 2026"*.
+- **L1013** — `LEAVE_FILE` embeds the export timestamp `"…_July 31, 2026_13.05.xlsx"`; a fresh Qualtrics download requires editing the constant (or passing `leaveFile=`).
+- **L977–978, L1526** — `createPatientStatsPerClinicPerRotation` and `buildCohortSummaryPdf` write to hard-coded relative paths under `BOH3_DDS4/`. The directory is never created, so a missing `BOH3_DDS4/` folder raises. `buildCohortSummaryPdf` writes `clinic_metrics_{cohort}.xlsx` **unconditionally**, even when `superExcelPath` is `None`.
+- **L979** — the rotation loop is the fixed list `["Rotation 1" … "Rotation 5"]`, even though `getRotationRange` and `getEntrustmentPerStudentBatch` elsewhere handle rotations 1–9.
+
+**Duplicated logic**
+
+- **L471–491** — `getWhereStatement` and `_where` are **byte-identical copies** of `Utils.getWhereStatement` / `Utils._where` (Utils.py L605–624). Because `main.ipynb` star-imports both modules, which definition wins depends on import order.
+- **L68** — `_autoFitColumns` shadows the imported `Utils.autoFitColumns` with different clamps (10/60 vs 5/30).
+- **L1132 and L1156** — two identical `_digits` nested helpers.
+- **L4536–4542** — `_collectFeedbackData` re-types the seven weakness labels as literals instead of reading `WEAKNESS_KEY_LABELS`, so the two lists can drift apart.
+
+**Silent failure / swallowed errors**
+
+- **L1174–1183** — `addPbnLeaveColumns` catches bare `Exception` around both external workbook reads and fills the columns with **zeros** after a `print`. A missing or renamed PBN/leave file produces a report that says "0 PBNs, 0 leave days" for everyone, which is indistinguishable from a clean cohort.
+- **L1693–1694** — `getStudentTopItemCodes` swallows any description-map failure and leaves the `description` column `NULL`.
+- **L3363–3366** — `_xlWriteDf` catches `ValueError` from `ws.add_table` and passes, so a duplicate table name silently costs you the autofilter.
+- **L3382–3383** — `_xlStyleTitleObj` catches `AttributeError` and passes.
+- **L4898–4901** — `buildCohortStudentExcelReports` catches `Exception` per student. Because the `try` wraps **both** writes, a student whose dashboard succeeded and whose export failed is logged twice (one `ok`, one `error`), and the error row's `kind` is the requested kind, not the failing stage.
+
+**Fragile assumptions**
+
+- **L149–154** — `getStandardizationSql` interpolates `fromNames` and `toName` straight into SQL with no escaping. A clinic containing an apostrophe (`"O'Connor Clinic"`) produces a syntax error. Its sibling `getClinicCodeStandardizationSql` does have an `esc()` helper (L178) — the escaping was only ever added on one side.
+- **L812** — `getClinicalIncidentSummary` interpolates both `extractValue` and `colName` into the SQL string.
+- **L478** — `getWhereStatement` emits `f"{key} IN :{key}"` for a `list` filter value, which is not valid SQL unless the bind parameter is declared as expanding. No caller in this module passes a list, so the path is untested.
+- **L1314–1316** — `formatSummaryExcel` reorders tabs by assigning to the **private** `wb._sheets` list; this is not part of openpyxl's public API.
+- **L1520–1523** — `functools.reduce` over `clinicMetrics.items()` raises `TypeError: reduce() of empty iterable` if no clinic reaches 5 patients (early in a cohort, or a small cohort).
+- **L1594, L1604** — inside the `if superExcelPath:` block, `incidentsDf.drop(...)` and `concernsDf.to_excel(...)` are called without a `None` check, even though L1529–1530 has just established that either may be `None`.
+- **L1258** — `_fmtSheet` samples only the first 59 data rows for column widths.
+- **L4595** — `_assertNoRawColumns` scans only the first 400 rows of each sheet and matches by exact lower-cased equality, so a header like `"patient_data (1)"` (which `_xlWriteDf`'s de-duplication can produce) would pass.
+- **L3973, L3979** — `_sheetSummary` records chart anchors as `r + 1`, coupling it to the fact that `_xlWriteDf` writes exactly one title line before the header. Changing `_xlWriteDf`'s layout silently misaligns the Dashboard doughnuts.
+- **L4287** — `chartRow += int(line.height / 0.53) + 2` — an undocumented "cm per default row" constant.
+- **L4186–4188, L4208–4210, L4245–4247** — `_sheetFeedback` and `_dashboardDoughnut` address chart source ranges by hard-coded `min_col=1` / `min_col=2`, unlike `_sheetSelfChecklist` which resolves by column name specifically to avoid this class of bug (see its comment at L3913–3914).
+- **L1656, L1666** — `getStudentTopItemCodes` uses `NULLIF((ic->>'quantity')::int, NULL)` — a no-op wrapper around an **unguarded** integer cast. An empty-string quantity raises `invalid input syntax for type integer`, where `getTopItemCodes` (L673) uses the safe `NULLIF(ic->>'quantity','')::int`.
+- **L2673 vs L2884** — `%`-escaping is inconsistent between otherwise-parallel SQL constants: `_WEAKNESS_SQL` uses `LIKE 'weakness-%%'` while `STUDENT_ENTRIES_SQL` uses `LIKE 'weakness-%%%%'`.
+- **L2642, L2665, L2678, L2689, L2744, L2764, L2835, L2842, L2914** — nine SQL constants (and `exportStudentTextWorkbook`'s inline query) hard-code the table name `dds4_boh3_forms_v3` instead of taking a `formsTable` parameter like the rest of the module.
+- **L2712–2715** — `buildStudentSheet` keys on `student_name`, the only student query set that does. Two students sharing a name would be merged; a renamed student would split.
+
+**Dead code and vestigial parameters**
+
+- **L2930–2938** — `TrackedStudentDoc` is defined but **never instantiated** anywhere, in this module or the notebook.
+- **L2919** — `_EntryMarker` is explicitly imported by `main.ipynb` (L2975) but never used there; the notebook uses `_BannerMarker` instead. The two classes are functionally identical.
+- **L3475–3477** — `_xlFreezeAndFilter` has zero callers.
+- **L2164** — `plotEntrustmentReadinessTimeSeries(useDateAxis=...)` is documented in the docstring but **never read in the body**; both call sites pass `useDateAxis=False`. The same docstring also promises shaded risk zones and a dashed mean line that the matplotlib version does not draw (they exist only in the Plotly templates).
+- **L2258** — `_addProceduresBarChart(uniColor=...)` is accepted and never used.
+- **L1795** — `getStudentSummaryTable(studentName=...)` is accepted and never used.
+- **L1821–1826** — `getStudentSummaryTable` runs an extra query for `totalIncidents` whose consuming metric row is commented out at L1844; the result is computed and thrown away on every call.
+- **L2045** — `buildStudentVsAssessorSection` queries `topWeaknessOther` (30 rows) whose `renderTopDf` call is commented out at L2133.
+- **L2332** — `buildStudentPdf` unpacks `selfDf, assessorDf` from `getStudentSummaryTable` and never uses them.
+- **L226–308** — `getBoh3Dds4FormsProcessSql` and `_CREATE_TABLE_SQL` are the superseded v2 pipeline; no caller remains.
+- Functions with no caller anywhere (module or notebook): `getFullDf`, `getAgeList`, `getClinicForStudent`, `getNotSubmitted`, `buildEntrustmentTimeSeriesHtml`, `buildStudentEntrustmentHtml` (its only call site is commented out inside `buildStudentPdf` at L2362–2364).
+- `ctx["checklistLegend"]` is collected by `_collectStudentExcelData` (L4326) and consumed by no sheet builder.
+- Large commented-out blocks: per-rotation cohort summaries (L1497–1502), the interactive-HTML link in the student PDF (L2359–2371), testing shortcuts in `buildCohortStudentReports` (L2403–2404, L2415), `# AND submitted_by_assessor` in `getEntrustmentPerStudentBatch` (L907), metric rows in `buildStudentVsAssessorSection` (L2078–2079, L2100, L2107–2110).
+
+**Other behavioural notes**
+
+- **L2975** — `buildIndividualEntryPage` calls `print(row.index)` unconditionally on every entry, flooding the notebook when looping a student's forms.
+- **L1562, L1563, L1627–1629** — `buildCohortSummaryPdf` mutates the caller's `patientPerStudentDf` in place (`sort_values`, `drop`, `rename` with `inplace=True`), so re-running the cell with the same frame behaves differently the second time. `addPbnLeaveColumns` likewise mutates its input.
+- **L2497, L3019** — both HTML templates claim in their docstrings that "the file works offline", but Plotly is loaded from `cdnjs.cloudflare.com` at page load.
+- **L2405, L4881** — the "safe name" sanitiser is applied to the **student number**, not the name, so it is effectively a no-op; student names never reach a filename (which is the intended privacy behaviour, but the code reads as if it were guarding a name).
+- **L1458, L4803** — report content includes `pd.Timestamp.now()` / `.today()`, so two runs on different days produce byte-different output.
+- **L2029–2030** — `weaknessPiePlot` never closes its figure, unlike every other plotting helper; generating a whole cohort accumulates open figures.
+- **L4849** — `buildStudentFormExport` does not forward `itemCodeLimit` to `buildStudentWorkbook`, so a caller who adds `"Procedures"` to its `sheets` list silently gets the default 55.
