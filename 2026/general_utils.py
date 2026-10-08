@@ -131,6 +131,17 @@ def getDeleteSql(formName=None):
     """
     return sql
 
+def getDeleteStudentsSql(tableName, studentNumbers=None, colName="student_number"):
+    """DELETE rows for specific student numbers (complete exclusion from analysis).
+    Defaults to variableUtils.EXCLUDED_STUDENT_NUMBERS; values int()-coerced
+    (column is BIGINT). Returns "" for an empty list -> callers guard with `if sql:`."""
+    if studentNumbers is None:
+        studentNumbers = EXCLUDED_STUDENT_NUMBERS
+    nums = sorted({int(n) for n in studentNumbers})
+    if not nums:
+        return ""
+    return f"DELETE FROM {tableName} WHERE {colName} IN ({', '.join(map(str, nums))});"
+
 def getInsertSqlRawforms(replace=False):
     if replace:
         onconflict = """
@@ -444,6 +455,7 @@ CREATE INDEX IF NOT EXISTS idx_rff_v3_cohort      ON {RAWFORM_FORMS_V3_NAME} (co
 CREATE INDEX IF NOT EXISTS idx_rff_v3_student     ON {RAWFORM_FORMS_V3_NAME} (student_number);
 CREATE INDEX IF NOT EXISTS idx_rff_v3_student_data_gin  ON {RAWFORM_FORMS_V3_NAME} USING GIN (student_data);
 CREATE INDEX IF NOT EXISTS idx_rff_v3_assessor_data_gin ON {RAWFORM_FORMS_V3_NAME} USING GIN (assessor_data);
+ALTER TABLE {RAWFORM_FORMS_V3_NAME} ADD COLUMN IF NOT EXISTS context_checklists JSONB;
 """
 
 # Cohorts routed to the dds4_boh3_forms_v3 table instead of here.
@@ -488,7 +500,7 @@ def getInsertSqlRawform_forms_v3(replace=False, cohorts=('BOH1', 'BOH2', 'DDS1',
     student_config = EXCLUDED.student_config, assessor_config = EXCLUDED.assessor_config,
     assessor_name = EXCLUDED.assessor_name, assessor_email = EXCLUDED.assessor_email,
     submitted_by_student = EXCLUDED.submitted_by_student, submitted_by_assessor = EXCLUDED.submitted_by_assessor,
-    additional_checklists = EXCLUDED.additional_checklists, insertedat = now()
+    additional_checklists = EXCLUDED.additional_checklists, context_checklists = EXCLUDED.context_checklists, insertedat = now()
         """
     else:
         onconflict = "ON CONFLICT (form_code, assessmentid) DO NOTHING"
@@ -505,7 +517,7 @@ def getInsertSqlRawform_forms_v3(replace=False, cohorts=('BOH1', 'BOH2', 'DDS1',
       patient_data, context_schema_snapshot,
       student_config, assessor_config,
       assessor_name, assessor_email,
-      submitted_by_student, submitted_by_assessor, additional_checklists,
+      submitted_by_student, submitted_by_assessor, additional_checklists, context_checklists,
       insertedat
     )
     SELECT
@@ -560,6 +572,7 @@ def getInsertSqlRawform_forms_v3(replace=False, cohorts=('BOH1', 'BOH2', 'DDS1',
       (f.form_value->>'submitted_by_student')::boolean                      AS submitted_by_student,
       (f.form_value->>'submitted_by_assessor')::boolean                     AS submitted_by_assessor,
       f.form_value->'additional_checklists'                                 AS additional_checklists,
+      fc.ctx->'checklists'                                                   AS context_checklists,
 
       r.insertedat
     FROM {RAWFORMS_NAME} r
@@ -2306,6 +2319,8 @@ CW_AMBER_BG   = "FFEB9C"
 CW_AMBER_TEXT = "9C6500"
 CW_GREEN_BG   = "C6EFCE"
 CW_GREEN_TEXT = "276221"
+CW_ORANGE_BG  = "FFD59E"
+CW_ORANGE_TEXT = "8A4B00"
 CW_EMPTY_BG   = "D9D9D9"      # mid grey — assessment not sat
 CW_LIGHT_GREY = "F2F2F2"
 CW_HEADER_FONT = Font(name="Arial", bold=True, color=CW_WHITE, size=10)
@@ -2321,6 +2336,7 @@ CW_LEVEL_PALETTE = {
     "red":   (CW_RED_BG,   CW_RED_TEXT),
     "amber": (CW_AMBER_BG, CW_AMBER_TEXT),
     "green": (CW_GREEN_BG, CW_GREEN_TEXT),
+    "orange":(CW_ORANGE_BG, CW_ORANGE_TEXT),
     "grey":  (CW_EMPTY_BG, "000000"),
 }
 
@@ -2379,7 +2395,7 @@ COMBINED_SHEET_COLUMN_LABELS_INVERSE = {v: k for k, v in COMBINED_SHEET_COLUMN_L
 # Columns of a score/flagged sheet that are NOT item codes and must be excluded from the
 # threshold colouring. Both spellings, so styleCombinedSheet works either side of the
 # rename — and so a sheet written before 2026-08-18 still styles correctly.
-COMBINED_META_COLS = {"Avg Score", "low_count", "Low Count", "Pass/Fail"}
+COMBINED_META_COLS = {"Avg Score", "Min Score", "Max Score", "low_count", "Low Count", "Pass/Fail"}
 
 # Same idea for the assessors sheet's trailing summary columns.
 COMBINED_ASSESSOR_SUMMARY_COLS = {
@@ -2519,6 +2535,46 @@ def applyGrColorScale(ws, firstRow, lastRow, firstCol, lastCol):
         end_type="num",   end_value=GR_SCALE_MAX,   end_color=CW_GREEN_BG))
 
 
+COUNT_LEVEL_HIGHLIGHT = {1: "amber", 2: "orange", 3: "red"}   # count -> colour, applied as ">= key"
+
+
+def highlightCountCells(ws, df, cols, colors=None, firstRow=2):
+    """Colour the GR/PR level-count cells by magnitude. Each key in *colors* is a
+    threshold applied as ">= key" with the highest match winning, so the default
+    {1:'amber', 2:'orange', 3:'red'} paints 1 amber, 2 orange, 3+ red; zero/blank cells
+    are left plain. Accepts palette names or explicit (bg, text) pairs (via
+    resolveLevelColors). Returns the number of cells coloured.
+    """
+    palette = resolveLevelColors(colors or COUNT_LEVEL_HIGHLIGHT)
+    if not palette:
+        return 0
+    tiers = sorted(palette)
+    colIndex = {c: i + 1 for i, c in enumerate(df.columns)}
+    n = 0
+    for c in cols:
+        if c not in colIndex:
+            continue
+        cIdx = colIndex[c]
+        for rOffset, val in enumerate(df[c]):
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(v) or v <= 0:
+                continue
+            hit = None
+            for t in tiers:
+                if v >= t:
+                    hit = palette[t]
+            if hit:
+                bg, txt = hit
+                cell = ws.cell(row=firstRow + rOffset, column=cIdx)
+                cell.fill = cwFill(bg)
+                cell.font = Font(name="Arial", size=9, color=txt, bold=True)
+                n += 1
+    return n
+
+
 def highlightBelowThreshold(ws, df, thresholds, valueCols, firstRow=2, amberMargin=0.0):
     """Red-fill every cell at or below its column's cutoff.
 
@@ -2548,8 +2604,46 @@ def highlightBelowThreshold(ws, df, thresholds, valueCols, firstRow=2, amberMarg
     return nRed, nAmber
 
 
+# ── Per-student GR/PR level-count summary columns (scores_flagged sheet) ──────
+# COUNT_LEVEL_SOURCES maps a spec's source token to the wide combined-workbook frame
+# it reads. exportCombinedNotebook builds those frames; these helpers turn one into a
+# per-student count column. Kept data-driven so columns can be added/re-levelled from
+# the notebook config without touching this module.
+COUNT_LEVEL_SOURCES = {"GR": "global_ratings", "PR": "practice_readiness"}
+
+
+def countLevelColumnLabel(source, levels):
+    """Header for a level-count column, generated FROM the levels so it always matches
+    the config, e.g. ('GR', (2, 1)) -> 'GR Level 2 & 1 Count', ('PR', (1,)) -> 'PR Level 1 Count'."""
+    return f"{source} Level {' & '.join(str(l) for l in levels)} Count"
+
+
+def countLevelsPerStudent(wideDf, idCols, levels, excludeCols=None):
+    """Series (indexed by the first id column) giving, per student, the number of
+    item-code cells in *wideDf* whose value is one of *levels*.
+
+    *wideDf* is a combined-workbook wide frame: id columns, one column per item code,
+    plus a trailing 'Avg Score'. Blank / non-numeric cells never count. Returns None
+    when there is nothing to count so the caller can fall back to zeros.
+    """
+    if wideDf is None or wideDf.empty or not levels:
+        return None
+    keyCol = idCols[0]
+    valueCols = [c for c in wideDf.columns if c not in idCols and c != "Avg Score"]
+    if excludeCols:
+        _skip = set(excludeCols)
+        valueCols = [c for c in valueCols if c not in _skip]
+    if not valueCols:
+        return None
+    wanted = {float(l) for l in levels}
+    vals = wideDf[valueCols].apply(pd.to_numeric, errors="coerce")
+    counts = vals.isin(wanted).sum(axis=1).astype("Int64")
+    return pd.Series(counts.values, index=wideDf[keyCol].values)
+
+
 def styleCombinedSheet(ws, df, idCols, kind="plain", thresholds=None,
-                       amberMargin=0.0, greyEmpty=True, levelColors=GR_LEVEL_COLORS):
+                       amberMargin=0.0, greyEmpty=True, levelColors=GR_LEVEL_COLORS,
+                       extraMetaCols=None, skipHighlightCols=None):
     """Header + freeze panes + borders + per-kind colouring for one combined-workbook sheet.
 
     kind:
@@ -2567,9 +2661,13 @@ def styleCombinedSheet(ws, df, idCols, kind="plain", thresholds=None,
 
     # COMBINED_META_COLS carries BOTH spellings of low_count, so this works on a sheet
     # written before the 2026-08-18 relabel and one written after.
-    valueCols = [c for c in df.columns if c not in idCols and c not in COMBINED_META_COLS]
+    metaCols = COMBINED_META_COLS | set(extraMetaCols or ())
+    valueCols = [c for c in df.columns if c not in idCols and c not in metaCols]
     if not valueCols:
         return
+    # Columns kept as data but excluded from highlighting (still bordered/greyed).
+    _skipHL = set(skipHighlightCols or ())
+    highlightCols = [c for c in valueCols if c not in _skipHL]
     firstCol = df.columns.get_loc(valueCols[0]) + 1
     lastCol = df.columns.get_loc(valueCols[-1]) + 1
     firstRow, lastRow = 2, nRows + 1
@@ -2582,9 +2680,9 @@ def styleCombinedSheet(ws, df, idCols, kind="plain", thresholds=None,
         if isinstance(levelColors, str) and levelColors.lower() == "scale":
             applyGrColorScale(ws, firstRow, lastRow, firstCol, lastCol)
         else:
-            highlightLevelCells(ws, df, valueCols, levelColors, firstRow)
+            highlightLevelCells(ws, df, highlightCols, levelColors, firstRow)
     elif kind in ("score", "flagged") and thresholds is not None:
-        highlightBelowThreshold(ws, df, thresholds, valueCols, firstRow, amberMargin)
+        highlightBelowThreshold(ws, df, thresholds, highlightCols, firstRow, amberMargin)
 
     if kind == "flagged" and "Pass/Fail" in df.columns:
         pfCol = df.columns.get_loc("Pass/Fail") + 1
@@ -3551,6 +3649,7 @@ def _flag_by_percentile(
     id_cols: list[str],
     percentile: float = 0.15,
     min_low_count: int = 3,
+    exclude_code_list: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Flag students who score at or below the *percentile* threshold in at
@@ -3560,6 +3659,12 @@ def _flag_by_percentile(
         c for c in score_df.columns if c not in id_cols and c != "Avg Score"
     ]
     thresholds = score_df[date_cols].quantile(percentile)
+    # Codes excluded from flagging: NaN the cutoff so they neither count toward
+    # low_count (value <= NaN is False) nor get red-highlighted — they stay as columns.
+    if exclude_code_list:
+        _excl = [c for c in thresholds.index if matchesIgnoreCode(c, exclude_code_list)]
+        if _excl:
+            thresholds.loc[_excl] = float('nan')
 
     def _count_low(row):
         return sum(
@@ -3589,6 +3694,7 @@ def _flag_by_blr(
     min_item_count: int = 0,
     include_code_list: list[str] | None = None,
     use_borderline_mean: bool = False,
+    exclude_code_list: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Flag students who fall at or below a GR-anchored cutoff in at least
@@ -3648,6 +3754,13 @@ def _flag_by_blr(
               f"(too few rows or a single GR value): "
               f"{', '.join(map(str, thresholds[thresholds.isna()].index))}")
 
+    # Codes excluded from flagging: NaN the cutoff so _count_low skips them (it already
+    # requires notna(threshold)) and highlightBelowThreshold leaves them uncoloured.
+    if exclude_code_list:
+        _excl = [c for c in thresholds.index if matchesIgnoreCode(c, exclude_code_list)]
+        if _excl:
+            thresholds.loc[_excl] = float('nan')
+
     def _count_low(row):
         return sum(
             1 for c in code_cols
@@ -3661,6 +3774,212 @@ def _flag_by_blr(
         lambda n: "Fail" if n >= min_low_count else "Pass"
     )
     return result, thresholds
+
+FLAG_FALLBACK_DEFAULT_CHAIN = ["blr", "borderline", "meanksd", "percentile", "passall"]
+
+
+def _resolveCodeCutoff(code, grp, scoreCol, chain, *, borderline_gr, percentile,
+                       blr_min_n, blr_min_r2, blr_min_low_gr,
+                       bgm_min_borderline_frac, bgm_min_borderline_n,
+                       pass_all_gr=2, meanksd_k=1.0, meanksd_min_low=1, meanksd_min_n=5,
+                       min_pass_score=0.5):
+    """Resolve ONE item code's cutoff by walking *chain* and taking the first method whose
+    usefulness check passes. Returns ``(cutoff, method, diag)`` where *diag* is a dict of
+    the stats and the per-method verdicts behind the decision (for the flag_methods report).
+    """
+    n = len(grp)
+    gr = grp["GR"] if n else pd.Series(dtype=float)
+    sc = grp["assessor_score"] if n else pd.Series(dtype=float)
+    distinct_gr = int(gr.nunique()) if n else 0
+    n_le_bg = int((gr <= borderline_gr).sum()) if n else 0
+
+    # Candidate stats — computed for the report regardless of whether the gate passes.
+    blr_slope = blr_r2 = blr_cutoff = float("nan")
+    if n and distinct_gr >= 2:
+        slope, intercept, r, *_ = stats.linregress(gr, sc)
+        blr_slope = round(float(slope), 4)
+        blr_r2 = round(float(r * r), 4)
+        blr_cutoff = round(float(slope * borderline_gr + intercept), 4)
+    bmask = (gr == borderline_gr) if n else pd.Series(dtype=bool)
+    bg_n = int(bmask.sum()) if n else 0
+    bg_frac = round(bg_n / n, 4) if n else 0.0
+    bg_cutoff = round(float(sc[bmask].mean()), 4) if bg_n else float("nan")
+    svals = scoreCol.dropna() if scoreCol is not None else pd.Series(dtype=float)
+    pct_cutoff = round(float(svals.quantile(percentile)), 4) if len(svals) >= 3 else float("nan")
+
+    # Fail tail = forms rated BELOW pass_all_gr (GR 1 when pass_all_gr=2). If none, the whole
+    # cohort is at/above pass_all_gr and the code passes everyone (no cutoff). mean-kSD is the
+    # statistical cutoff used when there IS a fail tail but BLR/BGM could not anchor one.
+    n_fail = int((gr < pass_all_gr).sum()) if n else 0
+    has_fail_tail = n_fail >= meanksd_min_low
+    meanksd_cutoff = float("nan")
+    if len(svals) >= 2:
+        _sd = float(svals.std(ddof=1))
+        if pd.notna(_sd):
+            meanksd_cutoff = round(float(svals.mean() - meanksd_k * _sd), 4)
+    score_min = round(float(svals.min()), 4) if len(svals) else float("nan")
+    score_max = round(float(svals.max()), 4) if len(svals) else float("nan")
+
+    # Per-method verdict: "ok", or the first failing gate as a short reason.
+    verdict = {}
+    if n < blr_min_n:
+        verdict["blr"] = f"n={n}<{blr_min_n}"
+    elif distinct_gr < 2:
+        verdict["blr"] = "single GR value"
+    elif not (gr.min() <= borderline_gr <= gr.max()):
+        verdict["blr"] = f"GR {int(gr.min())}-{int(gr.max())} excludes {borderline_gr}"
+    elif n_le_bg < blr_min_low_gr:
+        verdict["blr"] = f"{n_le_bg} at/below GR{borderline_gr} (<{blr_min_low_gr})"
+    elif blr_slope <= 0:
+        verdict["blr"] = f"slope {blr_slope}<=0"
+    elif blr_r2 < blr_min_r2:
+        verdict["blr"] = f"R2={blr_r2}<{blr_min_r2}"
+    elif not (0.0 <= blr_cutoff <= 1.0):
+        verdict["blr"] = f"cutoff {blr_cutoff} out of [0,1]"
+    else:
+        verdict["blr"] = "ok"
+
+    if n == 0:
+        verdict["borderline"] = "no forms"
+    elif bg_n < bgm_min_borderline_n:
+        verdict["borderline"] = f"borderline n={bg_n}<{bgm_min_borderline_n}"
+    elif bg_frac < bgm_min_borderline_frac:
+        verdict["borderline"] = f"borderline {bg_frac*100:.0f}%<{bgm_min_borderline_frac*100:.0f}%"
+    else:
+        verdict["borderline"] = "ok"
+
+    # meanksd / percentile only fire when there IS a fail tail; otherwise passall catches the
+    # code and everyone passes (whole cohort at/above pass_all_gr).
+    _no_tail = (f"no fail tail (0 below GR{pass_all_gr})" if n_fail == 0
+                else f"fail tail {n_fail}<{meanksd_min_low}")
+    if not has_fail_tail:
+        verdict["meanksd"] = _no_tail
+    elif len(svals) < meanksd_min_n:
+        verdict["meanksd"] = f"n={len(svals)}<{meanksd_min_n}"
+    elif pd.isna(meanksd_cutoff):
+        verdict["meanksd"] = "no score spread"
+    else:
+        verdict["meanksd"] = "ok"
+
+    if not has_fail_tail:
+        verdict["percentile"] = _no_tail
+    elif len(svals) < 3:
+        verdict["percentile"] = f"{len(svals)} scores (<3)"
+    else:
+        verdict["percentile"] = "ok"
+
+    # passall is the terminal safety net: always qualifies, no cutoff (NaN), so a code
+    # reaching it flags nobody. n_fail explains WHY (clean cohort vs no anchorable cutoff).
+    verdict["passall"] = "ok"
+
+    cutoff_of = {"blr": blr_cutoff, "borderline": bg_cutoff, "percentile": pct_cutoff,
+                 "meanksd": meanksd_cutoff, "passall": min_pass_score}
+    chosen, chosen_cut, steps = None, float("nan"), []
+    for m in chain:
+        v = verdict.get(m, f"unknown method {m}")
+        if v == "ok":
+            chosen = "pass_all" if m == "passall" else m
+            chosen_cut = cutoff_of[m]
+            if m == "passall":
+                steps.append(f"pass_all: min competency cutoff {min_pass_score} applied "
+                             + (f"(whole cohort at/above GR{pass_all_gr})" if n_fail == 0
+                                else "(fail tail present, no method could anchor)"))
+            else:
+                steps.append(f"{m}: used")
+            break
+        steps.append(f"{m}: {v}")
+    decision = " -> ".join(steps) if steps else "no method attempted"
+
+    diag = dict(item_code=code, n_forms=n, distinct_GR=distinct_gr,
+                n_at_or_below_bg=n_le_bg, n_fail=n_fail, min_score=score_min, max_score=score_max,
+                blr_slope=blr_slope, blr_R2=blr_r2,
+                blr_cutoff=blr_cutoff, bg_n=bg_n, bg_frac=bg_frac, bg_cutoff=bg_cutoff,
+                pct_cutoff=pct_cutoff, meanksd_cutoff=meanksd_cutoff,
+                method=chosen, cutoff=chosen_cut, decision=decision)
+    return chosen_cut, chosen, diag
+
+
+def _flag_by_fallback(
+    folder_path, score_df, id_cols, chain, *,
+    borderline_gr=2, min_low_count=3, percentile=0.15,
+    date_regex=DEFAULT_DATE_REGEX, file_pattern=DEFAULT_FILE_PATTERN,
+    period=PERIOD_ALL, min_date=None, max_date=None,
+    ignore_code_list=None, min_item_count=0, include_code_list=None,
+    exclude_code_list=None,
+    blr_min_n=15, blr_min_r2=0.10, blr_min_low_gr=3,
+    bgm_min_borderline_frac=0.20, bgm_min_borderline_n=5,
+    pass_all_gr=2, meanksd_k=1.0, meanksd_min_low=1, meanksd_min_n=5,
+    min_pass_score=0.5,
+):
+    """Per-item-code flagging with a method fallback chain (e.g. blr -> borderline ->
+    percentile). Each code's cutoff comes from the first method whose usefulness check
+    passes; a code that qualifies for none is left uncounted (NaN). The chosen method per
+    code is on ``thresholds.attrs['flag_methods']`` and a full per-code stats/decision
+    table on ``thresholds.attrs['flag_diagnostics']`` (written as the flag_methods sheet).
+    """
+    files = loadWeeklyFiles(folder_path, date_regex, file_pattern, period, min_date, max_date,
+                            ignore_code_list, min_item_count, verbose=False,
+                            includeCodeList=include_code_list)
+    code_cols = [c for c in score_df.columns if c not in id_cols and c != "Avg Score"]
+    frames = [df for _, df in files if not df.empty]
+    allRows = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    haveRows = (not allRows.empty) and {ITEM_CODE_COL, "assessor_score", "GR"}.issubset(allRows.columns)
+
+    cutoffs, methods, diags = {}, {}, []
+    for c in code_cols:
+        if haveRows:
+            grp = (allRows.loc[allRows[ITEM_CODE_COL] == c, ["assessor_score", "GR"]]
+                   .apply(pd.to_numeric, errors="coerce").dropna())
+        else:
+            grp = pd.DataFrame(columns=["assessor_score", "GR"])
+        scoreCol = score_df[c] if c in score_df.columns else None
+        cut, m, diag = _resolveCodeCutoff(
+            c, grp, scoreCol, chain, borderline_gr=borderline_gr, percentile=percentile,
+            blr_min_n=blr_min_n, blr_min_r2=blr_min_r2, blr_min_low_gr=blr_min_low_gr,
+            bgm_min_borderline_frac=bgm_min_borderline_frac,
+            bgm_min_borderline_n=bgm_min_borderline_n,
+            pass_all_gr=pass_all_gr, meanksd_k=meanksd_k,
+            meanksd_min_low=meanksd_min_low, meanksd_min_n=meanksd_min_n,
+            min_pass_score=min_pass_score)
+        cutoffs[c], methods[c] = cut, m
+        diags.append(diag)
+
+    thresholds = pd.Series(cutoffs, dtype=float).reindex(code_cols)
+    diagCols = ["item_code", "n_forms", "distinct_GR", "n_at_or_below_bg", "n_fail",
+                "min_score", "max_score",
+                "blr_slope", "blr_R2", "blr_cutoff", "bg_n", "bg_frac", "bg_cutoff",
+                "pct_cutoff", "meanksd_cutoff", "method", "cutoff", "decision"]
+    diagDf = pd.DataFrame(diags, columns=diagCols)
+
+    if exclude_code_list:
+        for c in [c for c in code_cols if matchesIgnoreCode(c, exclude_code_list)]:
+            thresholds.loc[c] = float("nan")
+            methods[c] = "excluded"
+            _mask = diagDf["item_code"] == c
+            diagDf.loc[_mask, "method"] = "excluded"
+            diagDf.loc[_mask, "cutoff"] = float("nan")
+            diagDf.loc[_mask, "decision"] = "excluded from flags (kept as column)"
+
+    thresholds.attrs["flag_methods"] = methods
+    thresholds.attrs["flag_diagnostics"] = diagDf
+
+    from collections import Counter
+    tally = Counter(m or "none" for m in methods.values())
+    print(f"Fallback flagging (chain: {' -> '.join(chain)}) — method per code: "
+          + ", ".join(f"{k}={v}" for k, v in tally.items()))
+
+    def _count_low(row):
+        return sum(
+            1 for c in code_cols
+            if pd.notna(row[c]) and pd.notna(thresholds.get(c)) and row[c] <= thresholds[c]
+        )
+
+    result = score_df.copy()
+    result["low_count"] = result.apply(_count_low, axis=1).astype("Int64")
+    result["Pass/Fail"] = result["low_count"].apply(
+        lambda k: "Fail" if k >= min_low_count else "Pass")
+    return result, thresholds
+
 
 def flag_low_students(
     score_df: pd.DataFrame,
@@ -3680,6 +3999,18 @@ def flag_low_students(
     ignore_code_list: list[str] | None = None,
     min_item_count: int = 0,
     include_code_list: list[str] | None = None,
+    exclude_code_list: list[str] | None = None,
+    fallback_chain: list[str] | None = None,
+    blr_min_n: int = 15,
+    blr_min_r2: float = 0.10,
+    blr_min_low_gr: int = 3,
+    bgm_min_borderline_frac: float = 0.20,
+    bgm_min_borderline_n: int = 5,
+    pass_all_gr: int = 2,
+    meanksd_k: float = 1.0,
+    meanksd_min_low: int = 1,
+    meanksd_min_n: int = 5,
+    min_pass_score: float = 0.5,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
     Unified interface for flagging low-performing students.
@@ -3703,10 +4034,31 @@ def flag_low_students(
     """
     if id_cols is None:
         id_cols = list(DEFAULT_ID_COLS)
+
+    # Per-code fallback chain takes over when set — each code's cutoff comes from the
+    # first method whose usefulness check passes (see _flag_by_fallback).
+    if fallback_chain:
+        if folder_path is None:
+            raise ValueError("fallback_chain needs folder_path to read GR/score rows.")
+        return _flag_by_fallback(
+            folder_path, score_df, id_cols, list(fallback_chain),
+            borderline_gr=borderline_gr, min_low_count=min_low_count, percentile=percentile,
+            date_regex=date_regex, file_pattern=file_pattern, period=period,
+            min_date=min_date, max_date=max_date, ignore_code_list=ignore_code_list,
+            min_item_count=min_item_count, include_code_list=include_code_list,
+            exclude_code_list=exclude_code_list,
+            blr_min_n=blr_min_n, blr_min_r2=blr_min_r2, blr_min_low_gr=blr_min_low_gr,
+            bgm_min_borderline_frac=bgm_min_borderline_frac,
+            bgm_min_borderline_n=bgm_min_borderline_n,
+            pass_all_gr=pass_all_gr, meanksd_k=meanksd_k,
+            meanksd_min_low=meanksd_min_low, meanksd_min_n=meanksd_min_n,
+            min_pass_score=min_pass_score)
+
     method = FlagMethod(method)
 
     if method == FlagMethod.PERCENTILE:
-        return _flag_by_percentile(score_df, id_cols, percentile, min_low_count)
+        return _flag_by_percentile(score_df, id_cols, percentile, min_low_count,
+                                   exclude_code_list=exclude_code_list)
 
     if method in (FlagMethod.BLR, FlagMethod.BORDERLINE):
         if folder_path is None:
@@ -3717,6 +4069,7 @@ def flag_low_students(
             period, min_date, max_date, ignore_code_list, min_item_count,
             include_code_list=include_code_list,
             use_borderline_mean=(method == FlagMethod.BORDERLINE),
+            exclude_code_list=exclude_code_list,
         )
 
     raise ValueError(f"Unknown method: {method}")

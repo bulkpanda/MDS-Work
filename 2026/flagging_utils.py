@@ -515,7 +515,63 @@ def _autofitPivotHeaders(ws, columns, start_col=3, minWidth=7, pad=2, maxWidth=4
 #                           count on a rarely-done code is not a concern, so only
 #                           codes students generally do get flagged  (option 2)
 #   mean_sd                 below mean - `sdK` × SD of the column       (option 3)
-COUNT_HIGHLIGHT_MODES = ("percentile", "mean_fraction", "mean_fraction_expected", "mean_sd")
+#   zeros                   red ONLY where the count is 0 (weekly-sim: each item
+#                           code is a distinct week, so most counts are 1 and a 0
+#                           is the only signal -- a missed week)
+#   column_gradient         per-column heatmap: shade EVERY cell by its percentile
+#                           rank within its column, low (red) -> yellow -> green
+COUNT_HIGHLIGHT_MODES = ("percentile", "mean_fraction", "mean_fraction_expected",
+                         "mean_sd", "zeros", "column_gradient")
+
+
+def _gradientHex(t):
+    """ARGB hex on a 3-stop red -> yellow -> green scale for t in [0, 1]
+    (0 = worst/red, 1 = best/green)."""
+    t = 0.0 if t < 0 else 1.0 if t > 1 else float(t)
+    stops = [(0.0, (0xF8, 0x69, 0x6B)), (0.5, (0xFF, 0xEB, 0x84)), (1.0, (0x63, 0xBE, 0x7B))]
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t <= t1:
+            f = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+            r = int(round(c0[0] + (c1[0] - c0[0]) * f))
+            g = int(round(c0[1] + (c1[1] - c0[1]) * f))
+            b = int(round(c0[2] + (c1[2] - c0[2]) * f))
+            return f"FF{r:02X}{g:02X}{b:02X}"
+    return "FFFFFFFF"
+
+
+def _colorPivotZeros(ws, pivotDf, data_start_col, data_start_row):
+    """Red-highlight ONLY cells whose count is 0. Built for weekly-sim Item Code
+    Count Pivots where each item code is a distinct week, so most counts are 1 and
+    a 0 is the only signal (the student missed that week's checklist). Columns of
+    all-1s show nothing; nothing else is touched."""
+    numCols = pivotDf.columns[data_start_col - 1:]
+    for c_offset, colName in enumerate(numCols):
+        excel_col = data_start_col + c_offset
+        col_vals  = pd.to_numeric(pivotDf[colName], errors="coerce")
+        for r_offset, val in enumerate(col_vals):
+            if pd.notna(val) and val == 0:
+                cell = ws.cell(row=data_start_row + r_offset, column=excel_col)
+                cell.fill = _fill(_RED_BG)
+                cell.font = Font(name="Arial", size=9, color=_RED_TEXT, bold=True)
+
+
+def _colorPivotColumnGradient(ws, pivotDf, data_start_col, data_start_row):
+    """Per-column heatmap: shade EVERY cell by its percentile RANK within its own
+    column, low (red) -> mid (yellow) -> high (green). Unlike the cutoff modes this
+    colours the whole column, so a reader sees each student's relative standing on
+    that item code even when the raw counts sit close together. A column where every
+    value is identical gets a single mid colour (rank = 1.0)."""
+    numCols = pivotDf.columns[data_start_col - 1:]
+    for c_offset, colName in enumerate(numCols):
+        excel_col = data_start_col + c_offset
+        col_vals  = pd.to_numeric(pivotDf[colName], errors="coerce")
+        ranks = col_vals.rank(method="average", pct=True)   # 0..1 within-column pct rank
+        for r_offset, (val, pr) in enumerate(zip(col_vals, ranks)):
+            if pd.isna(val) or pd.isna(pr):
+                continue
+            cell = ws.cell(row=data_start_row + r_offset, column=excel_col)
+            cell.fill = _fill(_gradientHex(pr))
+            cell.font = Font(name="Arial", size=9, color="FF000000")
 
 
 def resolveCountHighlightMode(value):
@@ -541,6 +597,12 @@ def _colorPivotByMode(ws, pivotDf, data_start_col, data_start_row, mode="percent
         return
     if mode == "mean_fraction":
         _colorPivotBelowMeanFraction(ws, pivotDf, data_start_col, data_start_row, ratio=ratio)
+        return
+    if mode == "zeros":
+        _colorPivotZeros(ws, pivotDf, data_start_col, data_start_row)
+        return
+    if mode == "column_gradient":
+        _colorPivotColumnGradient(ws, pivotDf, data_start_col, data_start_row)
         return
     numCols = pivotDf.columns[data_start_col - 1:]
     for c_offset, colName in enumerate(numCols):
@@ -743,6 +805,13 @@ FLAG_REGISTRY = {
         "flag_low_class_count", "n_classes", "min_classes", "below",
         "Low Cls", "Flag if attended fewer classes (distinct session dates) than the minimum",
     ),
+    # Unique item codes = distinct checklists sat (scale rows excluded). For weekly
+    # sim each item code is a different week, so this is effectively weeks attended;
+    # flagged below min_item_codes (auto = cohort mean - SD unless minItemCodes set).
+    "low_item_code_count": FlagSpec(
+        "flag_low_item_code_count", "checklist_unique", "min_item_codes", "below",
+        "Low IC", "Flag if fewer unique item codes (distinct checklists sat) than the minimum",
+    ),
     "no_improvement_es": CustomFlagSpec(
         "flag_no_improvement_es",
         fn=lambda row, t: row["last_third_es"] <= row["first_third_es"] + t["improvement_margin"],
@@ -781,6 +850,18 @@ FLAG_REGISTRY = {
     "high_es_lvl2": FlagSpec(
     "flag_high_es_lvl2", "es_lvl2_pct", "max_es_lvl2_pct", "above",
     "ES L2%", "Flag if >X% of ES ratings are level 2 (needs direct supervision)",
+    ),
+    # ── Count-based ES level flags (2026-10-01, DDS3 request) ────────────────
+    # Same idea as high_es_lvl1/2 but on the raw NUMBER of level-N ratings, so a
+    # cohort can allow a fixed leeway (DDS3: one L1 tolerated, a second flags)
+    # regardless of how many forms the student has. Opt-in (_OPT_IN_FLAGS).
+    "high_es_lvl1_count": FlagSpec(
+        "flag_high_es_lvl1_count", "es_lvl1_count", "max_es_lvl1_count", "above",
+        "ES L1 #", "Flag if the number of level-1 entrustment ratings is above X",
+    ),
+    "high_es_lvl2_count": FlagSpec(
+        "flag_high_es_lvl2_count", "es_lvl2_count", "max_es_lvl2_count", "above",
+        "ES L2 #", "Flag if the number of level-2 entrustment ratings is above X",
     ),
 }
 
@@ -871,7 +952,7 @@ def _build_summary_sheet(writer, flagDf, compDf, cohortDf, thresholds,
     # assessment) vs unique (distinct codes). Classes = distinct session dates.
     # Both guarded so an older flagDf without them still builds. (2026-08-19)
     _ckMode  = str(getattr(config, "checklistCountMode", "total")).strip().lower()
-    _ckExtra = [c for c in ("checklist_count", "n_classes") if c in flagDf.columns]
+    _ckExtra = [c for c in ("checklist_count", "checklist_unique", "n_classes") if c in flagDf.columns]
     # Operator / patient-seen columns are Clinic concepts — a Simulation form has no
     # operator role and no patient, so they are all zero/meaningless there. Dropped
     # from the Sim Summary (2026-08-19, user request); the cross-highlight blocks
@@ -894,6 +975,7 @@ def _build_summary_sheet(writer, flagDf, compDf, cohortDf, thresholds,
         **_ID_FRIENDLY,
         "form_count": "Forms",
         "checklist_count": f"Checklists ({'uniq' if _ckMode == 'unique' else 'tot'})",
+        "checklist_unique": "Unique Item Codes",
         "n_classes": "Classes",
         "operator_count": "Operator",
         "support_count": "Support", "pct_operator": "% Oper",
@@ -988,6 +1070,10 @@ def _build_summary_sheet(writer, flagDf, compDf, cohortDf, thresholds,
 
         if "flag_low_class_count" in FLAG_COLS and row.get("flag_low_class_count") and "n_classes" in SUM_COLS:
             c = ws.cell(row=r_idx, column=SUM_COLS.index("n_classes") + 1)
+            c.fill = _fill(_RED_BG); c.font = Font(name="Arial", size=9, color=_RED_TEXT, bold=True)
+
+        if "flag_low_item_code_count" in FLAG_COLS and row.get("flag_low_item_code_count") and "checklist_unique" in SUM_COLS:
+            c = ws.cell(row=r_idx, column=SUM_COLS.index("checklist_unique") + 1)
             c.fill = _fill(_RED_BG); c.font = Font(name="Arial", size=9, color=_RED_TEXT, bold=True)
 
         if "flag_high_fta" in FLAG_COLS and row.get("flag_high_fta"):
@@ -1306,6 +1392,24 @@ def _writeCountPivotSheet(writer, countPivot, groupColName, cohort, formType, pv
                         {"student_number": "ID", "student_name": "Student", "Total": "Total"})
     _colorPivotByMode(wp, countPivot, 3, 4, **(highlight or {"mode": "percentile"}))
 
+    # Column totals footer (sum of every numeric column, incl. the per-student Total).
+    totalRow = 4 + len(countPivot)
+    labelCell = wp.cell(row=totalRow, column=2, value="Column Total")
+    labelCell.font      = Font(name="Arial", bold=True, color=_WHITE, size=9)
+    labelCell.fill      = _fill(_NAVY)
+    labelCell.alignment = Alignment(horizontal="right", vertical="center")
+    labelCell.border    = _thin_border()
+    idCell = wp.cell(row=totalRow, column=1)
+    idCell.fill   = _fill(_NAVY)
+    idCell.border = _thin_border()
+    for cOff, colName in enumerate(pvt_cols[2:], start=3):
+        colSum = pd.to_numeric(countPivot[colName], errors="coerce").sum()
+        cell = wp.cell(row=totalRow, column=cOff, value=int(colSum))
+        cell.font      = Font(name="Arial", bold=True, color=_WHITE, size=9)
+        cell.fill      = _fill(_NAVY)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border    = _thin_border()
+
     wp.column_dimensions["A"].width = 12
     wp.column_dimensions["B"].width = 24
     _autofitPivotHeaders(wp, pvt_cols, start_col=3)
@@ -1365,7 +1469,7 @@ def _build_clinical_incidents_sheet(writer, flagDf, compDf, cohortDf, thresholds
     ][["student_number", "student_name", "datetimeutc", "clinical_incident"]
       + CI_CONTEXT].copy()
     ciDf["datetimeutc"] = pd.to_datetime(ciDf["datetimeutc"], errors="coerce").dt.date
-    ciDf.sort_values(["student_name", "datetimeutc"], inplace=True)
+    ciDf.sort_values(["datetimeutc", "student_name"], ascending=[False, True], inplace=True)  # date DESC (newest first), name as tiebreak
     ciDf.reset_index(drop=True, inplace=True)
     if "role" in ciDf.columns:
         ciDf["role"] = ciDf["role"].map(normalizeRole)   # show labels, not v3 codes
@@ -1417,6 +1521,88 @@ def _build_clinical_incidents_sheet(writer, flagDf, compDf, cohortDf, thresholds
     wci.freeze_panes = "A4"
 
 
+def _stripTags(val):
+    """Plain text for Excel: drop <b>…</b> label markup from the reflection composites."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    return re.sub(r"</?[^>]+>", "", str(val)).strip()
+
+
+def _formItemCodes(row):
+    """Item codes on one form (scale rows excluded), from item_codes, else the scores keys."""
+    codes = row.get("item_codes")
+    if not isinstance(codes, list) or not codes:
+        scores = row.get("scores")
+        codes = list(scores.keys()) if isinstance(scores, dict) else []
+    out = [str(c) for c in codes if c and not str(c).lower().startswith("scale")]
+    return ", ".join(dict.fromkeys(out))   # de-duplicated, order kept
+
+
+def _build_low_professionalism_sheet(writer, flagDf, compDf, cohortDf, thresholds,
+                                      cohort, formType, config, mappingFile=None):
+    """Every form where Professionalism == config.professionalismLevel (default 1):
+    student, Melbourne-local date, item codes, GR/ES/PS, assessor, clinic and the
+    assessor + student comments. Grouped by student, then date. (2026-09-30, BOH1.)"""
+    level = getattr(config, "professionalismLevel", 1)
+    if "professionalism" not in cohortDf.columns:
+        print("[low_professionalism] no 'professionalism' column — sheet skipped")
+        return
+    ps  = pd.to_numeric(cohortDf["professionalism"], errors="coerce")
+    sub = cohortDf[ps == level].copy()
+
+    dt = pd.to_datetime(sub["datetimeutc"], utc=True, errors="coerce")
+    sub["date"]       = dt.dt.tz_convert("Australia/Melbourne").dt.date
+    sub["itemCodes"]  = sub.apply(_formItemCodes, axis=1)
+    for c in ("global_rating", "entrustment", "professionalism"):
+        sub[c] = pd.to_numeric(sub[c], errors="coerce") if c in sub.columns else None
+    aCol = next((c for c in ("assessor_reflection_full", "assessor_reflection") if c in sub.columns), None)
+    sCol = next((c for c in ("student_reflection_full", "student_reflection") if c in sub.columns), None)
+    sub["assessorComments"] = sub[aCol].map(_stripTags) if aCol else ""
+    sub["studentComments"]  = sub[sCol].map(_stripTags) if sCol else ""
+    ctx = [c for c in ("assessor_name", "clinic") if c in sub.columns]
+
+    cols = (_ID_COLS + ["date", "itemCodes", "global_rating", "entrustment", "professionalism"]
+            + ctx + ["assessorComments", "studentComments"])
+    friendly = {**_ID_FRIENDLY, "date": "Date", "itemCodes": "Item Codes",
+                "global_rating": "GR", "entrustment": "ES", "professionalism": "PS",
+                "assessor_name": "Assessor", "clinic": "Clinic",
+                "assessorComments": "Assessor Comments", "studentComments": "Student Comments"}
+    sub = sub.sort_values(["student_name", "date"]).reset_index(drop=True)[cols]
+    nStu = sub["student_number"].nunique() if len(sub) else 0
+    print(f"[low_professionalism] {len(sub)} form(s) with PS = {level} across {nStu} student(s)")
+
+    sheet = f"Professionalism {level}"
+    sub.to_excel(writer, sheet_name=sheet, index=False, startrow=2)
+    ws = writer.sheets[sheet]
+    _styleHeader(ws, 1, len(cols),
+                 f"{cohort} {formType} — Forms with Professionalism = {level} "
+                 f"({len(sub)} forms, {nStu} students)")
+    _styleColumnHeaders(ws, 3, cols, friendly)
+
+    wrapCols = {"assessorComments", "studentComments", "itemCodes"}
+    leftCols = wrapCols | {"student_name", "assessor_name", "clinic"}
+    prev, shade = None, False
+    for r in range(4, 4 + len(sub)):
+        stu = sub.iat[r - 4, 0]
+        if stu != prev:                       # alternate shading per STUDENT block
+            shade, prev = not shade, stu
+        for c, name in enumerate(cols, start=1):
+            cell = ws.cell(row=r, column=c)
+            cell.font, cell.border = _BODY_FONT, _thin_border()
+            cell.fill = _fill(_LIGHT_GREY) if shade else _fill(_WHITE)
+            cell.alignment = Alignment(horizontal="left" if name in leftCols else "center",
+                                       vertical="top", wrap_text=name in wrapCols)
+            if name == "date":
+                cell.number_format = "dd/mm/yyyy"
+    widths = {"student_number": 10, "student_name": 24, "date": 12, "itemCodes": 22,
+              "global_rating": 6, "entrustment": 6, "professionalism": 6,
+              "assessor_name": 22, "clinic": 14, "assessorComments": 70, "studentComments": 60}
+    for name, w in widths.items():
+        if name in cols:
+            ws.column_dimensions[get_column_letter(cols.index(name) + 1)].width = w
+    ws.freeze_panes = "C4"
+
+
 def _build_legend_sheet(writer, flagDf, compDf, cohortDf, thresholds,
                          cohort, formType, config, mappingFile=None):
     """Threshold reference, colour key, and scale guide — auto-derived from active flags."""
@@ -1446,6 +1632,8 @@ def _build_legend_sheet(writer, flagDf, compDf, cohortDf, thresholds,
         "min_pt_seen":      "Min patients seen",
         "max_es_lvl1_pct":  "Max ES L1 %",
         "max_es_lvl2_pct":  "Max ES L2 %",
+        "max_es_lvl1_count": "Max ES L1 count",
+        "max_es_lvl2_count": "Max ES L2 count",
     }
 
     r = 1
@@ -1597,6 +1785,8 @@ DDS3_REPORTABLE_ITEMS = {
     "Fixed Pros":   ['613', '615', '618', '625', '627', '643'],
     "Pros":         ['711', '712', '719', '721', '722', '727', '728'],
     "General":      ['965'],
+    # "LA" removed 2026-10-01 (user) — non-numeric code broke the int() sort in
+    # the Reportable Items / Item Scale Dist sheets.
 }
 # Flat lookup: "511" -> "Restorative"
 _DDS3_ITEM_TO_CAT = {
@@ -2246,7 +2436,8 @@ OVERALL_PER_FORM = "Overall (per form)"
 OVERALL_BY_WEIGHTING = {SCORE_PER_FORM: OVERALL_PER_FORM, SCORE_PER_ITEM: OVERALL_PER_ITEM}
 
 
-def buildSectionScorePivot(cohortDf, formType="Clinic", mappingFile=None, groupBy=None):
+def buildSectionScorePivot(cohortDf, formType="Clinic", mappingFile=None, groupBy=None,
+                           reportableItems=None):
     """Student x Section (Clinic) or x item_code (Simulation) mean checklist score.
 
     ``groupBy`` overrides the default formType-based grouping: "item_code" forces
@@ -2261,7 +2452,24 @@ def buildSectionScorePivot(cohortDf, formType="Clinic", mappingFile=None, groupB
     Two totals are produced, OVERALL_PER_ITEM and OVERALL_PER_FORM — see the long
     comment where they are computed. They legitimately disagree; the per-form one
     is the number Summary shows and the low_score flag uses.
+
+    ``reportableItems`` ({category: [codes]}, only with groupBy="item_code") keeps
+    ONLY those codes — matched on the exact code or its numeric base ("511-2" ->
+    "511") — and orders the columns by category (DDS3 Reportable Item Score
+    Pivot, 2026-10-01). Both Overall columns are then computed over reportable
+    items only.
     """
+    _repOrder, _repMap = None, None
+    if reportableItems:
+        _repOrder = [str(c) for codes in reportableItems.values() for c in codes]
+        _repSet   = set(_repOrder)
+
+        def _repMap(code):
+            code = str(code).strip()
+            if code in _repSet:
+                return code
+            base = code.split("/")[0].strip().split("-")[0].strip()
+            return base if base in _repSet else None
     rows, formMeans = [], []
     for formIdx, (_, row) in enumerate(cohortDf.iterrows()):
         scores = row.get("scores")
@@ -2273,6 +2481,10 @@ def buildSectionScorePivot(cohortDf, formType="Clinic", mappingFile=None, groupB
             val = pd.to_numeric(val, errors="coerce")
             if pd.isna(val):
                 continue          # null / "Not Observed" items don't drag an average down
+            if _repMap is not None:
+                code = _repMap(code)
+                if code is None:
+                    continue      # not a reportable item
             formVals.append(float(val))
             rows.append({
                 "student_number": row["student_number"],
@@ -2362,6 +2574,12 @@ def buildSectionScorePivot(cohortDf, formType="Clinic", mappingFile=None, groupB
 
     numCols = [c for c in pivot.columns if c not in idx]
     pivot[numCols] = pivot[numCols].round(3)
+    if _repOrder is not None:
+        # Category order (Diagnostics -> ... -> LA); unassessed codes not added.
+        _overall = [c for c in (OVERALL_PER_ITEM, OVERALL_PER_FORM) if c in pivot.columns]
+        _ordered = idx + [c for c in _repOrder if c in pivot.columns] + _overall
+        pivot  = pivot[_ordered]
+        counts = counts[[c for c in _ordered if c in counts.columns]]
     pivot.sort_values("student_name", inplace=True)
     counts = counts.set_index(idx).reindex(
         pd.MultiIndex.from_frame(pivot[idx])).reset_index()
@@ -2391,12 +2609,20 @@ def _build_item_code_score_pivot_sheet(writer, flagDf, compDf, cohortDf, thresho
         print("[item_code_score_pivot] skipped — Simulation already groups the "
               "Section Score Pivot by item_code")
         return
+    reportableOnly = bool(getattr(config, "itemScorePivotReportableOnly", False))
+    reportable = None
+    if reportableOnly:
+        reportable = getattr(config, "reportableItems", None) or DDS3_REPORTABLE_ITEMS
     pivot, groupCol, counts = buildSectionScorePivot(cohortDf, formType, mappingFile,
-                                                     groupBy="item_code")
+                                                     groupBy="item_code",
+                                                     reportableItems=reportable)
     if pivot.empty:
+        if reportableOnly:
+            print("[item_code_score_pivot] no scored reportable items — sheet skipped")
         return
+    sheet = "Reportable Item Score Pivot" if reportableOnly else "Item Code Score Pivot"
     _writeScorePivotSheet(writer, pivot, groupCol, counts, thresholds,
-                          cohort, formType, config, "Item Code Score Pivot")
+                          cohort, formType, config, sheet)
 
 
 def _writeScorePivotSheet(writer, pivot, groupCol, counts, thresholds,
@@ -2516,6 +2742,7 @@ SHEET_REGISTRY = {
     "item_code_score_pivot":  _build_item_code_score_pivot_sheet,
     "item_code_count_pivot":  _build_item_code_count_pivot_sheet,
     "clinical_incidents":     _build_clinical_incidents_sheet,
+    "low_professionalism":    _build_low_professionalism_sheet,
     "reportable_items_pivot": _build_reportable_items_pivot_sheet,
     "item_scale_dist":        _build_item_scale_dist_sheet,
     "operator_by_clinic":     _build_operator_by_clinic_sheet,
@@ -2607,6 +2834,7 @@ class FlaggingConfig:
         minChecklists     = None,   # low_checklist_count threshold; None = auto
                                     # (cohort mean - sdMultiplier*SD) on the shown count.
         minClasses        = None,   # low_class_count threshold (distinct dates); None = auto.
+        minItemCodes      = None,   # low_item_code_count threshold (distinct item codes); None = auto.
         countLowPercentile = 0.25,  # Count Pivot sheets: a student's count for a code
                                     # /section is highlighted red when it is at/below
                                     # this per-column quantile of the cohort (default
@@ -2623,6 +2851,11 @@ class FlaggingConfig:
                                     # mean is below this — a low count on a rarely-done
                                     # code is not flagged.
         countSdK           = 1.0,   # mean_sd: red when count < column mean - countSdK*SD.
+        maxEsLvl1Count     = None,  # high_es_lvl1_count: flag if es_lvl1_count > this
+        maxEsLvl2Count     = None,  # high_es_lvl2_count: flag if es_lvl2_count > this
+        itemScorePivotReportableOnly = False,  # Item Code Score Pivot limited to
+                                    # reportableItems (DDS3) — sheet renamed accordingly
+        reportableItems    = None,  # {category: [codes]}; None = DDS3_REPORTABLE_ITEMS
     ):
         self.flags             = list(flags)
         self.sheets            = list(sheets)
@@ -2658,11 +2891,21 @@ class FlaggingConfig:
         self.checklistCountMode = _ckMode
         self.minChecklists     = minChecklists
         self.minClasses        = minClasses
+        self.minItemCodes      = minItemCodes
         self.countLowPercentile = countLowPercentile
         self.countHighlightMode = resolveCountHighlightMode(countHighlightMode)
         self.countMeanFraction  = countMeanFraction
         self.countMinMean       = countMinMean
         self.countSdK           = countSdK
+        self.maxEsLvl1Count     = maxEsLvl1Count
+        self.maxEsLvl2Count     = maxEsLvl2Count
+        self.itemScorePivotReportableOnly = bool(itemScorePivotReportableOnly)
+        self.reportableItems    = reportableItems
+        for _k, _v in (("high_es_lvl1_count", maxEsLvl1Count),
+                       ("high_es_lvl2_count", maxEsLvl2Count)):
+            if _k in self.flags and _v is None:
+                raise ValueError(f"{_k} is active but its max count is None — set "
+                                 f"{'maxEsLvl1Count' if '1' in _k else 'maxEsLvl2Count'}.")
         for key in self.inclusiveFlags:
             if key not in FLAG_REGISTRY:
                 print(f"[FlaggingConfig] WARNING: inclusiveFlags key '{key}' not in FLAG_REGISTRY — ignored")
@@ -2776,11 +3019,16 @@ class FlaggingConfig:
             checklistCountMode = self.checklistCountMode,
             minChecklists     = self.minChecklists,
             minClasses        = self.minClasses,
+            minItemCodes      = self.minItemCodes,
             countLowPercentile = self.countLowPercentile,
             countHighlightMode = self.countHighlightMode,
             countMeanFraction  = self.countMeanFraction,
             countMinMean       = self.countMinMean,
             countSdK           = self.countSdK,
+            maxEsLvl1Count     = self.maxEsLvl1Count,
+            maxEsLvl2Count     = self.maxEsLvl2Count,
+            itemScorePivotReportableOnly = self.itemScorePivotReportableOnly,
+            reportableItems    = self.reportableItems,
         )
         kwargs.update(overrides)
         return FlaggingConfig(**kwargs)
@@ -2848,6 +3096,7 @@ class FlaggingConfig:
             ("minForms",          "Min forms",         "auto = cohort mean - 1 SD"),
             ("minChecklists",     "Min checklists",    "auto = cohort mean - 1 SD; low_checklist_count"),
             ("minClasses",        "Min classes",       "auto = cohort mean - 1 SD; low_class_count"),
+            ("minItemCodes",      "Min item codes",    "auto = cohort mean - 1 SD; low_item_code_count"),
             ("slopeThreshold",    "Slope",             "0 = flag any decline"),
             ("improvementMargin", "Improvement margin","last-third <= first-third + margin"),
             ("behindRatio",       "Behind ratio",      "flag if count < cohort_avg x ratio"),
@@ -2856,6 +3105,8 @@ class FlaggingConfig:
             ("minPtSeen",         "Min patients seen", "auto = cohort mean - 1 SD"),
             ("maxEsLvl1Pct",      "Max ES L1 %",       "flag if >X% of ES ratings are level 1"),
             ("maxEsLvl2Pct",      "Max ES L2 %",       "flag if >X% of ES ratings are level 2"),
+            ("maxEsLvl1Count",    "Max ES L1 count",   "flag if more than X ES ratings are level 1"),
+            ("maxEsLvl2Count",    "Max ES L2 count",   "flag if more than X ES ratings are level 2"),
             ("sdMultiplier",      "SD Multiplier",     "multiplier for standard deviation in auto threshold calculation"),
         ]
         for attr, label, note in rows:
@@ -2893,13 +3144,15 @@ class FlaggingConfig:
 # Opt-in flags (2026-08-19): keep them out of the "all flags" presets so
 # clinic_full / at_risk_only are unchanged. low_declining_* are BOH2-clinic;
 # low_checklist_count / low_class_count are Sim (added to boh2_sim explicitly).
-_OPT_IN_FLAGS = ("low_checklist_count", "low_class_count")
+_OPT_IN_FLAGS = ("low_checklist_count", "low_class_count", "low_item_code_count",
+                 "high_es_lvl1_count", "high_es_lvl2_count")
 _ALL_FLAGS  = [k for k in FLAG_REGISTRY.keys()
                if not k.startswith("low_declining_") and k not in _OPT_IN_FLAGS]
 # item_code_score_pivot / item_code_count_pivot are BOH2-opt-in (2026-08-19): keep
 # them out of _ALL_SHEETS so clinic_full / dds2_clinic are unchanged; boh2_clinic
 # adds them explicitly.
-_BOH2_ONLY_SHEETS = ("item_code_score_pivot", "item_code_count_pivot")
+_BOH2_ONLY_SHEETS = ("item_code_score_pivot", "item_code_count_pivot",
+                     "low_professionalism")   # opt-in sheets (kept out of _ALL_SHEETS)
 _ALL_SHEETS = [k for k in SHEET_REGISTRY.keys() if k not in _BOH2_ONLY_SHEETS]
 
 
@@ -2961,7 +3214,7 @@ PRESETS = {
         lowTierFlags  = ["low_cs", "low_ps", "declining_es", "declining_gr", "declining_score"],
     ),
     "boh2_sim":FlaggingConfig(
-        flags  = ["low_es", "low_gr", "low_cs", "low_ps",
+        flags  = ["low_item_code_count", "low_es", "low_gr", "low_cs", "low_ps",
                   "low_score",
                   "low_checklist_count", "low_class_count",
                   "low_declining_es", "low_declining_gr", "low_declining_score",
@@ -2979,10 +3232,44 @@ PRESETS = {
         minChecklists = 25,
         minClasses    = 14,
         countLowPercentile = 0.2,
-        highTierFlags = ["low_es", "low_gr", "low_score",
+        highTierFlags = ["low_item_code_count", "low_es", "low_gr", "low_score",
                           "low_checklist_count", "low_class_count",
                           "clinical_incident", "high_es_lvl1"],
         lowTierFlags  = ["low_cs", "low_ps", "low_declining_es", "low_declining_gr", "low_declining_score"],
+    ),
+    # BOH1 Simulation preset (2026-09-30, BOH1 request). Same as boh2_sim except:
+    #   - entrustment is no longer a HIGH-tier signal: low_es and high_es_lvl1
+    #     move to lowTierFlags (still computed/shown, count toward Low Risk only);
+    #   - adds "section_score_pivot", which for Simulation is written as the
+    #     "Item Code Score Pivot" sheet (student x item_code mean score).
+    # min* thresholds default to None (auto = cohort mean - sdMultiplier*SD),
+    # matching the previous BOH1 run's .copy(minForms=None, ...) overrides.
+    "boh1_sim": FlaggingConfig(
+        flags  = ["low_item_code_count", "low_es", "low_gr", "low_cs", "low_ps",
+                  "low_score",
+                  "low_checklist_count", "low_class_count",
+                  "low_declining_es", "low_declining_gr", "low_declining_score",
+                  "clinical_incident",
+                  "high_es_lvl1",
+                  ],
+        sheets = ["legend", "summary", "level_distribution",
+                  "count_pivot", "section_score_pivot", "gr_pivot", "clinical_incidents",
+                  "low_professionalism"],   # 2026-09-30: forms with PS = 1 + comments
+        esThreshold = 2,
+        grThreshold = 2.5,
+        scoreThreshold = 0.7,
+        minForms    = 50,
+        maxEsLvl1Pct = 20.0,
+        sdMultiplier = 1.5,
+        minChecklists = 50,
+        minClasses    = 40,
+        countLowPercentile = 0.1,
+        countHighlightMode = "zeros",
+        highTierFlags = ["low_item_code_count", "low_gr", "low_score",
+                          "low_checklist_count", "low_class_count",
+                          "clinical_incident"],
+        lowTierFlags  = ["low_es", "high_es_lvl1",
+                          "low_cs", "low_ps", "low_declining_es", "low_declining_gr", "low_declining_score"],
     ),
     # BOH2 Clinic preset.
     # 2026-08-19 (BOH2 request): mirrors four tweaks off the recent DDS2 work —
@@ -2997,7 +3284,7 @@ PRESETS = {
     #   - Pt Seen already counts Operator-only forms (requireOperatorForPtSeen
     #     defaults True cohort-wide), so no change was needed there.
     "boh2_clinic": FlaggingConfig(
-        flags = [
+        flags = ["low_item_code_count", 
             "low_es", "low_gr", "low_cs", "low_ps", "low_score",
             # low_ts deliberately excluded — not appropriate at DDS2 clinic level
             "low_form_count",
@@ -3029,7 +3316,7 @@ PRESETS = {
         countMeanFraction  = 0.5,
         countMinMean       = 2.0,
         minPtSeen = None, # → auto from cohort mean - sdMultiplier * SD
-        highTierFlags = ["low_es", "low_gr", "low_score", "low_form_count",
+        highTierFlags = ["low_item_code_count", "low_es", "low_gr", "low_score", "low_form_count",
                           "clinical_incident", "low_pt_seen", "high_es_lvl1"],
         lowTierFlags  = ["low_cs", "low_ps",
                          "low_declining_es", "low_declining_gr", "low_declining_score"],
@@ -3058,7 +3345,7 @@ PRESETS = {
     "dds2_sim":FlaggingConfig(
         flags  = ["low_es", "low_gr", "low_cs", "low_ps",
                   "low_score",
-                  "low_checklist_count", "low_class_count",
+                  "low_checklist_count", "low_class_count", "low_item_code_count",
                   "low_declining_es", "low_declining_gr", "low_declining_score",
                     "clinical_incident",
                     "high_es_lvl1",
@@ -3073,9 +3360,13 @@ PRESETS = {
         sdMultiplier = 1.5,
         minChecklists = 25,
         minClasses    = 27,
-        countLowPercentile = 0.2,
+        minItemCodes  = 27,   # low_item_code_count threshold; None = auto (mean - SD)
+        countLowPercentile = 0.1,
+        countHighlightMode = "zeros",   # Item Code Count Pivot: red only on 0s (missed
+                                        # weeks). Use "column_gradient" for the per-column
+                                        # heatmap, or "percentile" for the old behaviour.
         highTierFlags = ["low_es", "low_gr", "low_score",
-                          "low_checklist_count", "low_class_count",
+                          "low_checklist_count", "low_class_count", "low_item_code_count",
                           "clinical_incident", "high_es_lvl1"],
         lowTierFlags  = ["low_cs", "low_ps", "low_declining_es", "low_declining_gr", "low_declining_score"],
     ),
@@ -3095,7 +3386,7 @@ PRESETS = {
     # these are absolute standards rather than cohort-relative ones — expect more
     # students flagged than the July run, by design.
     "dds2_clinic": FlaggingConfig(
-        flags = [
+        flags = ["low_item_code_count", 
             "low_es", "low_gr", "low_cs", "low_ps", "low_score",
             # low_ts deliberately excluded — not appropriate at DDS2 clinic level
             "low_form_count",
@@ -3124,7 +3415,7 @@ PRESETS = {
         maxEsLvl2Pct   = 100.0,   # flag if es_lvl2_pct > this (DDS2 clinic)
         sdMultiplier   = 1.5,
         scoreWeighting = SCORE_PER_ITEM,
-        highTierFlags = ["low_es", "low_gr", "low_score", "low_form_count",
+        highTierFlags = ["low_item_code_count", "low_es", "low_gr", "low_score", "low_form_count",
                           "clinical_incident", "low_pt_seen", "high_es_lvl1"],
         lowTierFlags  = ["low_cs", "low_ps", "low_declining_es", "low_declining_gr", "low_declining_score"],
     ),
@@ -3136,25 +3427,27 @@ PRESETS = {
     #   - Adds 3 DDS3-specific sheets: reportable_items_pivot, item_scale_dist,
     #     operator_by_clinic
     "dds3_clinic": FlaggingConfig(
-        flags = [
+        flags = ["low_item_code_count", "low_checklist_count",
             "low_es", "low_gr", "low_score", "low_form_count",
             # low_ts, low_cs, low_ps excluded — new CAF doesn't require them
             "low_declining_es", "low_declining_gr", "low_declining_score",
             # "no_improvement_es", "no_improvement_gr",   # shown as info flags only
             "low_operator_pct", "high_fta", "clinical_incident", "low_pt_seen",
-            "high_es_lvl1", 
+            "high_es_lvl1_count",   # count-based (2026-10-01): >1 level-1 ES flags
             "high_es_lvl2"
         ],
         info_flags = ["no_improvement_es", "no_improvement_gr"],
         sheets = [
             "summary",
             "reportable_items_pivot",
+            "item_code_score_pivot",   # reportable items only (itemScorePivotReportableOnly)
             "item_scale_dist",
             "item_scale_donuts",
             # "operator_by_clinic",
             "comparison",
             # "scale_trends",
             "level_distribution",
+            "section_score_pivot",
             "clinical_incidents",
             "legend",
         ],
@@ -3163,14 +3456,16 @@ PRESETS = {
         minForms       = None,  # auto = cohort mean - 1 SD
         minOperatorPct = 65.0,
         maxFtaPct      = 30.0,
-        maxEsLvl1Pct= 0.0,     # flag if es_lvl1_pct > this (DDS3 clinic)
+        maxEsLvl1Pct= 0.0,     # (unused now — high_es_lvl1 replaced by the count flag)
+        maxEsLvl1Count = 1,    # leeway of ONE level-1 ES; a second flags (2026-10-01)
+        itemScorePivotReportableOnly = True,
         maxEsLvl2Pct= 20.0,   # flag if es_lvl2_pct > this (DDS3 clinic)
         sdMultiplier= 1.5,
         createPdf=False,
         borderlineGrLevel= 3,
         useBorderlineThreshold=True,
-        highTierFlags = ["low_es", "low_gr", "low_score", "low_form_count",
-                          "clinical_incident", "low_pt_seen", "high_es_lvl1"],
+        highTierFlags = ["low_item_code_count", "low_es", "low_gr", "low_score", "low_form_count",
+                          "clinical_incident", "low_pt_seen", "high_es_lvl1_count"],
         lowTierFlags  = ["low_declining_es", "low_declining_gr", "low_declining_score",
                           "low_operator_pct", "high_fta", "high_es_lvl2"],
     ),
@@ -3282,6 +3577,9 @@ def getFlagDf(cohortDf, formType, config, mappingFile=None, periodInfo=None,
             return {lvl: round(counts.get(lvl, 0) / total * 100, 1) for lvl in levels}
 
         es_dist = _lvl_dist(grp["entrustment"],     [1, 2, 3, 4])
+        # Raw ES level counts (high_es_lvl1_count / high_es_lvl2_count)
+        _esVals = pd.to_numeric(grp["entrustment"], errors="coerce").dropna().astype(int)
+        es_cnt  = {lvl: int((_esVals == lvl).sum()) for lvl in [1, 2, 3, 4]}
         gr_dist = _lvl_dist(grp["global_rating"],   [1, 2, 3, 4, 5])
         ts_dist = _lvl_dist(grp["time_management"], [1, 2, 3, 4])
         cs_dist = _lvl_dist(grp["communication"],   [1, 2])
@@ -3378,6 +3676,7 @@ def getFlagDf(cohortDf, formType, config, mappingFile=None, periodInfo=None,
             "last_third_gr":   round(last_third_gr,  3),
         }
         for lvl, pct in es_dist.items(): rec[f"es_lvl{lvl}_pct"] = pct
+        for lvl, n   in es_cnt.items():  rec[f"es_lvl{lvl}_count"] = n
         for lvl, pct in gr_dist.items(): rec[f"gr_lvl{lvl}_pct"] = pct
         for lvl, pct in ts_dist.items(): rec[f"ts_lvl{lvl}_pct"] = pct
         for lvl, pct in cs_dist.items(): rec[f"cs_lvl{lvl}_pct"] = pct
@@ -3432,6 +3731,7 @@ def getFlagDf(cohortDf, formType, config, mappingFile=None, periodInfo=None,
         # used for requireOperatorForPtSeen / scoreWeighting.
         "min_checklists":   _auto("checklist_count", getattr(config, "minChecklists", None)),
         "min_classes":      _auto("n_classes",       getattr(config, "minClasses", None)),
+        "min_item_codes":   _auto("checklist_unique", getattr(config, "minItemCodes", None)),
         "slope":            config.slopeThreshold,
         "improvement_margin": config.improvementMargin,
         "behind_ratio":     config.behindRatio,
@@ -3443,6 +3743,8 @@ def getFlagDf(cohortDf, formType, config, mappingFile=None, periodInfo=None,
                             else 0.0,
         "max_es_lvl1_pct":  config.maxEsLvl1Pct,
         "max_es_lvl2_pct":  config.maxEsLvl2Pct,
+        "max_es_lvl1_count": getattr(config, "maxEsLvl1Count", None),
+        "max_es_lvl2_count": getattr(config, "maxEsLvl2Count", None),
         "sd_multiplier":    config.sdMultiplier or 1.0,
         "borderline_gr_level":     _borderlineGrLevel,
         "borderline_n":            _borderlineN,
@@ -3557,8 +3859,41 @@ def getFlagDf(cohortDf, formType, config, mappingFile=None, periodInfo=None,
 # ═══════════════════════════════════════════════════════════════════════════
 # _itemCodeCounts
 # ═══════════════════════════════════════════════════════════════════════════
+def _rawCodeQuantityMap(contextChecklists):
+    """{rawCode: summedQuantity} from a form's ``context_checklists`` ([{code, quantity}]).
+
+    Keys are the RAW code strings (NOT _shortItemCode-reduced) so they line up with
+    the raw item_codes the count pivots group on; verified equal in the payload
+    (e.g. "011", "BOH2 S2 141"). Older forms carry no context_checklists -> {} ->
+    every code weighted 1, so counts are unchanged except for genuine quantity>1."""
+    if isinstance(contextChecklists, str):
+        try:
+            contextChecklists = json.loads(contextChecklists)
+        except Exception:
+            return {}
+    qmap = {}
+    if isinstance(contextChecklists, list):
+        for it in contextChecklists:
+            if isinstance(it, dict) and it.get("code") not in (None, ""):
+                try:
+                    q = int(it.get("quantity", 1) or 1)
+                except (TypeError, ValueError):
+                    q = 1
+                code = str(it["code"])
+                qmap[code] = qmap.get(code, 0) + max(q, 1)
+    return qmap
+
+
 def _itemCodeCounts(df):
-    """Count (student, item_code) form occurrences from the raw cohort data."""
+    """Count (student, item_code) occurrences from the cohort data, quantity-weighted.
+
+    A code normally counts once per form; where the form carries context_checklists
+    (newer forms, ~June-on) the code is weighted by its quantity, so a procedure
+    recorded more than once on one form counts that many times. Codes still come
+    only from item_codes (the assessor-side flattened checklist keys), so a form
+    with no assessor checklist contributes nothing, exactly as before.
+    NOTE: a second, now-dead _itemCodeCounts(cohortDf) is defined earlier in this
+    file (~L304) and is shadowed by this one; this is the live definition."""
     records = []
     for _, row in df.iterrows():
         codes = row.get("item_codes")
@@ -3572,13 +3907,16 @@ def _itemCodeCounts(df):
         if not isinstance(codes, (list, set)):
             continue
         snum = row["student_number"]
+        qmap = _rawCodeQuantityMap(row.get("context_checklists"))
         for code in codes:
             if code and not str(code).startswith("scale"):
-                records.append({"student_number": snum, "item_code": str(code)})
+                records.append({"student_number": snum, "item_code": str(code),
+                                "qty": qmap.get(str(code), 1)})
     if not records:
         return pd.DataFrame()
     long = pd.DataFrame(records)
-    return long.groupby(["student_number", "item_code"]).size().reset_index(name="count")
+    return (long.groupby(["student_number", "item_code"])["qty"]
+            .sum().reset_index(name="count"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

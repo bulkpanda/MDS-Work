@@ -16,6 +16,8 @@
 
 ---
 
+> **2026-09-30** — re-added `getDeleteStudentsSql(tableName, studentNumbers=None, colName="student_number")` (after `getDeleteSql`): returns `DELETE FROM … WHERE student_number IN (…)` for `EXCLUDED_STUDENT_NUMBERS` (from variableUtils), `""` if empty. Called in cell 6 `processForms()`. See `_handover_docs/HANDOVER_boh1_sim_flagging_preset.md` §8.
+
 ## 1. Purpose and role in the pipeline
 
 This module is the **first stage of the MDS 2026 data pipeline** and, separately, the **whole DDS2 weekly-simulation reporting chain**. Those are the two things it does; they are joined only by the fact that the second reads the tables the first writes.

@@ -91,8 +91,20 @@ ITEM_CODE_COL = "item_code"
 
 BOH2_REMOVED_STUDENTS = [1352051, 1606158, 1605793, 1617958, 1605538]
 DDS2_REMOVED_STUDENTS = [1270152, 1155940, 914405]
-BOH1_REMOVED_STUDENTS = [1895048, 1895910, 1904651]
+BOH1_REMOVED_STUDENTS = [1895048, 1895910, 1904651,
+                         1639983,   # Nazia Popal   (added 2026-09-30)
+                         1756946,   # Ella Zou      (added 2026-09-30)
+                         1766318,   # Imijen Ellis  (added 2026-09-30)
+                         1895683,   # Hannah Kaur   (added 2026-09-30)
+                         1840287]   # Qossay Oukal  (added 2026-09-30)
 REMOVE_STUDENTS_DICT = {"BOH1": BOH1_REMOVED_STUDENTS, "BOH2": BOH2_REMOVED_STUDENTS, "DDS2": DDS2_REMOVED_STUDENTS, "DDS3": []}
+
+# Students removed COMPLETELY from every analysis (2026-09-30). main.ipynb cell 6
+# processForms() deletes their rows from rawform_forms_v3 right after ingest, so no
+# report, pivot or flagging run ever sees them. Reversible: drop a number here and
+# re-run cell 6 (the table is re-populated from rawforms on every run).
+# Currently = all BOH1 removed students; append other cohorts' lists here if needed.
+EXCLUDED_STUDENT_NUMBERS = list(BOH1_REMOVED_STUDENTS)
 
 
 

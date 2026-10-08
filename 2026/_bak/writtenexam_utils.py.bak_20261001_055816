@@ -1,0 +1,1049 @@
+"""
+writtenexam_utils.py
+─────────────────────────────────────────────────────────────────────────────
+Helper functions to generate individual student PDF feedback reports from a
+per-student score spreadsheet. Supports two source layouts, auto-detected:
+
+  "paired"  - one row per student; a name/id column, then repeating
+              (RawScore, Percentage[.N]) column pairs per section, ending in
+              a final (Total, Percentage[.N]) pair. Optional trailing summary
+              rows ("Marks available" / "Class average" / "Class average
+              percent"). Example: Extra/DDS2/Results to release to students.xlsx
+              (DDS2 written exam).
+
+  "rubric"  - one row per student; criteria columns scored out of a fixed
+              max (declared via an "Out of N" sub-header row), ending in a
+              Total and a Percentage column. May span a 2-row header (a
+              group label row + a field-name/"Out of N" row), and may include
+              a free-text Comments column and a Supervisor column.
+              Example: Extra/DDS3/research progress summary Raed.xlsx
+              (DDS3 research progress rubric).
+
+The loader auto-detects which layout a workbook uses and extracts sections,
+max points, name/id columns, comments and supervisor columns accordingly.
+Cohort averages are read from an existing "Class average" row when present,
+otherwise computed as a plain mean across student rows; display of the
+cohort-average column/row is controlled by `show_cohort_avg` (some rubric
+sheets are graded by different supervisors per group, so a single cohort
+average isn't a fair comparison and can be turned off).
+
+Visual style matches the existing DDS4 written-exam template:
+  Extra/DDS4/DENT90124_WrittenExam_Feedback/*.pdf
+(navy header banner, section performance table, grade-coloured overall-result
+box — green for high grades through orange to red for low grades).
+
+Reusable across cohorts/years/assessment types — call
+generate_all_written_exam_reports() with a different input_file / output_dir
+/ course_code / exam_title (and, for rubric-style sheets, id_col and
+show_cohort_avg=False) each time.
+
+Used from main.ipynb, e.g.:
+
+    import writtenexam_utils as wxu
+
+    # DDS2 written exam (paired score/percentage columns)
+    wxu.generate_all_written_exam_reports(
+        input_file="Extra/DDS2/Results to release to students.xlsx",
+        output_dir="Extra/DDS2/Student Reports",
+        course_code="DENT90146",
+        exam_title="Mid-Year Examination 2026",
+    )
+
+    # DDS3 research progress rubric (single-score "Out of N" columns,
+    # comments, no numeric student ID, no fair cohort average)
+    wxu.generate_all_written_exam_reports(
+        input_file="Extra/DDS3/research progress summary Raed.xlsx",
+        output_dir="Extra/DDS3/Student Reports",
+        course_code="DDS3",
+        exam_title="Research Progress Summary 2026",
+        id_col="DDS3 year now",           # group code column, e.g. DDS2-Grp-01-A
+        section_bar_label="Research Progress Summary",
+        show_cohort_avg=False,
+    )
+"""
+
+import os
+import re
+from html import escape as _xmlEscape
+import pandas as pd
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+)
+
+# ── House palette (sampled directly from the DDS4 written-exam PDF) ────────
+NAVY          = colors.HexColor("#003087")
+ORANGE        = colors.HexColor("#F57F17")
+ROW_ALT       = colors.HexColor("#F4F4F4")
+ROW_WHITE     = colors.white
+TOTAL_BG      = colors.HexColor("#E8EFF7")
+SUBTITLE_BLUE = colors.HexColor("#AEC6E8")
+TEXT_DARK     = colors.HexColor("#222222")
+GREY_LINE     = colors.HexColor("#C3D5E8")
+
+PAGE_W, PAGE_H = A4
+MARGIN    = 1.8 * cm
+CONTENT_W = PAGE_W - 2 * MARGIN
+
+# ── Default grade bands (University of Melbourne honours scale) ────────────
+# Applied to the *unrounded* overall percentage.
+# Confirmed by reverse-engineering the DDS4 sample report: 76/109 = 69.72%
+# displays as grade "H3" (65-69% band) even though the rounded "70%" shown
+# in the table would sit on the H2B boundary — so banding must use the
+# unrounded value.
+# Override per cohort by passing a different `grade_bands` list.
+DEFAULT_GRADE_BANDS = [
+    (80.0, "H1"),
+    (75.0, "H2A"),
+    (70.0, "H2B"),
+    (65.0, "H3"),
+    (50.0, "P"),
+    (0.0,  "N"),
+]
+
+# ── Overall-result box colour, keyed by grade label ─────────────────────────
+# Green (best) -> yellow-green -> gold -> orange (middle) -> deep orange ->
+# red (worst) — six visually distinct stops rather than shades of one colour.
+# H3 and P are sampled directly from the DDS4 template's PDFs (each grade has
+# one fixed colour across the cohort, not a per-student gradient by %); the
+# others are spread out further along the same hue progression so the top
+# three bands no longer all read as "green".
+# Override per cohort by passing a different `grade_colors` dict to
+# generate_student_pdf() / generate_all_written_exam_reports().
+DEFAULT_GRADE_COLORS = {
+    "H1":  "#1B5E20",   # dark green
+    "H2A": "#7CB342",   # yellow-green
+    "H2B": "#FBC02D",   # gold / yellow
+    "H3":  "#F57F17",   # orange (middle of the scale)
+    "P":   "#E65100",   # deep orange
+    "N":   "#C62828",   # red
+}
+FALLBACK_GRADE_COLOR = "#F57F17"
+
+
+def grade_color(grade, grade_colors=DEFAULT_GRADE_COLORS):
+    """Look up the result-box colour for a grade label, with an orange fallback."""
+    hex_code = grade_colors.get(grade, FALLBACK_GRADE_COLOR) if grade else FALLBACK_GRADE_COLOR
+    return colors.HexColor(hex_code)
+
+
+SUMMARY_ROW_LABELS = {
+    "marks available", "class average", "class average percent",
+    "cohort average", "average", "cohort average percent",
+}
+
+TITLE_PREFIX_RE = re.compile(r'^(mr|mrs|ms|miss|mx|dr|prof)\.?\s+', re.IGNORECASE)
+OUT_OF_RE = re.compile(r'out of\s+([\d.]+)', re.IGNORECASE)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Data loading
+# ═══════════════════════════════════════════════════════════════════════════
+def _dedupe_columns(header):
+    """
+    Rename repeated header labels the same way pandas does when it parses a
+    header row itself (name, name.1, name.2, ...). Needed here because we
+    build headers manually from raw cell text, which - unlike
+    pd.read_excel(header=0) - doesn't auto-dedupe repeated literal labels
+    (e.g. a sheet with the column header "Percentage" typed out seven times).
+    Without this, label-based lookups on a repeated name return a DataFrame
+    instead of a Series and break downstream code.
+    """
+    seen = {}
+    out = []
+    for h in header:
+        if h not in seen:
+            seen[h] = 0
+            out.append(h)
+        else:
+            seen[h] += 1
+            out.append(f"{h}.{seen[h]}")
+    return out
+
+
+def _find_col(columns, keywords):
+    for c in columns:
+        cl = str(c).lower()
+        if any(k in cl for k in keywords):
+            return c
+    return None
+
+
+def _clean_section_name(raw):
+    name = str(raw).strip()
+    name = re.sub(r"\s+", " ", name)
+    name = re.sub(r"\s+score$", "", name, flags=re.IGNORECASE)
+    return name
+
+
+def compute_grade(pct, grade_bands=DEFAULT_GRADE_BANDS):
+    """Map an overall percentage (0-100, unrounded) to a grade label."""
+    if pct is None or pd.isna(pct):
+        return None
+    for threshold, label in sorted(grade_bands, key=lambda x: -x[0]):
+        if pct >= threshold:
+            return label
+    return sorted(grade_bands, key=lambda x: x[0])[0][1]
+
+
+def _is_numeric_series(s, min_frac=0.6):
+    """True if a good fraction of the non-null values in s are numbers."""
+    non_null = s.dropna()
+    if len(non_null) == 0:
+        return False
+    numeric_count = sum(
+        1 for v in non_null
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
+    return (numeric_count / len(non_null)) >= min_frac
+
+
+def _detect_header(raw):
+    """
+    raw: DataFrame read with header=None (no assumptions about header shape).
+
+    Returns (header_labels, sub_header_labels, data_start_row):
+      header_labels     - list of column names to use (anchor row, filled in
+                           from the sub-header row where the anchor is blank)
+      sub_header_labels  - the raw sub-header row values (e.g. "Out of 5"),
+                           or None if there wasn't a second header row.
+                           Positions align with header_labels.
+      data_start_row     - first row index (into `raw`) containing real data.
+
+    Anchor row = first of the first 6 rows containing a cell that reads
+    exactly "total" (case-insensitive). If the row immediately below looks
+    like more header labels (mostly text, not scores) rather than a real
+    data row, it's treated as a second header row and merged in.
+    Falls back to "row 0 is the header, data starts at row 1" (the original
+    single-row-header assumption) if no "total" cell is found at all.
+    """
+    anchor = None
+    for i in range(min(6, len(raw))):
+        row = raw.iloc[i]
+        if any(pd.notna(v) and str(v).strip().lower() == "total" for v in row):
+            anchor = i
+            break
+
+    if anchor is None:
+        header = [str(v).strip() if pd.notna(v) else None for v in raw.iloc[0]]
+        header = [h if h else f"col_{i}" for i, h in enumerate(header)]
+        return header, None, 1
+
+    header = [str(v).strip() if pd.notna(v) else None for v in raw.iloc[anchor]]
+    sub_header = None
+    data_start = anchor + 1
+
+    if anchor + 1 < len(raw):
+        nxt = raw.iloc[anchor + 1]
+        text_like = sum(1 for v in nxt if pd.notna(v) and isinstance(v, str))
+        numeric_like = sum(1 for v in nxt if pd.notna(v) and isinstance(v, (int, float)))
+        if text_like > 0 and text_like >= numeric_like:
+            sub_header = [str(v).strip() if pd.notna(v) else None for v in nxt]
+            header = [h if h else s for h, s in zip(header, sub_header)]
+            data_start = anchor + 2
+
+    header = [h if h else f"col_{i}" for i, h in enumerate(header)]
+    return header, sub_header, data_start
+
+
+def _resolve_name_column(df, name_col=None):
+    """
+    Return (name_col, df) where df[name_col] holds a clean display name.
+
+    Tries, in order: an explicit override; a direct "name" column (DDS2-style);
+    synthesizing "{Preferred name} {Last name}"; stripping a title prefix
+    ("Mr "/"Ms "/...) off a "Legal name" column; any column with "name" in
+    its header.
+    """
+    if name_col:
+        return name_col, df
+
+    cols = list(df.columns)
+    lower = {c: str(c).strip().lower() for c in cols}
+
+    preferred = next((c for c in cols if lower[c] == "preferred name"), None)
+    last = next((c for c in cols if lower[c] == "last name"), None)
+    if preferred and last:
+        df = df.copy()
+        df["__display_name__"] = (
+            df[preferred].astype(str).str.strip() + " " + df[last].astype(str).str.strip()
+        )
+        return "__display_name__", df
+
+    legal = next((c for c in cols if "legal name" in lower[c]), None)
+    if legal:
+        df = df.copy()
+        df["__display_name__"] = df[legal].astype(str).str.replace(TITLE_PREFIX_RE, "", regex=True).str.strip()
+        return "__display_name__", df
+
+    found = _find_col(df.columns, ["name"])
+    if found:
+        return found, df
+
+    raise ValueError(
+        "Could not auto-detect a name column - pass name_col= explicitly. "
+        f"Columns found: {list(df.columns)}"
+    )
+
+
+def load_written_exam_results(input_file, sheet_name=0, name_col=None, id_col=None,
+                               comments_col=None, supervisor_col=None):
+    """
+    Load a per-student score workbook, auto-detecting whether it uses the
+    "paired" (score, percentage) column layout or the "rubric" (single score
+    out of a fixed max, no per-criterion percentage) layout — see module
+    docstring for details of each.
+
+    Returns a dict with:
+      students        - DataFrame, one row per real student (summary/blank
+                         rows dropped)
+      sections        - list of {name, score_col, pct_col, max_points}
+      total_col, total_pct_col, total_max
+      name_col, id_col, comments_col, supervisor_col  (None if not found)
+      cohort_avg      - {section_name: mean raw score}, plus "__total__"
+      cohort_avg_pct  - {section_name: mean percentage}, plus "__total__"
+      mode            - "paired" or "rubric", whichever was detected
+
+    id_col has no reliable auto-detection heuristic for rubric-style sheets
+    that have no numeric student ID (e.g. group-work rosters) — pass it
+    explicitly in that case (e.g. id_col="DDS3 year now" for the DDS3
+    research-progress workbook, which is really a group/section code column
+    despite its header text).
+    """
+    raw = pd.read_excel(input_file, sheet_name=sheet_name, header=None)
+    header, sub_header, data_start = _detect_header(raw)
+    header = _dedupe_columns(header)
+
+    df = raw.iloc[data_start:].copy()
+    df.columns = header
+    df = df.reset_index(drop=True)
+
+    name_col, df = _resolve_name_column(df, name_col)
+    id_col = id_col or _find_col(df.columns, ["sis_id", "student_id", "student_number", "id"])
+    if id_col is None:
+        raise ValueError(
+            "Could not auto-detect an id column - pass id_col= explicitly "
+            "(rubric-style sheets with no numeric student ID need this, e.g. "
+            "a group/section code column). "
+            f"Columns found: {list(df.columns)}"
+        )
+
+    comments_col = comments_col or _find_col(df.columns, ["comment"])
+    supervisor_col = supervisor_col or _find_col(df.columns, ["supervisor"])
+
+    total_col = _find_col(df.columns, ["total"])
+    if total_col is None:
+        raise ValueError("Could not find a 'Total' column.")
+    total_idx = list(df.columns).index(total_col)
+    total_pct_col = None
+    for j in range(total_idx + 1, min(total_idx + 3, len(df.columns))):
+        if "percent" in str(df.columns[j]).lower():
+            total_pct_col = df.columns[j]
+            break
+
+    sub_header_by_col = dict(zip(header, sub_header)) if sub_header else {}
+
+    # A "Marks available" row (if present) gives exact per-section max points.
+    marks_row = None
+    for _, r in df.iterrows():
+        if str(r[name_col]).strip().lower() == "marks available":
+            marks_row = r
+            break
+
+    id_idx = list(df.columns).index(id_col)
+    candidate_cols = list(df.columns)[id_idx + 1: total_idx]
+
+    # --- Try "paired" mode first: consecutive (score, "Percentage...") pairs.
+    sections = []
+    i = 0
+    while i < len(candidate_cols) - 1:
+        score_col, pct_col = candidate_cols[i], candidate_cols[i + 1]
+        if str(pct_col).lower().startswith("percentage"):
+            if marks_row is not None and pd.notna(marks_row.get(score_col)):
+                max_points = float(marks_row[score_col])
+            else:
+                ratios = (df[score_col] / (df[pct_col] / 100.0)).replace([float("inf")], pd.NA).dropna()
+                max_points = round(float(ratios.mode().iloc[0]), 2) if not ratios.empty else None
+            sections.append({
+                "name": _clean_section_name(score_col),
+                "score_col": score_col,
+                "pct_col": pct_col,
+                "max_points": max_points,
+            })
+            i += 2
+        else:
+            i += 1
+    mode = "paired"
+
+    # --- Fall back to "rubric" mode: single numeric score columns, max
+    # points declared via an "Out of N" sub-header.
+    if not sections:
+        mode = "rubric"
+        skip = {c for c in (comments_col, supervisor_col) if c}
+        for col in candidate_cols:
+            if col in skip:
+                continue
+            if not _is_numeric_series(df[col]):
+                continue
+            max_points = None
+            sub_text = sub_header_by_col.get(col)
+            if sub_text:
+                m = OUT_OF_RE.search(sub_text)
+                if m:
+                    max_points = float(m.group(1))
+            if max_points is None:
+                # last resort: use the largest observed score, rounded up
+                obs_max = pd.to_numeric(df[col], errors="coerce").max()
+                max_points = float(obs_max) if pd.notna(obs_max) else None
+            sections.append({
+                "name": _clean_section_name(col),
+                "score_col": col,
+                "pct_col": None,
+                "max_points": max_points,
+            })
+
+    # --- Total max points.
+    total_sub = sub_header_by_col.get(total_col)
+    total_max = None
+    if total_sub:
+        m = OUT_OF_RE.search(total_sub)
+        if m:
+            total_max = float(m.group(1))
+    if total_max is None:
+        if marks_row is not None and pd.notna(marks_row.get(total_col)):
+            total_max = float(marks_row[total_col])
+        elif total_pct_col is not None:
+            ratios = (df[total_col] / (df[total_pct_col] / 100.0)).replace([float("inf")], pd.NA).dropna()
+            total_max = round(float(ratios.mode().iloc[0]), 2) if not ratios.empty else None
+        else:
+            total_max = sum(s["max_points"] for s in sections if s["max_points"]) or None
+
+    students = df[df[id_col].notna()].copy()
+    students = students[~students[name_col].astype(str).str.strip().str.lower().isin(SUMMARY_ROW_LABELS)]
+    students = students.reset_index(drop=True)
+
+    cohort_avg = {s["name"]: pd.to_numeric(students[s["score_col"]], errors="coerce").mean() for s in sections}
+    cohort_avg["__total__"] = pd.to_numeric(students[total_col], errors="coerce").mean()
+    if total_pct_col:
+        cohort_avg_pct = {s["name"]: None for s in sections}
+        cohort_avg_pct["__total__"] = pd.to_numeric(students[total_pct_col], errors="coerce").mean()
+    else:
+        cohort_avg_pct = {"__total__": (cohort_avg["__total__"] / total_max * 100) if total_max else None}
+
+    return {
+        "students": students,
+        "sections": sections,
+        "total_col": total_col,
+        "total_pct_col": total_pct_col,
+        "total_max": total_max,
+        "name_col": name_col,
+        "id_col": id_col,
+        "comments_col": comments_col,
+        "supervisor_col": supervisor_col,
+        "cohort_avg": cohort_avg,
+        "cohort_avg_pct": cohort_avg_pct,
+        "mode": mode,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PDF rendering
+# ═══════════════════════════════════════════════════════════════════════════
+def _styles():
+    s = {}
+    s["name"] = ParagraphStyle("name", fontName="Helvetica-Bold", fontSize=20,
+                                textColor=colors.white, leading=24)
+    s["subtitle"] = ParagraphStyle("subtitle", fontName="Helvetica", fontSize=11,
+                                    textColor=SUBTITLE_BLUE, leading=14)
+    s["course"] = ParagraphStyle("course", fontName="Helvetica-Bold", fontSize=13,
+                                  textColor=colors.white, alignment=TA_LEFT, leading=16)
+    s["period"] = ParagraphStyle("period", fontName="Helvetica", fontSize=10,
+                                  textColor=SUBTITLE_BLUE, alignment=TA_LEFT, leading=13)
+    s["bar_title"] = ParagraphStyle("bar_title", fontName="Helvetica-Bold", fontSize=12.5,
+                                     textColor=colors.white, leading=15)
+    s["th"] = ParagraphStyle("th", fontName="Helvetica-Bold", fontSize=9.5,
+                              textColor=colors.white, leading=12)
+    s["td"] = ParagraphStyle("td", fontName="Helvetica", fontSize=9.5,
+                              textColor=TEXT_DARK, leading=12)
+    s["td_bold"] = ParagraphStyle("td_bold", fontName="Helvetica-Bold", fontSize=9.5,
+                                   textColor=NAVY, leading=12)
+    s["grade_big"] = ParagraphStyle("grade_big", fontName="Helvetica-Bold", fontSize=30,
+                                     textColor=colors.white, alignment=TA_CENTER, leading=32)
+    s["grade_lbl"] = ParagraphStyle("grade_lbl", fontName="Helvetica", fontSize=9.5,
+                                     textColor=colors.white, alignment=TA_CENTER, leading=12)
+    s["result_lbl"] = ParagraphStyle("result_lbl", fontName="Helvetica-Bold", fontSize=10,
+                                      textColor=colors.white, leading=13)
+    s["result_val"] = ParagraphStyle("result_val", fontName="Helvetica", fontSize=13.5,
+                                      textColor=colors.white, leading=17)
+    s["footer"] = ParagraphStyle("footer", fontName="Helvetica-Oblique", fontSize=8.5,
+                                  textColor=colors.HexColor("#666666"), leading=11)
+    s["comments_heading"] = ParagraphStyle("comments_heading", fontName="Helvetica-Bold", fontSize=12,
+                                            textColor=NAVY, leading=15, spaceBefore=4, spaceAfter=4)
+    s["comment"] = ParagraphStyle("comment", fontName="Helvetica-Oblique", fontSize=9.5,
+                                   textColor=TEXT_DARK, leading=14, alignment=TA_JUSTIFY)
+    return s
+
+
+def _header_banner(student_name, student_id, course_code, exam_title, styles, extra_subtitle=None,
+                    id_label="Student ID", assessment_label="Written Examination"):
+    id_line = f"{id_label}: {student_id}" if extra_subtitle else f"{id_label}: {student_id} &middot; {assessment_label}"
+    left = [Paragraph(student_name, styles["name"]),
+            Paragraph(id_line, styles["subtitle"])]
+    if extra_subtitle:
+        left.append(Paragraph(extra_subtitle, styles["subtitle"]))
+    right = [Paragraph(course_code, styles["course"]),
+             Paragraph(exam_title, styles["period"])]
+    tbl = Table([[left, right]], colWidths=[CONTENT_W * 0.62, CONTENT_W * 0.38])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (0, 0), "LEFT"),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (0, 0), 16),
+        ("RIGHTPADDING", (1, 0), (1, 0), 16),
+        ("TOPPADDING", (0, 0), (-1, -1), 18),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
+    ]))
+    return tbl
+
+
+def _section_bar(text, styles):
+    tbl = Table([[Paragraph(text, styles["bar_title"])]], colWidths=[CONTENT_W])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), NAVY),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return tbl
+
+
+def _score_table(sections, row_data, cohort_avg, total_col_label, total_max, total_score,
+                  total_cohort_avg, styles, show_cohort_avg=True):
+    if show_cohort_avg:
+        header = [Paragraph("Section", styles["th"]), Paragraph("Your Score", styles["th"]),
+                  Paragraph("Cohort Avg", styles["th"]), Paragraph("Your %", styles["th"])]
+        col_widths = [CONTENT_W * 0.46, CONTENT_W * 0.20, CONTENT_W * 0.18, CONTENT_W * 0.16]
+    else:
+        header = [Paragraph("Section", styles["th"]), Paragraph("Your Score", styles["th"]),
+                  Paragraph("Your %", styles["th"])]
+        col_widths = [CONTENT_W * 0.56, CONTENT_W * 0.24, CONTENT_W * 0.20]
+    rows = [header]
+    for sec in sections:
+        score = row_data[sec["score_col"]]
+        max_pts = sec["max_points"]
+        missing = pd.isna(score)
+        pct = (score / max_pts * 100) if (max_pts and not missing) else None
+        score_text = "&mdash; (not submitted)" if missing else f"{score:.2f}/{max_pts:.2f}"
+        pct_text = "&mdash;" if pct is None else f"{pct:.2f}%"
+        row = [Paragraph(_xmlEscape(sec["name"], quote=False), styles["td"]), Paragraph(score_text, styles["td"])]  # escape "&" (e.g. "Q&A")
+        if show_cohort_avg:
+            avg = cohort_avg[sec["name"]]
+            row.append(Paragraph(f"{avg:.2f}/{max_pts:.2f}", styles["td"]))
+        row.append(Paragraph(pct_text, styles["td"]))
+        rows.append(row)
+
+    total_pct = (total_score / total_max * 100) if total_max else 0
+    total_row = [Paragraph(f"<b>{total_col_label}</b>", styles["td_bold"]),
+                 Paragraph(f"<b>{total_score:.2f}/{total_max:.2f}</b>", styles["td_bold"])]
+    if show_cohort_avg:
+        total_row.append(Paragraph(f"{total_cohort_avg:.2f}/{total_max:.2f}", styles["td"]))
+    total_row.append(Paragraph(f"<b>{total_pct:.2f}%</b>", styles["td_bold"]))
+    rows.append(total_row)
+
+    tbl = Table(rows, colWidths=col_widths, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("TOPPADDING", (0, 0), (-1, 0), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 1), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, NAVY),
+        ("BACKGROUND", (0, -1), (-1, -1), TOTAL_BG),
+        ("LINEABOVE", (0, -1), (-1, -1), 1, NAVY),
+    ]
+    for i in range(1, len(rows) - 1):
+        style.append(("BACKGROUND", (0, i), (-1, i), ROW_ALT if i % 2 == 0 else ROW_WHITE))
+    tbl.setStyle(TableStyle(style))
+    return tbl
+
+
+def _result_box(grade, score, max_points, pct, cohort_avg, cohort_avg_pct, styles, box_color=None,
+                 show_cohort_avg=True):
+    box_color = box_color or colors.HexColor(FALLBACK_GRADE_COLOR)
+    grade_cell = [Paragraph(grade or "-", styles["grade_big"]),
+                  Paragraph("Grade", styles["grade_lbl"])]
+    info_cell = [
+        Paragraph("Your Score", styles["result_lbl"]),
+        Paragraph(f"{score:.2f}/{max_points:.2f} ({pct:.2f}%)", styles["result_val"]),
+    ]
+    if show_cohort_avg and cohort_avg is not None:
+        info_cell += [
+            Spacer(1, 4),
+            Paragraph("Cohort Average", styles["result_lbl"]),
+            Paragraph(f"{cohort_avg:.2f}/{max_points:.2f} ({cohort_avg_pct:.2f}%)", styles["result_val"]),
+        ]
+    tbl = Table([[grade_cell, info_cell]], colWidths=[CONTENT_W * 0.26, CONTENT_W * 0.74])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), box_color),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (0, 0), "CENTER"),
+        ("ALIGN", (1, 0), (1, 0), "LEFT"),
+        ("LEFTPADDING", (1, 0), (1, 0), 18),
+        ("TOPPADDING", (0, 0), (-1, -1), 16),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 16),
+        ("LINEAFTER", (0, 0), (0, 0), 1, colors.white),
+    ]))
+    return tbl
+
+
+def _comments_block(comment_text, styles):
+    return [
+        Spacer(1, 10),
+        Paragraph("Assessor Comments", styles["comments_heading"]),
+        Paragraph(comment_text, styles["comment"]),
+    ]
+
+
+def _safe_filename(text):
+    text = re.sub(r'[\\/:*?"<>|]', "", str(text))
+    return text.strip()
+
+
+def generate_student_pdf(row, loaded, course_code, exam_title, out_path,
+                          grade_bands=DEFAULT_GRADE_BANDS, grade_colors=DEFAULT_GRADE_COLORS,
+                          section_bar_label="Written Examination", total_row_label=None,
+                          show_cohort_avg=True, note=None, id_label="Student ID"):
+    """Render a single student's PDF report to out_path."""
+    styles = _styles()
+    name_col, id_col = loaded["name_col"], loaded["id_col"]
+    total_col, total_pct_col = loaded["total_col"], loaded["total_pct_col"]
+    total_max = loaded["total_max"]
+
+    student_name = str(row[name_col]).strip()
+    student_id = str(row[id_col]).strip()
+    if student_id.endswith(".0"):
+        student_id = student_id[:-2]
+
+    total_score = float(row[total_col])
+    total_pct = float(row[total_pct_col]) if total_pct_col else (total_score / total_max * 100)
+    grade = compute_grade(total_pct, grade_bands)
+    box_color = grade_color(grade, grade_colors)
+
+    supervisor_col = loaded.get("supervisor_col")
+    extra_subtitle = None
+    if supervisor_col and pd.notna(row.get(supervisor_col)) and str(row[supervisor_col]).strip():
+        extra_subtitle = f"Supervisor: {str(row[supervisor_col]).strip()}"
+
+    cohort_avg_total = loaded["cohort_avg"]["__total__"] if show_cohort_avg else None
+    cohort_avg_pct_total = loaded["cohort_avg_pct"].get("__total__") if show_cohort_avg else None
+
+    doc = SimpleDocTemplate(out_path, pagesize=A4, leftMargin=MARGIN, rightMargin=MARGIN,
+                             topMargin=MARGIN, bottomMargin=MARGIN)
+    story = [
+        _header_banner(student_name, student_id, course_code, exam_title, styles,
+                        extra_subtitle=extra_subtitle, id_label=id_label,
+                        assessment_label=section_bar_label),
+        Spacer(1, 14),
+        _section_bar(f"{section_bar_label} &mdash; Section Performance", styles),
+        _score_table(loaded["sections"], row, loaded["cohort_avg"],
+                     total_row_label or f"Overall {section_bar_label} Total",
+                     total_max, total_score, cohort_avg_total, styles,
+                     show_cohort_avg=show_cohort_avg),
+        Spacer(1, 14),
+        _section_bar(f"{section_bar_label} &mdash; Overall Result", styles),
+        Spacer(1, 8),
+        _result_box(grade, total_score, total_max, total_pct,
+                    cohort_avg_total, cohort_avg_pct_total, styles,
+                    box_color=box_color, show_cohort_avg=show_cohort_avg),
+    ]
+
+    comments_col = loaded.get("comments_col")
+    if comments_col and pd.notna(row.get(comments_col)) and str(row[comments_col]).strip():
+        story += _comments_block(str(row[comments_col]).strip(), styles)
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        note or ("Note: Individual questions are not released. The breakdown above "
+                 "shows your performance across each clinical topic area."),
+        styles["footer"],
+    ))
+    doc.build(story)
+
+
+def generate_all_written_exam_reports(input_file, output_dir, course_code, exam_title,
+                                       sheet_name=0, name_col=None, id_col=None,
+                                       comments_col=None, supervisor_col=None,
+                                       grade_bands=DEFAULT_GRADE_BANDS,
+                                       grade_colors=DEFAULT_GRADE_COLORS,
+                                       section_bar_label="Written Examination",
+                                       total_row_label=None, show_cohort_avg=True, note=None,
+                                       id_label="Student ID", id_in_filename=True):
+    """
+    Generate one PDF per student from a per-student score workbook (either
+    the "paired" written-exam layout or the "rubric" criteria layout — see
+    module docstring). Reusable for any cohort/year/assessment type: just
+    point at a different input_file / output_dir / course_code / exam_title,
+    and for rubric-style sheets pass id_col= explicitly and consider
+    show_cohort_avg=False if a single average isn't a fair comparison
+    (e.g. different supervisors grading different groups).
+
+    Files are named "Student Name (student id).pdf" in output_dir by default;
+    pass id_in_filename=False to use just "Student Name.pdf" instead (id_col
+    is still required internally - e.g. to identify each student's row - and
+    still shown on the report itself, just left out of the filename). If two
+    students share the exact same name, a " (2)", " (3)", ... suffix is added
+    to keep filenames unique.
+
+    The overall-result box colour follows the grade (green -> orange -> red,
+    see DEFAULT_GRADE_COLORS); override with a different `grade_colors` dict.
+    Returns a summary DataFrame (name, id, total score, total %, grade, out_path).
+    """
+    loaded = load_written_exam_results(input_file, sheet_name=sheet_name, name_col=name_col,
+                                        id_col=id_col, comments_col=comments_col,
+                                        supervisor_col=supervisor_col)
+    os.makedirs(output_dir, exist_ok=True)
+
+    used_names = {}
+    summary_rows = []
+    for _, row in loaded["students"].iterrows():
+        student_name = str(row[loaded["name_col"]]).strip()
+        student_id = str(row[loaded["id_col"]]).strip()
+        if student_id.endswith(".0"):
+            student_id = student_id[:-2]
+
+        if id_in_filename:
+            base_name = f"{student_name} ({student_id})"
+        else:
+            base_name = student_name
+            used_names[base_name] = used_names.get(base_name, 0) + 1
+            if used_names[base_name] > 1:
+                base_name = f"{base_name} ({used_names[base_name]})"
+        fname = _safe_filename(f"{base_name}.pdf")
+        out_path = os.path.join(output_dir, fname)
+
+        generate_student_pdf(row, loaded, course_code, exam_title, out_path,
+                              grade_bands=grade_bands, grade_colors=grade_colors,
+                              section_bar_label=section_bar_label, total_row_label=total_row_label,
+                              show_cohort_avg=show_cohort_avg, note=note, id_label=id_label)
+
+        total_score = float(row[loaded["total_col"]])
+        total_pct = float(row[loaded["total_pct_col"]]) if loaded["total_pct_col"] else (
+            total_score / loaded["total_max"] * 100 if loaded["total_max"] else None)
+        summary_rows.append({
+            "name": student_name, "id": student_id,
+            "total_score": total_score, "total_max": loaded["total_max"],
+            "total_pct": total_pct, "grade": compute_grade(total_pct, grade_bands),
+            "file": out_path,
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    print(f"Done - {len(summary)} PDFs written to: {output_dir} (mode: {loaded['mode']})")
+    return summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Group-based rubric layout  (e.g. DDS2 research-project oral presentation)
+# ═══════════════════════════════════════════════════════════════════════════
+# Unlike the one-row-per-student "rubric" layout above, a group-presentation
+# sheet grades a *whole group* on one row, then lists the group's members on
+# the following rows (each with their own Student ID but blank score cells).
+# Feedback comments are scattered across the members' rows and belong to the
+# group as a whole. This loader:
+#   * auto-detects columns from the two-row header (title row + "Out of N"
+#     sub-header) by header text, so sheets whose columns sit at different
+#     positions (different sessions) still parse;
+#   * walks each group, forward-filling the group's scores/percentage/
+#     supervisor onto every member, and joining all of the group's comment
+#     lines into one shared block per member;
+#   * looks up each member's e-mail from an id->email map so the report can
+#     show "Student Email:" in the header (matching the DDS3 sample style).
+# It returns the same `loaded` dict shape used by generate_student_pdf(), so
+# all of the PDF rendering above is reused unchanged.
+
+ORAL_SECTION_MAX = 5.0          # default criterion max (overridden by "Out of N" sub-headers)
+ORAL_TOTAL_MAX   = 20.0         # default total max (overridden by the "Out of N" total header)
+
+_ORAL_SUBHEADER_KEYS = ("family name", "last name")   # DDS2 uses "Family Name", DDS3 "Last name"
+
+
+def _oral_find_idx(title_row, sub_row, keywords, exact_sub=None):
+    """Return the first column index whose title-row OR sub-header text
+    matches. If exact_sub is given, match the sub-header exactly (used to
+    grab the 'Out of 5' / 'Out of 20' score columns)."""
+    n = max(len(title_row), len(sub_row))
+    for j in range(n):
+        t = str(title_row[j]).strip().lower() if j < len(title_row) and title_row[j] is not None else ""
+        s = str(sub_row[j]).strip().lower() if j < len(sub_row) and sub_row[j] is not None else ""
+        if exact_sub is not None:
+            if s == exact_sub.lower():
+                return j
+        elif any(k in t or k in s for k in keywords):
+            return j
+    return None
+
+
+def _oral_out_of(v):
+    """'Out of 25' -> 25.0, anything else -> None."""
+    m = re.match(r"^\s*out of\s*([\d.]+)\s*$", str(v), re.I) if v is not None else None
+    return float(m.group(1)) if m else None
+
+
+def _oral_blank(v):
+    return v is None or (isinstance(v, float) and pd.isna(v)) or (isinstance(v, str) and not v.strip())
+
+
+def _load_email_map(email_list_csv):
+    """Read studentEmailList.csv into {student_number(str): email}."""
+    df = pd.read_csv(email_list_csv, dtype=str)
+    num_col = _find_col(df.columns, ["student_number", "student number", "id"])
+    mail_col = _find_col(df.columns, ["email"])
+    return {str(n).strip(): str(e).strip()
+            for n, e in zip(df[num_col], df[mail_col]) if pd.notna(n)}
+
+
+def load_oral_presentation_results(input_file, sheets=None, email_map=None,
+                                   section_max=ORAL_SECTION_MAX,
+                                   total_max=ORAL_TOTAL_MAX):
+    """
+    Parse a group-presentation rubric workbook into a `loaded` dict compatible
+    with generate_student_pdf(). Handles both known layouts:
+
+      * DDS2 2026  - "Family Name / Preferred Name / Student ID", 4 criteria, Total "Out of 20"
+      * DDS3 2026  - "Legal name / Last name / Preferred name", group code + email (no
+                     student number), 5 criteria (one sub-header blank), Total "Out of 25",
+                     scores in vertically merged cells, a second per-student
+                     "Percentage grade" column (IGNORED - group % is used for everyone).
+
+    Criterion columns = every titled column from the first "Out of N" criterion
+    up to (not incl.) the Total column, so a blank "Out of 5" cell no longer drops
+    a criterion. Maxima are read from the "Out of N" sub-headers.
+
+    Grouping: a row with a Total value starts a new group; every following row
+    up to the next scored row is a member. Members inherit the group's scores,
+    the FIRST "Percentage grade" column, all supervisors listed for the group
+    (joined) and all comment lines (joined).
+
+    sheets      - list of sheet names to include (default: all sheets).
+    email_map   - {student_id(str): email}; used when the sheet has no email column.
+
+    Returns the standard loaded dict (mode="oral").
+    """
+    xls = pd.ExcelFile(input_file)
+    sheet_names = sheets or xls.sheet_names
+
+    records = []
+    section_titles = None
+    sec_max_found, tot_max_found = None, None
+
+    for sh in sheet_names:
+        raw = pd.read_excel(input_file, sheet_name=sh, header=None)
+        rows = raw.values.tolist()
+
+        # sub-header row = the one holding "Family Name" / "Last name"
+        sub_i = None
+        for i in range(min(8, len(rows))):
+            if any(str(v).strip().lower() in _ORAL_SUBHEADER_KEYS for v in rows[i] if v is not None):
+                sub_i = i
+                break
+        if sub_i is None or sub_i == 0:
+            print(f"[oral] sheet '{sh}': header row not found - skipped")
+            continue
+        title_row = rows[sub_i - 1]
+        sub_row = rows[sub_i]
+        ncol = max(len(title_row), len(sub_row))
+        txt = lambda row, j: str(row[j]).strip() if j < len(row) and not _oral_blank(row[j]) else ""
+
+        fam_idx  = _oral_find_idx(title_row, sub_row, ["family name", "last name"])
+        pref_idx = _oral_find_idx(title_row, sub_row, ["preferred name"])
+        id_idx   = _oral_find_idx(title_row, sub_row, ["student id"])
+        sup_idx  = _oral_find_idx(title_row, sub_row, ["supervisor"])
+        pct_idx  = _oral_find_idx(title_row, sub_row, ["percentage"])   # FIRST % column = group %
+
+        # "Out of N" columns: the largest N is the Total, the rest are criteria
+        outs = {j: _oral_out_of(sub_row[j]) for j in range(len(sub_row)) if _oral_out_of(sub_row[j])}
+        if not outs:
+            print(f"[oral] sheet '{sh}': no 'Out of N' score columns - skipped")
+            continue
+        total_idx = max(outs, key=lambda j: (outs[j], j))
+        crit_outs = [j for j in outs if j != total_idx]
+        first_crit = min(crit_outs) if crit_outs else None
+        sec_idxs = [j for j in range(first_crit, total_idx) if txt(title_row, j)] if first_crit is not None else []
+        s_max = outs[crit_outs[0]] if crit_outs else section_max
+        sec_max_found = sec_max_found or s_max
+        tot_max_found = tot_max_found or outs[total_idx]
+
+        # email column (DDS3 has one, no header) - detect by '@' in values
+        data_rows = rows[sub_i + 1:]
+        email_idx = None
+        for j in range(ncol):
+            n_at = sum(1 for r in data_rows if j < len(r) and isinstance(r[j], str) and "@" in r[j])
+            if n_at >= 3:
+                email_idx = j
+                break
+        # group-code column (e.g. DDS2-Grp-01-A) - used as id when there's no student number
+        code_idx = None
+        for j in range(ncol):
+            n_code = sum(1 for r in data_rows if j < len(r) and isinstance(r[j], str)
+                         and re.match(r"^[A-Z]+\d*-Grp-\d+", r[j].strip()))
+            if n_code >= 3:
+                code_idx = j
+                break
+
+        # Comments column: header may sit one column left of the text - pick the
+        # column at/after the header holding the most free-text strings.
+        com_hdr = _oral_find_idx(title_row, sub_row, ["comment"])
+        if com_hdr is not None:
+            best, best_n = com_hdr, -1
+            for j in range(com_hdr, com_hdr + 3):
+                n = sum(1 for r in data_rows
+                        if j < len(r) and isinstance(r[j], str) and len(r[j].strip()) > 3)
+                if n > best_n:
+                    best, best_n = j, n
+            com_idx = best
+        else:
+            com_idx = None
+
+        titles = [_clean_section_name(title_row[j]) for j in sec_idxs]
+        if section_titles is None:
+            section_titles = titles
+        elif titles != section_titles:
+            print(f"[oral] WARNING sheet '{sh}': criterion titles differ from first sheet: {titles}")
+
+        cur = None
+        for r in data_rows:
+            if all(_oral_blank(v) for v in r):
+                continue
+            if total_idx < len(r) and not _oral_blank(r[total_idx]):
+                cur = {"sheet": sh,
+                       "scores": [r[j] if j < len(r) else None for j in sec_idxs],
+                       "total": r[total_idx],
+                       "pct": r[pct_idx] if pct_idx is not None and pct_idx < len(r) else None,
+                       "supervisors": [], "comments": [], "members": []}
+                records.append(cur)
+            if cur is None:
+                continue
+
+            sup = txt(r, sup_idx) if sup_idx is not None else ""
+            if sup and sup not in cur["supervisors"]:
+                cur["supervisors"].append(sup)
+            ctext = txt(r, com_idx) if com_idx is not None else ""
+            if ctext and ctext.lower() != "nan":
+                cur["comments"].append(ctext)
+
+            sid = txt(r, id_idx) if id_idx is not None else ""
+            sid = sid[:-2] if sid.endswith(".0") else sid
+            email = txt(r, email_idx) if email_idx is not None else ""
+            code = txt(r, code_idx) if code_idx is not None else ""
+            if sid or email:                       # a member row
+                fam = txt(r, fam_idx) if fam_idx is not None else ""
+                pref = txt(r, pref_idx) if pref_idx is not None else ""
+                cur["members"].append({"name": f"{pref} {fam}".strip(),
+                                       "id": sid or code or email,
+                                       "email": email or (email_map or {}).get(sid, "")})
+
+    if section_titles is None:
+        raise ValueError(f"No oral-presentation sheet could be parsed in {input_file}")
+
+    flat = []
+    for g in records:
+        combined = re.sub(r"\s+", " ", " ".join(g["comments"])).strip()
+        for m in g["members"]:
+            row = {"name": m["name"], "id": m["id"], "email": m["email"],
+                   "supervisor": ", ".join(g["supervisors"]),
+                   "comments": combined, "total": g["total"], "pct": g["pct"],
+                   "sheet": g["sheet"]}
+            for k, sc in enumerate(g["scores"]):
+                row[f"__sec{k}"] = sc
+            flat.append(row)
+
+    students = pd.DataFrame(flat)
+    sec_max = sec_max_found or section_max
+    sections = [{"name": title, "score_col": f"__sec{k}", "pct_col": None, "max_points": sec_max}
+                for k, title in enumerate(section_titles)]
+    id_col = "email" if students["email"].astype(bool).any() else "id"
+
+    return {
+        "students": students,
+        "sections": sections,
+        "total_col": "total",
+        "total_pct_col": "pct",
+        "total_max": tot_max_found or total_max,
+        "name_col": "name",
+        "id_col": id_col,
+        "comments_col": "comments",
+        "supervisor_col": "supervisor",
+        "cohort_avg": {s["name"]: None for s in sections} | {"__total__": None},
+        "cohort_avg_pct": {"__total__": None},
+        "mode": "oral",
+    }
+
+
+def generate_all_oral_presentation_reports(input_file, output_dir, course_code, exam_title,
+                                           email_list_csv=None, sheets=None,
+                                           section_bar_label="Oral Presentation",
+                                           id_label="Student Email", id_in_filename=True,
+                                           grade_bands=DEFAULT_GRADE_BANDS,
+                                           grade_colors=DEFAULT_GRADE_COLORS, note=None):
+    """
+    Generate one PDF per student from a group-presentation rubric workbook
+    (see load_oral_presentation_results). Members of a group share the group's
+    grade and a combined comments block. The report header shows the student's
+    e-mail (looked up from email_list_csv) and supervisor, no cohort average
+    (each group is graded by a different supervisor, so a single average isn't
+    a fair comparison) — matching the DDS3 research-summary sample style.
+
+    Files are named "Student Name (student id).pdf" by default. Returns a
+    summary DataFrame (name, id, total score, total %, grade, file).
+    """
+    email_map = _load_email_map(email_list_csv) if email_list_csv else None
+    loaded = load_oral_presentation_results(input_file, sheets=sheets, email_map=email_map)
+    os.makedirs(output_dir, exist_ok=True)
+
+    default_note = ("This assessment contributes 20% to your final grade. "
+                    "Comments above reflect your supervisor's feedback on this component.")
+
+    used_names = {}
+    summary_rows = []
+    for _, row in loaded["students"].iterrows():
+        student_name = str(row[loaded["name_col"]]).strip()
+        student_id = str(row["id"]).strip()
+
+        if id_in_filename:
+            base_name = f"{student_name} ({student_id})"
+        else:
+            base_name = student_name
+            used_names[base_name] = used_names.get(base_name, 0) + 1
+            if used_names[base_name] > 1:
+                base_name = f"{base_name} ({used_names[base_name]})"
+        out_path = os.path.join(output_dir, _safe_filename(f"{base_name}.pdf"))
+
+        generate_student_pdf(
+            row, loaded, course_code, exam_title, out_path,
+            grade_bands=grade_bands, grade_colors=grade_colors,
+            section_bar_label=section_bar_label,
+            total_row_label=f"Overall {section_bar_label} Total",
+            show_cohort_avg=False, note=note or default_note, id_label=id_label,
+        )
+
+        total_score = float(row["total"])
+        total_pct = float(row["pct"]) if pd.notna(row["pct"]) else (total_score / loaded["total_max"] * 100)
+        summary_rows.append({
+            "name": student_name, "id": student_id,
+            "total_score": total_score, "total_max": loaded["total_max"],
+            "total_pct": total_pct, "grade": compute_grade(total_pct, grade_bands),
+            "supervisor": row["supervisor"], "file": out_path,
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    print(f"Done - {len(summary)} PDFs written to: {output_dir} (mode: {loaded['mode']})")
+    return summary

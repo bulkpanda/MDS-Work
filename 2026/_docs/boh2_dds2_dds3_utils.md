@@ -2,11 +2,13 @@
 
 > Query, processing and report-building helpers that turn `rawform_forms_v3` DASH assessment forms into cohort-level Excel workbooks and per-student / per-cohort PDF reports for the BOH2, DDS2 and DDS3 cohorts (and, in practice, BOH1 and DDS1 too).
 
-> **Changed since generation (2026-08-14).** 2026-08-18 added `clinicalIncidentSqlExpr()` and the `CLINICAL_INCIDENT_NO_DETAILS` constant, and rewired `getDataDf` and `getCriticalIncidentDf` to use them — a fix for clinical incidents never populating on the 2026 form templates. Details in the `clinicalIncidentSqlExpr` entry in §5 and in `_handover_docs/HANDOVER_dds2_clinic_flagging_fhy.md` §7.
+> **Changed since generation (2026-08-14).** 2026-08-18 added `clinicalIncidentSqlExpr()` and the `CLINICAL_INCIDENT_NO_DETAILS` constant, and rewired `getDataDf` and `getCriticalIncidentDf` to use them — a fix for clinical incidents never populating on the 2026 form templates. Details in the `clinicalIncidentSqlExpr` entry in §5 and in `_handover_docs/HANDOVER_dds2_clinic_flagging_fhy.md` §7. **2026-09-22** rewrote `clinicalIncidentSqlExpr` again to COMPOSE `Category — detail` from all three shapes: the 2026 template's detail lives in `texts.clinical-incident-additional-details` (category in `multi-select`), not `texts.clinical-incident`, so the old first-match returned only "Yes (no details recorded)". See `_handover_docs/HANDOVER_clinical_incident_additional_details.md`.
 
 > **Changed since generation (2026-09-09).** Added a **redesigned per-student report (V2)** as a parallel, additive stack — no original function changed. New entry points `buildEntireCohortStudentReportsV2` / `buildStudentReportV2` and ~20 `*V2` helpers: `_v2MakePageDecorators` (whole-page tint), `_v2SummaryTable` (zebra + compact two-line patient rows), `_makeRatingBarsFigureV2` (pies→stacked bars), `_addProceduresV2`/`_v2ProcPanel`/`_v2ChipsImage` (Sim+Clinic meter bars + rounded pill chips), `_addSectionPerformanceV2`/`_v2DrawSpider` (Clinic-default spider), `_addTimeSeriesPageV2`/`_v2FullFigImage` (original charts + rolling-avg line, full-frame embed to keep scatter/rubric x-ticks aligned), `_addReflectionCardsV2`/`_v2ReflectionCard` (GR-keyed cards + collapsed log). Two V2-only **data-logic fixes**: `_v2RemapUnmappedSections` (checklist/composite item codes → section via their 3-digit code, killing the Miscellaneous over-count) and `_v2OperatorClinicDf` (patient age distribution + patient outcomes counted on Operator-role forms only, role CODE `O`). New palette consts `V2_*`. LOC now 4410 (3336 at the 2026-08-14 note). Full detail: `_handover_docs/HANDOVER_student_report_v2_redesign.md`.
 
 > **Related module (2026-09-15).** `student_report_html_utils.py` (new, additive) turns the V2 per-student report into an **interactive HTML** per student by importing this module and *calling* its `*V2` data functions (`getDataDf`, `_computeSummaryMetrics`, `_v2OperatorClinicDf`, `explodeScoresToLong`/`_mergeSection`/`_v2RemapUnmappedSections`, `_v2SectionAggs`, `_v2EntCounts`/`_v2GrCounts`, `_v2SessionMeanByDate`, `_v2VisibleReflection`/`_v2LogTag`, `getCohortItemCodeAverages`) plus the `V2_*` palette — so the HTML numbers cannot drift from the PDF. **Nothing in this module was changed.** See `_docs/student_report_html_utils.md` and `_handover_docs/HANDOVER_student_report_interactive_html.md`.
+
+> **Changed since generation (2026-09-22).** `buildCohortTimeSeriesPdf` score scatter brought to parity with the V2 student report: new `_addRollingAvgToScatter` overlays the navy rolling-avg(3) line (over `_v2SessionMeanByDate`) on the cohort score scatter in **both** layouts, for **Sim + Clinic**; and `streamCohort` is now threaded into `_drawScoresScatter`/`plotStudentScoresTimeSeries` for **Simulation** so DDS2 Sim points get stream colours, the stream legend and `CD/P/FP/E` labels. Rubric panels, item-code counts table, missing-session dots and half-year divider unchanged. `main.ipynb` not edited (cell 11). Full detail: `_handover_docs/HANDOVER_unique_item_code_flag_and_cohort_ts_rolling_avg.md`.
 
 | | |
 |---|---|
@@ -445,6 +447,44 @@ So the stored column was NULL and **every** downstream consumer showed zero inci
 ~66 of the 159 are `"yes"` with no detail text typed. Those resolve to `CLINICAL_INCIDENT_NO_DETAILS = "Yes (no details recorded)"`, not an empty string — an empty string would read as "no incident", which is the whole failure being fixed.
 
 > `clinical-incidents` (plural) and `heading-clinical-incidents` appear in the payload but are only a `group_key` and a heading on the **config**, never data fields. Don't chase them.
+
+> **Updated 2026-09-22 — supersedes the shape-2 detail source and the first-match design above.**
+> The 2026 BOH2/DDS2 template does **not** use the `texts.clinical-incident` key. It records the
+> **category** in `multi-select.clinical-incident` and the **detail** in
+> `texts.clinical-incident-additional-details`:
+>
+> ```jsonc
+> "assessor_data": {
+>   "radio":        { "clinical-incident-occurred": "yes" },
+>   "multi-select": { "clinical-incident": [ { "key": "CI14", "value": "Sharps injuries and/or blood and bodily fluid exposures" } ] },
+>   "texts":        { "clinical-incident-additional-details": "Poked LA needle into patient's upper lip…" }
+> }
+> ```
+>
+> So the old radio branch (which read `texts.clinical-incident`, empty here) returned
+> `"Yes (no details recorded)"` and dropped both the category and the detail on **117 of 243**
+> incident forms. The expression now **composes** them:
+>
+> ```sql
+> COALESCE(
+>     NULLIF(concat_ws(' — ',
+>         (SELECT string_agg(x->>'value', '; ' ORDER BY x->>'value')                 -- category
+>            FROM jsonb_array_elements(COALESCE(f.assessor_data->'multi-select'->'clinical-incident','[]'::jsonb)) x),
+>         CASE WHEN <occurred='yes'> OR <category IS NOT NULL>                         -- gate
+>              THEN COALESCE(NULLIF(TRIM(f.assessor_data->'texts'->>'clinical-incident'),''),
+>                            NULLIF(TRIM(f.assessor_data->'texts'->>'clinical-incident-additional-details'),'')) END
+>     ), ''),
+>     CASE WHEN <occurred='yes'> THEN 'Yes (no details recorded)' END,               -- tick-only marker
+>     NULLIF(TRIM(COALESCE(f.clinical_incident, '')), '')                            -- stored fallback
+> )
+> ```
+>
+> Changes from the 2026-08-18 version: (a) detail source adds
+> `clinical-incident-additional-details` (COALESCE after `clinical-incident`); (b) the category is
+> concatenated in, not used only as a last resort; (c) the **composed value is preferred over the
+> stored column** (it can never hold more, so this repairs the table with no reload); (d) detail is
+> **gated** on `occurred='yes'` OR a category, so the 22 `occurred='no'` "Nil"/"N/A" free-text forms
+> stay NULL exactly as before. Net: the same 220 forms are flagged — pure content enrichment.
 
 **Called by** — `getDataDf`, `getCriticalIncidentDf`.
 

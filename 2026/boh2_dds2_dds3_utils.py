@@ -68,6 +68,15 @@ COMBINE_TIMESERIES_PANELS = False
 TS_SPLIT_DATE = pd.Timestamp("2026-06-15", tz="Australia/Melbourne")
 INTERACTIVE_TS_COHORTS = ("DDS3",)
 
+# ── DDS1 PE | CD side-by-side time series (2026-09-24, additive) ──
+# For these cohorts the static V2 "Simulation — Performance Over Time" page draws
+# two panels side by side: Periodontics (PE) and Conservative Dentistry (CD), so
+# students see their progress in each separately. A form is PE when any of its
+# checklist / item codes starts with "PE-" (NOT clinic_type: ~12 PE forms in 2026
+# were saved as CD/EN). Every other Sim form goes to the CD panel.
+PE_CD_SPLIT_COHORTS = ("DDS1",)
+PE_CD_PANELS = (("PE", "Periodontics (PE)"), ("CD", "Conservative Dentistry (CD)"))
+
 
 
 
@@ -1173,21 +1182,53 @@ CLINICAL_INCIDENT_NO_DETAILS = "Yes (no details recorded)"
 
 
 def clinicalIncidentSqlExpr(alias="f"):
-    """SQL scalar expression resolving a form's clinical incident from any of the
-    three storage shapes. *alias* is the forms-table alias ('f'), or '' / None
-    when the query has no alias."""
+    """SQL scalar expression resolving a form's clinical incident from EVERY
+    storage shape the DASH templates use, COMBINING them instead of stopping at
+    the first match (2026-09-22). *alias* is the forms-table alias ('f'), or ''
+    / None when the query has no alias.
+
+    A single form can carry up to three complementary pieces, and the 2026
+    BOH2/DDS2 template uses two of them AT ONCE:
+      * multi-select ``clinical-incident``             -> incident CATEGORY/ies (CI codes)
+      * texts ``clinical-incident``                    -> free-text detail (older template)
+      * texts ``clinical-incident-additional-details`` -> free-text detail (2026 template)
+    The 2026 template stores the CATEGORY in multi-select and the DETAIL under
+    ``clinical-incident-additional-details`` (there is NO ``clinical-incident``
+    text key), so the old first-match COALESCE fired the radio branch, found the
+    ``clinical-incident`` text key empty and returned only the "Yes (no details
+    recorded)" marker -- dropping BOTH the category and the real detail on 117 of
+    the 243 incident forms in the 2026 CAF pull. This builds ``Category -- detail``
+    and prefers it over the stored column (itself derived from this same JSON, so
+    it can never hold more), repairing the current table with no reload.
+
+    Gating (measured on the 2026 pull): a form counts as an incident when the
+    assessor ticked ``clinical-incident-occurred = yes`` OR selected a multi-select
+    category. The DETAIL text is only surfaced under that gate, so 22 forms that
+    answered ``no`` and typed "Nil"/"N/A" in the free-text box stay NULL exactly as
+    before -- the change never introduces a new incident, it only enriches the ones
+    already flagged. Detail precedence within a form is ``clinical-incident`` then
+    ``clinical-incident-additional-details`` (they never co-occur, so COALESCE just
+    picks whichever the template used)."""
     p = f"{alias}." if alias else ""
     noDetails = CLINICAL_INCIDENT_NO_DETAILS.replace("'", "''")
+    category = (
+        f"(SELECT string_agg(x->>'value', '; ' ORDER BY x->>'value') "
+        f"FROM jsonb_array_elements("
+        f"COALESCE({p}assessor_data->'multi-select'->'clinical-incident', '[]'::jsonb)) x)"
+    )
+    occurred = f"lower(COALESCE({p}assessor_data->'radio'->>'clinical-incident-occurred', '')) = 'yes'"
+    detail = (
+        f"COALESCE("
+        f"NULLIF(TRIM(COALESCE({p}assessor_data->'texts'->>'clinical-incident', '')), ''), "
+        f"NULLIF(TRIM(COALESCE({p}assessor_data->'texts'->>'clinical-incident-additional-details', '')), ''))"
+    )
     return f"""COALESCE(
-        NULLIF(TRIM(COALESCE({p}clinical_incident, '')), ''),
-        CASE WHEN lower(COALESCE({p}assessor_data->'radio'->>'clinical-incident-occurred', '')) = 'yes'
-             THEN COALESCE(
-                    NULLIF(TRIM(COALESCE({p}assessor_data->'texts'->>'clinical-incident', '')), ''),
-                    '{noDetails}')
-        END,
-        (SELECT string_agg(x->>'value', '; ' ORDER BY x->>'value')
-           FROM jsonb_array_elements(
-                COALESCE({p}assessor_data->'multi-select'->'clinical-incident', '[]'::jsonb)) x)
+        NULLIF(concat_ws(' — ',
+            {category},
+            CASE WHEN {occurred} OR {category} IS NOT NULL THEN {detail} END
+        ), ''),
+        CASE WHEN {occurred} THEN '{noDetails}' END,
+        NULLIF(TRIM(COALESCE({p}clinical_incident, '')), '')
     )"""
 
 
@@ -1960,6 +2001,33 @@ def plotStudentScoresTimeSeries(df, dateCol="Date", scoreDictCol="scores", score
         fig.tight_layout()
     return fig
 
+
+
+def _addRollingAvgToScatter(ax, df, xCategories, streamCohort=None):
+    """Overlay the navy rolling-average(3) line of per-date session means on a
+    score scatter — the SAME line the V2 student report adds (via
+    _v2SessionMeanByDate), so the cohort time-series score graph matches the
+    per-student report. Re-runs the scatter legend so the new key is included.
+    No-op (returns False) when there are fewer than 2 dated means."""
+    perDate = _v2SessionMeanByDate(df)
+    if perDate is None:
+        return False
+    perDate = perDate.reindex(xCategories)
+    roll = perDate.rolling(3, min_periods=1).mean()
+    xi = [i for i, d in enumerate(xCategories) if not pd.isna(perDate.get(d))]
+    yi = [roll[xCategories[i]] for i in xi]
+    if len(xi) < 2:
+        return False
+    ax.plot(xi, yi, "-", color=variableUtils.uniColor, linewidth=1.4, alpha=0.5,
+            zorder=5, label="Rolling avg (3)")
+    # Re-run the legend (matching _drawScoresScatter's placement) so "Rolling
+    # avg (3)" joins the existing keys rather than replacing them.
+    if streamCohort:
+        ax.legend(loc="upper left", fontsize=7.5, ncol=2, framealpha=0.9)
+    else:
+        ax.legend(loc="upper left", bbox_to_anchor=(0.9, 0.97), fontsize=8,
+                  framealpha=0.9)
+    return True
 
 
 def rubricPlot(ax, studentDf, label, color, xLabelRotation=45, maxY=None, xCategories=None,
@@ -3032,6 +3100,12 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
     # per-student layout has a second column.
     showCounts = wantsItemCountsTable(itemCountsTable, formType)
 
+    # DDS2 Simulation runs multiple coded streams (CD/P/FP/E); passing the cohort
+    # makes the score scatter colour + label points by stream and build the stream
+    # legend, matching the per-student report. Non-sim runs, and single-stream
+    # date-routed cohorts (BOH2/BOH1), fall through to plain colouring.
+    simStreamCohort = cohort if (formType and str(formType).strip().lower().startswith("sim")) else None
+
     # The page gets wider to fit the counts table; the CHARTS keep sizing against
     # the original page so the graphs are unchanged. addPlotImage's own default
     # is bound at import time, so this has to be passed explicitly. No table for
@@ -3204,9 +3278,11 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
             _drawScoresScatter(
                 axes[0], timeSeriesDf, dateCol="Date", scoreDictCol="scores",
                 scoreKey="score", fallbackKey=None, xCategories=xCategories,
-                missingDates=missingDates,
+                missingDates=missingDates, streamCohort=simStreamCohort,
             )
             axes[0].set_title(f"Item Scores – {titleText}")
+            _addRollingAvgToScatter(axes[0], studentDataDf, xCategories,
+                                    streamCohort=simStreamCohort)
             for ax, (lbl, col, my) in zip(axes[1:], _rubricSpecs):
                 rubricPlot(ax, rubricDf, lbl, col, maxY=my, xCategories=xCategories,
                            missingDates=missingDates)
@@ -3228,9 +3304,11 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
                 scoreKey="score", fallbackKey=None,
                 title=f"Item Scores – {titleText}",
                 xCategories=xCategories, marginFractions=scatterMargins,
-                missingDates=missingDates,
+                missingDates=missingDates, streamCohort=simStreamCohort,
             )
             if scoreFig is not None:
+                _addRollingAvgToScatter(scoreFig.axes[0], studentDataDf, xCategories,
+                                        streamCohort=simStreamCohort)
                 chartFlowables.append(addPlotImage(scoreFig, 0.9, pageSize=chartPageSize))
                 chartFlowables.append(Spacer(1, 12))
 
@@ -4021,6 +4099,405 @@ def _addTimeSeriesPageV2Split(elements, df, typeLabel, subheadingStyle, combined
                              combined=combined, cohort=cohort)
 
 
+def _v2IsPeRow(row):
+    """True when a form is a Periodontics (PE) form: any code in item_codes /
+    checklists / scores starts with "PE-". clinic_type is deliberately ignored."""
+    codes = []
+    ic = row.get("item_codes")
+    if isinstance(ic, (list, tuple, np.ndarray)):
+        codes += list(ic)
+    for col in ("checklists", "scores"):
+        v = row.get(col)
+        if isinstance(v, dict):
+            codes += list(v.keys())
+    return any(str(c).strip().upper().startswith("PE-") for c in codes)
+
+
+def _v2PeCdSplit(df):
+    """{"PE": subDf, "CD": subDf} for a DDS1 Sim frame (see _v2IsPeRow)."""
+    if df is None or df.empty:
+        return {"PE": df, "CD": df}
+    isPe = df.apply(_v2IsPeRow, axis=1).astype(bool)
+    return {"PE": df[isPe], "CD": df[~isPe]}
+
+
+def _v2PeCdColumn(axScatter, axRubrics, sub, panelTitle, rubricSpecs):
+    """Draw ONE stream column: item scatter + rolling avg(3) on top, then the
+    Entrustment / Global Rating rubric panels, all on the stream's own dates."""
+    for ax in [axScatter] + list(axRubrics):
+        ax.set_facecolor(V2_PAGE)
+    axScatter.set_title(panelTitle, fontsize=12, loc="left", color=V2_INK, fontweight="bold")
+    if sub is None or sub.empty:
+        axScatter.text(0.5, 0.5, "No forms in this period", ha="center", va="center",
+                       transform=axScatter.transAxes, fontsize=10, color="#666666")
+        axScatter.set_xticks([]); axScatter.set_yticks([])
+        for ax in axRubrics:
+            ax.set_axis_off()
+        return
+    xCategories = sorted(sub["datetimeutc"].dt.strftime("%Y-%m-%d").unique())
+
+    tsDf = sub.copy()
+    tsDf["Date"] = tsDf["datetimeutc"]
+    if "clinic" not in tsDf.columns:
+        tsDf["clinic"] = None
+    drew = _drawScoresScatter(axScatter, tsDf, dateCol="Date", scoreDictCol="scores",
+                              scoreKey="score", xCategories=xCategories,
+                              showXTickLabels=False, showLegend=False)
+    axScatter.tick_params(axis="x", labelbottom=False)   # dates live on the bottom rubric
+    if not drew:
+        axScatter.text(0.5, 0.5, "No scored items", ha="center", va="center",
+                       transform=axScatter.transAxes, fontsize=10, color="#666666")
+    perDate = _v2SessionMeanByDate(sub)
+    if perDate is not None:
+        perDate = perDate.reindex(xCategories)
+        roll = perDate.rolling(3, min_periods=1).mean()
+        xi = [i for i, d in enumerate(xCategories) if not pd.isna(perDate.get(d))]
+        yi = [roll[xCategories[i]] for i in xi]
+        if len(xi) >= 2:
+            axScatter.plot(xi, yi, "-", color=variableUtils.uniColor, linewidth=1.4,
+                           alpha=0.5, zorder=5, label="Rolling avg (3)")
+    if drew:
+        axScatter.legend(loc="upper left", fontsize=7.5, framealpha=0.9)
+
+    rubricDf = sub[["datetimeutc", "entrustment", "global_rating"]].copy()
+    rubricDf.rename(columns={"datetimeutc": "Date", "entrustment": "Entrustment",
+                             "global_rating": "Global Rating"}, inplace=True)
+    rubricDf.sort_values("Date", inplace=True)
+    rubricDf["Date"] = rubricDf["Date"].dt.strftime("%Y-%m-%d")
+    for c in ("Entrustment", "Global Rating"):
+        rubricDf[c] = pd.to_numeric(rubricDf[c], errors="coerce")
+    for i, (ax, (lbl, col, my)) in enumerate(zip(axRubrics, rubricSpecs)):
+        rubricPlot(ax, rubricDf, lbl, col, maxY=my, xCategories=xCategories)
+        ax.set_facecolor(V2_PAGE)
+        ax.title.set_fontsize(10)
+        if i < len(axRubrics) - 1:
+            ax.tick_params(axis="x", labelbottom=False)
+
+
+def _addTimeSeriesPageV2PeCd(elements, df, typeLabel, subheadingStyle, cohort=None,
+                             tsSplit=False, splitDate=None, task7Scoring=True):
+    """DDS1 static time-series: PE and CD side by side (one column each) on ONE
+    whole-year page. No FHY/SHY split by default (tsSplit=False; the report
+    builder's tsSplit is deliberately NOT passed through). Each column
+    keeps the V2 look — item scatter + rolling avg(3), then Entrustment and
+    Global Rating — on its OWN dates, so each stream reads as its own progress."""
+    if df is None or df.empty:
+        return
+    rubricSpecs = [("Entrustment", "blue", 4.5), ("Global Rating", "green", 5.5)]
+    segs = _v2SplitFhyShy(df, splitDate) if tsSplit else [("", df)]
+    for n, (suffix, segDf) in enumerate(segs):
+        if n:
+            elements.append(PageBreak())
+        streams = _v2PeCdSplit(segDf)
+        label = f"{typeLabel} · {suffix}" if suffix else typeLabel
+        heading = Paragraph(f"{label} — Performance Over Time", subheadingStyle)
+
+        fig = plt.figure(figsize=(14, 14), dpi=200, facecolor=V2_PAGE)
+        gs = fig.add_gridspec(3, 2, height_ratios=[3, 1.1, 1.1], hspace=0.35, wspace=0.14,
+                              left=0.055, right=0.99, top=0.965, bottom=0.075)
+        for c, (key, title) in enumerate(PE_CD_PANELS):
+            axS = fig.add_subplot(gs[0, c])
+            axR = [fig.add_subplot(gs[1, c]), fig.add_subplot(gs[2, c])]
+            colDf = streams.get(key)
+            if key == "CD" and task7Scoring and colDf is not None and not colDf.empty:
+                colDf = _v2ApplyTask7Scores(colDf)   # Task 7 points = completed-section %
+            _v2PeCdColumn(axS, axR, colDf, title, rubricSpecs)
+            if c:
+                axS.set_ylabel("")
+        img = _v2FullFigImage(fig, 0.98)
+
+        elements.append(Spacer(1, 18))
+        elements.append(KeepTogether([heading, Spacer(1, 12), img]))
+
+
+# ── DDS1 Cons Dent Task 7 section charts (2026-09-24, additive) ──
+# Scores come from dds1_pe_utils.scoreTask7Forms (band-table section scoring that
+# reproduces DDS1_Task7_section_scores.xlsx). Layout chosen per call via
+# `task7Chart=` on the V2 builders: "heatmap" (A), "bars" (C), "both", or None
+# (page off AND CD panel keeps generic scoring). Every layout ends with an
+# Entrustment panel on the SAME per-form x columns. Colour-blind safe: UniMelb
+# blue <-> orange.
+TASK7_CHART_STYLES = ("heatmap", "bars", "both")
+TASK7_SECTION_COLORS = {            # stacked-bar fills (C) — blue/orange families
+    "Isolation": "#7fb3e0",         # light blue
+    "Preparation": V2_SIM_COLOR,    # V2 blue
+    "Matrix": "#f0b27a",            # light orange
+    "Restoration": V2_CLINIC_COLOR, # V2 orange
+}
+TASK7_INCOMPLETE_FILL = "#d9d9d9"
+TASK7_HEAT_COLORS = [V2_CLINIC_COLOR, "#f2dcc6", "#dbe6f3", V2_SIM_COLOR]   # low -> high (A)
+TASK7_ENTRUST_COLOR = "blue"        # same as the V2 rubric Entrustment line
+_T7_ABBR = {"Isolation": "Iso", "Preparation": "Prep", "Matrix": "Matrix", "Restoration": "Resto"}
+_T7_ROW_HEIGHTS = {"heatmap": 3.9, "bars": 5.0, "entrust": 1.9}   # inches per panel
+
+
+def _t7Forms(scoresLong):
+    """One row per scored Task 7 checklist instance, in date order, with an x label."""
+    f = scoresLong.drop_duplicates("formKey")[["formKey", "date", "datetime", "task"]].copy()
+    f = f.sort_values(["datetime", "task"]).reset_index(drop=True)
+    f["label"] = [f"{pd.Timestamp(d).strftime('%d %b')}\nT{t}" for d, t in zip(f["date"], f["task"])]
+    return f
+
+
+def _t7Fmt(v):
+    return f"{v:g}"
+
+
+def _t7FontSize(n):
+    return 8 if n <= 12 else (7 if n <= 18 else 6)
+
+
+def _t7SetX(ax, forms, fs, showLabels):
+    """Shared per-form categorical x-axis — identical on every Task 7 panel."""
+    n = len(forms)
+    ax.set_xlim(-0.6, n - 0.4)
+    ax.set_xticks(range(n))
+    if showLabels:
+        ax.set_xticklabels(forms["label"], fontsize=fs - 0.5, color=V2_INK)
+    else:
+        ax.set_xticklabels([])
+    ax.tick_params(axis="x", length=0)
+
+
+def _t7DrawHeatmap(ax, scoresLong, forms, colors=None, showLabels=True):
+    """Option A on *ax*: rows = sections, columns = forms."""
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.patches import Patch
+    import dds1_pe_utils as _pe
+    cmap = LinearSegmentedColormap.from_list("t7heat", colors or TASK7_HEAT_COLORS)
+    secs = list(_pe.TASK7_SECTIONS)
+    fs = _t7FontSize(len(forms))
+    ax.set_facecolor(V2_PAGE)
+    for xi, fr in forms.iterrows():
+        sub = scoresLong[scoresLong["formKey"] == fr["formKey"]].set_index("section")
+        for yi, sec in enumerate(secs):
+            box = dict(xy=(xi - 0.45, yi - 0.42), width=0.9, height=0.84)
+            if sec not in sub.index:
+                ax.add_patch(Rectangle(**box, fc="white", ec=V2_LINE, lw=0.6))
+                ax.text(xi, yi, "–", ha="center", va="center", color="#9aa0ad", fontsize=fs)
+                continue
+            r = sub.loc[sec]
+            if not bool(r["complete"]):
+                ax.add_patch(Rectangle(**box, fc=TASK7_INCOMPLETE_FILL, ec="#8a8a8a", hatch="///", lw=0.6))
+                ax.text(xi, yi, f"Incomplete\n{int(r['nReviewed'])}/{int(r['nCriteria'])} rev.",
+                        ha="center", va="center", fontsize=fs - 1.5, color="#333333")
+            else:
+                pct = float(r["pct"])
+                ax.add_patch(Rectangle(**box, fc=cmap(pct / 100.0), ec="white", lw=0.8))
+                txt = "white" if (pct <= 30 or pct >= 80) else V2_INK
+                ax.text(xi, yi, f"{_t7Fmt(r['score'])}/{int(r['maxScore'])}", ha="center", va="center",
+                        fontsize=fs, fontweight="bold", color=txt)
+    ax.set_ylim(len(secs) - 0.5, -0.5)
+    ax.set_yticks(range(len(secs)))
+    ax.set_yticklabels([f"{s} (/{_pe.TASK7_SECTION_MAX[s]})" for s in secs], fontsize=9, color=V2_INK)
+    ax.tick_params(axis="y", length=0)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    _t7SetX(ax, forms, fs, showLabels)
+    handles = [Patch(fc=cmap(v), ec="none", label=l) for v, l in ((0.1, "Low"), (0.5, "Mid"), (0.95, "High"))]
+    handles += [Patch(fc=TASK7_INCOMPLETE_FILL, ec="#8a8a8a", hatch="///", label="Incomplete"),
+                Patch(fc="white", ec=V2_LINE, label="– not in task")]
+    ax.legend(handles=handles, ncol=5, fontsize=7.5, loc="lower left", bbox_to_anchor=(0, 1.0),
+              frameon=False)
+
+
+def _t7DrawBars(ax, scoresLong, forms, sectionColors=None, showLabels=True):
+    """Option C on *ax*: one stacked bar per form, a quarter per section."""
+    from matplotlib.patches import Patch
+    import dds1_pe_utils as _pe
+    colors = dict(TASK7_SECTION_COLORS, **(sectionColors or {}))
+    secs = list(_pe.TASK7_SECTIONS)
+    fs = _t7FontSize(len(forms)) - 0.5
+    h = 25.0
+    ax.set_facecolor(V2_PAGE)
+    for x, fr in forms.iterrows():
+        sub = scoresLong[scoresLong["formKey"] == fr["formKey"]].set_index("section")
+        for i, sec in enumerate(secs):
+            y0 = i * h
+            if sec not in sub.index:
+                continue
+            r = sub.loc[sec]
+            ax.add_patch(Rectangle((x - 0.36, y0 + 0.6), 0.72, h - 1.2, fc="white", ec="#a7adba", lw=0.6))
+            if not bool(r["complete"]):
+                ax.add_patch(Rectangle((x - 0.36, y0 + 0.6), 0.72, h - 1.2, fc=TASK7_INCOMPLETE_FILL,
+                                       ec="#8a8a8a", hatch="///", lw=0.6))
+                ax.text(x, y0 + h / 2, f"{_T7_ABBR[sec]}\ninc {int(r['nReviewed'])}/{int(r['nCriteria'])}",
+                        ha="center", va="center", fontsize=fs, color="#333333")
+            else:
+                frac = float(r["pct"]) / 100.0
+                ax.add_patch(Rectangle((x - 0.36, y0 + 0.6), 0.72, (h - 1.2) * frac, fc=colors[sec], ec="none"))
+                dark = sec in ("Preparation", "Restoration") and frac > 0.45
+                ax.text(x, y0 + h / 2, f"{_T7_ABBR[sec]}\n{_t7Fmt(r['score'])}/{int(r['maxScore'])}",
+                        ha="center", va="center", fontsize=fs, fontweight="bold",
+                        color=("white" if dark else V2_INK))
+    ax.set_ylim(0, 4 * h + 1)
+    ax.set_yticks([h * (i + 0.5) for i in range(4)])
+    ax.set_yticklabels([f"{s} (/{_pe.TASK7_SECTION_MAX[s]})" for s in secs], fontsize=9, color=V2_INK)
+    ax.tick_params(axis="y", length=0)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    _t7SetX(ax, forms, fs + 0.5, showLabels)
+    handles = [Patch(fc=colors[s], label=s) for s in secs]
+    handles += [Patch(fc=TASK7_INCOMPLETE_FILL, ec="#8a8a8a", hatch="///", label="Incomplete")]
+    ax.legend(handles=handles, ncol=5, fontsize=7.5, loc="lower left", bbox_to_anchor=(0, 1.0), frameon=False)
+
+
+def _t7DrawEntrust(ax, forms, entrustment, showLabels=True):
+    """Entrustment per Task 7 form on the SAME x columns (gaps where not rated)."""
+    fs = _t7FontSize(len(forms))
+    ax.set_facecolor(V2_PAGE)
+    ent = {} if entrustment is None else dict(entrustment)
+    xs, ys = [], []
+    for x, fk in enumerate(forms["formKey"]):
+        v = pd.to_numeric(ent.get(fk), errors="coerce")
+        if v is not None and not pd.isna(v):
+            xs.append(x)
+            ys.append(float(v))
+    if xs:
+        ax.plot(xs, ys, "-o", color=TASK7_ENTRUST_COLOR, ms=4, lw=1.4)
+    else:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes)
+    ax.set_ylim(0, 4.5)
+    ax.set_yticks(range(0, 5))
+    ax.set_ylabel("Entrustment", fontsize=9, color=V2_INK)
+    ax.grid(True, ls="--", alpha=0.4)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    _t7SetX(ax, forms, fs, showLabels)
+
+
+def plotTask7SectionPanel(scoresLong, chartStyle="heatmap", entrustment=None, title=None,
+                          figWidth=14, heatColors=None, sectionColors=None):
+    """Task 7 figure: chosen chart(s) + an Entrustment panel, all sharing ONE per-form
+    x-axis (date + task under the bottom panel only, so columns line up exactly).
+    chartStyle: "heatmap" | "bars" | "both". entrustment: {formKey: level} (optional;
+    None -> no Entrustment panel). Returns a Figure or None."""
+    if scoresLong is None or scoresLong.empty:
+        return None
+    style = str(chartStyle).strip().lower()
+    if style not in TASK7_CHART_STYLES:
+        raise ValueError(f"chartStyle must be one of {TASK7_CHART_STYLES}, got {chartStyle!r}")
+    forms = _t7Forms(scoresLong)
+    rows = (["heatmap"] if style in ("heatmap", "both") else []) + (["bars"] if style in ("bars", "both") else [])
+    if entrustment is not None:
+        rows.append("entrust")
+    heights = [_T7_ROW_HEIGHTS[r] for r in rows]
+    topIn, botIn, gapIn = (0.55 + (0.3 if title else 0)), 0.75, 0.55
+    H = sum(heights) + topIn + botIn + gapIn * (len(rows) - 1)
+    fig = plt.figure(figsize=(figWidth, H), dpi=200, facecolor=V2_PAGE)
+    gs = fig.add_gridspec(len(rows), 1, height_ratios=heights,
+                          hspace=gapIn / (sum(heights) / len(rows)),
+                          left=0.14, right=0.99, top=1 - topIn / H, bottom=botIn / H)
+    for i, r in enumerate(rows):
+        ax = fig.add_subplot(gs[i, 0])
+        last = i == len(rows) - 1
+        if r == "heatmap":
+            _t7DrawHeatmap(ax, scoresLong, forms, colors=heatColors, showLabels=last)
+        elif r == "bars":
+            _t7DrawBars(ax, scoresLong, forms, sectionColors=sectionColors, showLabels=last)
+        else:
+            _t7DrawEntrust(ax, forms, entrustment, showLabels=last)
+    if title:
+        fig.suptitle(title, x=0.01, ha="left", fontsize=11, color=V2_INK)
+    return fig
+
+
+def plotTask7SectionHeatmap(scoresLong, title=None, colors=None, figWidth=14, entrustment=None):
+    """Option A — section heatmap timeline (+ aligned Entrustment when given)."""
+    return plotTask7SectionPanel(scoresLong, "heatmap", entrustment=entrustment, title=title,
+                                 figWidth=figWidth, heatColors=colors)
+
+
+def plotTask7SectionBars(scoresLong, title=None, sectionColors=None, figWidth=14, entrustment=None):
+    """Option C — stacked section bars per form (+ aligned Entrustment when given)."""
+    return plotTask7SectionPanel(scoresLong, "bars", entrustment=entrustment, title=title,
+                                 figWidth=figWidth, sectionColors=sectionColors)
+
+
+def _v2Task7Long(df):
+    """Task 7 section scores for a (one-student) form frame; empty frame on failure."""
+    try:
+        import dds1_pe_utils as _pe
+        return _pe.scoreTask7Forms(df)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _v2Task7Entrustment(df):
+    """{formKey: entrustment} using the SAME formKey rule as scoreTask7Forms."""
+    import dds1_pe_utils as _pe
+    if df is None or df.empty or "entrustment" not in df.columns:
+        return {}
+    idCol = next((c for c in ("form_code", "form_id", "id", "assessmentid") if c in df.columns), None)
+    out = {}
+    for idx, row in df.iterrows():
+        key = row[idCol] if idCol else idx
+        for code in _pe._t7Checklists(row):
+            out[f"{key}|{code}"] = row["entrustment"]
+    return out
+
+
+def _addTask7SectionPageV2(elements, df, subheadingStyle, chartStyle="heatmap"):
+    """Append the 'Cons Dent Task 7 — Section Scores Over Time' page: the chosen
+    chart(s) ('heatmap' | 'bars' | 'both') with an aligned Entrustment panel below.
+    No-op when chartStyle is None or there are no Task 7 forms."""
+    if not chartStyle:
+        return
+    style = str(chartStyle).strip().lower()
+    if style not in TASK7_CHART_STYLES:
+        raise ValueError(f"task7Chart must be one of {TASK7_CHART_STYLES} or None, got {chartStyle!r}")
+    long_ = _v2Task7Long(df)
+    if long_.empty:
+        return
+    nInc = int((~long_["complete"].astype(bool)).sum())
+    nDone = int(long_["complete"].astype(bool).sum())
+    note = _V2ParagraphStyle("t7note", fontName="Helvetica", fontSize=9.5, leading=12.5,
+                             textColor=V2_MUTED)
+    fig = plotTask7SectionPanel(long_, style, entrustment=_v2Task7Entrustment(df))
+    parts = [Paragraph("Cons Dent Task 7 — Section Scores Over Time", subheadingStyle), Spacer(1, 8),
+             Paragraph(f"Each Task 7 form is scored per section (Isolation /2, Preparation /10, "
+                       f"Matrix /2, Restoration /10) using that section’s band table. A section is "
+                       f"<b>Incomplete</b> until every criterion in it has been assessed. "
+                       f"Entrustment for the same forms is shown underneath. "
+                       f"So far: {nDone} section(s) scored, {nInc} incomplete.", note),
+             Spacer(1, 8)]
+    if fig is not None:
+        parts.append(_v2FullFigImage(fig, 0.98))
+    elements.append(Spacer(1, 12))
+    elements.append(KeepTogether(parts))
+
+
+def _v2ApplyTask7Scores(df):
+    """Copy of *df* whose 'scores' use the Task 7 SECTION method for Task 7 codes:
+    completed sections' total / their max (0-1); a Task 7 code with no completed
+    section is dropped from the scatter (it shows as Incomplete on the Task 7 page)."""
+    long_ = _v2Task7Long(df)
+    if long_.empty or "scores" not in df.columns:
+        return df
+    import dds1_pe_utils as _pe
+    pctByKey = _pe.task7FormPercent(long_)
+    idCol = next((c for c in ("form_code", "form_id", "id", "assessmentid") if c in df.columns), None)
+    out = df.copy()
+    newScores = []
+    for idx, row in out.iterrows():
+        sc = row["scores"]
+        if not isinstance(sc, dict):
+            newScores.append(sc)
+            continue
+        sc = dict(sc)
+        key = row[idCol] if idCol else idx
+        for code in list(sc.keys()):
+            if str(code).strip() in _pe.TASK7_LAYOUT:
+                p = pctByKey.get(f"{key}|{code}")
+                if p is None or pd.isna(p):
+                    sc.pop(code)
+                else:
+                    sc[code] = dict(sc[code] or {}, score=float(p) / 100.0)
+        newScores.append(sc)
+    out["scores"] = newScores
+    return out
+
+
 def _v2CleanPreviewImage(segments, typeLabel, cohort=None):
     """Clean, label-free printable preview for the interactive page: assessed-item
     scatter (no code labels) + rolling avg on top, Entrustment/Global-Rating rubric
@@ -4501,8 +4978,8 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
                          subsubheadingStyleL=None, tableTextStyle=None, tableTextStyleSmall=None,
                          uniColor=None, cohort=None, classAvgItemCounts=None, combined=None,
                          sectionStreams=("Clinic",), studentName=None, studentNumber=None,
-                         interactiveTimeSeries=None, tsSplit=True, tsSplitDate=None,
-                         attachSink=None):
+                         interactiveTimeSeries=None, tsSplit=False, tsSplitDate=None,
+                         attachSink=None, task7Chart="heatmap", task7Scoring=None):
     """Redesigned single-student report (see mockup). Builds reportlab flowables
     using ONLY the new V2 helpers; the original buildStudentReport is untouched.
 
@@ -4512,16 +4989,26 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
                               interactive chart in the PDF (needs `attachSink`, which
                               the cohort driver supplies + post-processes); False keeps
                               the static matplotlib charts.
-      tsSplit               : True -> split a stream into a FHY page and a SHY page
+      tsSplit               : (default False since 2026-09-24 -- opt-in per call, e.g. DDS3)
+                              True -> split a stream into a FHY page and a SHY page
                               (PageBreak between) when it spans TS_SPLIT_DATE; both the
                               static and interactive paths honour it. False -> one page.
       tsSplitDate           : override the 15-Jun-2026 boundary (a tz-aware Timestamp).
+      task7Chart            : DDS1 only (PE_CD_SPLIT_COHORTS) — Cons Dent Task 7 section page:
+                              "heatmap" (A), "bars" (C), "both", or None to omit (2026-09-24).
+      task7Scoring          : DDS1 only — None (default) follows task7Chart: when task7Chart is
+                              "heatmap"/"bars"/"both", Task 7 points on the CD time-series panel =
+                              sum of COMPLETED section scores / their max sum x 100 (a form with no
+                              completed section is not plotted); when task7Chart is None, generic
+                              calcScore. True/False forces it.
       attachSink            : mutable list the interactive path appends embed payloads to;
                               None -> the interactive path degrades to the static split page."""
     if scoreMap is None:
         scoreMap = SCORE_MAP
     if interactiveTimeSeries is None:
         interactiveTimeSeries = cohort in INTERACTIVE_TS_COHORTS
+    if task7Scoring is None:   # section-method Task 7 totals only when a Task 7 chart is chosen
+        task7Scoring = bool(task7Chart)
     if uniColor is None:
         uniColor = variableUtils.uniColor
     if subheadingStyle is None:
@@ -4678,9 +5165,23 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
                 elements,
                 _V2TocMark(_v2TocText(f"{typeLabel} \u2014 Performance Over Time",
                                       "assessed-item scores and rubric trends over the year")),
-                lambda e=typeDf, t=typeLabel: _addTimeSeriesPageV2Split(
-                    elements, e, t, subheadingStyle=subheadingStyle, combined=combined,
-                    cohort=cohort, tsSplit=tsSplit, splitDate=tsSplitDate))
+                lambda e=typeDf, t=typeLabel: (
+                    _addTimeSeriesPageV2PeCd(
+                        elements, e, t, subheadingStyle=subheadingStyle, cohort=cohort,
+                        task7Scoring=task7Scoring)
+                    if cohort in PE_CD_SPLIT_COHORTS and t == "Simulation"
+                    else _addTimeSeriesPageV2Split(
+                        elements, e, t, subheadingStyle=subheadingStyle, combined=combined,
+                        cohort=cohort, tsSplit=tsSplit, splitDate=tsSplitDate)))
+
+    # DDS1: Cons Dent Task 7 section scores page (heatmap / bars / both / None)
+    if cohort in PE_CD_SPLIT_COHORTS and task7Chart and not simAdf.empty:
+        _v2AddSection(
+            elements,
+            _V2TocMark(_v2TocText("Cons Dent Task 7 — Section Scores",
+                                  "each section’s score per form, incl. incomplete sections")),
+            lambda: _addTask7SectionPageV2(elements, simAdf, subheadingStyle=subheadingStyle,
+                                           chartStyle=task7Chart))
 
     # Reflections as cards + collapsed log
     for typeLabel, typeDf in typePages:
@@ -4703,14 +5204,19 @@ def buildEntireCohortStudentReportsV2(engine, cohort, formsTable="rawform_forms_
                                       uniColor=None, scoreMap=None, combined=None,
                                       sectionStreams=("Clinic",), outSubfolder="Individual Student Reports V2",
                                       onlyStudents=None, interactiveTimeSeries=None,
-                                      tsSplit=True, tsSplitDate=None):
+                                      tsSplit=False, tsSplitDate=None, task7Chart="heatmap",
+                                      task7Scoring=None):
     """V2 equivalent of buildEntireCohortStudentReports — same data/gating, new
     layout. Saves to a separate folder so the original reports are not overwritten.
 
     Time-series kwargs (2026-09-16): interactiveTimeSeries (None -> DDS3 on, others off;
     True/False forces it), tsSplit (FHY/SHY two-page split when a stream spans
-    tsSplitDate; default True), tsSplitDate (override the 15-Jun-2026 boundary). When
-    interactive, the interactive chart is embedded into each PDF here after multiBuild."""
+    tsSplitDate; default False since 2026-09-24 -- opt-in, e.g. DDS3), tsSplitDate (override the 15-Jun-2026 boundary). When
+    interactive, the interactive chart is embedded into each PDF here after multiBuild.
+
+    DDS1 (2026-09-24): task7Chart = "heatmap" | "bars" | "both" | None selects the Cons Dent
+    Task 7 section page (+ aligned Entrustment panel); task7Scoring (None -> follows
+    task7Chart) switches Task 7 points on the CD panel to completed-sections total/max x 100."""
     if pageSize is None:
         pageSize = variableUtils.pageSize
     if leftMargin is None:
@@ -4763,6 +5269,7 @@ def buildEntireCohortStudentReportsV2(engine, cohort, formsTable="rawform_forms_
             studentName=studentName, studentNumber=studentNumber,
             interactiveTimeSeries=interactiveTimeSeries, tsSplit=tsSplit,
             tsSplitDate=tsSplitDate, attachSink=attachSink,
+            task7Chart=task7Chart, task7Scoring=task7Scoring,
         )
         _v2First, _v2Later = _v2MakePageDecorators("Till Date performance report",
                                                    f"{studentName} ({studentNumber})")
@@ -5115,3 +5622,231 @@ def _v2OperatorClinicDf(clinicDf):
     resolved = clinicDf["role"].map(lambda r: roleMap.get(r, r))
     mask = resolved.astype(str).str.strip().str.casefold() == "operator"
     return clinicDf[mask]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Item-code YEAR summary (cohort-level activity on checklist item codes)
+# Added 2026-10-08 — requested for the BOH2 end-of-year whole-student brief.
+# Reports, per form type (Clinic / Simulation, shown separately), how many times
+# each checklist item code was assessed across the whole year and how many
+# students it covered, for a requested set of codes plus the top-N codes overall.
+# Output is a PDF with embedded document metadata. Postgres-backed via readDf.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _codeQuantityMap(contextChecklists):
+    """{{cleanCode: summedQuantity}} from a form's ``context_checklists`` list.
+
+    ``context_checklists`` is ``form_context.checklists`` carried into the DB:
+    ``[{{"code","quantity"}}, ...]`` (present on newer forms, ~mid-year onward).
+    Codes are cleaned with _shortItemCode and split, the quantity applied to each
+    resulting 3-digit code. Returns ``{{}}`` when the form has no such list.
+    """
+    qmap = {}
+    if isinstance(contextChecklists, list):
+        for it in contextChecklists:
+            if isinstance(it, dict) and it.get("code") not in (None, ""):
+                try:
+                    q = int(it.get("quantity", 1) or 1)
+                except (TypeError, ValueError):
+                    q = 1
+                q = max(q, 1)
+                for c in str(_shortItemCode(it["code"])).split(","):
+                    c = c.strip()
+                    if c:
+                        qmap[c] = qmap.get(c, 0) + q
+    return qmap
+
+
+def getItemCodeCohortCounts(engine, cohort, formsTable="rawform_forms_v3", filters=None):
+    """Cohort-level, quantity-aware counts per item code for the in-scope period.
+
+    Form inclusion and side are UNCHANGED from the rest of the pipeline: codes
+    come from getDataDf's ``item_codes`` (the assessor-side flattened checklist
+    keys, with the Smile Squad student->assessor swap already applied), so only
+    assessor-filled forms (and swapped Smile Squad forms) contribute, exactly as
+    before. Each raw label is reduced to its real 3-digit code(s) via
+    _shortItemCode and multi-code labels are split.
+
+    The ONLY new behaviour is quantity: where a form carries
+    ``context_checklists`` (``form_context.checklists`` = ``[{code, quantity}]``,
+    present on newer forms), each code is weighted by its quantity; where it is
+    absent (older forms), the quantity is 1 — so counts are identical to before
+    except that genuine multiples (quantity > 1) are now counted. Excluded
+    students (REMOVE_STUDENTS_DICT) are dropped; year window from _where.
+
+    Returns one row per item code, sorted by frequency:
+        "Item Code", "Count", "Students"
+    """
+    df = getDataDf(engine, cohort, formsTable=formsTable, filters=filters)
+    cols = ["Item Code", "Count", "Students"]
+    if df is None or len(df) == 0 or "item_codes" not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    removeStudents = REMOVE_STUDENTS_DICT.get(cohort, [])
+    if "student_number" in df.columns and removeStudents:
+        df = df[~df["student_number"].isin(removeStudents)]
+
+    hasCtx = "context_checklists" in df.columns
+    records = []
+    for _, row in df.iterrows():
+        sn = row.get("student_number")
+        codes = row.get("item_codes")
+        if not isinstance(codes, list) or not codes:
+            continue
+        qmap = _codeQuantityMap(row.get("context_checklists")) if hasCtx else {}
+        for raw in codes:
+            for c in str(_shortItemCode(raw)).split(","):
+                c = c.strip()
+                if not c:
+                    continue
+                records.append((sn, c, qmap.get(c, 1)))
+    if not records:
+        return pd.DataFrame(columns=cols)
+
+    long = pd.DataFrame(records, columns=["student_number", "Item Code", "qty"])
+    out = (long.groupby("Item Code")
+           .agg(**{"Count": ("qty", "sum"), "Students": ("student_number", "nunique")})
+           .reset_index())
+    out = out.sort_values(["Count", "Item Code"], ascending=[False, True]).reset_index(drop=True)
+    return out[cols]
+
+
+def plotItemCodeBars(countsDf, uniColor=None, title="Top item codes for the year",
+                     figWidth=11, figHeight=4.5):
+    """Bar chart of item-code quantity ('Count').
+
+    countsDf must have 'Item Code' and 'Count' columns, already sorted and
+    truncated by the caller. Returns a (closed) matplotlib Figure.
+    """
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
+    fig, ax = plt.subplots(figsize=(figWidth, figHeight), dpi=200)
+    codes = countsDf["Item Code"].astype(str).tolist()
+    freqs = [int(v) for v in countsDf["Count"].tolist()]
+    ax.bar(range(len(codes)), freqs, color=uniColor)
+    ax.set_xticks(range(len(codes)))
+    ax.set_xticklabels(codes, rotation=90, ha="center", fontsize=8, color=uniColor)
+    ax.set_ylabel("Count (quantity)", fontsize=10, color=uniColor)
+    ax.set_title(title, fontsize=13, color=uniColor)
+    ax.set_ylim(0, (max(freqs) if freqs else 1) * 1.15)
+    for i, v in enumerate(freqs):
+        ax.text(i, v, str(v), ha="center", va="bottom", fontsize=6, color=uniColor)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    plt.tight_layout()
+    plt.close(fig)
+    return fig
+
+
+def buildItemCodeYearSummaryPdf(engine, cohort, outPath, requestedCodes, today,
+                                formsTable="rawform_forms_v3",
+                                types=("Clinic", "Simulation"), topN=20,
+                                mappingFile=None, uniColor=None,
+                                subheadingStyle=None, requestedBy=None,
+                                bannerTitle=None, year="2026", author="Kunal Patel"):
+    """Build a PDF year-summary of checklist item-code activity for a cohort.
+
+    For each form type in `types` (reported SEPARATELY) the PDF shows:
+      * 'Requested item codes' — the codes in `requestedCodes`, with
+        Section / Sub-section, Times Assessed and Students; a requested code not
+        found on any form is still listed, with 0 / "not assessed".
+      * 'Top N item codes for the year' — the most-assessed codes, as a table
+        and a bar chart.
+
+    PDF document metadata (title / author / subject / creator / keywords) is
+    embedded. Returns {formType: {"requested": df, "top": df, "all": df}}.
+    """
+    if uniColor is None:
+        uniColor = variableUtils.uniColor
+    if subheadingStyle is None:
+        subheadingStyle = variableUtils.subheadingStyle
+    if mappingFile is None:
+        mappingFile = variableUtils.itemSectionMappingFile
+    if bannerTitle is None:
+        bannerTitle = f"{cohort} Item-Code Activity — {year}"
+
+    requestedCodes = [str(c).strip() for c in requestedCodes]
+    mappingDf = _loadSectionMapping(mappingFile)
+
+    def _withSections(df):
+        merged = _mergeSection(df.copy(), mappingDf)
+        for col in ("Section", "Sub-section"):
+            if col in merged.columns:
+                merged[col] = merged[col].fillna("Unmapped")
+        return merged
+
+    def _sectionFor(code):
+        sec = _mergeSection(pd.DataFrame({"Item Code": [code]}), mappingDf).iloc[0]
+        return (sec.get("Section") or "Unmapped", sec.get("Sub-section") or "Unmapped")
+
+    elements = [Paragraph(bannerTitle, subheadingStyle), Spacer(1, 12)]
+
+    results = {}
+    for i, ft in enumerate(types):
+        allCounts = getItemCodeCohortCounts(engine, cohort, formsTable, filters={"type": ft})
+        allCounts = _withSections(allCounts)
+
+        reqRows = []
+        for code in requestedCodes:
+            match = allCounts[allCounts["Item Code"].astype(str) == code]
+            if len(match):
+                r = match.iloc[0]
+                reqRows.append([code, r["Section"], r["Sub-section"],
+                                int(r["Count"]), int(r["Students"])])
+            else:
+                sec, sub = _sectionFor(code)
+                reqRows.append([code, sec, sub, 0, 0])
+        reqDf = pd.DataFrame(
+            reqRows,
+            columns=["Item Code", "Section", "Sub-section", "Count", "Students"],
+        )
+        topDf = (allCounts.head(topN)[["Item Code", "Section", "Count", "Students"]]
+                 .reset_index(drop=True))
+
+        totalCount = int(allCounts["Count"].sum()) if not allCounts.empty else 0
+        elements.append(Paragraph(f"{ft} forms", variableUtils.subheadingStyleL))
+        elements.append(Paragraph(
+            f"{totalCount} procedures (quantity-weighted) across {len(allCounts)} distinct codes.",
+            variableUtils.subsubheadingStyleL))
+        elements.append(Spacer(1, 6))
+        elements.append(Paragraph("Requested item codes", variableUtils.smallsubsubheadingStyleL))
+        elements.append(createTable(
+            reqDf, title=f"{ft} — requested codes", colRatio=[1.2, 2.6, 3.0, 1.4, 1.2],
+            customTextCols=[1, 2], headerColor=uniColor,
+            tableTextStyle=variableUtils.tableTextStyleSmall))
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph(f"Top {topN} item codes for the year", variableUtils.smallsubsubheadingStyleL))
+        elements.append(createTable(
+            topDf, title=f"{ft} — top {topN}", colRatio=[1.3, 4.0, 1.4, 1.2],
+            customTextCols=[1], headerColor=uniColor,
+            tableTextStyle=variableUtils.tableTextStyleSmall))
+        elements.append(Spacer(1, 10))
+        if not topDf.empty:
+            fig = plotItemCodeBars(topDf, uniColor=uniColor,
+                                   title=f"{cohort} {ft}: top {topN} item codes ({year})")
+            elements.append(addPlotImage(fig, 0.7))
+        if i < len(types) - 1:
+            elements.append(PageBreak())
+        results[ft] = {"requested": reqDf, "top": topDf, "all": allCounts}
+
+    os.makedirs(os.path.dirname(outPath) or ".", exist_ok=True)
+    subjectText = (f"{cohort} checklist item-code activity for {year} "
+                   f"({', '.join(types)}); requested codes {', '.join(requestedCodes)}.")
+    doc = SimpleDocTemplate(
+        outPath, pagesize=pageSize,
+        leftMargin=leftMargin, rightMargin=rightMargin,
+        topMargin=topMargin, bottomMargin=bottomMargin,
+        title=f"{cohort} Item-Code Year Summary {year}",
+        author=author, subject=subjectText,
+        creator="MDS assessment analytics — boh2_dds2_dds3_utils.buildItemCodeYearSummaryPdf",
+        keywords=f"{cohort}, item codes, {year}, " + ", ".join(requestedCodes),
+    )
+    # Belt-and-braces: ensure metadata reaches the PDF /Info dict.
+    doc.title = f"{cohort} Item-Code Year Summary {year}"
+    doc.author = author
+    doc.subject = subjectText
+    doc.creator = "MDS assessment analytics — boh2_dds2_dds3_utils.buildItemCodeYearSummaryPdf"
+    doc.keywords = f"{cohort}, item codes, {year}, " + ", ".join(requestedCodes)
+    doc.build(elements)
+    print(f"Wrote {outPath}")
+    return results

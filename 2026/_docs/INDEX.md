@@ -11,7 +11,7 @@ plus at-risk flagging, assessor-bias analysis and two live Gradio dashboards.
 
 | | |
 |---|---|
-| **Modules documented** | 22 |
+| **Modules documented** | 23 |
 | **Lines of Python** | 20,348 |
 | **Function definitions** | 537 (all documented) |
 | **Classes** | 15 |
@@ -48,7 +48,7 @@ dashboards (see §4).
 ## 2. Module index
 
 Sorted by size. "Entry pts" = functions `main.ipynb` calls directly.
-**†** = counts refreshed 2026-08-18; the prose in that module's doc still describes the
+**†** = counts refreshed 2026-08-18 (`osce_utils` 2026-10-01); the prose in that module's doc still describes the
 2026-08-14 snapshot except where a dated note says otherwise.
 
 | Module | Layer | LOC | Fns | Cls | Consts | Entry pts | Imports |
@@ -59,12 +59,14 @@ Sorted by size. "Entry pts" = functions `main.ipynb` calls directly.
 | [`boh2_dds2_dds3_utils.py`](boh2_dds2_dds3_utils.md) | Cohort reporting | 3,336 † | 70 | 0 | 29 | 8 | Utils, variableUtils |
 | [`risk_report.py`](risk_report.md) | Flagging & risk | 1,205 | 37 | 1 | 4 | 1 | — |
 | [`viva_gradio.py`](viva_gradio.md) | Dashboards | 1,071 | 36 | 0 | 5 | — | gradio_utils |
+| [`dds1_pe_utils.py`](dds1_pe_utils.md) | Cohort reporting (added 2026-09-24) | 1,122 | 22 | 0 | 14 | 1 | general_utils (lazy, optional) |
 | [`writtenexam_utils.py`](writtenexam_utils.md) | Cohort reporting | 1,012 | 22 | 0 | 18 | 1 | — |
 | [`Utils.py`](Utils.md) | Shared core | 703 | 30 | 0 | 0 | 9 | variableUtils |
 | [`boh1_utils.py`](boh1_utils.md) | Cohort reporting | 692 | 15 | 0 | 8 | 2 | Utils, variableUtils |
 | [`scbd_gradio.py`](scbd_gradio.md) | Dashboards | 492 | 18 | 0 | 20 | — | — |
+| [`mcq_analysis_utils.py`](mcq_analysis_utils.md) | Statistical analysis — Canvas MCQ item analysis + Rasch (added 2026-10-01) | 485 | 20 | 0 | 5 | 1 | — |
 | [`osce_pdfs.py`](osce_pdfs.md) | Cohort reporting | 466 | 9 | 0 | 20 | 2 | — |
-| [`osce_utils.py`](osce_utils.md) | OSCE station reports + standard-setting | 865 | 19 | 0 | 12 | 1 | osce_metrics |
+| [`osce_utils.py`](osce_utils.md) | OSCE station reports + standard-setting + student feedback PDFs | 2,211 † | 57 † | 0 | 31 † | 1 | osce_metrics |
 | [`osce_metrics.py`](osce_metrics.md) | OSCE AMEE-49 psychometrics | 285 | 9 | 0 | 0 | — | osce_utils |
 | [`assessor_confound.py`](assessor_confound.md) | Statistical analysis | 436 | 8 | 0 | 3 | 1 | — |
 | [`assessor_analysis.py`](assessor_analysis.md) | Statistical analysis | 414 | 12 | 0 | 4 | 3 | Utils |
@@ -113,6 +115,7 @@ flowchart TD
         ac["assessor_confound.py"]
         bl["blr_analysis.py"]
         bc["build_canned_comments.py"]
+        ma["mcq_analysis_utils.py<br/>Canvas MCQ + Rasch"]
     end
     subgraph APP["Dashboards"]
         vg["viva_gradio.py"]
@@ -128,7 +131,7 @@ flowchart TD
     NB["main.ipynb<br/>orchestrator — 69 code cells"]
     b1 & b2 & b3 & we & os --> NB
     fl & rr --> NB
-    aa & ac --> NB
+    aa & ac & ma --> NB
     genu --> NB
 
     gr & gm & bc & bl & anon -.->|"standalone — not imported"| CLI["python x.py"]
@@ -226,7 +229,7 @@ Later imports win. This matters — see §6.4.
 ### `main.ipynb` section order
 
 `Initialize` → `URL to postgres` → `Separating forms` → `BOH1 BOH2 DDS2 DDS3
-general` → `Student Reports` → `PRP section` → `SCBD` → `Assessor Analysis` →
+general` → `Student Reports` → `PRP section` → `MCQ Exam Analysis` (added 2026-10-01) → `SCBD` → `Assessor Analysis` →
 `BOH1 for the date` → `OSCE` → `DDS2 / Weekly` → `Mini-CEx` → `DDS4 BOH3` (data
 processing → cohort reports → student PDFs → student Excel reports) → `Written
 Exam Feedback Reports` → `DDS3 Research Progress Summary` → `Send Emails`.
@@ -245,12 +248,14 @@ Exam Feedback Reports` → `DDS3 Research Progress Summary` → `Send Emails`.
 | Edit a BOH3/DDS4 student PDF or Excel dashboard | [`boh3_dds4_utils`](boh3_dds4_utils.md) |
 | Edit a BOH2/DDS2/DDS3 cohort or student report | [`boh2_dds2_dds3_utils`](boh2_dds2_dds3_utils.md) |
 | Edit the BOH1 timed-session / item report | [`boh1_utils`](boh1_utils.md) |
-| Edit an OSCE station feedback PDF | [`osce_pdfs`](osce_pdfs.md) |
+| Edit an OSCE station feedback PDF (BOH1 checklist/GR style) | [`osce_pdfs`](osce_pdfs.md) |
+| Edit the DDS4-style OSCE student feedback PDF (template + cutoff, station metadata workbook) | [`osce_utils`](osce_utils.md) §0 (added 2026-10-01) |
 | Edit written-exam feedback PDFs | [`writtenexam_utils`](writtenexam_utils.md) |
 | Edit the Mini-CEX PDFs | [`generate_mcex_reports`](generate_mcex_reports.md) |
 | Investigate assessor harshness / bias | [`assessor_analysis`](assessor_analysis.md), [`assessor_confound`](assessor_confound.md) |
 | Recompute the BLR cut score | [`general_utils`](general_utils.md) (live) — **not** `blr_analysis` (superseded) |
 | De-identify an export | [`dash_anonymize_pipeline`](dash_anonymize_pipeline.md) |
+| Analyse a Canvas MCQ exam (item difficulty, distractors, AM/PM, IRT) | [`mcq_analysis_utils`](mcq_analysis_utils.md) — add an entry to `mcqExams` in the notebook's *MCQ Exam Analysis* cell |
 | Change the live viva dashboard | [`viva_gradio`](viva_gradio.md) + [`gradio_utils`](gradio_utils.md) |
 | Change the live SCBD dashboard | [`scbd_gradio`](scbd_gradio.md) |
 
@@ -449,7 +454,10 @@ item 6) — all 2026-08-18, see
 `_handover_docs/HANDOVER_dds2_clinic_flagging_fhy.md`; and `boh3_dds4_utils.md`
 (§0 — weakness analytics, all-comments, PDF cover/contents & page numbers) on
 2026-09-16, see `_handover_docs/HANDOVER_student_report_weakness_comments_and_toc.md`.
-A full regeneration would
+`mcq_analysis_utils.md` was hand-written on 2026-10-01 when the module was added
+(not AST-generated; its counts come from an `ast` pass on that date).
+`osce_utils.md` was amended on 2026-10-01 (§0: student OSCE feedback PDFs + station
+metadata workbook; header counts), see `_handover_docs/HANDOVER_osce_student_feedback_pdfs.md`. A full regeneration would
 replace all of them; §2 of `python-reference-docs` in project memory has the
 recipe.
 

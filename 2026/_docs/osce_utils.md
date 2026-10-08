@@ -6,11 +6,35 @@
 
 | | |
 |---|---|
-| **Lines** | ~915 |
-| **Deps** | numpy, scipy (`stats`), matplotlib (Agg), openpyxl |
+| **Lines** | ~915 → **2,211** (2026-10-01, +feedback-PDF section; 57 functions, 31 constants) |
+| **Deps** | numpy, scipy (`stats`), matplotlib (Agg), openpyxl; **reportlab** (imported lazily inside `buildStudentFeedbackPdf`, 2026-10-01) |
 | **Imports from this codebase** | lazily imports `osce_metrics` inside `buildOsceWorkbook` |
 | **Run how** | Imported by `main.ipynb` (cell ~34). Pure library, no `__main__`. |
-| **Handover** | `_handover_docs/HANDOVER_osce_stationwise_blr_analysis.md` |
+| **Handover** | `_handover_docs/HANDOVER_osce_stationwise_blr_analysis.md`; feedback PDFs: `_handover_docs/HANDOVER_osce_student_feedback_pdfs.md` |
+
+---
+
+## 0. Changes since this document was generated
+
+> **Changed 2026-10-01: student OSCE feedback PDFs.** New section appended at the end of the module ("STUDENT OSCE FEEDBACK PDFs"); no existing function changed. Full detail: `_handover_docs/HANDOVER_osce_student_feedback_pdfs.md`.
+
+Builds one A4 PDF per student in the `OSCE/OSCE Feedback Template.xlsx` layout (navy header + UniMelb logo, green panel on every page), plus a station cutoff field. Inputs: the cleaned station workbook (`OSCE/DDS4/DDS4 OSCE (2).xlsx`), the BLR workbook (`… BLR & Validity.xlsx`, "Standard Setting → APPLIED cut %") and the station metadata workbook `OSCE/OSCE Station Metadata.xlsx`.
+
+| Name | Kind | Role |
+|---|---|---|
+| `DDS4_FEEDBACK_STATION_META`, `FEEDBACK_EXCLUDE_SHEETS` | const | Fallback station list (sheet → label/domain/type/topic[/counted]) + always-excluded sheets (Diagnostics, Fixed Prosth) |
+| `STATION_META_PATH`, `STATION_META_SHEET`, `STATION_META_COLUMNS` | const | Metadata workbook location and columns (`Cohort, Year, Report Order, Station, Sheet Name, Domain, Station Type, Topic, Include, Counts To Outcome, Notes`) |
+| `FB_NAVY`, `FB_PANEL`, `FB_FAIL`, `FB_LOGO_MEDIA` | const | Template colours; logo path inside the template xlsx |
+| `loadStationMeta(metaPath, cohort, year, sheetName)` | fn | → `(meta, excluded)`; `Include=N` excluded; `Counts To Outcome=N` → `counted=False` |
+| `writeStationMetaWorkbook(metaPath, cohort, year, stationMeta, excludeSheets, overwrite)` | fn | Seeds the metadata workbook from the dict |
+| `readStationSheet(ws)` / `loadFeedbackStations(stationPath, stationMeta, excludeSheets)` | fn | Rows `{name, studentNo, score, gr, feedback, bfInfo}`; `(stations, skipped)` |
+| `loadAppliedCuts(analysisPath)` | fn | Zips "Student x Station" station headers with "Standard Setting" rows (station no. cross-checked) → `{sheet: cutPct, passAll, excluded, mean2sdPct}` |
+| `computeFeedbackStats(stations, cuts, passAllCutOffset, notCountedSheets)` | fn | Cohort mean/SD/min/max/2SDBM per station; per-student outcome (`FAIL` if `round(score,1) < cut`, `N/A` if not counted), nPass/nFail/nSdbm, avg |
+| `loadTemplateLogo`, `fmtNum`, `commentHtml` | fn | Helpers |
+| `buildStudentFeedbackPdf(...)` | fn | One PDF. `BaseDocTemplate` + `autoNextPageTemplate` (not `SimpleDocTemplate`, which drops `onPage` after page 2) |
+| `buildOsceFeedbackReports(...)` | fn | **Entry point** (called from `main.ipynb`, cell after the station-wise BLR cell). Options: `studentNumbers`, `hideOverallFor` (mark), `maxStationFails=4`, `overallOutcomes`, `passAllCutOffset=1`, `notCountedSheets`, `bfHeading/bfText` (`always`/`failOnly`/`never`), `stationGapCm`, `metaPath`, `year` |
+
+Gotchas specific to this section: the cut alignment is positional (a reordered Standard Setting sheet raises `ValueError`); PASS ALL stations print cutoff = lowest − 1 (cosmetic); the overall outcome uses "> 4 failed stations" only, not the official "avg ≥ avg cut" condition; ReportLab names are aliased (`RlPara`, `RlTable`, …) and imported inside the function, so they don't collide with the module's openpyxl `Font`/`XlImage`.
 
 ---
 

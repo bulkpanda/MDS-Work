@@ -1,0 +1,3930 @@
+import requests
+import pandas as pd
+from sqlalchemy import text
+from enum import Enum
+from scipy import stats
+from variableUtils import *
+from Utils import autoFitColumns, readDf
+from psycopg.types.json import Json
+from openpyxl.chart.axis import ChartLines
+from openpyxl import load_workbook
+from openpyxl.formatting.rule import FormulaRule, ColorScaleRule
+from openpyxl.styles import Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import ScatterChart, BarChart, Reference, Series
+from openpyxl.chart.trendline import Trendline
+from openpyxl.chart.marker import Marker
+from openpyxl.drawing.line import LineProperties
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.label import DataLabelList
+from openpyxl.drawing.fill import ColorChoice
+import os
+import re
+import fnmatch
+# Insert data into rawforms table, creating the table if it doesn't exist. Uses upsert logic to avoid duplicates based on assessmentId.
+RAWFORMS_NAME = "rawforms"
+RAWFORM_FORMS_NAME = "rawform_forms_v3"
+SCBD_NAME = "scbd"
+OSCE_NAME = "osce"
+
+
+CREATE_RAWFORMS_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {RAWFORMS_NAME} (
+  id BIGSERIAL PRIMARY KEY,
+  assessmentId BIGINT,
+  student_number BIGINT,
+  student_name text,
+  student_email text,
+  datetimeUtc TIMESTAMPTZ,
+  cohort TEXT,
+  subject TEXT,
+  type TEXT,
+  completed BOOLEAN,
+  forms JSONB NOT NULL,
+  insertedAt TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rawforms_assessmentId ON {RAWFORMS_NAME} (assessmentId);
+CREATE INDEX IF NOT EXISTS idx_rawforms_datetimeUtc ON {RAWFORMS_NAME} (datetimeUtc);
+CREATE INDEX IF NOT EXISTS idx_rawforms_studentnum ON {RAWFORMS_NAME} (student_number);
+CREATE INDEX IF NOT EXISTS idx_rawforms_forms_gin ON {RAWFORMS_NAME} USING GIN (forms);
+"""
+
+CREATE_RAWFORM_FORMS_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {RAWFORM_FORMS_NAME} (
+  form_code TEXT NOT NULL,
+  assessmentid BIGINT NOT NULL,
+
+  student_number BIGINT NOT NULL,
+  student_name TEXT,
+  student_email TEXT,
+  datetimeutc TIMESTAMPTZ,
+  cohort TEXT,
+  subject TEXT,
+  type TEXT,
+  completed BOOLEAN,
+
+  student_data JSONB,
+  assessor_data JSONB,
+
+  student_reflection TEXT,
+  assessor_reflection TEXT,
+  clinical_incident TEXT,
+
+  patient_complexity TEXT,
+
+  role TEXT,
+  clinic TEXT,
+  scales JSONB,
+  checklists JSONB,
+  version INTEGER,
+
+  patient_age INTEGER,
+  patient_drn TEXT,
+  assessor_name TEXT,
+  patient_details TEXT,
+  patient_interpreter BOOLEAN,
+
+  submitted_by_student BOOLEAN,
+  additional_checklists JSONB,
+  submitted_by_assessor BOOLEAN,
+
+  insertedat TIMESTAMPTZ DEFAULT now(),
+
+  PRIMARY KEY (form_code, assessmentid)
+);
+
+"""
+
+CREATE_SCBD_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {SCBD_NAME} (
+  assessmentid     BIGINT PRIMARY KEY,
+  student_name     TEXT,
+  assessor_name    TEXT,
+  datetimeutc      TIMESTAMPTZ,
+  cohort           TEXT,
+  subject          TEXT,
+  submitted        BOOLEAN,
+  version          INTEGER,
+  global_rating    SMALLINT,
+  assessor_comments TEXT,
+  checklist_key    TEXT,
+  checklist_data   JSONB,
+  form             JSONB,
+  insertedat       TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scbd_datetimeutc  ON {SCBD_NAME} (datetimeutc);
+CREATE INDEX IF NOT EXISTS idx_scbd_cohort        ON {SCBD_NAME} (cohort);
+CREATE INDEX IF NOT EXISTS idx_scbd_student_name  ON {SCBD_NAME} (student_name);
+CREATE INDEX IF NOT EXISTS idx_scbd_form_gin      ON {SCBD_NAME} USING GIN (form);
+"""
+
+def getDeleteSql(formName=None):
+    sql = f"""Delete from {formName}
+    where lower(student_name) = 'kunal patel'
+    or lower(student_name) = 'suhrid gupta'
+    or lower(student_name) = 'test student'
+    or lower(student_name) = 'test1 student1'
+    or student_number is null
+    ;
+    """
+    return sql
+
+def getInsertSqlRawforms(replace=False):
+    if replace:
+        onconflict = """
+    ON CONFLICT (assessmentId) DO UPDATE
+    SET
+    student_number = EXCLUDED.student_number,
+    student_name   = EXCLUDED.student_name,
+    student_email  = EXCLUDED.student_email,
+    datetimeUtc   = EXCLUDED.datetimeUtc,
+    cohort        = EXCLUDED.cohort,
+    subject       = EXCLUDED.subject,
+    type          = EXCLUDED.type,
+    completed     = EXCLUDED.completed,
+    forms         = EXCLUDED.forms,
+    insertedAt    = now()
+    """
+    else:        onconflict = "ON CONFLICT (assessmentId) DO NOTHING"
+    insertSql = f"""
+    INSERT INTO {RAWFORMS_NAME} (
+    assessmentId,
+    student_number,
+    student_name,
+    student_email,
+    datetimeUtc,
+    cohort,
+    subject,
+    type,
+    completed,
+    forms
+    )
+    SELECT
+    :assessmentId,
+    :student_number,
+    :student_name,
+    :student_email,
+    :datetimeUtc,
+    :cohort,
+    :subject,
+    :type,
+    :completed,
+    :forms
+    WHERE :datetimeUtc >= TIMESTAMPTZ '2026-01-01'
+    {onconflict}
+    """
+    
+    return insertSql
+
+def runDdl(conn, ddl):
+    for stmt in ddl.strip().split(";"):
+        if stmt.strip():
+            conn.execute(text(stmt))
+
+def fetchAllAssessments(apiUrl, bearerToken):
+    headers = {
+        "Authorization": f"Token {bearerToken}",
+        "Accept": "application/json",
+    }
+
+    records = []
+    nextUrl = apiUrl
+    with requests.Session() as session:
+        while nextUrl:
+            resp = session.get(nextUrl, headers=headers, timeout=60)
+            # print(f"Requesting: {nextUrl} - Status Code: {resp}")
+            # print("status:", resp.status_code)
+            # print("contentType:", resp.headers.get("content-type"))
+            # print("textStart:", resp.text[:1500])
+
+            resp.raise_for_status()
+            payload = resp.json()
+
+            pageResults = payload.get("results")
+            # print(f"Results in this page: {len(pageResults) if pageResults else 'No results key'}")
+            if not isinstance(pageResults, list):
+                raise ValueError("Unexpected response: missing 'results' list")
+
+            records.extend(pageResults)
+            nextUrl = payload.get("next")  # handles pagination if present
+            print(f"Fetched {len(pageResults)} records, total so far: {len(records)}")
+            # break
+
+    return records
+
+def toRows(records, formCol = "forms"):
+    rows = []
+    for r in records:
+        studentInfo = r.get("student")
+        if not studentInfo or not isinstance(studentInfo, dict):
+            continue
+        else:
+            studentName = studentInfo["first_name"] + " " + studentInfo["last_name"]
+            studentNumber = studentInfo.get("student_number")
+            studentEmail = studentInfo.get("email")
+            if not studentNumber:
+                continue
+        rows.append({
+            "assessmentId": r.get("assessment_id") or r.get("id"),
+            "student_number": studentNumber,
+            "student_name": studentName,
+            "student_email": studentEmail,
+            "datetimeUtc": r.get("datetime"),
+            "cohort": r.get("cohort"),
+            "subject": r.get("subject"),
+            "type": r.get("type"),
+            "completed": r.get("completed"),
+            formCol: (r.get("forms")),
+        })
+    return rows
+
+def insertRows(engine, rows, insertSql, batchSize=1000):
+    with engine.begin() as conn:
+        runDdl(conn, CREATE_RAWFORMS_TABLE_SQL)
+        for i in range(0, len(rows), batchSize):
+            conn.execute(text(insertSql), rows[i:i + batchSize])
+        runDdl(conn, getDeleteSql(F"{RAWFORMS_NAME}"))
+
+def buildCohortList(useAll, allCohorts, includeCohorts, excludeCohorts):
+    if useAll:
+        cohortSet = set(allCohorts)
+    else:
+        cohortSet = set(includeCohorts)
+    cohortSet -= set(excludeCohorts)
+    return [c for c in allCohorts if c in cohortSet]
+
+#========================================================================================================================================
+# Now utils for form separation and creation of rawform_forms table
+
+def getInsertSqlRawform_forms(replace=False):
+    if replace:
+        onconflict = f"""
+    ON CONFLICT (form_code, assessmentid) DO UPDATE
+    SET
+    student_number = EXCLUDED.student_number,
+    student_name   = EXCLUDED.student_name,
+    student_email  = EXCLUDED.student_email,
+    datetimeutc   = EXCLUDED.datetimeutc,
+    cohort        = EXCLUDED.cohort,
+    subject       = EXCLUDED.subject,
+    type          = EXCLUDED.type,
+    completed     = EXCLUDED.completed,
+    student_data  = EXCLUDED.student_data,
+    assessor_data = EXCLUDED.assessor_data,
+    student_reflection = EXCLUDED.student_reflection,
+    assessor_reflection = EXCLUDED.assessor_reflection,
+    clinical_incident = EXCLUDED.clinical_incident,
+    patient_complexity = EXCLUDED.patient_complexity,
+    role          = EXCLUDED.role,
+    clinic        = EXCLUDED.clinic,
+    scales        = EXCLUDED.scales,
+    checklists    = EXCLUDED.checklists,
+    version       = EXCLUDED.version,
+    patient_age   = EXCLUDED.patient_age,
+    patient_drn   = EXCLUDED.patient_drn,
+    assessor_name = EXCLUDED.assessor_name,
+    patient_details = EXCLUDED.patient_details,
+    patient_interpreter = EXCLUDED.patient_interpreter,
+    submitted_by_student = EXCLUDED.submitted_by_student,
+    additional_checklists = EXCLUDED.additional_checklists,
+    submitted_by_assessor = EXCLUDED.submitted_by_assessor,
+    insertedat    = now()
+        """
+    else:
+        onconflict = "ON CONFLICT (form_code, assessmentid) DO NOTHING"
+    insertSql = f"""
+    INSERT INTO {RAWFORM_FORMS_NAME} (
+      form_code,
+      assessmentid, student_number, student_name, student_email, datetimeutc, cohort, subject, type, completed,
+      student_data, assessor_data,
+      student_reflection, assessor_reflection,
+      clinical_incident,
+      -- time_mgmt, professionalism, communication, entrustment,
+      patient_complexity,
+      role, clinic, scales, checklists, version,
+      patient_age, patient_drn, assessor_name, patient_details, patient_interpreter,
+      submitted_by_student, additional_checklists, submitted_by_assessor, insertedat
+    )
+    SELECT
+      f.form_code,
+
+      r.assessmentid, r.student_number, r.student_name, r.student_email, r.datetimeutc, r.cohort, r.subject, r.type, r.completed,
+
+      /* studentdata: remove reflection only */
+      (studentJson - 'reflection') AS studentdata,
+
+      /* assessordata: remove extracted keys */
+      (assessorJson
+        - 'reflection'
+        -- - 'time_mgmt'
+        -- - 'professionalism'
+        -- - 'communication'
+        -- - 'entrustment'
+        - 'patient_complexity'
+      - 'clinical_incident'
+      ) AS assessordata,
+
+      /* reflections */
+      (studentJson->>'reflection')  AS student_reflection,
+      (assessorJson->>'reflection') AS assessor_reflection,
+    /* put this exactly where clinical_incident is in INSERT */
+      NULLIF(COALESCE(assessorJson->>'critical_incident', assessorJson->>'clinical_incident'), '') AS clinical_incident,
+
+      /* extracted scalars (no assessor_ prefix) */
+      -- NULLIF(assessorJson->'time_mgmt'->>'scale','')::smallint       AS time_mgmt,
+      -- NULLIF(assessorJson->'professionalism'->>'scale','')::smallint AS professionalism,
+      -- NULLIF(assessorJson->'communication'->>'scale','')::smallint   AS communication,
+      -- NULLIF(assessorJson->'entrustment'->>'scale','')::smallint     AS entrustment,
+      (assessorJson->'patient_complexity'->>'scale')                 AS patient_complexity,
+
+      f.form_value->>'role' AS role,
+      COALESCE(f.form_value->>'clinic_type', f.form_value->>'clinic') AS clinic,
+      f.form_value->'scales' AS scales,
+      f.form_value->'checklists' AS checklists,
+      NULLIF(f.form_value->>'version','')::int AS version,
+
+      NULLIF(f.form_value->>'patient_age','')::int AS patient_age,
+      NULLIF(f.form_value->>'patient_drn','') AS patient_drn,
+      f.form_value->>'assessor_name' AS assessor_name,
+      f.form_value->>'patient_details' AS patient_details,
+      (f.form_value->>'patient_interpreter')::boolean AS patient_interpreter,
+
+      (f.form_value->>'submitted_by_student')::boolean AS submitted_by_student,
+      f.form_value->'additional_checklists' AS additional_checklists,
+      (f.form_value->>'submitted_by_assessor')::boolean AS submitted_by_assessor,
+      r.insertedat
+    FROM {RAWFORMS_NAME} r
+    CROSS JOIN LATERAL (
+      SELECT e.key AS form_code, e.value AS form_value
+      FROM jsonb_each(r.forms) e
+      WHERE jsonb_typeof(r.forms) = 'object'
+      UNION ALL
+      SELECT a.value->>'form_key' AS form_code, a.value AS form_value
+      FROM jsonb_array_elements(r.forms) a
+      WHERE jsonb_typeof(r.forms) = 'array'
+    ) f
+    CROSS JOIN LATERAL (
+      SELECT
+        COALESCE(f.form_value->'student_data',  f.form_value->'data'->'student')  AS studentJson,
+        COALESCE(f.form_value->'assessor_data', f.form_value->'data'->'assessor') AS assessorJson
+    ) j
+    WHERE f.form_code IS NOT NULL
+    AND r.datetimeUtc >= TIMESTAMPTZ '2026-01-01'
+    {onconflict}
+    """
+    return insertSql
+
+#========================================================================================================================================
+# =========================================================================================================================================
+# v3: OTHER-COHORTS pipeline (BOH1/BOH2/DDS1/DDS2/DDS3 -- everything except DDS4/BOH3, which have their own
+# dds4_boh3_forms_v3 table). Reads the new rawforms JSON where form_context holds role/clinic_type/patient and
+# student_data/assessor_data are nested (radio/texts/scales/checklists/multi-select).
+#
+# Storage decisions (agreed):
+#   * scales      -> kept in the NEW nested shape under *_data->'scales' (bare keys, {key,value}).
+#   * checklists  -> kept nested under *_data->'checklists' AND ALSO flattened up to the top level of
+#                    student_data/assessor_data in the OLD v2 shape {item_code:{MCk: <key-string>}} so the
+#                    existing item-code/checklist reports stay compatible.
+#   * patient info-> single patient_data JSONB (= form_context->patient) instead of separate patient_* columns.
+#   * context_schema_snapshot + assessor_email added.
+# Column names otherwise match v2 rawform_forms so downstream reporting keeps the same names.
+
+RAWFORM_FORMS_V3_NAME = "rawform_forms_v3"
+
+CREATE_RAWFORM_FORMS_V3_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {RAWFORM_FORMS_V3_NAME} (
+  form_code TEXT NOT NULL,
+  assessmentid BIGINT NOT NULL,
+
+  student_number BIGINT NOT NULL,
+  student_name TEXT,
+  student_email TEXT,
+  datetimeutc TIMESTAMPTZ,
+  cohort TEXT,
+  subject TEXT,
+  type TEXT,
+  completed BOOLEAN,
+
+  student_data JSONB,
+  assessor_data JSONB,
+
+  student_reflection TEXT,
+  assessor_reflection TEXT,
+  clinical_incident TEXT,
+
+  patient_complexity TEXT,
+
+  role TEXT,
+  clinic TEXT,
+  scales JSONB,
+  checklists JSONB,
+  version INTEGER,
+
+  patient_data JSONB,
+  context_schema_snapshot JSONB,
+  student_config JSONB,
+  assessor_config JSONB,
+
+  assessor_name TEXT,
+  assessor_email TEXT,
+
+  submitted_by_student BOOLEAN,
+  submitted_by_assessor BOOLEAN,
+  additional_checklists JSONB,
+
+  insertedat TIMESTAMPTZ DEFAULT now(),
+
+  PRIMARY KEY (form_code, assessmentid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rff_v3_datetimeutc ON {RAWFORM_FORMS_V3_NAME} (datetimeutc);
+CREATE INDEX IF NOT EXISTS idx_rff_v3_cohort      ON {RAWFORM_FORMS_V3_NAME} (cohort);
+CREATE INDEX IF NOT EXISTS idx_rff_v3_student     ON {RAWFORM_FORMS_V3_NAME} (student_number);
+CREATE INDEX IF NOT EXISTS idx_rff_v3_student_data_gin  ON {RAWFORM_FORMS_V3_NAME} USING GIN (student_data);
+CREATE INDEX IF NOT EXISTS idx_rff_v3_assessor_data_gin ON {RAWFORM_FORMS_V3_NAME} USING GIN (assessor_data);
+"""
+
+# Cohorts routed to the dds4_boh3_forms_v3 table instead of here.
+RAWFORM_FORMS_V3_EXCLUDE_COHORTS = ("DDS4", "BOH3")
+
+
+def _flattenChecklistsSqlExpr(rawExpr):
+    """Return a SQL scalar expression producing the OLD-shape flattened checklists
+    {item_code:{MCk:<key-string>}} from a nested *_data jsonb passed as ``rawExpr``.
+    Robust to missing/non-object checklists (returns '{}')."""
+    return f"""COALESCE((
+        SELECT jsonb_object_agg(c.item_code, z.flat_mc)
+        FROM jsonb_each(
+               CASE WHEN jsonb_typeof(({rawExpr})->'checklists') = 'object'
+                    THEN ({rawExpr})->'checklists' ELSE '{{}}'::jsonb END
+             ) AS c(item_code, mcs)
+        CROSS JOIN LATERAL (
+          SELECT jsonb_object_agg(m.mc_key, COALESCE(m.mc_val->>'key', m.mc_val#>>'{{}}')) AS flat_mc
+          FROM jsonb_each(
+                 CASE WHEN jsonb_typeof(c.mcs) = 'object' THEN c.mcs ELSE '{{}}'::jsonb END
+               ) AS m(mc_key, mc_val)
+        ) AS z
+        WHERE jsonb_typeof(c.mcs) = 'object'
+      ), '{{}}'::jsonb)"""
+
+
+def getInsertSqlRawform_forms_v3(replace=False, cohorts=('BOH1', 'BOH2', 'DDS1', 'DDS2', 'DDS3')):
+    """INSERT ... SELECT that separates rawforms into rawform_forms_v3 for the
+    non-final-year cohorts. Keeps scales nested (new shape) and merges a v2-style
+    flattened checklist copy onto the top level of student_data/assessor_data."""
+    if replace:
+        onconflict = f"""
+    ON CONFLICT (form_code, assessmentid) DO UPDATE SET
+    student_number = EXCLUDED.student_number, student_name = EXCLUDED.student_name, student_email = EXCLUDED.student_email,
+    datetimeutc = EXCLUDED.datetimeutc, cohort = EXCLUDED.cohort, subject = EXCLUDED.subject, type = EXCLUDED.type,
+    completed = EXCLUDED.completed, student_data = EXCLUDED.student_data, assessor_data = EXCLUDED.assessor_data,
+    student_reflection = EXCLUDED.student_reflection, assessor_reflection = EXCLUDED.assessor_reflection,
+    clinical_incident = EXCLUDED.clinical_incident, patient_complexity = EXCLUDED.patient_complexity,
+    role = EXCLUDED.role, clinic = EXCLUDED.clinic, scales = EXCLUDED.scales, checklists = EXCLUDED.checklists,
+    version = EXCLUDED.version, patient_data = EXCLUDED.patient_data,
+    context_schema_snapshot = EXCLUDED.context_schema_snapshot,
+    student_config = EXCLUDED.student_config, assessor_config = EXCLUDED.assessor_config,
+    assessor_name = EXCLUDED.assessor_name, assessor_email = EXCLUDED.assessor_email,
+    submitted_by_student = EXCLUDED.submitted_by_student, submitted_by_assessor = EXCLUDED.submitted_by_assessor,
+    additional_checklists = EXCLUDED.additional_checklists, insertedat = now()
+        """
+    else:
+        onconflict = "ON CONFLICT (form_code, assessmentid) DO NOTHING"
+
+    studentFlat  = _flattenChecklistsSqlExpr("sdr.raw")
+    assessorFlat = _flattenChecklistsSqlExpr("adr.raw")
+
+    insertSql = f"""
+    INSERT INTO {RAWFORM_FORMS_V3_NAME} (
+      form_code, assessmentid, student_number, student_name, student_email, datetimeutc, cohort, subject, type, completed,
+      student_data, assessor_data,
+      student_reflection, assessor_reflection, clinical_incident, patient_complexity,
+      role, clinic, scales, checklists, version,
+      patient_data, context_schema_snapshot,
+      student_config, assessor_config,
+      assessor_name, assessor_email,
+      submitted_by_student, submitted_by_assessor, additional_checklists,
+      insertedat
+    )
+    SELECT
+      f.form_code,
+      r.assessmentid, r.student_number, r.student_name, r.student_email, r.datetimeutc, r.cohort, r.subject, r.type, r.completed,
+
+      /* raw nested student_data/assessor_data, with a v2-style flattened checklist copy merged on top */
+      (sdr.raw || {studentFlat})  AS student_data,
+      (adr.raw || {assessorFlat}) AS assessor_data,
+
+      (sdr.raw->'texts'->>'reflection') AS student_reflection,
+      (adr.raw->'texts'->>'reflection') AS assessor_reflection,
+
+      /* Clinical incident — TWO template shapes, both must be read (2026-08-18).
+         Reading only the multi-select array (the original expression) returned
+         NULL for every DDS2/BOH2/BOH1 2026 form, because those templates record
+         an incident as radio 'clinical-incident-occurred' = 'yes' plus a
+         free-text detail under texts->'clinical-incident'. 159 forms in the 2026
+         CAF payload were lost that way (DDS2 Clinic 35, DDS2 Sim 40, BOH2 Clinic
+         32, BOH1 Sim 23, DDS1 Sim 20, BOH2 Sim 9) against 87 carrying the array
+         shape. ~66 of the 159 are 'yes' with nothing typed, so they get a
+         placeholder — an empty string here would read as "no incident".
+         NOTE: rows already in the table keep the old NULL until it is reloaded.
+         getDataDf / getCriticalIncidentDf apply the SAME resolution at READ time
+         (boh2_dds2_dds3_utils.clinicalIncidentSqlExpr), so reports are correct
+         without a reload; this keeps the stored column right going forward. */
+      COALESCE(
+        (SELECT string_agg(x->>'value', '; ' ORDER BY x->>'value')
+           FROM jsonb_array_elements(COALESCE(adr.raw->'multi-select'->'clinical-incident','[]'::jsonb)) x),
+        CASE WHEN lower(COALESCE(adr.raw->'radio'->>'clinical-incident-occurred','')) = 'yes'
+             THEN COALESCE(NULLIF(TRIM(COALESCE(adr.raw->'texts'->>'clinical-incident','')), ''),
+                           'Yes (no details recorded)')
+        END
+      )                                                                       AS clinical_incident,
+
+      adr.raw->'scales'->'scale-patient-complexity'->>'key'                  AS patient_complexity,
+
+      fc.ctx->>'role'                                                        AS role,
+      fc.ctx->>'clinic_type'                                                 AS clinic,
+      adr.raw->'scales'                                                      AS scales,
+      adr.raw->'checklists'                                                  AS checklists,
+      NULLIF(f.form_value->>'version','')::int                              AS version,
+
+      fc.ctx->'patient'                                                      AS patient_data,
+      f.form_value->'context_schema_snapshot'                               AS context_schema_snapshot,
+      f.form_value->'student_config'                                        AS student_config,
+      f.form_value->'assessor_config'                                       AS assessor_config,
+
+      f.form_value->>'assessor_name'                                        AS assessor_name,
+      f.form_value->>'assessor_email'                                       AS assessor_email,
+
+      (f.form_value->>'submitted_by_student')::boolean                      AS submitted_by_student,
+      (f.form_value->>'submitted_by_assessor')::boolean                     AS submitted_by_assessor,
+      f.form_value->'additional_checklists'                                 AS additional_checklists,
+
+      r.insertedat
+    FROM {RAWFORMS_NAME} r
+    CROSS JOIN LATERAL (
+      SELECT e.key AS form_code, e.value AS form_value
+      FROM jsonb_each(r.forms) e
+      WHERE jsonb_typeof(r.forms) = 'object'
+      UNION ALL
+      SELECT a.value->>'form_key' AS form_code, a.value AS form_value
+      FROM jsonb_array_elements(r.forms) a
+      WHERE jsonb_typeof(r.forms) = 'array'
+    ) f
+    CROSS JOIN LATERAL (SELECT COALESCE(f.form_value->'form_context', '{{}}'::jsonb) AS ctx) fc
+    CROSS JOIN LATERAL (SELECT COALESCE(f.form_value->'student_data',  '{{}}'::jsonb) AS raw) sdr
+    CROSS JOIN LATERAL (SELECT COALESCE(f.form_value->'assessor_data', '{{}}'::jsonb) AS raw) adr
+    WHERE f.form_code IS NOT NULL
+      AND r.cohort NOT IN {RAWFORM_FORMS_V3_EXCLUDE_COHORTS}
+      AND r.cohort IN {cohorts}
+      AND r.datetimeUtc >= TIMESTAMPTZ '2026-01-01'
+    {onconflict}
+    """
+    return insertSql
+
+
+# =========================================================================================================================================
+# For SCBD table creation and insertion, similar pattern to above but simpler since no form separation needed
+
+def getScbdInsertSql(replace=False):
+    if replace:
+        onconflict = f"""
+    ON CONFLICT (assessmentid) DO UPDATE SET
+        student_name      = EXCLUDED.student_name,
+        assessor_name     = EXCLUDED.assessor_name,
+        datetimeutc       = EXCLUDED.datetimeutc,
+        cohort            = EXCLUDED.cohort,
+        subject           = EXCLUDED.subject,
+        submitted         = EXCLUDED.submitted,
+        version           = EXCLUDED.version,
+        global_rating     = EXCLUDED.global_rating,
+        assessor_comments = EXCLUDED.assessor_comments,
+        checklist_key     = EXCLUDED.checklist_key,
+        checklist_data    = EXCLUDED.checklist_data,
+        form              = EXCLUDED.form,
+        insertedat        = now()
+        """
+    else:
+        onconflict = "ON CONFLICT (assessmentid) DO NOTHING"
+
+    return f"""
+    INSERT INTO {SCBD_NAME} (
+        assessmentid, student_name, assessor_name, datetimeutc, cohort, subject,
+        submitted, version, global_rating, assessor_comments,
+        checklist_key, checklist_data, form
+    ) VALUES (
+        :assessmentId, :student_name, :assessor_name, :datetimeUtc, :cohort, :subject,
+        :submitted, :version, :global_rating, :assessor_comments,
+        :checklist_key, :checklist_data, :form
+    )
+    {onconflict}
+    """
+
+def toRowsScbd(records):
+    rows = []
+
+    for r in records:
+        student = r.get("student")
+        if not student or not isinstance(student, str):
+            continue
+        if student.lower() in excludeNames:
+            continue
+
+        assessorData = (r.get("form") or {}).get("data", {}).get("assessor", {})
+
+        grRaw = (assessorData.get("scale-global-rating") or {}).get("scale")
+        globalRating = int(grRaw) if grRaw is not None else None
+
+        # Checklist key = the one key that isn't comments or a scale
+        checklistKey, checklistData = None, None
+        for k, v in assessorData.items():
+            if k not in ("comments", "scale-global-rating") and isinstance(v, dict):
+                checklistKey = k
+                checklistData = v
+                break
+
+        rows.append({
+            "assessmentId":    r.get("id"),
+            "student_name":    student,
+            "assessor_name":   r.get("assessor"),
+            "datetimeUtc":     r.get("datetime"),
+            "cohort":          r.get("cohort"),
+            "subject":         r.get("subject"),
+            "submitted":       r.get("submitted"),
+            "version":         r.get("version"),
+            "global_rating":   globalRating,
+            "assessor_comments": assessorData.get("comments") or None,
+            "checklist_key":   checklistKey,
+            "checklist_data":  Json(checklistData) if checklistData else None,
+            "form":            Json(r.get("form")),
+        })
+    return rows
+
+def insertScbdRows(engine, rows, insertSql, batchSize=1000):
+    with engine.begin() as conn:
+        runDdl(conn, CREATE_SCBD_TABLE_SQL)
+        for i in range(0, len(rows), batchSize):
+            conn.execute(text(insertSql), rows[i : i + batchSize])
+
+#========================================================================================================================================
+# For OSCE table creation and insertion, similar pattern to above but simpler since no form separation needed
+
+CREATE_OSCE_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {OSCE_NAME} (
+  assessmentid    BIGINT PRIMARY KEY,
+  student_name    TEXT,
+  assessor_name   TEXT,
+  datetimeutc     TIMESTAMPTZ,
+  cohort          TEXT,
+  subject         TEXT,
+  submitted       BOOLEAN,
+  version         INTEGER,
+  station         SMALLINT,
+  visible         BOOLEAN,
+  global_rating   SMALLINT,
+  checklist_key   TEXT,
+  checklist_data  JSONB,
+  scales_data     JSONB,
+  form            JSONB,
+  insertedat      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_osce_datetimeutc ON {OSCE_NAME} (datetimeutc);
+CREATE INDEX IF NOT EXISTS idx_osce_cohort       ON {OSCE_NAME} (cohort);
+CREATE INDEX IF NOT EXISTS idx_osce_student_name ON {OSCE_NAME} (student_name);
+CREATE INDEX IF NOT EXISTS idx_osce_form_gin     ON {OSCE_NAME} USING GIN (form);
+"""
+
+def getOsceInsertSql(replace=False):
+    if replace:
+        onconflict = f"""
+    ON CONFLICT (assessmentid) DO UPDATE SET
+        student_name   = EXCLUDED.student_name,
+        assessor_name  = EXCLUDED.assessor_name,
+        datetimeutc    = EXCLUDED.datetimeutc,
+        cohort         = EXCLUDED.cohort,
+        subject        = EXCLUDED.subject,
+        submitted      = EXCLUDED.submitted,
+        version        = EXCLUDED.version,
+        station        = EXCLUDED.station,
+        visible        = EXCLUDED.visible,
+        global_rating  = EXCLUDED.global_rating,
+        checklist_key  = EXCLUDED.checklist_key,
+        checklist_data = EXCLUDED.checklist_data,
+        scales_data    = EXCLUDED.scales_data,
+        form           = EXCLUDED.form,
+        insertedat     = now()
+        """
+    else:
+        onconflict = "ON CONFLICT (assessmentid) DO NOTHING"
+
+    return f"""
+    INSERT INTO {OSCE_NAME} (
+        assessmentid, student_name, assessor_name, datetimeutc, cohort, subject,
+        submitted, version, station, visible, global_rating,
+        checklist_key, checklist_data, scales_data, form
+    ) VALUES (
+        :assessmentId, :student_name, :assessor_name, :datetimeUtc, :cohort, :subject,
+        :submitted, :version, :station, :visible, :global_rating,
+        :checklist_key, :checklist_data, :scales_data, :form
+    )
+    {onconflict}
+    """
+
+def toRowsOsce(records):
+    rows = []
+    for r in records:
+        student = r.get("student")
+        if not student or not isinstance(student, str):
+            continue
+        if student.lower() in excludeNames:
+            continue
+
+        assessorData = (r.get("form") or {}).get("data", {}).get("assessor", {})
+
+        # Extract all scale-* keys as flat {key: int}
+        scalesData = {}
+        for k, v in assessorData.items():
+            if k.startswith("scale-") and isinstance(v, dict):
+                raw = v.get("scale")
+                if raw is not None:
+                    try:
+                        scalesData[k] = int(raw)
+                    except (ValueError, TypeError):
+                        pass
+
+        globalRating = scalesData.get("scale-global-rating")
+
+        # First non-scale key is the checklist
+        checklistKey, checklistData = None, None
+        for k, v in assessorData.items():
+            if not k.startswith("scale-") and isinstance(v, dict):
+                checklistKey = k
+                checklistData = v
+                break
+
+        rows.append({
+            "assessmentId":   r.get("id"),
+            "student_name":   student,
+            "assessor_name":  r.get("assessor"),
+            "datetimeUtc":    r.get("datetime"),
+            "cohort":         r.get("cohort"),
+            "subject":        r.get("subject"),
+            "submitted":      r.get("submitted"),
+            "version":        r.get("version"),
+            "station":        r.get("station"),
+            "visible":        r.get("visible"),
+            "global_rating":  globalRating,
+            "checklist_key":  checklistKey,
+            "checklist_data": Json(checklistData) if checklistData else None,
+            "scales_data":    Json(scalesData) if scalesData else None,
+            "form":           Json(r.get("form")),
+        })
+    return rows
+
+def insertOsceRows(engine, rows, insertSql, batchSize=1000):
+    with engine.begin() as conn:
+        runDdl(conn, CREATE_OSCE_TABLE_SQL)
+        for i in range(0, len(rows), batchSize):
+            conn.execute(text(insertSql), rows[i : i + batchSize])
+
+#========================================================================================================================================
+# DDS2 Weekly Sim
+#
+# Semester split for the weekly sim workbooks. Everything on/after this date is
+# semester 2 (2026); semester 1 workbooks were already built and live in
+# "DDS2/Weekly Sim". The builders default to minDate = this value so a re-run
+# never rebuilds semester 1. To build semester 1 instead, call with
+# minDate=None, maxDate='2026-06-14' (maxDate is an inclusive <= bound).
+SEMESTER_SPLIT_DATE = "2026-06-15"
+
+# O-code -> 0..1 score used when expanding the flattened checklist json (mc_json).
+# Mirrors the CASE expression inside getWeeklySimDataSql so the python-side
+# MC columns and the SQL-side "Assessor Score"/"Student Score" always agree.
+WEEKLY_SIM_SCORE_MAP = {
+    "O1": 1.00,
+    "O2": 0.80,
+    "O3": 0.60,
+    "O4": 0.40,
+    "O5": 0.00,
+    "Yes": 1.00,
+    "No": 0.00,
+}
+
+# How the MC (checklist item) columns are written into the weekly workbook.
+#
+#   '0-1'  the original proportion scale, matching "Assessor Score"/"Student Score"
+#   '1-5'  the O-codes as levels, 5 = best — reads the same way round as GR, so a low
+#          number means a weak result on both
+#
+# These are NOT linear rescales of one another: O5 is 0.00 on '0-1' but 1 on '1-5'. That
+# matters in exactly one place — runBlrAnalysis computes its per-item stats and Cronbach's
+# alpha from the MC columns, so those shift when the scale changes. The regression CUTOFF
+# and all flagging read "Assessor Score", which comes from SQL and is always 0-1, so
+# Pass/Fail is unaffected either way.
+WEEKLY_MC_SCALES = {
+    "0-1": {"O1": 1.00, "O2": 0.80, "O3": 0.60, "O4": 0.40, "O5": 0.00,
+            "Yes": 1.00, "No": 0.00},
+    "1-5": {"O1": 5, "O2": 4, "O3": 3, "O4": 2, "O5": 1,
+            "Yes": 5, "No": 1},
+}
+
+# "This is a weak result" per scale, so switching scale can't leave the colours pointing
+# at the wrong end of the range — on '0-1' the low end is 0.0, on '1-5' it is 1.
+WEEKLY_MC_HIGHLIGHT_BY_SCALE = {
+    "1-5": {1: "red", 2: "amber"},
+    "0-1": {0.0: "red", 0.4: "amber"},
+}
+
+WEEKLY_GR_HIGHLIGHT = {1: "red", 2: "amber", 5: "green"}
+
+
+def resolveMcScale(scale=None):
+    """(scoreMap, label) from a scale name ('0-1' / '1-5'), an explicit dict, or None.
+
+    None keeps the historical 0-1 behaviour, so nothing changes unless asked.
+    """
+    if scale is None:
+        return dict(WEEKLY_SIM_SCORE_MAP), "0-1"
+    if isinstance(scale, dict):
+        return dict(scale), "custom"
+    key = str(scale).strip()
+    if key not in WEEKLY_MC_SCALES:
+        raise ValueError(f"Unknown MC scale {scale!r} — use one of "
+                         f"{list(WEEKLY_MC_SCALES)} or pass an explicit dict.")
+    return dict(WEEKLY_MC_SCALES[key]), key
+
+
+# ---------------------------------------------------------------------------------------
+# Weekly sheet PRESENTATION layer (added 2026-08-18).
+#
+# The per-date weekly workbook is read by humans against a paper list, so it carries the
+# reader's vocabulary, not the database's. Three things happen on the way out, and ONLY on
+# the way out — every dataframe inside the pipeline stays snake_case:
+#
+#   1. columns in WEEKLY_SHEET_DROP_COLS are dropped,
+#   2. the MC block is moved to sit immediately BEFORE WEEKLY_SHEET_MC_BEFORE,
+#   3. the remaining columns are relabelled through WEEKLY_SHEET_COLUMN_LABELS.
+#
+# loadWeeklyFiles reverses (3) on the way back in, so the combined workbook, BLR and the
+# flagging chain keep seeing 'student_number' / 'item_code' and neither knows nor cares
+# which layout a workbook on disk was written with. Workbooks built before this change
+# load unchanged.
+#
+# GR / TS / CS / PS / PR / PEC keep their acronyms deliberately: addAssessmentCharts looks
+# up 'GR' by header text, styleWeeklySheet's grCols defaults to ('GR',), and
+# runBlrAnalysis takes grCol='GR'. Renaming them means touching all three.
+
+# Dropped from the sheet. 'date' is safe to lose because every downstream reader takes the
+# date from the FILENAME (loadWeeklyFiles -> buildWideDf sets tmp['date'] = dateStr), and
+# assessmentid / form_code / student_email are identifiers nobody reads off this sheet.
+# 'subject' is deliberately KEPT: cell 39 guards on `if "subject" in columns` to emit the
+# combined workbook's subject_mismatches sheet. Add it here to drop that cross-check —
+# cell 37's DB-driven `<COHORT> subject code mismatches.xlsx` covers the same ground.
+WEEKLY_SHEET_DROP_COLS = ["student_email", "date", "assessmentid", "form_code"]
+
+# The MC block lands immediately before this column, so the sheet reads
+# per-item marks -> the score they roll up into. Set to None to leave MC at the end.
+WEEKLY_SHEET_MC_BEFORE = "Assessor Score"
+
+# snake_case -> what the reader sees. Anything not listed passes through untouched, which
+# is what keeps GR/TS/CS/PS/PR/PEC and the MCn columns as they are.
+WEEKLY_SHEET_COLUMN_LABELS = {
+    "student_number":      "Student Number",
+    "last_name":           "Last Name",
+    "first_name":          "First Name",
+    "student_name":        "Student Name",
+    "student_email":       "Student Email",
+    "assessor_name":       "Assessor Name",
+    "subject":             "Subject",
+    "item_code":           "Item Code",
+    "date":                "Date",
+    "clinical_incident":   "Clinical Incident",
+    "assessor_reflection": "Assessor Reflection",
+    "student_reflection":  "Student Reflection",
+    "assessmentid":        "Assessment ID",
+    "form_code":           "Form Code",
+}
+
+# Read back the other way in loadWeeklyFiles. Built once so a typo in one map can't
+# desynchronise the two directions.
+WEEKLY_SHEET_COLUMN_LABELS_INVERSE = {v: k for k, v in WEEKLY_SHEET_COLUMN_LABELS.items()}
+
+
+# ---------------------------------------------------------------------------------------
+# Weekly sheet ATTENDANCE layer (added 2026-08-18).
+#
+# Two questions the sheet could not answer before:
+#   "who was not assessed at all?"          -> a blank row per absentee, greyed
+#   "did anyone get more than one form?"    -> those students' rows go amber
+#
+# The absentee rows come from the cohort roster (BOH2/BOH2 Roster 2026.xlsx via loadRoster).
+# No roster file, no absentee rows; the counts still reach the Session Summary sheet, so
+# DDS2 (which has no roster) gets the summary and nothing else.
+#
+# A placeholder row carries the student's number and name and NOTHING else — in particular
+# no item_code — which is how BOTH the styling (grey where Item Code is blank) and
+# loadWeeklyFiles (drop those rows) recognise it. The analysis chain never sees them.
+#
+# HISTORY: 18 Aug 2026 this also wrote a per-row `Forms` column carrying that student's
+# form count. It was dropped the same day — the number is identical down every row of a
+# student, and the Session Summary already names the absentees and the duplicates. The
+# column can be brought back with addForms=True; everything that reads it still works.
+
+WEEKLY_FORMS_COL = "Forms"
+
+# Colouring for the Forms column, used only when addForms=True. 0 = nobody assessed this
+# student, 2+ = more than one form where the session expects one.
+WEEKLY_FORMS_HIGHLIGHT = {0: "grey", 2: "amber", 3: "red"}
+
+# Applied to a duplicate student's rows when there is no Forms column to colour.
+WEEKLY_DUPLICATE_COLOR = "amber"
+
+
+def addWeeklyAttendance(df, roster=None, formsCol=WEEKLY_FORMS_COL,
+                        idCol="student_number", nameCol="student_name",
+                        countCol="assessmentid", addForms=False, addAbsent=True):
+    """Count forms per student and add one blank row per roster student with no data.
+
+    Returns ``(out, stats)``. ``stats`` feeds sessionSummaryLines and styleWeeklySheet and
+    holds: expected, assessed, missing, duplicate, extra (in data but not on the roster),
+    absentDf, duplicateDf, duplicateIds, extraDf, itemCodes, hasRoster.
+
+    The form count is ALWAYS computed — it is what `duplicate` / `duplicateIds` are built
+    from — but it is only written into the sheet as a column when ``addForms=True``
+    (off by default since 18 Aug 2026; the value is identical down every row of a student
+    and the Session Summary names the duplicates instead).
+
+    The count is of DISTINCT ``countCol`` (assessmentid), not rows: a DDS2 form carrying
+    three checklists is ONE form on three rows. Falls back to a row count if assessmentid
+    is absent — which over-counts multi-checklist forms, so keep assessmentid in the frame
+    until after this call.
+
+    Placeholder rows are appended, not sorted — call applyRosterOrder afterwards to fold
+    them into last-name order. They deliberately carry no item_code (see loadWeeklyFiles).
+    """
+    out = df.copy()
+    stats = {"expected": None, "assessed": 0, "missing": 0, "duplicate": 0, "extra": 0,
+             "absentDf": pd.DataFrame(), "duplicateDf": pd.DataFrame(),
+             "extraDf": pd.DataFrame(), "duplicateIds": [], "itemCodes": [],
+             "hasRoster": False}
+
+    if idCol not in out.columns:
+        return out, stats
+
+    if ITEM_CODE_COL in out.columns:
+        stats["itemCodes"] = sorted(out[ITEM_CODE_COL].dropna().astype(str).unique())
+    stats["assessed"] = int(out[idCol].nunique())
+
+    # ── the count, computed BEFORE any placeholder row exists ──────────────────
+    if countCol in out.columns:
+        perStudent = out.groupby(idCol)[countCol].nunique()
+    else:
+        perStudent = out.groupby(idCol).size()
+    if addForms:
+        out[formsCol] = out[idCol].map(perStudent).fillna(0)
+    dup = perStudent[perStudent > 1]
+    stats["duplicate"] = int(len(dup))
+    stats["duplicateIds"] = list(dup.index)
+    if len(dup):
+        names = (out.drop_duplicates(idCol).set_index(idCol)[nameCol]
+                 if nameCol in out.columns else None)
+        stats["duplicateDf"] = pd.DataFrame({
+            idCol: dup.index,
+            nameCol: [names.get(i) if names is not None else None for i in dup.index],
+            formsCol: dup.values})
+
+    # ── one blank row per roster student with nothing in the data ──────────────
+    hasRoster = roster is not None and not getattr(roster, "empty", True)
+    if hasRoster:
+        stats["hasRoster"] = True
+        stats["expected"] = int(len(roster))
+        present = set(out[idCol].dropna())
+        absent = roster[~roster[idCol].isin(present)].copy()
+        stats["missing"] = int(len(absent))
+        stats["extra"] = int(len(present - set(roster[idCol].dropna())))
+        if stats["extra"]:
+            extra = out[~out[idCol].isin(set(roster[idCol].dropna()))]
+            stats["extraDf"] = extra[[c for c in (idCol, nameCol) if c in extra.columns]] \
+                .drop_duplicates().reset_index(drop=True)
+        if addAbsent and not absent.empty:
+            blanks = pd.DataFrame(index=range(len(absent)), columns=out.columns)
+            blanks[idCol] = absent[idCol].values
+            if nameCol in blanks.columns and {"first_name", "last_name"}.issubset(absent.columns):
+                blanks[nameCol] = (absent["first_name"].fillna("").astype(str) + " "
+                                   + absent["last_name"].fillna("").astype(str)).str.strip().values
+            if formsCol in blanks.columns:
+                blanks[formsCol] = 0
+            stats["absentDf"] = pd.DataFrame({
+                idCol: blanks[idCol].values,
+                nameCol: blanks[nameCol].values if nameCol in blanks.columns else None,
+                "notes": (absent["notes"].values if "notes" in absent.columns else None)})
+            # dropna(how='all') keeps the FutureWarning about all-NA frames away and is a
+            # no-op here — every placeholder carries at least a student number.
+            out = pd.concat([out, blanks.dropna(axis=1, how="all")], ignore_index=True)
+            # student_number must not become 1746763.0 in the sheet just because the
+            # placeholder rows introduced NaNs elsewhere.
+            if pd.api.types.is_numeric_dtype(df[idCol]):
+                out[idCol] = pd.to_numeric(out[idCol], errors="coerce").astype("Int64")
+
+    if addForms and formsCol in out.columns:
+        out[formsCol] = pd.to_numeric(out[formsCol], errors="coerce").fillna(0).astype(int)
+        # Sits with the identity block, not the scores: on an absentee row it is the only
+        # non-blank cell after the name, which is what makes the sheet read as a register.
+        anchor = nameCol if nameCol in out.columns else idCol
+        cols = [c for c in out.columns if c != formsCol]
+        at = cols.index(anchor) + 1
+        out = out[cols[:at] + [formsCol] + cols[at:]]
+
+    return out, stats
+
+
+def sessionSummaryLines(stats, date=None, cohort=None, stream=None, formsCol=WEEKLY_FORMS_COL):
+    """(label, value) rows for writeDescriptionSheet — the Session Summary sheet."""
+    lines = [("Session", None)]
+    if date:
+        lines.append(("Date", str(date)))
+    if cohort:
+        lines.append(("Cohort", str(cohort)))
+    if stream:
+        lines.append(("Stream", str(stream)))
+    if stats.get("itemCodes"):
+        lines.append(("Item code(s)", ", ".join(stats["itemCodes"])))
+    lines += [(None, None), ("Attendance", None)]
+
+    if stats.get("hasRoster"):
+        lines.append(("Expected (roster)", str(stats["expected"])))
+    lines.append(("Assessed", str(stats["assessed"])))
+    if stats.get("hasRoster"):
+        lines.append(("Not assessed", str(stats["missing"])))
+    lines.append(("More than one form", str(stats["duplicate"])))
+    if stats.get("extra"):
+        lines.append(("In data but not on the roster", str(stats["extra"])))
+    if not stats.get("hasRoster"):
+        lines.append(("Roster", "Not found for this cohort — no absentee rows were added. "
+                                "Add <COHORT>/<COHORT> Roster <year>.xlsx to enable them."))
+
+    def _names(frame, extra=None):
+        if frame is None or frame.empty:
+            return None
+        parts = []
+        for _, row in frame.iterrows():
+            label = f"{row.iloc[0]} {row.iloc[1]}" if len(row) > 1 and pd.notna(row.iloc[1]) \
+                else str(row.iloc[0])
+            if extra and extra in frame.columns and pd.notna(row.get(extra)):
+                label += f" ({row[extra]})"
+            parts.append(label.strip())
+        return "; ".join(parts)
+
+    absent = _names(stats.get("absentDf"), extra="notes")
+    if absent:
+        lines += [(None, None), ("Not assessed this session", None), ("Students", absent)]
+    dupes = _names(stats.get("duplicateDf"), extra=formsCol)
+    if dupes:
+        lines += [(None, None), ("More than one form", None), ("Students", dupes)]
+    extras = _names(stats.get("extraDf"))
+    if extras:
+        lines += [(None, None), ("Not on the roster", None), ("Students", extras)]
+
+    lines += [(None, None), ("How to read this", None),
+              ("Grey rows", "Roster students with no data this session — the row is a "
+                            "placeholder carrying only a number and a name. It has no item "
+                            "code, which is how loadWeeklyFiles drops it, so an absentee "
+                            "never reaches the combined workbook or the flagging."),
+              ("Amber student number", "That student has more than one form this session — a "
+                                       "repeat, or a duplicate submission. Every session is "
+                                       "expected to be one form per student."),
+              ("Counting", "'More than one form' counts distinct forms, not rows. One form "
+                           "carrying several checklists is one form on several rows."),
+              ("Absent students", "Cross-check against leave applications before treating a "
+                                  "blank row as a missed session — the roster cannot know "
+                                  "about leave.")]
+    return lines
+
+
+def formatWeeklySheet(df, dropCols=None, labels=None, mcBefore=None):
+    """Drop, reorder and relabel a weekly-sim frame for writing to Excel.
+
+    Returns a NEW frame; the caller's is untouched. Pass dropCols=[] / labels={} /
+    mcBefore=None to switch any one of the three steps off.
+
+    The MC move is positional, not a full column list, so a stream that ships an unusual
+    column set (or a future column added to getWeeklySimDataSql) keeps its natural order
+    instead of silently vanishing.
+    """
+    dropCols = WEEKLY_SHEET_DROP_COLS if dropCols is None else dropCols
+    labels = WEEKLY_SHEET_COLUMN_LABELS if labels is None else labels
+    mcBefore = WEEKLY_SHEET_MC_BEFORE if mcBefore is None else mcBefore
+
+    out = df.drop(columns=[c for c in (dropCols or []) if c in df.columns])
+
+    if mcBefore:
+        cols = list(out.columns)
+        mcCols = _sortMcColumns([c for c in cols if re.match(r"^MC\d+$", str(c))])
+        # mcBefore is given as the FINAL label, but this runs pre-rename — accept either.
+        anchors = {mcBefore, WEEKLY_SHEET_COLUMN_LABELS_INVERSE.get(mcBefore, mcBefore)}
+        rest = [c for c in cols if c not in mcCols]
+        anchorAt = next((i for i, c in enumerate(rest) if c in anchors), None)
+        if mcCols and anchorAt is not None:
+            out = out[rest[:anchorAt] + mcCols + rest[anchorAt:]]
+        elif mcCols:
+            out = out[rest + mcCols]          # anchor absent: leave MC at the end
+
+    if labels:
+        out = out.rename(columns={c: labels[c] for c in out.columns if c in labels})
+    return out
+
+
+# ---------------------------------------------------------------------------------------
+# DDS2 simulation STREAMS.
+#
+# From semester 2 DDS2 sim runs three parallel subjects on three different weekdays, each
+# with its own checklist family. They are told apart by ITEM CODE, never by subject code:
+# students pick the subject themselves and get it wrong often (measured on the 2026 data,
+# 76 of 1,859 semester-2 forms carry the wrong subject — 37 FP and 16 Endo forms tagged
+# DENT90146, 23 Paeds tagged DENT90148). The item code, by contrast, comes from the
+# checklist the assessor actually opened, and lines up with the weekday almost perfectly
+# (Paeds 526/526 Mon, FP 733/737 Tue, Endo 578/581 Wed — the strays are catch-ups).
+#
+#   codePatterns are fnmatch globs and are FULL matches, which is what keeps them disjoint:
+#   'Week-*' matches 'Week-01' but NOT 'FP-Week-01' or 'Paeds-2026-Week-01'.
+#   weekday / subject are recorded for reporting and validation only — nothing routes on them.
+#   folder '' means the base Weekly Sim folder itself (semester 1 workbooks already live there).
+#   codePatterns = None means route by DATE RANGE ALONE — everything in the window belongs
+#   to the stream. That is right for BOH2, which runs ONE weekly session whose checklist
+#   code is the free-text task name ('14MODB (534 577) (preparation)'): there is no stable
+#   pattern to match, and no ambiguity to resolve because nothing else shares the day.
+SIM_STREAMS = {
+    "DDS2": {
+        # endDate is None on purpose: students still complete semester-1 checklists
+        # (2026-Week-xx) during semester 2 as catch-ups — 15 such forms by 12 Aug 2026 —
+        # and that work belongs to the semester-1 record, not to whichever stream owned
+        # the day. Set an endDate here if you ever want semester 1 frozen instead.
+        "SEM1": {
+            "name": "Semester 1 Sim", "folder": "", "subject": "DENT90146",
+            "weekday": "Mon", "startDate": None, "endDate": None,
+            "codePatterns": ["2026-Week-*"],
+        },
+        "PAEDS": {
+            "name": "Paediatric Dentistry Sim", "folder": "Paediatrics", "subject": "DENT90146",
+            "weekday": "Mon", "startDate": "2026-07-13", "endDate": None,
+            "codePatterns": ["Paeds*"],
+        },
+        "FP": {
+            "name": "Fixed Prosthodontics Sim", "folder": "Fixed Prosthodontics",
+            "subject": "DENT90148", "weekday": "Tue",
+            "startDate": "2026-06-30", "endDate": None,
+            "codePatterns": ["FP-Week-*"],
+        },
+        "ENDO": {
+            "name": "Endodontics Sim", "folder": "Endodontics", "subject": "DENT90148",
+            "weekday": "Wed", "startDate": "2026-06-30", "endDate": None,
+            "codePatterns": ["Week-*"],
+        },
+    },
+    # BOH2 moved to weekly sessions in semester 2. Verified against the DB 2026-08-17:
+    # every SHY session is a Tuesday carrying exactly one checklist, except the two
+    # advertised choice weeks. Item codes are the task names, so these route on dates only.
+    "BOH2": {
+        "FHY": {
+            "name": "Semester 1 Sim", "folder": "", "subject": "ORAL20005",
+            "weekday": "Tue", "startDate": None, "endDate": "2026-06-14",
+            "codePatterns": None,
+        },
+        "SHY": {
+            "name": "Semester 2 Weekly Sim", "folder": "Weekly SHY", "subject": "ORAL20005",
+            "weekday": "Tue", "startDate": "2026-06-15", "endDate": None,
+            "codePatterns": None,
+        },
+    },
+    # BOH1 (first-year BOH, ORAL10005) runs simulation Tue+Wed in semester 1 and
+    # Mon+Tue+Wed in semester 2. Verified against the CAF dump 2026-09-15: 49 session
+    # dates, 2371 forms. Item codes are task/checklist names ('531', 'OHP1-PL-EO',
+    # 'Instrument Sharpening', ...) with no shared week token, so — exactly like BOH2 —
+    # they route on DATE only (codePatterns=None), never on the code.
+    "BOH1": {
+        "FHY": {
+            "name": "Semester 1 Sim", "folder": "", "subject": "ORAL10005",
+            "weekday": "Tue", "startDate": None, "endDate": "2026-06-14",
+            "codePatterns": None,
+        },
+        "SHY": {
+            "name": "Semester 2 Weekly Sim", "folder": "Weekly SHY", "subject": "ORAL10005",
+            "weekday": "Tue", "startDate": "2026-06-15", "endDate": None,
+            "codePatterns": None,
+        },
+    },
+}
+
+# Back-compat: the DDS2 registry used to be its own module-level dict.
+DDS2_SIM_STREAMS = SIM_STREAMS["DDS2"]
+
+DEFAULT_COHORT = "DDS2"
+STREAM_ALL = "ALL"
+
+
+def cohortStreams(cohort=DEFAULT_COHORT):
+    """Stream registry for one cohort. An unknown cohort raises rather than returning
+    nothing, so a typo can't produce an empty run that looks like 'no data'."""
+    if cohort not in SIM_STREAMS:
+        raise ValueError(f"No sim streams defined for cohort {cohort!r} — known: "
+                         f"{list(SIM_STREAMS)}. Add an entry to SIM_STREAMS.")
+    return SIM_STREAMS[cohort]
+
+
+def weeklySimBaseFolder(cohort=DEFAULT_COHORT):
+    """'DDS2/Weekly Sim', 'BOH2/Weekly Sim', …"""
+    return os.path.join(cohort, "Weekly Sim")
+
+
+def weeklySimFileTemplate(cohort=DEFAULT_COHORT):
+    """'dds2 {date} assessment_data.xlsx' — lower-cased cohort, matching the existing
+    DDS2 filenames exactly so nothing already on disk is orphaned."""
+    return f"{cohort.lower()} {{date}} assessment_data.xlsx"
+
+
+def resolveStreams(stream=STREAM_ALL, streams=None, cohort=DEFAULT_COHORT):
+    """Normalise a stream selector into an ordered list of (key, cfg) pairs.
+
+    Accepts 'ALL', a single key ('PAEDS'), a list of keys (['PAEDS','FP']), or a stream
+    name ('Endodontics Sim'). Case-insensitive. Unknown keys raise rather than silently
+    resolving to nothing.
+    """
+    streams = cohortStreams(cohort) if streams is None else streams
+    if stream is None or (isinstance(stream, str) and stream.strip().upper() == STREAM_ALL):
+        return list(streams.items())
+    wanted = [stream] if isinstance(stream, str) else list(stream)
+    byName = {cfg["name"].strip().casefold(): key for key, cfg in streams.items()}
+    out = []
+    for item in wanted:
+        key = str(item).strip().upper()
+        if key not in streams:
+            key = byName.get(str(item).strip().casefold())
+        if key is None or key not in streams:
+            raise ValueError(f"Unknown stream {item!r} — use 'ALL' or any of {list(streams)}.")
+        if key not in [k for k, _ in out]:
+            out.append((key, streams[key]))
+    return out
+
+
+def streamForItemCode(itemCode, streams=None, cohort=DEFAULT_COHORT):
+    """Which stream an item code belongs to, or None.
+
+    Only streams that declare codePatterns can be identified from a code alone; a
+    date-range stream (codePatterns=None, e.g. all of BOH2) returns None here, because
+    the code genuinely carries no stream information."""
+    streams = cohortStreams(cohort) if streams is None else streams
+    for key, cfg in streams.items():
+        if cfg.get("codePatterns") and matchesIgnoreCode(itemCode, cfg["codePatterns"]):
+            return key
+    return None
+
+
+def streamForDate(date, streams=None, cohort=DEFAULT_COHORT):
+    """Which stream a DATE falls in, for cohorts whose streams route on dates.
+
+    Only consulted when the code patterns cannot answer — a date-range stream carries no
+    information in the item code, so asking streamForItemCode about a BOH2 task name
+    always returns None. The narrowest matching window wins, so a bounded stream beats a
+    catch-all with no dates.
+    """
+    streams = cohortStreams(cohort) if streams is None else streams
+    d = _asDateStr(date)
+    if d is None:
+        return None
+    best, bestSpan = None, None
+    for key, cfg in streams.items():
+        lo, hi = _asDateStr(cfg.get("startDate")), _asDateStr(cfg.get("endDate"))
+        if (lo and d < lo) or (hi and d > hi):
+            continue
+        span = (lo is not None) + (hi is not None)      # more bounds = more specific
+        if bestSpan is None or span > bestSpan:
+            best, bestSpan = key, span
+    return best
+
+
+def weeklySimFolder(baseFolder, streamKey, streams=None, cohort=DEFAULT_COHORT):
+    """Folder a stream's workbooks live in. '' folder -> the base folder itself."""
+    streams = cohortStreams(cohort) if streams is None else streams
+    sub = streams.get(streamKey, {}).get("folder", "") if streamKey else ""
+    return os.path.join(baseFolder, sub) if sub else baseFolder
+
+
+def weeklySimFolders(baseFolder, stream=STREAM_ALL, streams=None, existingOnly=True,
+                     cohort=DEFAULT_COHORT):
+    """Folders to read for a stream selector — a list, so 'ALL' spans every subfolder.
+
+    Deduplicated and (by default) restricted to folders that actually exist, so a pooled
+    read doesn't fail on a stream you haven't built yet.
+    """
+    out = []
+    for key, _ in resolveStreams(stream, streams, cohort):
+        path = weeklySimFolder(baseFolder, key, streams, cohort)
+        if path not in out and (not existingOnly or os.path.isdir(path)):
+            out.append(path)
+    return out
+
+
+def weeklySimOutFolder(baseFolder, stream=STREAM_ALL, streams=None, cohort=DEFAULT_COHORT):
+    """Where a stream-scoped analysis (combined / BLR / risk) should write.
+
+    A single stream writes into that stream's own folder; 'ALL' or several streams
+    write into the base folder, since the result spans them.
+    """
+    selected = resolveStreams(stream, streams, cohort)
+    if len(selected) == 1:
+        return weeklySimFolder(baseFolder, selected[0][0], streams, cohort)
+    return baseFolder
+
+
+def weeklySimOutPath(baseFolder, filename, stream=STREAM_ALL, period=None, streams=None,
+                     cohort=DEFAULT_COHORT):
+    """Full, collision-free output path for a stream-scoped analysis.
+
+    Single stream  -> that stream's own folder, plain filename.
+    Several streams-> base folder with ' (All streams)' inserted before the extension.
+    That suffix is not cosmetic: semester 1's folder IS the base folder, so a pooled
+    run would otherwise overwrite the semester-1 workbook of the same name.
+    ``period`` (optional) adds the usual ' (FHY)' / ' (SHY)' suffix on top.
+    """
+    selected = resolveStreams(stream, streams, cohort)
+    path = os.path.join(weeklySimOutFolder(baseFolder, stream, streams, cohort), filename)
+    if len(selected) > 1:
+        root, ext = os.path.splitext(path)
+        path = f"{root} (All streams){ext}"
+    return periodSuffixPath(path, period) if period else path
+
+
+def _globToSqlLike(pattern):
+    """fnmatch glob -> SQL LIKE pattern ('Paeds*' -> 'Paeds%', 'FP-Week-0?' -> 'FP-Week-0_')."""
+    out = []
+    for ch in str(pattern):
+        if ch == "*":
+            out.append("%")
+        elif ch == "?":
+            out.append("_")
+        elif ch in ("%", "_"):
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _streamCodeSqlFilter(columnExpr, stream=STREAM_ALL, streams=None, cohort=DEFAULT_COHORT):
+    """SQL predicate restricting an item-code column to the selected stream(s).
+
+    Returns 'TRUE' for ALL. Case-insensitive (ILIKE) because the raw DASH codes are not
+    normalised — 'Paeds 2026-Week-1' with a space is matched by 'Paeds%' just the same.
+    """
+    if stream is None or (isinstance(stream, str) and str(stream).strip().upper() == STREAM_ALL):
+        return "TRUE"
+    likes = []
+    for _, cfg in resolveStreams(stream, streams, cohort):
+        if not cfg.get('codePatterns'):
+            return 'TRUE'          # date-range stream: the window already selects it
+        for pattern in cfg["codePatterns"]:
+            likes.append(_globToSqlLike(pattern).replace("%", "%%"))
+    if not likes:
+        return "TRUE"
+    return "(" + " OR ".join(f"{columnExpr} ILIKE '{l}'" for l in likes) + ")"
+
+
+def createWeeklySimWhere(prefix, date=None, minDate=None, maxDate=None,
+                             cohort="DDS2", type_="Simulation"):
+    """WHERE clause shared by every DDS2 weekly-sim query.
+
+    Pass ``date`` for a single day (the original behaviour) and/or ``minDate`` /
+    ``maxDate`` for an inclusive range. All three compare against
+    ``datetimeutc::date``, which resolves in the *Postgres session* timezone.
+    The DASH feed stores each session as local midnight (13:00Z under AEDT,
+    14:00Z under AEST), so the ::date only matches the human-facing session date
+    while the session TimeZone is Australia/Melbourne. Discovery and extraction
+    both go through this helper, so they can never disagree about a date.
+    """
+    clauses = [
+        f"{prefix}.cohort = '{cohort}'",
+        f"{prefix}.submitted_by_assessor",
+        f"{prefix}.type = '{type_}'",
+    ]
+    if date is not None:
+        clauses.insert(0, f"{prefix}.datetimeutc::date = DATE '{date}'")
+    if minDate is not None:
+        clauses.append(f"{prefix}.datetimeutc::date >= DATE '{minDate}'")
+    if maxDate is not None:
+        clauses.append(f"{prefix}.datetimeutc::date <= DATE '{maxDate}'")
+    return "\n      where " + "\n      and ".join(clauses) + "\n      "
+
+def getGlobalRatingSql(date='2026-04-13', minDate=None, maxDate=None,
+                       cohort=DEFAULT_COHORT, type_='Simulation'):
+    """Global-rating distribution for one DDS2 sim date (or an inclusive range).
+
+    v3 shape: scales are nested under assessor_data->'scales' with PREFIXED keys
+    and the graded level lives under ->>'key' (see rawforms-v3-scale-keys).
+    """
+    globalratingsSql = f"""
+    SELECT
+    global_rating,
+    COUNT(*) AS n
+    FROM (
+    SELECT NULLIF(v->>'key','')::int AS global_rating
+    FROM {RAWFORM_FORMS_NAME} f
+    CROSS JOIN LATERAL jsonb_each(COALESCE(f.assessor_data->'scales','{{}}'::jsonb)) k(key, v)
+    {createWeeklySimWhere('f', date, minDate, maxDate, cohort, type_)}
+        AND k.key = 'scale-global-rating'
+    ) x
+    GROUP BY global_rating
+    ORDER BY global_rating;
+    """
+    return globalratingsSql
+
+
+def getWeeklySimDatesSql(minDate=SEMESTER_SPLIT_DATE, maxDate=None,
+                             cohort=DEFAULT_COHORT, type_="Simulation", stream=STREAM_ALL):
+    """SQL listing every assessment date that has weekly-sim data, with counts.
+
+    Returns one row per ``datetimeutc::date`` with:
+      date        - the session date (same expression the data query filters on)
+      n_forms     - forms on that date CARRYING A MATCHING ITEM CODE (see below)
+      n_students  - distinct students on that date
+      week_keys   - comma-separated checklist/item codes used on that date
+                    (e.g. 'FP-Week-03' or 'Paeds-2026-Week-02'), so a low-volume
+                    catch-up day is obvious before you build a workbook for it.
+
+    ``stream`` ('ALL', 'PAEDS', ['FP','ENDO'], …) restricts to that stream's item codes,
+    so the counts are the stream's own — a Monday Paeds day carrying one stray FP form
+    reports 106 under PAEDS and 1 under FP, not 107 under both.
+
+    Note the counts are per (form × matching item code): a form is normally one code, but
+    a form with two checklists counts once per code. That matches what the data query and
+    the workbook produce, which is the number that matters when sanity-checking a build.
+    """
+    codeFilter = _streamCodeSqlFilter("ck.ckey", stream, cohort=cohort)
+    return f"""
+        WITH forms AS (
+            SELECT f.form_code, f.assessmentid, f.student_number,
+                   f.datetimeutc::date AS date,
+                   f.assessor_data
+            FROM {RAWFORM_FORMS_NAME} f
+            {createWeeklySimWhere('f', None, minDate, maxDate, cohort, type_)}
+        ),
+        itemrows AS (
+            SELECT b.date, b.student_number, b.form_code, b.assessmentid, ck.ckey AS item_code
+            FROM forms b
+            CROSS JOIN LATERAL jsonb_each(COALESCE(b.assessor_data,'{{}}'::jsonb)) ck(ckey, cval)
+            WHERE NOT ck.ckey LIKE 'scale-%%'
+              AND ck.ckey NOT IN ('radio','texts','scales','checklists','multi-select')
+              AND jsonb_typeof(ck.cval) = 'object'
+              AND NOT (ck.cval ? 'scale')
+              AND {codeFilter}
+        )
+        SELECT
+            r.date,
+            COUNT(*)                          AS n_forms,
+            COUNT(DISTINCT r.student_number)  AS n_students,
+            string_agg(DISTINCT r.item_code, ', ' ORDER BY r.item_code) AS week_keys
+        FROM itemrows r
+        GROUP BY r.date
+        ORDER BY r.date
+    """
+
+
+def getSubjectMismatchSql(minDate=SEMESTER_SPLIT_DATE, maxDate=None,
+                              cohort=DEFAULT_COHORT, type_="Simulation"):
+    """Every weekly-sim form with its subject code and its item code, for cross-checking.
+
+    Classification never uses ``subject`` (students pick it themselves and get it wrong),
+    but the disagreements are worth chasing, so this pulls both and lets python decide.
+    """
+    return f"""
+        WITH forms AS (
+            SELECT f.form_code, f.assessmentid, f.student_number, f.student_name,
+                   f.student_email, f.assessor_name, f.subject,
+                   f.datetimeutc::date AS date,
+                   f.assessor_data
+            FROM {RAWFORM_FORMS_NAME} f
+            {createWeeklySimWhere('f', None, minDate, maxDate, cohort, type_)}
+        )
+        SELECT b.date, b.student_number, b.student_name, b.student_email,
+               b.assessor_name, b.subject, ck.ckey AS item_code,
+               b.form_code, b.assessmentid
+        FROM forms b
+        CROSS JOIN LATERAL jsonb_each(COALESCE(b.assessor_data,'{{}}'::jsonb)) ck(ckey, cval)
+        WHERE NOT ck.ckey LIKE 'scale-%%'
+          AND ck.ckey NOT IN ('radio','texts','scales','checklists','multi-select')
+          AND jsonb_typeof(ck.cval) = 'object'
+          AND NOT (ck.cval ? 'scale')
+        ORDER BY b.date, b.student_number, ck.ckey
+    """
+
+
+def getWeeklySimDataSql(date='2026-04-13', stream=STREAM_ALL,
+                        cohort=DEFAULT_COHORT, type_='Simulation'):
+    dataSql = f"""
+        WITH base AS (
+        SELECT
+            f.form_code,
+            f.assessmentid,
+            f.student_number,
+            f.student_name,
+            f.student_email,
+            f.assessor_name,
+            f.cohort,
+            f.subject,
+            f.type,
+            f.datetimeutc,
+            f.clinic,
+            f.assessor_reflection,
+            f.student_reflection,
+            f.clinical_incident,
+
+            MAX(CASE WHEN s.key = 'scale-global-rating'       THEN NULLIF(s.value->>'key','')::int END) AS "GR",
+            MAX(CASE WHEN s.key = 'scale-time-mgmt'           THEN NULLIF(s.value->>'key','')::int END) AS "TS",
+            MAX(CASE WHEN s.key = 'scale-communication'       THEN NULLIF(s.value->>'key','')::int END) AS "CS",
+            MAX(CASE WHEN s.key = 'scale-professionalism'     THEN NULLIF(s.value->>'key','')::int END) AS "PS",
+            MAX(CASE WHEN s.key = 'scale-practice-readiness'  THEN NULLIF(s.value->>'key','')::int END) AS "PR",
+            MAX(CASE WHEN s.key = 'scale-position-ergonomics' THEN NULLIF(s.value->>'key','')::int END) AS "PEC"
+
+        FROM {RAWFORM_FORMS_NAME} f
+        LEFT JOIN LATERAL jsonb_each(COALESCE(f.assessor_data->'scales','{{}}'::jsonb)) s(key, value)
+            ON jsonb_typeof(s.value) = 'object' AND (s.value ? 'key')
+        {createWeeklySimWhere('f', date, cohort=cohort, type_=type_)}
+        GROUP BY f.form_code, f.assessmentid
+        ),
+
+        -- One row per (assessment, session key) with per-session avg + raw json
+        sessionChecklist AS (
+        SELECT
+            f.form_code,
+            f.assessmentid,
+            ck.ckey                                    AS item_code,
+            ck.cval                                    AS mc_json,
+            ROUND(AVG(
+            CASE it.value
+                WHEN 'O1' THEN 1.00 WHEN 'O2' THEN 0.80 WHEN 'O3' THEN 0.60
+                WHEN 'O4' THEN 0.40 WHEN 'O5' THEN 0.00
+                WHEN 'Yes' THEN 1.00 WHEN 'No'  THEN 0.00
+                ELSE NULL::numeric
+            END
+            ), 2)                                      AS assessor_score01
+        FROM {RAWFORM_FORMS_NAME} f
+        CROSS JOIN LATERAL jsonb_each(COALESCE(f.assessor_data,'{{}}'::jsonb)) ck(ckey, cval)
+        CROSS JOIN LATERAL jsonb_each_text(ck.cval) it(key, value)
+        {createWeeklySimWhere('f', date, cohort=cohort, type_=type_)}
+            AND NOT ck.ckey LIKE 'scale-%%'
+            AND ck.ckey NOT IN ('radio','texts','scales','checklists','multi-select')
+            AND jsonb_typeof(ck.cval) = 'object'
+            AND NOT (ck.cval ? 'scale')
+            AND {_streamCodeSqlFilter('ck.ckey', stream, cohort=cohort)}
+        GROUP BY f.form_code, f.assessmentid, ck.ckey, ck.cval
+        ),
+
+        studentRubricAvgPerSession AS (
+        SELECT
+            f.form_code,
+            f.assessmentid,
+            ck.ckey                                    AS item_code,
+            ROUND(AVG(
+            CASE it.value
+                WHEN 'O1' THEN 1.00 WHEN 'O2' THEN 0.80 WHEN 'O3' THEN 0.60
+                WHEN 'O4' THEN 0.40 WHEN 'O5' THEN 0.00
+                WHEN 'Yes' THEN 1.00 WHEN 'No'  THEN 0.00
+                ELSE NULL::numeric
+            END
+            ), 2)                                      AS student_score01
+        FROM {RAWFORM_FORMS_NAME} f
+        CROSS JOIN LATERAL jsonb_each(COALESCE(f.student_data,'{{}}'::jsonb)) ck(ckey, cval)
+        CROSS JOIN LATERAL jsonb_each_text(ck.cval) it(key, value)
+        {createWeeklySimWhere('f', date, cohort=cohort, type_=type_)}
+            AND NOT ck.ckey LIKE 'scale-%%'
+            AND ck.ckey NOT IN ('radio','texts','scales','checklists','multi-select')
+            AND jsonb_typeof(ck.cval) = 'object'
+            AND NOT (ck.cval ? 'scale')
+        GROUP BY f.form_code, f.assessmentid, ck.ckey
+        )
+
+        SELECT
+        b.student_number,
+        b.student_name,
+        b.student_email,
+        b.assessor_name,
+        b.subject,
+        sc.item_code,
+        b.datetimeutc::date                          AS date,
+        sc.mc_json,
+        b."GR",
+        b."TS",
+        b."CS",
+        b."PS",
+        b."PR",
+        b."PEC",
+        sc.assessor_score01                          AS "Assessor Score",
+        sr.student_score01                           AS "Student Score",
+        b.clinical_incident,
+        b.assessor_reflection,
+        b.student_reflection,
+        b.assessmentid,
+        b.form_code
+        FROM base b
+        JOIN sessionChecklist sc
+        ON  sc.assessmentid = b.assessmentid
+        AND sc.form_code    = b.form_code
+        LEFT JOIN studentRubricAvgPerSession sr
+        ON  sr.assessmentid = b.assessmentid
+        AND sr.form_code    = b.form_code
+        AND sr.item_code    = sc.item_code
+        ORDER BY b.cohort, b.student_number, b.datetimeutc, b.form_code, sc.item_code;
+        """
+    return dataSql
+
+_WEEK_KEY_RE = re.compile(r'^(?P<prefix>.*?)[-\s]*Week[-\s]*(?P<num>\d{1,2})$', re.IGNORECASE)
+
+
+def standardizeWeekFormat(itemCode):
+    """Normalise a weekly checklist / item code so it sorts and groups correctly.
+
+    Handles every family DDS2 has used in 2026 (verified against the raw pull):
+      sem 1 : '2026-Week-1'        -> '2026-Week-01'
+      sem 2 : 'Week-01'            -> 'Week-01'          (unchanged)
+              'FP-Week-3'          -> 'FP-Week-03'
+              'Paeds 2026-Week-1'  -> 'Paeds-2026-Week-01'
+              'Paeds-2026-Week-2'  -> 'Paeds-2026-Week-02'
+
+    Two things are fixed: the week number is always zero-padded to 2 digits, and
+    the separator before 'Week' is always a hyphen. DDS2 sem 2 shipped the Paeds
+    checklist under BOTH 'Paeds 2026-Week-1' (space) and 'Paeds-2026-Week-2'
+    (hyphen), which otherwise split one item into two in every pivot.
+    Non-week codes (e.g. 'positioning', 'DDS2-MAR-31', '19-Jan-SIM') pass through
+    untouched. Used by both getChecklistBank and the weekly-sim builders, so the
+    checklist bank and the data always agree on a key.
+    """
+    if not isinstance(itemCode, str):
+        return itemCode
+    m = _WEEK_KEY_RE.match(itemCode.strip())
+    if not m:
+        return itemCode
+    prefix = re.sub(r'[\s-]+', '-', m.group('prefix').strip()).strip('-')
+    num = m.group('num').zfill(2)
+    return f"{prefix}-Week-{num}" if prefix else f"Week-{num}"
+
+
+def _sortMcColumns(columns):
+    """Order MC columns numerically (MC1, MC2, ... MC10) instead of lexically."""
+    def key(col):
+        m = re.match(r'^MC(\d+)$', str(col))
+        return (0, int(m.group(1))) if m else (1, str(col))
+    return sorted(columns, key=key)
+
+def addAssessmentCharts(filepath, sheet1Name='Sheet1', chartSheetName='Charts', blrFilter=None):
+    """
+    Adds charts on a second sheet:
+      1. Student Score vs Assessor Score (scatter)
+      2. GR counts (bar)
+      3. Assessor Score vs GR (scatter with trendline, optionally filtered)
+    """
+    wb = load_workbook(filepath)
+    ws1 = wb[sheet1Name]
+
+    if chartSheetName in wb.sheetnames:
+        del wb[chartSheetName]
+    ws2 = wb.create_sheet(chartSheetName)
+
+    # Column letters from dataDf order (openpyxl is 1-indexed)
+    headers = {cell.value: cell.column for cell in ws1[1]}
+    grCol = headers['GR']
+    assessorCol = headers['Assessor Score']
+    studentCol = headers['Student Score']
+    nRows = ws1.max_row
+    lightGrid = ChartLines(
+        spPr=GraphicalProperties(ln=LineProperties(solidFill="D9D9D9"))
+    )
+    
+
+    # ── Chart 1: Student Score vs Assessor Score ─────────────────
+    chart1 = ScatterChart()
+    chart1.title = "Student Score vs Assessor Score"
+    chart1.x_axis.title = "Assessor Score"
+    chart1.y_axis.title = "Student Score"
+    chart1.x_axis.scaling.min = 0
+    chart1.x_axis.scaling.max = 1
+    chart1.y_axis.scaling.min = 0
+    chart1.y_axis.scaling.max = 1
+    chart1.x_axis.majorUnit = 0.1
+    chart1.x_axis.majorTickMark = "out"
+    chart1.x_axis.delete = False
+    chart1.y_axis.majorUnit = 0.1
+    chart1.y_axis.majorTickMark = "out"
+    chart1.y_axis.delete = False
+    chart1.legend = None
+    chart1.height = 10
+    chart1.width = 15
+    chart1.y_axis.majorGridlines = lightGrid
+    xRef = Reference(ws1, min_col=assessorCol, min_row=2, max_row=nRows)
+    yRef = Reference(ws1, min_col=studentCol, min_row=2, max_row=nRows)
+    s1 = Series(yRef, xRef, title="Scores")
+    s1.marker = Marker(
+        symbol='circle',
+        size=6,
+        spPr=GraphicalProperties(solidFill="1F77B4", ln=LineProperties(solidFill="1F77B4"))
+    )
+    s1.graphicalProperties = GraphicalProperties(ln=LineProperties(noFill=True))
+    chart1.series.append(s1)
+        # ── 45-degree reference line ─────────────────
+    # Write helper values somewhere off-screen on ws2
+    refRow = 80
+    ws2.cell(row=refRow,     column=5, value=0)
+    ws2.cell(row=refRow,     column=6, value=0)
+    ws2.cell(row=refRow + 1, column=5, value=1)
+    ws2.cell(row=refRow + 1, column=6, value=1)
+
+    xRefLine = Reference(ws2, min_col=5, min_row=refRow, max_row=refRow + 1)
+    yRefLine = Reference(ws2, min_col=6, min_row=refRow, max_row=refRow + 1)
+
+    refSeries = Series(yRefLine, xRefLine, title="y = x")
+    refSeries.marker = Marker(symbol='none')
+    refSeries.graphicalProperties = GraphicalProperties(
+        ln=LineProperties(solidFill="888888", prstDash="dash", w=9525)
+    )
+    chart1.series.append(refSeries)
+    ws2.add_chart(chart1, "A1")
+
+    
+    # ── Chart 2: GR counts bar ─────────────────
+    grValues = [row[0] for row in ws1.iter_rows(
+        min_row=2, min_col=grCol, max_col=grCol, values_only=True) if row[0] is not None]
+    grCounts = pd.Series(grValues).value_counts().sort_index()
+
+    startRow = 45
+    ws2.cell(row=startRow, column=1, value='GR')
+    ws2.cell(row=startRow, column=2, value='Count')
+    for i, (gr, cnt) in enumerate(grCounts.items(), start=1):
+        ws2.cell(row=startRow + i, column=1, value=int(gr))
+        ws2.cell(row=startRow + i, column=2, value=int(cnt))
+
+    chart2 = BarChart()
+    chart2.title = "Global Rating Distribution"
+    chart2.x_axis.title = "GR"
+    chart2.y_axis.title = "Count"
+    chart2.legend = None
+    chart2.height = 10
+    chart2.width = 15
+    chart2.y_axis.majorGridlines = lightGrid
+
+    dataRef = Reference(ws2, min_col=2, min_row=startRow, max_row=startRow + len(grCounts))
+    catRef = Reference(ws2, min_col=1, min_row=startRow + 1, max_row=startRow + len(grCounts))
+    chart2.add_data(dataRef, titles_from_data=True)
+    chart2.set_categories(catRef)
+
+    # Uniform blue color for all bars
+    chart2.series[0].graphicalProperties = GraphicalProperties(solidFill="1F77B4")
+
+    # Show value labels on top of bars
+    chart2.dataLabels = DataLabelList(
+        showVal=True,
+        showCatName=False,
+        showSerName=False,
+        showLegendKey=False,
+    )
+
+    # Ensure x-axis tick labels are shown
+    chart2.x_axis.delete = False
+    chart2.y_axis.delete = False
+
+    ws2.add_chart(chart2, "J1")
+
+# ── Chart 3: Assessor Score vs GR ─────────────────
+    chart3 = ScatterChart()
+    chart3.title = "Assessor Score vs GR"
+    chart3.x_axis.title = "GR"
+    chart3.y_axis.title = "Assessor Score"
+    chart3.legend = None
+    chart3.height = 10
+    chart3.width = 15
+
+    chart3.x_axis.delete = False
+    chart3.y_axis.delete = False
+    chart3.x_axis.scaling.min = 0
+    chart3.x_axis.scaling.max = 5
+    chart3.x_axis.majorUnit = 1
+    chart3.x_axis.majorTickMark = "out"
+    chart3.y_axis.scaling.min = 0
+    chart3.y_axis.scaling.max = 1
+    chart3.y_axis.majorUnit = 0.1
+    chart3.y_axis.majorTickMark = "out"
+    chart3.y_axis.number_format = '0.0'
+
+    xRef3 = Reference(ws1, min_col=grCol, min_row=2, max_row=nRows)
+    yRef3 = Reference(ws1, min_col=assessorCol, min_row=2, max_row=nRows)
+
+    s3 = Series(yRef3, xRef3, title="Assessor Score vs GR")
+    s3.marker = Marker(
+        symbol='circle',
+        size=6,
+        spPr=GraphicalProperties(solidFill="1F77B4", ln=LineProperties(solidFill="1F77B4"))
+    )
+    s3.graphicalProperties = GraphicalProperties(ln=LineProperties(noFill=True))
+    s3.trendline = Trendline(trendlineType='linear', dispEq=True, dispRSqr=True)
+    chart3.series.append(s3)
+    ws2.add_chart(chart3, "A22")
+
+    wb.save(filepath)
+
+
+# ------ DDS2 weekly sim: date discovery + batch workbook build ─────────────────
+def _asDateStr(value):
+    """Coerce str / date / datetime / pd.Timestamp to 'YYYY-MM-DD'."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+def getWeeklySimDates(engine, minDate=SEMESTER_SPLIT_DATE, maxDate=None,
+                          cohort=DEFAULT_COHORT, type_="Simulation", minForms=1,
+                          stream=STREAM_ALL, useStreamDates=True):
+    """Every DDS2 weekly-sim assessment date in the DB, as a DataFrame.
+
+    Columns: date (str 'YYYY-MM-DD'), n_forms, n_students, week_keys, and — when a single
+    stream is selected — weekday plus offWeekday (True if the session did not fall on that
+    stream's usual day, i.e. a catch-up).
+
+    ``minDate`` defaults to SEMESTER_SPLIT_DATE ('2026-06-15') so semester 1
+    — whose workbooks are already built — is never returned. Pass minDate=None to
+    see the whole year.
+
+    ``stream`` restricts to one stream's item codes. With ``useStreamDates`` (default) the
+    stream's own startDate/endDate are applied too, intersected with minDate/maxDate — so
+    getWeeklySimDates(engine, stream='PAEDS') gives Paeds Mondays from 13 July with no
+    other arguments. An explicit minDate/maxDate always narrows further, never widens.
+
+    ``minForms`` drops low-volume days. DDS2 has a handful of 1-3 form days that
+    are individual catch-ups/tests rather than a cohort session; leave it at 1 to
+    see everything, raise it (e.g. 20) to list only real sessions.
+    """
+    minDate, maxDate = _asDateStr(minDate), _asDateStr(maxDate)
+    selected = resolveStreams(stream, cohort=cohort)
+    if useStreamDates and len(selected) == 1:
+        cfg = selected[0][1]
+        sMin, sMax = _asDateStr(cfg.get("startDate")), _asDateStr(cfg.get("endDate"))
+        minDate = max([d for d in (minDate, sMin) if d], default=None)
+        maxDate = min([d for d in (maxDate, sMax) if d], default=None)
+
+    sql = getWeeklySimDatesSql(minDate, maxDate, cohort, type_, stream)
+    df = readDf(engine, sql)
+    if df.empty:
+        return pd.DataFrame(columns=["date", "n_forms", "n_students", "week_keys"])
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    # Normalise the discovered checklist codes the same way the data build does.
+    df["week_keys"] = df["week_keys"].apply(
+        lambda s: ", ".join(sorted({standardizeWeekFormat(k.strip()) for k in s.split(",")}))
+        if isinstance(s, str) and s else s
+    )
+    if len(selected) == 1:
+        expected = selected[0][1].get("weekday")
+        df["weekday"] = pd.to_datetime(df["date"]).dt.strftime("%a")
+        if expected:
+            df["offWeekday"] = df["weekday"] != expected
+    if minForms and minForms > 1:
+        df = df[df["n_forms"] >= minForms]
+    return df.reset_index(drop=True)
+
+
+def getSubjectMismatches(engine, minDate=SEMESTER_SPLIT_DATE, maxDate=None,
+                             cohort=DEFAULT_COHORT, type_="Simulation", onlyMismatches=True):
+    """Forms whose subject code disagrees with the subject implied by their item code.
+
+    Students choose the subject themselves, so it is wrong often enough to be misleading
+    (76 of 1,859 semester-2 forms in 2026). Nothing in the pipeline routes on ``subject``
+    — this report exists purely so the bad ones can be chased and corrected in DASH.
+
+    Returns date | student_number | student_name | student_email | assessor_name |
+    item_code | stream | subject | expected_subject | weekday | expected_weekday |
+    off_weekday | form_code | assessmentid.
+    Rows whose item code belongs to no known stream are always returned (stream = None),
+    since those cannot be checked and are worth eyeballing too.
+    """
+    df = readDf(engine, getSubjectMismatchSql(_asDateStr(minDate), _asDateStr(maxDate),
+                                                  cohort, type_))
+    if df.empty:
+        return df
+    df["item_code"] = df["item_code"].apply(standardizeWeekFormat)
+    streams = cohortStreams(cohort)
+    # A cohort with no code-pattern streams (BOH2) cannot be classified from the item
+    # code at all, so fall back to the date window. Without this every correctly-tagged
+    # form looks like a mismatch — 329 false positives out of 337 on BOH2 SHY.
+    usesCodes = any(c.get("codePatterns") for c in streams.values())
+    if usesCodes:
+        df["stream"] = df["item_code"].apply(lambda c: streamForItemCode(c, streams, cohort))
+    else:
+        df["stream"] = df["date"].apply(lambda d: streamForDate(d, streams, cohort))
+    df["expected_subject"] = df["stream"].map(
+        lambda k: streams[k]["subject"] if k in streams else None)
+    df["expected_weekday"] = df["stream"].map(
+        lambda k: streams[k]["weekday"] if k in streams else None)
+    df["date"] = pd.to_datetime(df["date"])
+    df["weekday"] = df["date"].dt.strftime("%a")
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    df["off_weekday"] = (df["expected_weekday"].notna()
+                         & (df["weekday"] != df["expected_weekday"]))
+    cols = ["date", "weekday", "student_number", "student_name", "student_email",
+            "assessor_name", "item_code", "stream", "subject", "expected_subject",
+            "expected_weekday", "off_weekday", "form_code", "assessmentid"]
+    df = df[cols]
+    if onlyMismatches:
+        bad = df["stream"].isna() | (df["subject"] != df["expected_subject"])
+        df = df[bad]
+    return df.reset_index(drop=True)
+
+
+def _sanitizeCodeForFilename(code):
+    """Make one item code safe to embed in a Windows filename: strip the reserved
+    characters <>:\"/\\|?* (BOH1 codes include '/' and '*', e.g. '11/12 explorer',
+    'OHP1-PL-*'), collapse whitespace and stray dashes."""
+    s = re.sub(r'[<>:"/\\|?*]+', '-', str(code).strip())
+    s = re.sub(r'\s+', ' ', s)
+    s = re.sub(r'-+', '-', s).strip(' -')
+    return s or 'code'
+
+
+def subsetSuffixPath(path, includeCodeList, maxTagLen=80):
+    """Tag a filtered build's filename with the ACTUAL item codes it was restricted to, so a
+    subset workbook is self-describing and never overwrites the complete workbook of the same
+    name (e.g. 'boh1 2026-07-07 assessment_data (531, 532).xlsx'). Returns the path unchanged
+    when includeCodeList is empty/None.
+
+    Codes are sanitised for the filesystem (see _sanitizeCodeForFilename). If the joined tag
+    would be too long for the path it is truncated to as many codes as fit plus '+N more' — two
+    very different large selections could then share a name, so keep selections small when you
+    care about distinct files. The tag always sits inside '(...)' before the extension, so the
+    name never ends in 'assessment_data.xlsx' and subset files stay invisible to the
+    combined/BLR reader (DEFAULT_FILE_PATTERN)."""
+    if not includeCodeList:
+        return path
+    root, ext = os.path.splitext(path)
+    codes = [_sanitizeCodeForFilename(c) for c in includeCodeList]
+    tag = ", ".join(codes)
+    if len(tag) > maxTagLen or len(codes) > 6:
+        shown, used = [], 0
+        for c in codes:
+            if used + len(c) + 2 > maxTagLen:
+                break
+            shown.append(c); used += len(c) + 2
+        remaining = len(codes) - len(shown)
+        tag = ", ".join(shown) + (f" +{remaining} more" if remaining else "")
+    return f"{root} ({tag}){ext}"
+
+
+def buildWeeklySimWorkbook(engine, date, folder=None, scoreMap=None,
+                               fileTemplate=None,
+                               blrFilter="BLR", sheet1Name="Sheet1", chartSheetName="Charts",
+                               returnDf=False, stream=STREAM_ALL,
+                               cohort=DEFAULT_COHORT, type_="Simulation",
+                               mcScale=None, roster=None, styleSheet=False,
+                               grLevels=None, mcLevels=None,
+                               dropCols=None, labels=None, mcBefore=None,
+                               addForms=False, addAbsent=True,
+                               summarySheet=True, summarySheetName="Session Summary",
+                               includeCodeList=None):
+    """Build ONE weekly-sim workbook for a single date. Returns the file path.
+
+    This is the old notebook ``createDateReport`` lifted out of main.ipynb, with
+    the v3 data pull, week-key normalisation and numeric MC column ordering.
+
+    ``stream`` restricts the workbook to one stream's item codes. ``folder`` is used
+    as given — the caller decides the subfolder (see weeklySimFolder).
+
+    mcScale     '0-1' (default, unchanged) or '1-5' for the MC columns — see
+                WEEKLY_MC_SCALES. ``scoreMap`` still wins if given explicitly.
+    roster      order rows by LAST NAME and add last_name / first_name columns.
+                Students not on the roster are kept, at the end.
+    styleSheet  navy header, freeze panes, GR and MC level colouring.
+    addForms    also write the per-row ``Forms`` column (distinct forms per student this
+                session). OFF by default — the count is the same down every row of a
+                student, and the Session Summary names the duplicates instead. The count
+                is computed either way; only the column is optional.
+    addAbsent   append a blank row per roster student with no data, so the sheet doubles
+                as an attendance register. Needs ``roster``; without one it is a no-op.
+                Absentee rows are greyed, and a student with more than one form gets an
+                amber Student Number cell (both need styleSheet=True).
+    summarySheet / summarySheetName
+                a "Session Summary" sheet between Sheet1 and Charts: expected / assessed /
+                missing / duplicate counts and the named students behind each.
+    dropCols/labels/mcBefore
+                overrides for the sheet presentation — see formatWeeklySheet. The
+                defaults drop student_email/date/assessmentid/form_code, put the MC
+                block before "Assessor Score" and relabel to Title Case. Pass
+                dropCols=[], labels={}, mcBefore=False for the pre-2026-08-18 layout.
+
+    With returnDf=True the frame returned is the one WRITTEN (dropped, reordered and
+    relabelled), so it matches the file. Use getWeeklySimDataSql directly if you want
+    the raw pull.
+    """
+    date = _asDateStr(date)
+    resolvedMap, scaleLabel = resolveMcScale(mcScale)
+    scoreMap = resolvedMap if scoreMap is None else scoreMap
+    if mcLevels is None:
+        mcLevels = WEEKLY_MC_HIGHLIGHT_BY_SCALE.get(scaleLabel)
+    folder = weeklySimBaseFolder(cohort) if folder is None else folder
+    fileTemplate = weeklySimFileTemplate(cohort) if fileTemplate is None else fileTemplate
+    os.makedirs(folder, exist_ok=True)
+    filePath = subsetSuffixPath(os.path.join(folder, fileTemplate.format(date=date)),
+                                includeCodeList)
+
+    dataDf = readDf(engine, getWeeklySimDataSql(date, stream, cohort, type_))
+    if dataDf.empty:
+        print(f"  [{date}] no rows returned — nothing written.")
+        return (None, dataDf) if returnDf else None
+
+    dataDf[ITEM_CODE_COL] = dataDf[ITEM_CODE_COL].apply(standardizeWeekFormat)
+
+    # ONLY_CODES whitelist: keep just the chosen item codes (same wildcard matcher as the
+    # ignore list, inverted). Applied before the MC expand / attendance so the sheet, its
+    # charts and its summary all reflect the subset.
+    if includeCodeList:
+        dataDf = dataDf[dataDf[ITEM_CODE_COL].apply(
+            lambda c: matchesIgnoreCode(c, includeCodeList))].reset_index(drop=True)
+        if dataDf.empty:
+            print(f"  [{date}] no rows match includeCodeList — nothing written.")
+            return (None, dataDf) if returnDf else None
+
+    # Expand the flattened checklist json ({'MC1': 'O2', ...}) into MC columns.
+    mcDf = pd.json_normalize(dataDf["mc_json"])
+    mcDf = mcDf.replace(scoreMap)
+    mcDf = mcDf.apply(pd.to_numeric, errors="coerce")
+    mcDf = mcDf[_sortMcColumns(mcDf.columns)]
+
+    dataDf = pd.concat([dataDf.drop(columns=["mc_json"]), mcDf], axis=1)
+
+    # Attendance BEFORE ordering, so the placeholder rows are sorted in with everyone else
+    # and the sheet reads as one alphabetical register rather than data + an appendix.
+    dataDf, sessionStats = addWeeklyAttendance(
+        dataDf, roster if addAbsent else None, addForms=addForms, addAbsent=addAbsent)
+
+    if roster is not None and not roster.empty:
+        dataDf, _notOnRoster, _noData = applyRosterOrder(dataDf, roster)
+
+    # Presentation last: applyRosterOrder above still works on snake_case, and everything
+    # from here down (styling, charts) sees exactly what lands in the file.
+    sheetDf = formatWeeklySheet(dataDf, dropCols=dropCols, labels=labels, mcBefore=mcBefore)
+
+    sheetDf.to_excel(filePath, index=False)
+    with pd.ExcelWriter(filePath, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+        ws = writer.sheets[sheet1Name]
+        autoFitColumns(ws)
+        if styleSheet:
+            styleWeeklySheet(ws, sheetDf, grLevels=grLevels, mcLevels=mcLevels,
+                             duplicateIds=sessionStats.get("duplicateIds"))
+        if summarySheet:
+            writeDescriptionSheet(
+                writer.book,
+                sessionSummaryLines(sessionStats, date=date, cohort=cohort,
+                                    stream=None if stream == STREAM_ALL else stream),
+                title=f"{cohort} session summary — {date}",
+                sheetName=summarySheetName, index=None)     # after Sheet1, before Charts
+
+    addAssessmentCharts(filePath, sheet1Name=sheet1Name,
+                            chartSheetName=chartSheetName, blrFilter=blrFilter)
+    return (filePath, sheetDf) if returnDf else filePath
+
+
+_BUILD_SUMMARY_COLS = ["stream", "date", "n_forms", "n_students", "week_keys", "status", "path"]
+
+
+def _buildWeeklySimForOneStream(engine, folder, streamKey, dates, minDate, maxDate,
+                                skipExisting, minForms, dryRun, scoreMap, fileTemplate,
+                                blrFilter, cohort, type_, useStreamDates,
+                                mcScale=None, roster=None, styleSheet=False,
+                                grLevels=None, mcLevels=None,
+                                dropCols=None, labels=None, mcBefore=None,
+                                addForms=False, addAbsent=True,
+                                summarySheet=True, summarySheetName="Session Summary",
+                                includeCodeList=None):
+    """One stream (or the legacy unsplit run when streamKey is None). Internal."""
+    streams = cohortStreams(cohort)
+    label = streams[streamKey]["name"] if streamKey else "all item codes (unsplit)"
+    outFolder = weeklySimFolder(folder, streamKey, streams, cohort) if streamKey else folder
+    codeSel = streamKey if streamKey else STREAM_ALL
+
+    if streamKey and useStreamDates:
+        cfg = streams[streamKey]
+        sMin, sMax = _asDateStr(cfg.get("startDate")), _asDateStr(cfg.get("endDate"))
+        minDate = max([d for d in (minDate, sMin) if d], default=None)
+        maxDate = min([d for d in (maxDate, sMax) if d], default=None)
+
+    print(f"\n=== {label} -> {outFolder}"
+          f"  (minDate={minDate}, maxDate={maxDate}) ===")
+    os.makedirs(outFolder, exist_ok=True)
+
+    discovered = getWeeklySimDates(engine, minDate=minDate, maxDate=maxDate,
+                                       cohort=cohort, type_=type_, minForms=1,
+                                       stream=codeSel, useStreamDates=False)
+    counts = discovered.set_index("date").to_dict("index") if not discovered.empty else {}
+
+    if dates is None:
+        plan = list(counts.keys())
+    else:
+        if isinstance(dates, (str, pd.Timestamp)) or not hasattr(dates, "__iter__"):
+            dates = [dates]
+        plan = [_asDateStr(d) for d in dates]
+
+    rows = []
+    skippedNoMatch = 0
+    for date in plan:
+        info = counts.get(date, {})
+        nForms = info.get("n_forms", 0)
+        row = {"stream": streamKey, "date": date, "n_forms": nForms,
+               "n_students": info.get("n_students", 0),
+               "week_keys": info.get("week_keys"), "status": None, "path": None}
+        filePath = subsetSuffixPath(os.path.join(outFolder, fileTemplate.format(date=date)),
+                                    includeCodeList)
+
+        # ONLY_CODES: a date whose codes include none of the whitelisted codes produces no
+        # subset workbook. Skip it quietly rather than listing every date — this is what makes
+        # the dry-run plan show only the code files you asked for.
+        if includeCodeList and date in counts:
+            keys = [k.strip() for k in str(info.get("week_keys") or "").split(",") if k.strip()]
+            if not any(matchesIgnoreCode(k, includeCodeList) for k in keys):
+                row["status"] = "skipped-no-match"
+                rows.append(row)
+                skippedNoMatch += 1
+                continue
+
+        if (minDate and date < minDate) or (maxDate and date > maxDate):
+            row["status"] = "skipped-out-of-range"
+        elif date not in counts:
+            row["status"] = "no-rows"
+        elif minForms and nForms < minForms:
+            row["status"] = "skipped-low-volume"
+        elif skipExisting and os.path.exists(filePath):
+            row["status"] = "skipped-exists"
+            row["path"] = filePath
+        elif dryRun:
+            row["status"] = "planned"
+            row["path"] = filePath
+        else:
+            try:
+                built = buildWeeklySimWorkbook(
+                    engine, date, folder=outFolder, scoreMap=scoreMap,
+                    fileTemplate=fileTemplate, blrFilter=blrFilter, stream=codeSel,
+                    cohort=cohort, type_=type_, mcScale=mcScale, roster=roster,
+                    styleSheet=styleSheet, grLevels=grLevels, mcLevels=mcLevels,
+                    dropCols=dropCols, labels=labels, mcBefore=mcBefore,
+                    addForms=addForms, addAbsent=addAbsent,
+                    summarySheet=summarySheet, summarySheetName=summarySheetName,
+                    includeCodeList=includeCodeList)
+                row["status"] = "built" if built else "no-rows"
+                row["path"] = built
+            except Exception as exc:                      # keep going through the batch
+                row["status"] = f"error: {type(exc).__name__}: {exc}"
+        rows.append(row)
+        offDay = " *off-day" if info.get("offWeekday") else ""
+        tail = f"  -> {os.path.basename(row['path'])}" if (includeCodeList and row['path']) else ""
+        print(f"  {date}  n={row['n_forms']:>4}  {row['status']:<22} "
+              f"{row['week_keys'] or ''}{offDay}{tail}")
+    if includeCodeList and skippedNoMatch:
+        print(f"  ({skippedNoMatch} date(s) skipped \u2014 no ONLY_CODES match)")
+    if not rows:
+        print("  (no dates)")
+    return rows
+
+
+def buildWeeklySimReports(engine, folder=None, dates=None,
+                              minDate=SEMESTER_SPLIT_DATE, maxDate=None,
+                              skipExisting=True, minForms=1, dryRun=False,
+                              scoreMap=None, fileTemplate=None,
+                              blrFilter="BLR", cohort=DEFAULT_COHORT, type_="Simulation",
+                              stream=None, useStreamDates=True,
+                              mcScale=None, roster=None, styleSheet=False,
+                              grLevels=None, mcLevels=None,
+                              dropCols=None, labels=None, mcBefore=None,
+                              addForms=False, addAbsent=True,
+                              summarySheet=True, summarySheetName="Session Summary",
+                              includeCodeList=None):
+    """Build weekly-sim workbooks, optionally split by stream into subfolders.
+
+    Parameters
+    ----------
+    stream       : None (default) = the original unsplit behaviour — one workbook per date
+                   containing every item code, written straight into ``folder``.
+                   'ALL' = build every stream in DDS2_SIM_STREAMS, each into its own
+                   subfolder (Paediatrics / Fixed Prosthodontics / Endodontics; semester 1
+                   has folder '' so it stays in the base folder).
+                   A key or list of keys ('PAEDS', ['FP','ENDO']) builds just those.
+                   Rows are routed by ITEM CODE, so a catch-up FP form filled on a Paeds
+                   Monday lands in the Fixed Prosthodontics folder under its real date.
+    useStreamDates : intersect each stream's own startDate/endDate with minDate/maxDate.
+                   On by default, so stream='ALL' needs no dates at all.
+    dates        : explicit list of dates ('2026-07-13', date, Timestamp — mixed is
+                   fine). If None, the dates are read from the DB via
+                   getWeeklySimDates and filtered by minDate/maxDate/minForms.
+                   An explicit list is still filtered by minDate/maxDate so a stray
+                   semester-1 date can't sneak back in; pass minDate=None to disable.
+                   With stream='ALL' the same list is offered to every stream.
+    minDate      : inclusive lower bound, default SEMESTER_SPLIT_DATE
+                   ('2026-06-15') = the semester 1 / semester 2 boundary, so
+                   already-built semester 1 workbooks are never reconsidered.
+                   Pass None to let each stream's own startDate decide.
+    maxDate      : inclusive upper bound. For semester 1 use
+                   minDate=None, maxDate='2026-06-14'.
+    skipExisting : True (default) never overwrites an existing workbook — the run
+                   is safe to repeat weekly. Set False to force a rebuild.
+    minForms     : skip dates with fewer than this many forms IN THAT STREAM.
+    dryRun       : print/return the plan without touching any file.
+
+    addForms / addAbsent / summarySheet / summarySheetName
+                 : attendance options, passed straight to buildWeeklySimWorkbook. The
+                   absentee rows need a `roster=`; without one they are a no-op.
+    dropCols/labels/mcBefore
+                 : sheet presentation overrides, passed straight to formatWeeklySheet.
+                   Defaults give the 2026-08-18 layout (Title Case headers, MC block
+                   before "Assessor Score", no student_email/date/assessmentid/form_code).
+
+    Returns a summary DataFrame: stream, date, n_forms, n_students, week_keys, status, path.
+    ``status`` is one of built / skipped-exists / skipped-low-volume /
+    skipped-out-of-range / no-rows / planned / error.
+    """
+    minDate, maxDate = _asDateStr(minDate), _asDateStr(maxDate)
+    folder = weeklySimBaseFolder(cohort) if folder is None else folder
+    fileTemplate = weeklySimFileTemplate(cohort) if fileTemplate is None else fileTemplate
+    os.makedirs(folder, exist_ok=True)
+
+    streamKeys = [None] if stream is None else [k for k, _ in resolveStreams(stream, cohort=cohort)]
+
+    rows = []
+    for key in streamKeys:
+        rows += _buildWeeklySimForOneStream(
+            engine, folder, key, dates, minDate, maxDate, skipExisting, minForms,
+            dryRun, scoreMap, fileTemplate, blrFilter, cohort, type_, useStreamDates,
+            mcScale, roster, styleSheet, grLevels, mcLevels,
+            dropCols, labels, mcBefore,
+            addForms, addAbsent, summarySheet, summarySheetName,
+            includeCodeList=includeCodeList)
+
+    summary = pd.DataFrame(rows, columns=_BUILD_SUMMARY_COLS)
+    built = (summary["status"] == "built").sum() if not summary.empty else 0
+    print(f"\n{'DRY RUN — ' if dryRun else ''}{len(summary)} (stream, date) pair(s) considered, "
+          f"{built} workbook(s) written under {folder}"
+          f"  (stream={stream}, skipExisting={skipExisting}, minForms={minForms})")
+
+    # A split run silently leaves behind any item code that matches no stream. Say so —
+    # otherwise the per-stream workbooks look like a complete account of the data.
+    if stream is not None:
+        try:
+            allCodes = readDf(engine, getWeeklySimDatesSql(minDate, maxDate, cohort,
+                                                               type_, STREAM_ALL))
+            seen = {standardizeWeekFormat(c.strip())
+                    for s in allCodes.get("week_keys", pd.Series(dtype=str)).dropna()
+                    for c in str(s).split(",")}
+            streams = cohortStreams(cohort)
+            # Only meaningful for cohorts that route by code; a date-range cohort has no
+            # notion of an unclassified code, so skip the check entirely.
+            if not any(c.get("codePatterns") for c in streams.values()):
+                orphans = []
+            else:
+                orphans = sorted(c for c in seen
+                                 if streamForItemCode(c, streams, cohort) is None)
+            if orphans:
+                print(f"  NOTE: {len(orphans)} item code(s) belong to no stream and were not "
+                      f"built: {', '.join(orphans)}")
+        except Exception as exc:                      # never let a report kill the build
+            print(f"  (unclassified-code check skipped: {type(exc).__name__}: {exc})")
+    return summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Combined-workbook styling
+#
+# Same palette and conventions as flagging_utils.py so the two families of
+# workbooks look like one system.
+# ═══════════════════════════════════════════════════════════════════════════
+CW_NAVY       = "010D44"
+CW_WHITE      = "FFFFFF"
+CW_RED_BG     = "FFC7CE"
+CW_RED_TEXT   = "9C0006"
+CW_AMBER_BG   = "FFEB9C"
+CW_AMBER_TEXT = "9C6500"
+CW_GREEN_BG   = "C6EFCE"
+CW_GREEN_TEXT = "276221"
+CW_EMPTY_BG   = "D9D9D9"      # mid grey — assessment not sat
+CW_LIGHT_GREY = "F2F2F2"
+CW_HEADER_FONT = Font(name="Arial", bold=True, color=CW_WHITE, size=10)
+CW_BODY_FONT   = Font(name="Arial", size=9)
+CW_BOLD_BODY   = Font(name="Arial", bold=True, size=9)
+
+# Fixed GR scale: 1 = red, 3 = amber, 5 = green. Deliberately NOT data-driven, so a
+# colour means the same thing in every sheet, every stream and every week.
+GR_SCALE_MIN, GR_SCALE_MID, GR_SCALE_MAX = 1, 3, 5
+
+# Named colours you can use in a level spec, so the config reads as words not hex.
+CW_LEVEL_PALETTE = {
+    "red":   (CW_RED_BG,   CW_RED_TEXT),
+    "amber": (CW_AMBER_BG, CW_AMBER_TEXT),
+    "green": (CW_GREEN_BG, CW_GREEN_TEXT),
+    "grey":  (CW_EMPTY_BG, "000000"),
+}
+
+# Which GR / PR levels get highlighted, and in what colour. A full 1-5 gradient across
+# every cell washes the sheet out, so by default only the levels that need attention are
+# coloured and everything else is left plain.
+#   {1: "red", 2: "amber"}                  <- default
+#   {1: "red", 2: "amber", 5: "green"}      <- also mark the top level
+#   [1, 2]                                  <- shorthand, all red
+#   "scale"                                 <- the old full 1-5 gradient
+#   None                                    <- no colouring at all
+GR_LEVEL_COLORS = {1: "red", 2: "amber"}
+
+
+# ---------------------------------------------------------------------------------------
+# Combined-workbook PRESENTATION layer (added 2026-08-18).
+#
+# The same idea as formatWeeklySheet (§6e): every frame in the pipeline stays snake_case,
+# and the headers are relabelled once, at write time. Without this the two families of
+# workbook disagree — a weekly sheet says "Student Number" and the combined workbook says
+# "student_number" for the same thing.
+#
+# TWO THINGS MAKE THIS DIFFERENT FROM THE WEEKLY SHEET:
+#
+# 1. Most columns of a combined sheet are ITEM CODES ('FP-Week-03', '41MIBL (524 578)').
+#    They are data, not headers, and must never be renamed — the thresholds Series is
+#    indexed by them and risk_report finds its week columns by substring. Only names in
+#    the label map are touched, and `protect` covers anything else.
+# 2. The workbook is READ BACK by risk_report.py, which hard-codes student_number,
+#    student_name and missing_item_codes. That module is standalone (no general_utils
+#    import) and carries its own copy of the inverse map — keep the two in step.
+
+COMBINED_SHEET_COLUMN_LABELS = {
+    **WEEKLY_SHEET_COLUMN_LABELS,
+    # flagging
+    "low_count":          "Low Count",
+    # repeated_attempts
+    "n_attempts":         "Attempts",
+    "dates":              "Dates",
+    "scores":             "Scores",
+    # scores_missing
+    "missing_item_codes": "Missing Item Codes",
+    # assessors — NOT "Forms"/"Assessors": the weekly sheet already uses "Forms" for
+    # something else (§6f) and one word meaning two things across the two workbooks is
+    # exactly the confusion this layer exists to remove.
+    "n_forms":            "Total Forms",
+    "n_assessors":        "Distinct Assessors",
+    "most_seen_assessor": "Most Seen Assessor",
+    "most_seen_count":    "Most Seen Count",
+    # subject_mismatches
+    "stream":             "Stream",
+    "expected_subject":   "Expected Subject",
+}
+COMBINED_SHEET_COLUMN_LABELS_INVERSE = {v: k for k, v in COMBINED_SHEET_COLUMN_LABELS.items()}
+
+# Columns of a score/flagged sheet that are NOT item codes and must be excluded from the
+# threshold colouring. Both spellings, so styleCombinedSheet works either side of the
+# rename — and so a sheet written before 2026-08-18 still styles correctly.
+COMBINED_META_COLS = {"Avg Score", "low_count", "Low Count", "Pass/Fail"}
+
+# Same idea for the assessors sheet's trailing summary columns.
+COMBINED_ASSESSOR_SUMMARY_COLS = {
+    "n_forms", "n_assessors", "most_seen_assessor", "most_seen_count",
+    "Total Forms", "Distinct Assessors", "Most Seen Assessor", "Most Seen Count",
+}
+
+
+def formatCombinedSheet(df, idCols=None, labels=None, protect=None):
+    """Relabel a combined-workbook frame for writing. Returns ``(out, outIdCols)``.
+
+    ``out`` is a NEW frame; the caller's is untouched. ``outIdCols`` is ``idCols`` mapped
+    through the same labels, so styleCombinedSheet / highlightRepeatAssessors keep
+    resolving after the rename — pass it on rather than reusing the original list.
+
+    Only names present in ``labels`` are renamed, so item-code columns pass through
+    untouched. ``protect`` is an explicit belt-and-braces set for a column that must keep
+    its name even if it collides with a label key (no real case today).
+
+    ``labels={}`` is the escape hatch: it returns the frame and idCols unchanged, which
+    reproduces the pre-2026-08-18 workbook exactly.
+    """
+    labels = COMBINED_SHEET_COLUMN_LABELS if labels is None else labels
+    protect = set(protect or ())
+    if not labels:
+        return df.copy(), list(idCols or [])
+    mapping = {c: labels[c] for c in df.columns if c in labels and c not in protect}
+    out = df.rename(columns=mapping)
+    outIdCols = [mapping.get(c, c) for c in (idCols or [])]
+    return out, outIdCols
+
+
+def resolveLevelColors(spec):
+    """Normalise a level spec into {float(level): (bgHex, textHex)}.
+
+    Accepts a dict of level -> palette name or (bg, text) pair, a list/set of levels
+    (all red), or None. Levels are keyed as floats so 2, 2.0 and '2' all match the value
+    openpyxl hands back.
+    """
+    if spec is None:
+        return {}
+    if isinstance(spec, str):                       # "scale" is handled by the caller
+        return {}
+    if isinstance(spec, dict):
+        items = spec.items()
+    else:
+        items = [(lvl, "red") for lvl in spec]
+    out = {}
+    for level, colour in items:
+        if isinstance(colour, str):
+            if colour not in CW_LEVEL_PALETTE:
+                raise ValueError(f"Unknown colour {colour!r} — use one of "
+                                 f"{list(CW_LEVEL_PALETTE)} or an explicit (bg, text) pair.")
+            colour = CW_LEVEL_PALETTE[colour]
+        try:
+            out[float(level)] = tuple(colour)
+        except (TypeError, ValueError):
+            raise ValueError(f"Level {level!r} is not numeric.")
+    return out
+
+
+def highlightLevelCells(ws, df, valueCols, levelColors, firstRow=2):
+    """Fill only the cells whose value matches one of the listed levels.
+
+    Used for GR and PR, where a full gradient over every cell saturates the sheet and the
+    only thing anyone looks for is the low end.
+    """
+    colours = resolveLevelColors(levelColors)
+    if not colours:
+        return 0
+    colIndex = {col: i + 1 for i, col in enumerate(df.columns)}
+    n = 0
+    for col in valueCols:
+        cIdx = colIndex[col]
+        for rOffset, val in enumerate(df[col]):
+            if pd.isna(val):
+                continue
+            try:
+                hit = colours.get(float(val))
+            except (TypeError, ValueError):
+                continue
+            if hit:
+                bg, txt = hit
+                cell = ws.cell(row=firstRow + rOffset, column=cIdx)
+                cell.fill = cwFill(bg)
+                cell.font = Font(name="Arial", size=9, color=txt, bold=True)
+                n += 1
+    return n
+
+
+def cwFill(hexColor):
+    return PatternFill(start_color=hexColor, end_color=hexColor, fill_type="solid")
+
+
+def cwBorder():
+    s = Side(style="thin", color="D9D9D9")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def styleHeaderRow(ws, nCols, row=1, height=32):
+    """Navy column headers, white bold text, wrapped and centred."""
+    for c in range(1, nCols + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.font = CW_HEADER_FONT
+        cell.fill = cwFill(CW_NAVY)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = cwBorder()
+    ws.row_dimensions[row].height = height
+
+
+def freezeAfter(ws, nIdCols, headerRow=1):
+    """Freeze the header row and the leading identity columns."""
+    ws.freeze_panes = f"{get_column_letter(nIdCols + 1)}{headerRow + 1}"
+
+
+def fillEmptyCells(ws, firstRow, lastRow, firstCol, lastCol, color=CW_EMPTY_BG):
+    """Grey out cells with no value — 'not assessed', which is different from a low score."""
+    n = 0
+    for r in range(firstRow, lastRow + 1):
+        for c in range(firstCol, lastCol + 1):
+            cell = ws.cell(row=r, column=c)
+            if cell.value is None or (isinstance(cell.value, str) and not cell.value.strip()):
+                cell.fill = cwFill(color)
+                n += 1
+    return n
+
+
+def applyGrColorScale(ws, firstRow, lastRow, firstCol, lastCol):
+    """Fixed 1-5 red -> amber -> green scale over a block of GR cells."""
+    if lastRow < firstRow or lastCol < firstCol:
+        return
+    rng = (f"{get_column_letter(firstCol)}{firstRow}:"
+           f"{get_column_letter(lastCol)}{lastRow}")
+    ws.conditional_formatting.add(rng, ColorScaleRule(
+        start_type="num", start_value=GR_SCALE_MIN, start_color=CW_RED_BG,
+        mid_type="num",   mid_value=GR_SCALE_MID,   mid_color=CW_AMBER_BG,
+        end_type="num",   end_value=GR_SCALE_MAX,   end_color=CW_GREEN_BG))
+
+
+def highlightBelowThreshold(ws, df, thresholds, valueCols, firstRow=2, amberMargin=0.0):
+    """Red-fill every cell at or below its column's cutoff.
+
+    ``thresholds`` is a per-column Series/dict (one cutoff per item code). Columns with
+    no cutoff are left alone rather than being treated as zero. ``amberMargin`` > 0 also
+    ambers cells within that fraction above the cutoff.
+    """
+    colIndex = {col: i + 1 for i, col in enumerate(df.columns)}
+    nRed = nAmber = 0
+    for col in valueCols:
+        cutoff = thresholds.get(col) if hasattr(thresholds, "get") else None
+        if cutoff is None or pd.isna(cutoff):
+            continue
+        cIdx = colIndex[col]
+        for rOffset, val in enumerate(df[col]):
+            if pd.isna(val):
+                continue
+            cell = ws.cell(row=firstRow + rOffset, column=cIdx)
+            if val <= cutoff:
+                cell.fill = cwFill(CW_RED_BG)
+                cell.font = Font(name="Arial", size=9, color=CW_RED_TEXT, bold=True)
+                nRed += 1
+            elif amberMargin and val <= cutoff * (1 + amberMargin):
+                cell.fill = cwFill(CW_AMBER_BG)
+                cell.font = Font(name="Arial", size=9, color=CW_AMBER_TEXT)
+                nAmber += 1
+    return nRed, nAmber
+
+
+# ── Per-student GR/PR level-count summary columns (scores_flagged sheet) ──────
+# COUNT_LEVEL_SOURCES maps a spec's source token to the wide combined-workbook frame
+# it reads. exportCombinedNotebook builds those frames; these helpers turn one into a
+# per-student count column. Kept data-driven so columns can be added/re-levelled from
+# the notebook config without touching this module.
+COUNT_LEVEL_SOURCES = {"GR": "global_ratings", "PR": "practice_readiness"}
+
+
+def countLevelColumnLabel(source, levels):
+    """Header for a level-count column, generated FROM the levels so it always matches
+    the config, e.g. ('GR', (2, 1)) -> 'GR Level 2 & 1 Count', ('PR', (1,)) -> 'PR Level 1 Count'."""
+    return f"{source} Level {' & '.join(str(l) for l in levels)} Count"
+
+
+def countLevelsPerStudent(wideDf, idCols, levels, excludeCols=None):
+    """Series (indexed by the first id column) giving, per student, the number of
+    item-code cells in *wideDf* whose value is one of *levels*.
+
+    *wideDf* is a combined-workbook wide frame: id columns, one column per item code,
+    plus a trailing 'Avg Score'. Blank / non-numeric cells never count. Returns None
+    when there is nothing to count so the caller can fall back to zeros.
+    """
+    if wideDf is None or wideDf.empty or not levels:
+        return None
+    keyCol = idCols[0]
+    valueCols = [c for c in wideDf.columns if c not in idCols and c != "Avg Score"]
+    if excludeCols:
+        _skip = set(excludeCols)
+        valueCols = [c for c in valueCols if c not in _skip]
+    if not valueCols:
+        return None
+    wanted = {float(l) for l in levels}
+    vals = wideDf[valueCols].apply(pd.to_numeric, errors="coerce")
+    counts = vals.isin(wanted).sum(axis=1).astype("Int64")
+    return pd.Series(counts.values, index=wideDf[keyCol].values)
+
+
+def styleCombinedSheet(ws, df, idCols, kind="plain", thresholds=None,
+                       amberMargin=0.0, greyEmpty=True, levelColors=GR_LEVEL_COLORS,
+                       extraMetaCols=None, skipHighlightCols=None):
+    """Header + freeze panes + borders + per-kind colouring for one combined-workbook sheet.
+
+    kind:
+      'gr'      highlight only the levels in ``levelColors`` (default 1 red, 2 amber).
+                Pass levelColors="scale" for the old full 1-5 gradient, or None for none.
+      'score'   red only where the value is at or below that item code's cutoff
+      'flagged' same as 'score', plus the Pass/Fail column coloured
+      'plain'   header and freeze panes only
+    """
+    nRows, nCols = len(df), len(df.columns)
+    styleHeaderRow(ws, nCols)
+    freezeAfter(ws, len(idCols))
+    if nRows == 0:
+        return
+
+    # COMBINED_META_COLS carries BOTH spellings of low_count, so this works on a sheet
+    # written before the 2026-08-18 relabel and one written after.
+    metaCols = COMBINED_META_COLS | set(extraMetaCols or ())
+    valueCols = [c for c in df.columns if c not in idCols and c not in metaCols]
+    if not valueCols:
+        return
+    # Columns kept as data but excluded from highlighting (still bordered/greyed).
+    _skipHL = set(skipHighlightCols or ())
+    highlightCols = [c for c in valueCols if c not in _skipHL]
+    firstCol = df.columns.get_loc(valueCols[0]) + 1
+    lastCol = df.columns.get_loc(valueCols[-1]) + 1
+    firstRow, lastRow = 2, nRows + 1
+
+    for r in range(firstRow, lastRow + 1):
+        for c in range(1, nCols + 1):
+            ws.cell(row=r, column=c).border = cwBorder()
+
+    if kind == "gr":
+        if isinstance(levelColors, str) and levelColors.lower() == "scale":
+            applyGrColorScale(ws, firstRow, lastRow, firstCol, lastCol)
+        else:
+            highlightLevelCells(ws, df, highlightCols, levelColors, firstRow)
+    elif kind in ("score", "flagged") and thresholds is not None:
+        highlightBelowThreshold(ws, df, thresholds, highlightCols, firstRow, amberMargin)
+
+    if kind == "flagged" and "Pass/Fail" in df.columns:
+        pfCol = df.columns.get_loc("Pass/Fail") + 1
+        for rOffset, val in enumerate(df["Pass/Fail"]):
+            cell = ws.cell(row=firstRow + rOffset, column=pfCol)
+            if val == "Fail":
+                cell.fill = cwFill(CW_RED_BG)
+                cell.font = Font(name="Arial", size=9, color=CW_RED_TEXT, bold=True)
+            else:
+                cell.fill = cwFill(CW_GREEN_BG)
+                cell.font = Font(name="Arial", size=9, color=CW_GREEN_TEXT)
+
+    # Grey AFTER the colour work: a blank cell means "not assessed", which must not be
+    # confused with a low score, and the GR colour scale simply skips blanks.
+    if greyEmpty:
+        fillEmptyCells(ws, firstRow, lastRow, firstCol, lastCol)
+
+
+ASSESSOR_REPEAT_COLORS = {2: "amber", 3: "red"}     # count -> colour, applied as ">= count"
+
+
+def buildAssessorPivot(longDf, idCols, pivotCol=ITEM_CODE_COL, assessorCol="assessor_name",
+                       sep=" | "):
+    """student x item code grid filled with assessor name(s), for spotting repeat assessors.
+
+    A student who sat the same item code twice shows BOTH names joined by ``sep`` — a repeat
+    is exactly where a second exposure to the same assessor turns up, so dropping one would
+    defeat the point.
+
+    Returns (wideDf, repeatCounts):
+      wideDf       idCols + one column per item code + n_forms, n_assessors,
+                   most_seen_assessor, most_seen_count
+      repeatCounts {(idTuple, assessorName): timesSeen} — drives the highlighting.
+    """
+    cols = idCols + [pivotCol, assessorCol]
+    missing = [c for c in cols if c not in longDf.columns]
+    if missing:
+        raise KeyError(f"buildAssessorPivot needs column(s) {', '.join(missing)}.")
+
+    df = longDf[cols + (["date"] if "date" in longDf.columns else [])].dropna(subset=[assessorCol])
+    df = df.drop_duplicates()
+    if df.empty:
+        return pd.DataFrame(columns=idCols), {}
+
+    sortCols = idCols + [pivotCol] + (["date"] if "date" in df.columns else [])
+    df = df.sort_values(sortCols)
+
+    wide = (df.groupby(idCols + [pivotCol])[assessorCol]
+              .agg(lambda s: sep.join(dict.fromkeys(s)))      # de-dup, keep order
+              .unstack(pivotCol))
+    wide = wide.reindex(sorted(wide.columns), axis=1).reset_index()
+
+    # How many times each student saw each assessor, across all their item codes.
+    perStudent = df.groupby(idCols + [assessorCol]).size()
+    repeatCounts = {}
+    for key, n in perStudent.items():
+        ids, name = tuple(key[:len(idCols)]), key[len(idCols)]
+        repeatCounts[(ids, name)] = int(n)
+
+    stats = df.groupby(idCols).agg(
+        n_forms=(assessorCol, "size"),
+        n_assessors=(assessorCol, "nunique")).reset_index()
+    top = (perStudent.rename("n").reset_index()
+             .sort_values(idCols + ["n"], ascending=[True] * len(idCols) + [False])
+             .groupby(idCols).head(1)
+             .rename(columns={assessorCol: "most_seen_assessor", "n": "most_seen_count"}))
+    wide = wide.merge(stats, on=idCols, how="left").merge(top, on=idCols, how="left")
+    return wide, repeatCounts
+
+
+def highlightRepeatAssessors(ws, df, idCols, repeatCounts, valueCols,
+                             levelColors=ASSESSOR_REPEAT_COLORS, sep=" | ", firstRow=2):
+    """Colour cells where the student has seen that assessor more than once.
+
+    ``levelColors`` maps a MINIMUM count to a palette name, e.g. {2: 'amber', 3: 'red'} —
+    the highest matching threshold wins, so 3+ shows red and exactly 2 shows amber.
+    ``None`` (or an empty dict) means NO highlighting — the default lives in the signature
+    rather than behind a None-check, so passing None genuinely turns it off.
+    """
+    tiers = sorted(((int(k), CW_LEVEL_PALETTE.get(v, v)) for k, v in (levelColors or {}).items()),
+                   reverse=True)
+    if not tiers:
+        return 0
+    colIndex = {col: i + 1 for i, col in enumerate(df.columns)}
+    n = 0
+    for rOffset, (_, row) in enumerate(df.iterrows()):
+        ids = tuple(row[c] for c in idCols)
+        for col in valueCols:
+            val = row[col]
+            if not isinstance(val, str) or not val.strip():
+                continue
+            best = max((repeatCounts.get((ids, name.strip()), 0)
+                        for name in val.split(sep)), default=0)
+            hit = next((colour for threshold, colour in tiers if best >= threshold), None)
+            if hit:
+                bg, txt = hit
+                cell = ws.cell(row=firstRow + rOffset, column=colIndex[col])
+                cell.fill = cwFill(bg)
+                cell.font = Font(name="Arial", size=9, color=txt, bold=True)
+                n += 1
+    return n
+
+
+# Both spellings on purpose: styleWeeklySheet is handed the RELABELLED frame for a new
+# build, but is still callable on a raw snake_case frame. Names absent from the frame are
+# ignored, so listing both costs nothing.
+WEEKLY_FREEZE_AFTER = ["student_number", "last_name", "first_name", "student_name",
+                       "Student Number", "Last Name", "First Name", "Student Name"]
+
+
+# Both spellings, because styleWeeklySheet is handed the RELABELLED frame for a new build
+# but is still callable on a raw snake_case one.
+WEEKLY_ITEM_CODE_COLS = (ITEM_CODE_COL, "Item Code")
+WEEKLY_ID_COLS = ("student_number", "Student Number")
+
+
+def _firstPresent(df, names):
+    return next((c for c in names if c in df.columns), None)
+
+
+def styleWeeklySheet(ws, df, grLevels=None, mcLevels=None, grCols=("GR",),
+                     freezeAfterCols=None, greyEmpty=True,
+                     formsCol=WEEKLY_FORMS_COL, formsLevels=None, greyAbsentRows=True,
+                     absentCol=None, duplicateIds=None, idCol=None,
+                     duplicateColor=WEEKLY_DUPLICATE_COLOR):
+    """Header, freeze panes and level colouring for a per-date weekly workbook.
+
+    grLevels  colouring for the GR column(s) — default {1:'red', 2:'amber', 5:'green'}.
+              Add 'TS','CS','PS','PR','PEC' to ``grCols`` to treat the other 1-5 scales
+              the same way; they are left plain by default.
+    mcLevels  colouring for the MC columns. Pass the value that matches the ACTIVE scale
+              (see WEEKLY_MC_HIGHLIGHT_BY_SCALE) — 1 means "worst" on the 1-5 scale but
+              "best" on the 0-1 scale, so the wrong one here inverts the meaning.
+
+    Attendance (§6f) — the sheet has no Forms column by default, so both signals are read
+    off the data itself:
+    greyAbsentRows  fill the whole row light grey where ``absentCol`` is blank. An
+                  absentee placeholder row is precisely "a row with no item code", so
+                  ``absentCol`` defaults to the item-code column under either spelling.
+                  A real row can never have a blank item code — the extraction query
+                  inner-joins the checklist CTE.
+    duplicateIds  student ids with more than one form this session (stats['duplicateIds']
+                  from addWeeklyAttendance). Their id cell goes ``duplicateColor``. Passed
+                  in rather than recomputed because assessmentid — the only correct thing
+                  to count — has already been dropped from the sheet by this point.
+    formsCol / formsLevels
+                  only used when the sheet still HAS a Forms column (addForms=True); see
+                  WEEKLY_FORMS_HIGHLIGHT. Note it matches EXACT values, so 3 means exactly
+                  three forms, not three or more.
+    """
+    grLevels = WEEKLY_GR_HIGHLIGHT if grLevels is None else grLevels
+    nRows, nCols = len(df), len(df.columns)
+    styleHeaderRow(ws, nCols)
+
+    freezeAfterCols = WEEKLY_FREEZE_AFTER if freezeAfterCols is None else freezeAfterCols
+    present = [c for c in freezeAfterCols if c in df.columns]
+    nFreeze = max((df.columns.get_loc(c) for c in present), default=-1) + 1
+    ws.freeze_panes = f"{get_column_letter(nFreeze + 1)}2" if nFreeze else "A2"
+    if nRows == 0:
+        return
+
+    mcCols = [c for c in df.columns if re.match(r"^MC\d+$", str(c))]
+    grPresent = [c for c in grCols if c in df.columns]
+    if grPresent and grLevels:
+        highlightLevelCells(ws, df, grPresent, grLevels)
+    if mcCols and mcLevels:
+        highlightLevelCells(ws, df, mcCols, mcLevels)
+    if greyEmpty and mcCols:
+        first = df.columns.get_loc(mcCols[0]) + 1
+        last = df.columns.get_loc(mcCols[-1]) + 1
+        fillEmptyCells(ws, 2, nRows + 1, first, last)
+
+    # ── Attendance ────────────────────────────────────────────────────────────
+    # Row fills go on FIRST so the per-cell colours below survive them.
+    absentCol = _firstPresent(df, WEEKLY_ITEM_CODE_COLS) if absentCol is None else absentCol
+    if greyAbsentRows and absentCol in df.columns:
+        fill = cwFill(CW_LIGHT_GREY)
+        # POSITIONAL, matching highlightLevelCells — the frame's index may not be a clean
+        # RangeIndex after the concat that added the placeholder rows.
+        for rOffset, val in enumerate(df[absentCol]):
+            if pd.isna(val):
+                for col in range(1, nCols + 1):
+                    ws.cell(row=2 + rOffset, column=col).fill = fill
+
+    idCol = _firstPresent(df, WEEKLY_ID_COLS) if idCol is None else idCol
+    if duplicateIds and idCol in df.columns and duplicateColor:
+        bg, txt = CW_LEVEL_PALETTE[duplicateColor] if isinstance(duplicateColor, str) \
+            else tuple(duplicateColor)
+        # Compare as strings: the id column is Int64 in the frame but the ids come from a
+        # groupby index that may be plain int64, and 1746763 != numpy.int64(1746763) is
+        # not a risk worth taking.
+        wanted = {str(i) for i in duplicateIds}
+        cIdx = df.columns.get_loc(idCol) + 1
+        for rOffset, val in enumerate(df[idCol]):
+            if pd.notna(val) and str(val) in wanted:
+                cell = ws.cell(row=2 + rOffset, column=cIdx)
+                cell.fill = cwFill(bg)
+                cell.font = Font(name="Arial", size=9, color=txt, bold=True)
+
+    if formsCol in df.columns:
+        formsLevels = WEEKLY_FORMS_HIGHLIGHT if formsLevels is None else formsLevels
+        if formsLevels:
+            highlightLevelCells(ws, df, [formsCol], formsLevels)
+
+
+def writeDescriptionSheet(wb, lines, title="How to read this workbook", sheetName="Description",
+                          index=0):
+    """Leading sheet documenting how the numbers were produced.
+
+    ``lines`` is a list of ('section', None) headers, ('label', 'value') rows, or
+    (None, None) spacers. ``index`` is the sheet position: 0 (default) puts it first so
+    it opens first — what the combined workbook wants. ``index=None`` appends instead,
+    which is what the weekly workbook wants so ``Sheet1`` still opens first.
+    """
+    ws = wb.create_sheet(sheetName) if index is None else wb.create_sheet(sheetName, index)
+    ws.sheet_view.showGridLines = False
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 104
+
+    ws.merge_cells("A1:B1")
+    c = ws.cell(row=1, column=1, value=title)
+    c.font = Font(name="Arial", bold=True, size=14, color=CW_WHITE)
+    c.fill = cwFill(CW_NAVY)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    r = 3
+    for label, value in lines:
+        if label is None and value is None:
+            r += 1
+            continue
+        if value is None:                                  # section header
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+            cell = ws.cell(row=r, column=1, value=label)
+            cell.font = CW_HEADER_FONT
+            cell.fill = cwFill(CW_NAVY)
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            ws.row_dimensions[r].height = 20
+        else:
+            a = ws.cell(row=r, column=1, value=label)
+            b = ws.cell(row=r, column=2, value=str(value))
+            a.font, b.font = CW_BOLD_BODY, CW_BODY_FONT
+            a.fill = cwFill(CW_LIGHT_GREY)
+            a.alignment = Alignment(vertical="top")
+            b.alignment = Alignment(vertical="top", wrap_text=True)
+            a.border = b.border = cwBorder()
+            ws.row_dimensions[r].height = max(15, 12 * (1 + len(str(value)) // 100))
+        r += 1
+    return ws
+
+
+def describeLevelColors(spec):
+    """Plain-English description of a GR/PR level spec, for the Description sheet.
+
+    Public (no leading underscore) on purpose: the notebook uses `from general_utils import *`,
+    which skips underscore-prefixed names, so a private helper called from a cell raises
+    NameError at runtime.
+    """
+    if spec is None:
+        return "not colour-coded."
+    if isinstance(spec, str) and spec.lower() == "scale":
+        return ("full 1-5 gradient — 1 = red, 3 = amber, 5 = green, across every cell.")
+    colours = resolveLevelColors(spec)
+    if not colours:
+        return "not colour-coded."
+    nameFor = {v: k for k, v in CW_LEVEL_PALETTE.items()}
+    parts = [f"level {int(lvl) if float(lvl).is_integer() else lvl} = "
+             f"{nameFor.get(rgb, 'custom')}" for lvl, rgb in sorted(colours.items())]
+    return ("only these levels are highlighted (" + ", ".join(parts)
+            + "); every other level is left plain so the sheet stays readable.")
+
+
+def describeRepeatColors(spec):
+    """Plain-English description of an assessor-repeat spec, for the Description sheet.
+
+    Public for the same reason as describeLevelColors — `import *` skips `_name`."""
+    colours = {} if spec is None else spec
+    if not colours:
+        return "Repeat pairings are not colour-coded."
+    nameFor = {v: k for k, v in CW_LEVEL_PALETTE.items()}
+    parts = [f"{nameFor.get(CW_LEVEL_PALETTE.get(c, c), c) if isinstance(c, str) else 'custom'}"
+             f" from {int(n)} forms" for n, c in sorted(colours.items())]
+    return ("Cells are coloured where that student has seen that assessor repeatedly ("
+            + ", ".join(parts) + "); the highest matching threshold wins.")
+
+
+def colourKeyLines(kind="all", levelColors=GR_LEVEL_COLORS, amberMargin=0.0):
+    """The colour-key rows shared by every Description sheet."""
+    amber = ("Within the amber margin just above the cutoff."
+             if amberMargin else "Not in use this run (amberMargin = 0).")
+    return [
+        ("Colour key", None),
+        ("Red cell (scores)", "Score at or below that item code's cutoff — this is what "
+                              "low_count counts."),
+        ("Amber cell (scores)", amber),
+        ("Green / red Pass-Fail", "Overall outcome for the student."),
+        ("Grey cell", "No assessment recorded for that item code — NOT a low score."),
+        ("GR / PR highlighting", describeLevelColors(levelColors)),
+    ]
+
+
+# ------ Cohort reference data: session schedule + student roster ─────────────
+#
+# Both live as Excel in the cohort folder so they can be edited without touching code.
+# Seeded 2026-08-17; see the BOH2 files for the expected column shape.
+
+def sessionSchedulePath(cohort=DEFAULT_COHORT, year=2026):
+    return os.path.join(cohort, f"{cohort} Sim Sessions {year}.xlsx")
+
+
+def rosterPath(cohort=DEFAULT_COHORT, year=2026):
+    return os.path.join(cohort, f"{cohort} Roster {year}.xlsx")
+
+
+def loadSessionSchedule(cohort=DEFAULT_COHORT, year=2026, path=None, period=None):
+    """The planned session schedule, or an EMPTY frame if the file doesn't exist.
+
+    Columns: cohort, period, week_no, date, weekday, task, is_choice_week,
+    choice_options, counts_toward_total, notes. A missing file is not an error — the
+    schedule is a cross-check, not a dependency.
+    """
+    path = path or sessionSchedulePath(cohort, year)
+    cols = ["cohort", "period", "week_no", "date", "weekday", "task",
+            "is_choice_week", "choice_options", "counts_toward_total", "notes"]
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=cols)
+    df = pd.read_excel(path, sheet_name=0)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if period and "period" in df.columns:
+        df = df[df["period"].astype(str).str.upper() == str(period).upper()]
+    return df.reset_index(drop=True)
+
+
+def loadRoster(cohort=DEFAULT_COHORT, year=2026, path=None, activeOnly=True):
+    """The student roster, or an EMPTY frame if the file doesn't exist.
+
+    Columns: cohort, sort_order, student_number, first_name, last_name, status,
+    supplied_student_number, notes. Returned in LAST-NAME order — that ordering is the
+    point of the file, so reports can present students the way staff read them rather
+    than by student number.
+    """
+    path = path or rosterPath(cohort, year)
+    cols = ["cohort", "sort_order", "student_number", "first_name", "last_name",
+            "status", "supplied_student_number", "notes"]
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=cols)
+    df = pd.read_excel(path, sheet_name=0)
+    if activeOnly and "status" in df.columns:
+        df = df[df["status"].astype(str).str.lower() != "inactive"]
+    if {"last_name", "first_name"}.issubset(df.columns):
+        df = df.sort_values(["last_name", "first_name"], kind="stable")
+    df = df.reset_index(drop=True)
+    df["sort_order"] = range(1, len(df) + 1)
+    return df
+
+
+def nameSortKey(name):
+    """Sort key for a single display-name string: ``(surname, firstName)``, casefolded.
+
+    Splits on whitespace, treating the LAST token as the surname and everything
+    before it as the given name(s) — correct for the common two-part name and the
+    best guess otherwise (there is no roster available at this call site, unlike
+    ``boh2_dds2_dds3_utils._surnameKey``). Returns a 2-tuple so callers can append
+    their own tie-breaker, e.g. ``(*nameSortKey(name), studentNumber)``.
+    """
+    parts = str(name or "").strip().split()
+    if not parts:
+        return ("", "")
+    return (parts[-1].casefold(), " ".join(parts[:-1]).casefold())
+
+
+def applyRosterOrder(df, roster, idCol="student_number", nameCol="student_name"):
+    """Order ``df`` by the roster's last-name sequence and add last/first name columns.
+
+    Returns (ordered, notOnRoster, noData):
+      ordered      last_name / first_name inserted after the id, sorted by roster order.
+                   Anyone NOT on the roster is appended at the end rather than dropped —
+                   silently losing a student is worse than showing an unexpected one.
+      notOnRoster  ids present in df but absent from the roster
+      noData       roster rows with no matching row in df (catches ID typos as well as
+                   genuine non-attendance)
+    """
+    if roster is None or roster.empty or idCol not in df.columns:
+        return df, pd.DataFrame(), pd.DataFrame()
+
+    order = roster[[idCol, "first_name", "last_name", "sort_order"]].copy()
+    out = df.merge(order, on=idCol, how="left")
+    notOnRoster = out[out["sort_order"].isna()][
+        [c for c in (idCol, nameCol) if c in out.columns]].drop_duplicates()
+    noData = roster[~roster[idCol].isin(df[idCol])][
+        [idCol, "first_name", "last_name"] + (["notes"] if "notes" in roster.columns else [])]
+
+    out["_missing"] = out["sort_order"].isna()
+    out = (out.sort_values(["_missing", "sort_order", idCol], kind="stable")
+              .drop(columns=["_missing", "sort_order"]).reset_index(drop=True))
+
+    cols = list(out.columns)
+    for c in ("last_name", "first_name"):
+        cols.remove(c)
+    at = cols.index(idCol) + 1
+    out = out[cols[:at] + ["last_name", "first_name"] + cols[at:]]
+    return out, notOnRoster.reset_index(drop=True), noData.reset_index(drop=True)
+
+
+def compareSessionsToSchedule(datesDf, schedule):
+    """Cross-check discovered assessment dates against the planned schedule.
+
+    Returns week_no, date, task, is_choice_week, n_forms, n_students, week_keys, status —
+    ``status`` being matched / missing (planned but nothing in the data yet) / unplanned.
+    """
+    cols = ["week_no", "date", "task", "is_choice_week",
+            "n_forms", "n_students", "week_keys", "status"]
+    if schedule is None or schedule.empty:
+        return pd.DataFrame(columns=cols)
+    plan = schedule[schedule["date"].notna()].copy()
+    obs = datesDf.copy() if datesDf is not None else pd.DataFrame(columns=["date"])
+    merged = plan.merge(obs, on="date", how="outer", indicator=True)
+    merged["status"] = merged["_merge"].map(
+        {"both": "matched", "left_only": "missing", "right_only": "unplanned"})
+    for c in cols:
+        if c not in merged.columns:
+            merged[c] = None
+    return merged.sort_values("date")[cols].reset_index(drop=True)
+
+
+# ------ Backwards-compatible DDS2 aliases ────────────────────────────────────
+# The weekly-sim chain was DDS2-only until BOH2 moved to weekly sessions in semester 2.
+# The functions are cohort-neutral now; these keep older call sites working.
+createwhereStatementDDS2   = createWeeklySimWhere
+getGlobalRatingSqlDDS2     = getGlobalRatingSql
+getWeeklySimDatesSqlDDS2   = getWeeklySimDatesSql
+getSubjectMismatchSqlDDS2  = getSubjectMismatchSql
+getWeeklySimDataSqlDDS2    = getWeeklySimDataSql
+addAssessmentChartsDDS2    = addAssessmentCharts
+getWeeklySimDatesDDS2      = getWeeklySimDates
+getSubjectMismatchesDDS2   = getSubjectMismatches
+buildWeeklySimWorkbookDDS2 = buildWeeklySimWorkbook
+buildWeeklySimReportsDDS2  = buildWeeklySimReports
+DDS2_SEMESTER_SPLIT_DATE   = SEMESTER_SPLIT_DATE
+
+
+# ------ Weekly Analysis utilities ────────────────────────────────────────────
+#
+# Semester ("half year") selector for everything that reads the Weekly Sim folder.
+# Semester 1 and semester 2 workbooks live side by side in "DDS2/Weekly Sim", so a
+# plain folder glob mixes them. PERIOD picks which half of the year to analyse:
+#   FHY - first half year  : dates strictly BEFORE  SEMESTER_SPLIT_DATE
+#   SHY - second half year : dates on/after         SEMESTER_SPLIT_DATE
+#   ALL - the whole year   : no date filter (the original behaviour)
+# The boundary is derived from SEMESTER_SPLIT_DATE, so moving that one constant
+# moves both halves and they always stay complementary (FHY + SHY == ALL, no overlap).
+PERIOD_FHY = "FHY"
+PERIOD_SHY = "SHY"
+PERIOD_ALL = "ALL"
+
+
+def resolvePeriod(period=PERIOD_ALL, minDate=None, maxDate=None, splitDate=None):
+    """Turn a period name into an inclusive (minDate, maxDate, label) triple.
+
+    ``period`` accepts 'FHY' / 'SHY' / 'ALL' (case-insensitive, and the aliases
+    'SEM1'/'S1'/'H1' and 'SEM2'/'S2'/'H2'), or None to use minDate/maxDate as given.
+    Explicit ``minDate`` / ``maxDate`` always win over the period's own bounds, so
+    you can narrow a half year further (e.g. period='SHY', maxDate='2026-07-31').
+
+    Returns (minDate, maxDate, label) with dates as 'YYYY-MM-DD' strings or None.
+    """
+    splitDate = _asDateStr(splitDate or SEMESTER_SPLIT_DATE)
+    dayBeforeSplit = (pd.Timestamp(splitDate) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    aliases = {"FHY": PERIOD_FHY, "SEM1": PERIOD_FHY, "S1": PERIOD_FHY, "H1": PERIOD_FHY,
+               "SHY": PERIOD_SHY, "SEM2": PERIOD_SHY, "S2": PERIOD_SHY, "H2": PERIOD_SHY,
+               "ALL": PERIOD_ALL, "": PERIOD_ALL}
+    label = PERIOD_ALL if period is None else aliases.get(str(period).strip().upper())
+    if label is None:
+        raise ValueError(f"Unknown period {period!r} — use 'FHY', 'SHY' or 'ALL'.")
+
+    bounds = {PERIOD_FHY: (None, dayBeforeSplit),
+              PERIOD_SHY: (splitDate, None),
+              PERIOD_ALL: (None, None)}[label]
+    return (_asDateStr(minDate) or bounds[0], _asDateStr(maxDate) or bounds[1], label)
+
+
+def periodSuffixPath(path, period=PERIOD_ALL):
+    """'…/x.xlsx' + 'SHY' -> '…/x (SHY).xlsx'. ALL/None is returned unchanged, so the
+    existing whole-year filenames (and anything downstream pointing at them) keep
+    working exactly as before."""
+    _, _, label = resolvePeriod(period)
+    if label == PERIOD_ALL:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root} ({label}){ext}"
+
+
+def matchesIgnoreCode(itemCode, ignoreCodeList):
+    """True if ``itemCode`` matches any entry in ``ignoreCodeList``.
+
+    Entries are shell-style glob patterns, matched case-insensitively:
+        'positioning'        exact (a pattern with no wildcard is just an exact match)
+        '2026-Week-*'        every semester-1 catch-up code
+        'Paeds*'             the whole Paeds family
+        '*-Week-0?'          weeks 01-09 of any family
+    BOTH sides are pushed through standardizeWeekFormat first, so listing
+    'Paeds 2026-Week-1' (the raw DASH spelling) still matches the normalised
+    'Paeds-2026-Week-01' that ends up in the workbooks.
+    """
+    if not ignoreCodeList:
+        return False
+    code = str(standardizeWeekFormat(str(itemCode).strip())).casefold()
+    for pattern in ignoreCodeList:
+        pat = str(standardizeWeekFormat(str(pattern).strip())).casefold()
+        if fnmatch.fnmatch(code, pat):
+            return True
+    return False
+
+
+def dropIgnoredItemCodes(weeklyFiles, ignoreCodeList=None, minItemCount=0, verbose=True,
+                         idCol="student_number", includeCodeList=None):
+    """Drop unwanted item codes from a [(dateStr, df), ...] list of weekly files.
+
+    ignoreCodeList : glob patterns (see matchesIgnoreCode). Default None = drop nothing.
+    minItemCount   : drop any item code sat by fewer than this many DISTINCT students
+                     across the whole loaded set. Default 0 = off. This is the automatic
+                     version of the ignore list: a code done by one catch-up student
+                     still gets its own column and its own percentile threshold computed
+                     over n=1, which is meaningless — minItemCount=5 removes those.
+                     Counted across all dates together, so a code split over two dates
+                     is judged on its combined student count, not per date.
+    verbose        : print what was dropped. Silent dropping would make the combined
+                     workbook look complete when it isn't.
+
+    Returns a new [(dateStr, df), ...]; dates left with no rows are removed entirely.
+    """
+    if not ignoreCodeList and not minItemCount and not includeCodeList:
+        return weeklyFiles
+
+    present = [(d, df) for d, df in weeklyFiles if ITEM_CODE_COL in df.columns]
+    if not present:
+        return weeklyFiles
+
+    dropped = {}                       # item code -> reason
+
+    if includeCodeList:
+        for _, df in present:
+            for code in df[ITEM_CODE_COL].dropna().unique():
+                if code not in dropped and not matchesIgnoreCode(code, includeCodeList):
+                    dropped[code] = "not in includeCodeList"
+
+    if ignoreCodeList:
+        for _, df in present:
+            for code in df[ITEM_CODE_COL].dropna().unique():
+                if code not in dropped and matchesIgnoreCode(code, ignoreCodeList):
+                    dropped[code] = "ignoreCodeList"
+
+    if minItemCount:
+        counts = {}
+        for _, df in present:
+            sub = df[[c for c in (idCol, ITEM_CODE_COL) if c in df.columns]].dropna()
+            for code, grp in sub.groupby(ITEM_CODE_COL):
+                seen = counts.setdefault(code, set())
+                seen.update(grp[idCol].unique() if idCol in grp.columns else range(len(grp)))
+        for code, seen in counts.items():
+            if code not in dropped and len(seen) < minItemCount:
+                dropped[code] = f"minItemCount (n={len(seen)})"
+
+    if not dropped:
+        return weeklyFiles
+
+    out, emptied = [], []
+    for dateStr, df in weeklyFiles:
+        if ITEM_CODE_COL in df.columns:
+            kept = df[~df[ITEM_CODE_COL].isin(dropped.keys())]
+            if kept.empty:
+                emptied.append(dateStr)
+                continue
+            df = kept.reset_index(drop=True)
+        out.append((dateStr, df))
+
+    if verbose:
+        print(f"Ignored {len(dropped)} item code(s): "
+              + ", ".join(f"{c} [{r}]" for c, r in sorted(dropped.items())))
+        if emptied:
+            print(f"  {len(emptied)} date(s) left with no rows and were dropped: {', '.join(emptied)}")
+    return out
+
+
+def loadWeeklyFiles(folderPath, dateRegex=DEFAULT_DATE_REGEX, filePattern=DEFAULT_FILE_PATTERN,
+                    period=PERIOD_ALL, minDate=None, maxDate=None,
+                    ignoreCodeList=None, minItemCount=0, verbose=True,
+                    includeCodeList=None):
+    """Load the weekly assessment workbooks in a folder as [(dateStr, df), ...].
+
+    The date is taken from the FILENAME via ``dateRegex`` (files are named
+    'dds2 <YYYY-MM-DD> assessment_data.xlsx'), so the filter is a plain string
+    comparison — ISO dates sort and compare correctly as text.
+
+    ``period`` ('FHY' / 'SHY' / 'ALL') selects the half year; ``minDate`` / ``maxDate``
+    (inclusive) override it for an arbitrary window. Default 'ALL' reproduces the
+    original whole-folder behaviour exactly.
+
+    ``ignoreCodeList`` / ``minItemCount`` drop item codes — see dropIgnoredItemCodes.
+    Both default to "nothing dropped", so the default call is unchanged behaviour.
+
+    ``folderPath`` may be a single folder or a LIST of folders (see weeklySimFolders) —
+    a pooled read across stream subfolders. Workbooks sharing a date across folders are
+    concatenated into that date's frame, which is what makes an all-streams combined
+    report possible without moving any files. Missing folders in a list are skipped.
+    """
+    minDate, maxDate, _ = resolvePeriod(period, minDate, maxDate)
+    folders = [folderPath] if isinstance(folderPath, (str, os.PathLike)) else list(folderPath)
+    compiledFile = re.compile(filePattern, re.IGNORECASE)
+    compiledDate = re.compile(dateRegex)
+    byDate = {}
+    for oneFolder in folders:
+        if not os.path.isdir(oneFolder):
+            continue
+        for filename in sorted(os.listdir(oneFolder)):
+            if filename.startswith("~$"):
+                continue
+            if not compiledFile.search(filename):
+                continue
+            dateMatch = compiledDate.search(filename)
+            if not dateMatch:
+                continue
+            dateStr = dateMatch.group(0)
+            if (minDate and dateStr < minDate) or (maxDate and dateStr > maxDate):
+                continue
+            filePath = os.path.join(oneFolder, filename)
+            df = pd.read_excel(filePath, engine="openpyxl")
+            # Undo the sheet's presentation labels so everything downstream keeps working
+            # in snake_case. A workbook written before 2026-08-18 has no labels to undo,
+            # so the same call handles both layouts and the two can sit in one folder.
+            df.rename(columns={**WEEKLY_SHEET_COLUMN_LABELS_INVERSE,
+                               'Assessor Score': 'assessor_score'}, inplace=True)
+            # Normalise the week keys on load as well as at build time, so a workbook
+            # written before standardizeWeekFormat was generalised still lines up with
+            # the rest — and so ignoreCodeList only ever has to match one spelling.
+            if ITEM_CODE_COL in df.columns:
+                # Attendance placeholders (a roster student with no data — see
+                # addWeeklyAttendance) carry a name and nothing else. They exist so the
+                # SHEET reads as a register; letting one through would put a student with
+                # all-blank scores into the combined workbook, where the flagging would
+                # score them Pass. Dropped here, in the single funnel, so every downstream
+                # consumer is unchanged. Also drops the `Forms` column for the same reason.
+                df = df[df[ITEM_CODE_COL].notna()].copy()
+                df[ITEM_CODE_COL] = df[ITEM_CODE_COL].apply(standardizeWeekFormat)
+            df = df.drop(columns=[c for c in (WEEKLY_FORMS_COL,) if c in df.columns])
+            byDate.setdefault(dateStr, []).append(df)
+    files = [(d, parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True))
+             for d, parts in sorted(byDate.items())]
+    return dropIgnoredItemCodes(files, ignoreCodeList, minItemCount, verbose=verbose,
+                                includeCodeList=includeCodeList)
+
+class FlagMethod(str, Enum):
+    """Method used to identify low-performing students.
+
+    All three produce ONE cutoff PER ITEM CODE, because that is what the wide score
+    table is pivoted on. A student is flagged Fail when they sit at or below the cutoff
+    in at least ``min_low_count`` item codes.
+
+    PERCENTILE - cutoff = the given quantile (default 0.15) of the cohort's scores for
+                 that item code. Purely relative: some students are always below it.
+    BLR        - borderline regression. Fit assessor_score ~ GR across every form
+                 carrying that item code, then read the fitted score at GR =
+                 borderline_gr. Uses the assessors' own global ratings to locate
+                 "borderline" on the score scale.
+    BORDERLINE - borderline group average. Cutoff = mean assessor_score of the forms
+                 whose GR equals borderline_gr, for that item code. Same idea as BLR
+                 but without assuming the score/GR relationship is linear; noisier when
+                 few students sit on the borderline rating.
+    """
+    PERCENTILE = "percentile"
+    BLR = "blr"
+    BORDERLINE = "borderline"
+
+
+# Human-readable description of each method, used on the Description sheet.
+FLAG_METHOD_NOTES = {
+    "percentile": ("Cutoff per item code = the {percentile:.0%} quantile of the cohort's scores "
+                   "for that code. Relative — a fixed share of the cohort is always below it."),
+    "blr": ("Borderline regression per item code: assessor_score ~ GR is fitted across every "
+            "form carrying that code, and the cutoff is the fitted score at GR = {borderline_gr}. "
+            "Anchored to the assessors' own global ratings."),
+    "borderline": ("Borderline group average per item code: cutoff = mean assessor_score of the "
+                   "forms rated GR = {borderline_gr} for that code. No linearity assumption, but "
+                   "noisier when few students sit on the borderline rating."),
+}
+
+def printDuplicateItemStudents(longDf, idCols, valueCol):
+    """Print students who have done the same item code more than once, with dates and scores.
+
+    Always returns a DataFrame (columns idCols + item_code + dates + scores) — EMPTY when
+    there are no repeats. It used to return None in that case, which crashed the caller in
+    exportCombinedNotebook on `duplicates.to_excel(...)`; a stream with no repeated codes
+    (perfectly normal early in a semester) took the whole combined build down with it.
+    """
+    emptyCols = idCols + [ITEM_CODE_COL, "dates", "scores"]
+
+    # Count occurrences per student + item code
+    grouped = longDf.groupby(idCols + [ITEM_CODE_COL, "date"])[valueCol].max().reset_index()
+
+    # Find student+item combos with more than one date
+    countPerCombo = grouped.groupby(idCols + [ITEM_CODE_COL])["date"].count().reset_index()
+    countPerCombo.columns = idCols + [ITEM_CODE_COL, "n_attempts"]
+
+    duplicates = countPerCombo[countPerCombo["n_attempts"] > 1]
+
+    if duplicates.empty:
+        print("No students with multiple attempts on the same item code.")
+        return pd.DataFrame(columns=emptyCols)
+
+    print(f"Students with multiple attempts on the same item code ({len(duplicates)} combos):\n")
+    dupCombos = duplicates[idCols + [ITEM_CODE_COL]]
+    dupsDf = grouped.merge(dupCombos, on=idCols + [ITEM_CODE_COL], how="inner").sort_values(
+        idCols + [ITEM_CODE_COL, "date"]
+    ).reset_index(drop=True)
+    dupsDf = dupsDf.groupby(idCols + [ITEM_CODE_COL]).agg(
+    dates=("date", list),
+    scores=(valueCol, list)
+        ).reset_index()
+    for _, row in duplicates.iterrows():
+        # Build filter mask across idCols + item code
+        mask = pd.Series([True] * len(grouped))
+        for col in idCols:
+            mask &= (grouped[col] == row[col])
+        mask &= (grouped[ITEM_CODE_COL] == row[ITEM_CODE_COL])
+        
+        attempts = grouped[mask].sort_values("date")
+        
+        # Header line
+        idStr = "  |  ".join(f"{col}: {row[col]}" for col in idCols)
+        print(f"  {idStr}  |  Item: {row[ITEM_CODE_COL]}  ({int(row['n_attempts'])} attempts)")
+        
+        for _, a in attempts.iterrows():
+            score = a[valueCol]
+            print(f"    {a['date']}  →  {score}")
+        print()
+    return dupsDf
+
+def getChecklistBank(engine, cohort: str = "DDS2", type_: str = "Simulation") -> pd.DataFrame:
+    sql = f"""
+        SELECT DISTINCT
+            week_key,
+            week_name,
+            mc_key,
+            mc_desc,
+            LENGTH(mc_key)  AS mc_key_len
+        FROM {RAWFORM_FORMS_NAME},
+        -- v3: checklist DEFINITIONS (name + fields:{MC:desc}) live in the config,
+        -- not the data column. Prefer assessor_config, fall back to student_config
+        -- (BOH1 student-only / BOH2 Smile Squad forms have only student_config).
+        LATERAL jsonb_each(
+            COALESCE(assessor_config->'checklists'->'selected',
+                     student_config->'checklists'->'selected',
+                     '{{}}'::jsonb)
+        )                                                AS week_entry(week_key, week_val),
+        LATERAL jsonb_each(week_val -> 'fields')         AS mc_entry(mc_key, mc_val),
+        LATERAL (SELECT
+            week_val ->> 'name'    AS week_name,
+            mc_val #>> '{{}}'        AS mc_desc
+        ) meta
+        WHERE cohort                = :cohort
+          AND datetimeutc >= TIMESTAMPTZ '2026-01-01'
+          AND type                  = :type_
+          AND submitted_by_assessor = true
+          AND week_val ? 'fields'
+        ORDER BY week_key, mc_key_len, mc_key
+    """
+    df = readDf(engine, sql, {"cohort": cohort, "type_": type_})
+    df["week_key"] = df["week_key"].apply(standardizeWeekFormat)
+    # remove duplicate week_key + mc_key combos keeping the first (should be the most complete description due to ordering by length desc)
+    df = df.drop_duplicates(subset=["week_key", "mc_key"], keep="first").reset_index(drop=True)
+    # get unique descriptions and assign numeric ids like CH1, CH2, etc for easier reference in analysis    
+    uniqueMcs = df["mc_desc"].unique()
+    uniqueMcs.sort()
+    mcIdMap = {desc: f"CH{i+1}" for i, desc in enumerate(uniqueMcs)}
+    df["mc_id"] = df["mc_desc"].map(mcIdMap)
+    return df
+
+def buildWideDf(folderPath, valueCol, dateRegex=DEFAULT_DATE_REGEX,filePattern=DEFAULT_FILE_PATTERN, idCols=DEFAULT_ID_COLS,
+                pivotCol="date", period=PERIOD_ALL, minDate=None, maxDate=None,
+                ignoreCodeList=None, minItemCount=0, verbose=True,
+                includeCodeList=None,
+                extraCols=("subject", "assessor_name"), aggfunc="max"):
+    """Wide (student x pivotCol) table plus the long frame it was built from.
+
+    ``aggfunc`` decides what happens when a student has the SAME item code more than
+    once — i.e. a repeat or catch-up attempt. Default "max" keeps the student's BEST
+    attempt, which is the intended behaviour: a student who redoes a week and improves
+    should be judged on the improved result. Use "min"/"mean"/"last" to change it.
+    'Avg Score' is then the mean across those per-code best attempts.
+
+    ``extraCols`` are carried through into the LONG frame when the workbook has them
+    (they play no part in the pivot). 'subject' is kept so callers can cross-check it
+    against the item code, and 'assessor_name' so they can build the assessor pivot;
+    a workbook that lacks either column simply has it skipped.
+    """
+    weeklyFiles = loadWeeklyFiles(folderPath, dateRegex, filePattern, period, minDate, maxDate,
+                                  ignoreCodeList, minItemCount, verbose,
+                                  includeCodeList=includeCodeList)
+    rows = []
+    for dateStr, df in weeklyFiles:
+        if not all(c in df.columns for c in idCols + [valueCol]):
+            continue
+        keep = idCols + [valueCol, ITEM_CODE_COL] + [c for c in (extraCols or ())
+                                                     if c in df.columns and c not in idCols]
+        tmp = df[keep].copy()
+        tmp["date"] = dateStr
+        rows.append(tmp)
+
+    if not rows:
+        return pd.DataFrame(columns=idCols), pd.DataFrame(columns=idCols), pd.DataFrame(columns=idCols)
+
+    longDf = pd.concat(rows, ignore_index=True)
+
+    # aggfunc="max" -> a repeated item code keeps the student's BEST attempt.
+    wideDf = (longDf.pivot_table(index=idCols, columns=pivotCol, values=valueCol,
+                                 aggfunc=aggfunc).reset_index())
+
+    dateCols = sorted([c for c in wideDf.columns if c not in idCols])
+    wideDf = wideDf[idCols + dateCols]
+    wideDf[dateCols] = wideDf[dateCols].apply(pd.to_numeric, errors="coerce").round(2)
+    wideDf['Avg Score'] = wideDf[dateCols].mean(axis=1).round(2)
+
+    missingDf = wideDf.copy()
+    missingDf["missing_item_codes"] = missingDf.apply(lambda row: [col for col in dateCols if pd.isna(row[col])], axis=1)
+    missingDf = missingDf[missingDf["missing_item_codes"].map(len) > 0][idCols + ["missing_item_codes"]].reset_index(drop=True)
+    return wideDf, longDf, missingDf
+
+def runBlrAnalysis(df, dateStr, borderlineGr, mcCols=None, grCol = "GR"):
+    """Run full BLR analysis for a single day's data. Returns dict of results."""
+    print(f"Running BLR analysis for {dateStr} (n={len(df)})...")
+    if mcCols is None:
+        mcCols = [c for c in df.columns if c.startswith("MC")]
+
+    # ── 1. Borderline group method: mean score of borderline group ──
+    borderlineScores = df.loc[df[grCol] == borderlineGr, "assessor_score"]
+    borderlineMean = borderlineScores.mean()
+    borderlineSd = borderlineScores.std()
+
+    # ── 2. Linear regression: assessor_score ~ global_rating ──
+    slope, intercept, rVal, pVal, stdErr = stats.linregress(
+        df[grCol], df["assessor_score"]
+    )
+    regressionCutoff = slope * borderlineGr + intercept
+    rSquared = rVal ** 2
+
+    # ── 3. Per-rating group stats ──
+    ratingGroups = df.groupby(grCol)["assessor_score"]
+    ratingStats = ratingGroups.agg(["mean", "std", "count"]).rename(
+        columns={"mean": "meanScore", "std": "sdScore", "count": "n"}
+    )
+
+    # ── 4. Item analysis ──
+    itemStats = []
+    for mc in mcCols:
+        if mc not in df.columns:
+            continue
+        itemMean = df[mc].mean()
+        borderlineItemMean = df.loc[df[grCol] == borderlineGr, mc].mean()
+        itemTotalCorr = df[mc].corr(df["assessor_score"])
+        itemStats.append({
+            "item": mc,
+            "mean": round(itemMean, 3),
+            "borderlineMean": round(borderlineItemMean, 3),
+            "itemTotalCorr": round(itemTotalCorr, 3),
+        })
+    itemStatsDf = pd.DataFrame(itemStats)
+
+    # ── 5. Cronbach's alpha ──
+    validMcCols = [c for c in mcCols if c in df.columns]
+    mcData = df[validMcCols].dropna()
+    k = len(validMcCols)
+    itemVars = mcData.var(axis=0, ddof=1)
+    totalVar = mcData.sum(axis=1).var(ddof=1)
+    cronbachAlpha = (k / (k - 1)) * (1 - itemVars.sum() / totalVar) if k > 1 else np.nan
+
+    # ── 6. Flag students below cutoff ──
+    belowCutoffDf = df.loc[
+        df["assessor_score"] <= regressionCutoff,
+        ["student_number", "student_name", "assessor_score", grCol, "assessor_name"],
+    ].sort_values("assessor_score")
+
+    return {
+        "date": dateStr,
+        "n": len(df),
+        "borderlineMean": round(borderlineMean*100, 2),
+        "borderlineSd": round(borderlineSd*100, 2),
+        "regressionCutoff": round(regressionCutoff*100, 2),
+        "slope": round(slope, 2),
+        "intercept": round(intercept, 2),
+        "rSquared": round(rSquared, 2),
+        "pVal": round(pVal, 4),
+        "overallMean": round(df["assessor_score"].mean()*100, 2),
+        "overallSd": round(df["assessor_score"].std()*100, 2),
+        "cronbachAlpha": round(cronbachAlpha, 2),
+        "ratingStats": ratingStats,
+        "itemStatsDf": itemStatsDf,
+        "belowCutoffDf": belowCutoffDf,
+        "df": df,
+    }
+
+def runBlrAnalysisForAllFiles(folderPath, borderlineGr=2, dateRegex=r"\d{4}-\d{2}-\d{2}", filePattern=r"assessment_data\.xlsx$",
+                              period=PERIOD_ALL, minDate=None, maxDate=None,
+                              ignoreCodeList=None, minItemCount=0, minRows=3, includeCodeList=None):
+    """Run BLR analysis for the weekly files in folder. Returns a DataFrame of results.
+
+    ``folderPath`` may be one folder or a list (see loadWeeklyFiles / weeklySimFolders).
+    ``period`` ('FHY' / 'SHY' / 'ALL') restricts which workbooks are analysed.
+    ``ignoreCodeList`` / ``minItemCount`` drop item codes before the regression is fitted,
+    so an ignored code contributes nothing to that date's cutoff.
+    ``minRows`` skips dates with too few rows to regress at all — the per-stream split
+    creates genuine 1-2 form catch-up days, and scipy returns an all-NaN row for those
+    rather than failing, which is worse than saying so. Set 0 to keep them.
+    """
+    files = loadWeeklyFiles(folderPath, dateRegex, filePattern, period, minDate, maxDate,
+                            ignoreCodeList, minItemCount, includeCodeList=includeCodeList)
+    if not files:
+        print(f"No weekly files matched in {folderPath} for period={period}.")
+        return pd.DataFrame()
+    allResults, tooSmall = [], []
+    for dateStr, df in files:
+        if minRows and len(df) < minRows:
+            tooSmall.append(f"{dateStr} (n={len(df)})")
+            continue
+        allResults.append(runBlrAnalysis(df, dateStr, borderlineGr))
+    if tooSmall:
+        print(f"BLR skipped {len(tooSmall)} date(s) with fewer than {minRows} rows: "
+              + ", ".join(tooSmall))
+    return pd.DataFrame(allResults)
+
+
+# ─── Student flagging ─────────────────────────────────────────────────────────
+
+def highlightFlaggedCells(ws, flagged_df, thresholds, id_cols):
+    """
+    Highlight cells in the scores_flagged sheet where the student's score
+    is at or below the threshold for that date column.
+    Also highlights the Pass/Fail cell for Fail rows.
+    """
+    date_cols = [c for c in flagged_df.columns if c not in id_cols + ["Avg Score", "low_count", "Pass/Fail"]]
+
+    # Build column-name -> Excel-column-index mapping (1-based)
+    col_index = {col: i + 1 for i, col in enumerate(flagged_df.columns)}
+
+    for row_idx, (_, row) in enumerate(flagged_df.iterrows(), start=2):  # row 1 = header
+        # Highlight individual date cells that are below threshold
+        for dc in date_cols:
+            val = row[dc]
+            thresh = thresholds.get(dc)
+            if pd.notna(val) and pd.notna(thresh) and val <= thresh:
+                cell = ws.cell(row=row_idx, column=col_index[dc])
+                cell.fill = FAIL_FILL
+                cell.font = FAIL_TEXT
+
+        # Highlight the Pass/Fail cell if Fail
+        if row.get("Pass/Fail") == "Fail":
+            pf_cell = ws.cell(row=row_idx, column=col_index["Pass/Fail"])
+            pf_cell.fill = FAIL_FILL
+            pf_cell.font = FAIL_TEXT
+
+def _flag_by_percentile(
+    score_df: pd.DataFrame,
+    id_cols: list[str],
+    percentile: float = 0.15,
+    min_low_count: int = 3,
+    exclude_code_list: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Flag students who score at or below the *percentile* threshold in at
+    least *min_low_count* assessment dates.
+    """
+    date_cols = [
+        c for c in score_df.columns if c not in id_cols and c != "Avg Score"
+    ]
+    thresholds = score_df[date_cols].quantile(percentile)
+    # Codes excluded from flagging: NaN the cutoff so they neither count toward
+    # low_count (value <= NaN is False) nor get red-highlighted — they stay as columns.
+    if exclude_code_list:
+        _excl = [c for c in thresholds.index if matchesIgnoreCode(c, exclude_code_list)]
+        if _excl:
+            thresholds.loc[_excl] = float('nan')
+
+    def _count_low(row):
+        return sum(
+            1 for c in date_cols
+            if pd.notna(row[c]) and row[c] <= thresholds[c]
+        )
+
+    result = score_df.copy()
+    result["low_count"] = result.apply(_count_low, axis=1).astype("Int64")
+    result["Pass/Fail"] = result["low_count"].apply(
+        lambda n: "Fail" if n >= min_low_count else "Pass"
+    )
+    return result, thresholds
+
+def _flag_by_blr(
+    folder_path: str,
+    score_df: pd.DataFrame,
+    id_cols: list[str],
+    borderline_gr: int = 2,
+    min_low_count: int = 3,
+    date_regex: str = DEFAULT_DATE_REGEX,
+    file_pattern: str = DEFAULT_FILE_PATTERN,
+    period: str = PERIOD_ALL,
+    min_date: str | None = None,
+    max_date: str | None = None,
+    ignore_code_list: list[str] | None = None,
+    min_item_count: int = 0,
+    include_code_list: list[str] | None = None,
+    use_borderline_mean: bool = False,
+    exclude_code_list: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Flag students who fall at or below a GR-anchored cutoff in at least
+    *min_low_count* item codes.
+
+    Two flavours, both keyed PER ITEM CODE:
+      use_borderline_mean=False -> FlagMethod.BLR: fit assessor_score ~ GR over every
+                                   form carrying that code, read the fitted value at
+                                   GR = borderline_gr.
+      use_borderline_mean=True  -> FlagMethod.BORDERLINE: mean assessor_score of the
+                                   forms rated GR = borderline_gr for that code.
+
+    NOTE (2026-08-17): this used to key the cutoffs by DATE, taken from the workbook
+    filename, while the caller pivots the wide table on ITEM CODE. The reindex therefore
+    never matched, every threshold came out NaN and BLR flagged nobody. Cutoffs are now
+    computed per item code, pooling that code's rows across all dates — which also gives
+    a code sat on several dates (catch-ups) one consistent cutoff.
+    """
+    files = loadWeeklyFiles(folder_path, date_regex, file_pattern, period, min_date, max_date,
+                            ignore_code_list, min_item_count, verbose=False,
+                            includeCodeList=include_code_list)
+    code_cols = [
+        c for c in score_df.columns if c not in id_cols and c != "Avg Score"
+    ]
+
+    # Pool every row by item code, across dates.
+    frames = [df for _, df in files if not df.empty]
+    if not frames:
+        return score_df.copy().assign(low_count=0, **{"Pass/Fail": "Pass"}), pd.Series(dtype=float)
+    allRows = pd.concat(frames, ignore_index=True)
+    needed = {ITEM_CODE_COL, "assessor_score", "GR"}
+    if not needed.issubset(allRows.columns):
+        missing = ", ".join(sorted(needed - set(allRows.columns)))
+        raise KeyError(f"BLR/borderline flagging needs column(s) {missing} in the weekly workbooks.")
+
+    cutoffs = {}
+    for code, grp in allRows.groupby(ITEM_CODE_COL):
+        sub = grp[["assessor_score", "GR"]].apply(pd.to_numeric, errors="coerce").dropna()
+        if sub.empty:
+            continue
+        if use_borderline_mean:
+            borderline = sub.loc[sub["GR"] == borderline_gr, "assessor_score"]
+            if not borderline.empty:
+                cutoffs[code] = round(float(borderline.mean()), 4)
+        else:
+            if sub["GR"].nunique() < 2 or len(sub) < 3:
+                continue                       # can't fit a line through one GR value
+            slope, intercept, *_ = stats.linregress(sub["GR"], sub["assessor_score"])
+            cutoffs[code] = round(float(slope * borderline_gr + intercept), 4)
+
+    thresholds = pd.Series(cutoffs, dtype=float).reindex(code_cols)
+    if thresholds.notna().sum() == 0:
+        print("WARNING: no cutoff could be computed for any item code — nothing will be "
+              "flagged. Check that the workbooks carry GR and Assessor Score.")
+    elif thresholds.isna().any():
+        print(f"  no cutoff for {int(thresholds.isna().sum())} item code(s) "
+              f"(too few rows or a single GR value): "
+              f"{', '.join(map(str, thresholds[thresholds.isna()].index))}")
+
+    # Codes excluded from flagging: NaN the cutoff so _count_low skips them (it already
+    # requires notna(threshold)) and highlightBelowThreshold leaves them uncoloured.
+    if exclude_code_list:
+        _excl = [c for c in thresholds.index if matchesIgnoreCode(c, exclude_code_list)]
+        if _excl:
+            thresholds.loc[_excl] = float('nan')
+
+    def _count_low(row):
+        return sum(
+            1 for c in code_cols
+            if pd.notna(row[c]) and pd.notna(thresholds.get(c))
+            and row[c] <= thresholds[c]
+        )
+
+    result = score_df.copy()
+    result["low_count"] = result.apply(_count_low, axis=1).astype("Int64")
+    result["Pass/Fail"] = result["low_count"].apply(
+        lambda n: "Fail" if n >= min_low_count else "Pass"
+    )
+    return result, thresholds
+
+FLAG_FALLBACK_DEFAULT_CHAIN = ["blr", "borderline", "percentile"]
+
+
+def _resolveCodeCutoff(code, grp, scoreCol, chain, *, borderline_gr, percentile,
+                       blr_min_n, blr_min_r2, blr_min_low_gr,
+                       bgm_min_borderline_frac, bgm_min_borderline_n):
+    """Return (cutoff, method) for ONE item code, trying each method in *chain* and
+    using the first whose lightweight usefulness check passes; (nan, None) if none do.
+
+    grp      : per-code DataFrame with numeric 'assessor_score' and 'GR' (already dropna).
+    scoreCol : the wide per-student best-attempt Series for this code (percentile source).
+
+    Checks (deliberately light, not inferential):
+      blr        n >= blr_min_n; >=2 distinct GR; GR brackets borderline_gr (no
+                 extrapolation) with >= blr_min_low_gr forms at/below it; slope > 0 and
+                 R^2 >= blr_min_r2; fitted cutoff within [0, 1].
+      borderline >= bgm_min_borderline_n forms rated GR == borderline_gr AND they are
+                 >= bgm_min_borderline_frac of the code's forms.
+      percentile any column with >= 3 values — the safety net.
+    """
+    n = len(grp)
+    for method in chain:
+        if method == "blr":
+            if n < blr_min_n:
+                continue
+            gr = grp["GR"]
+            if gr.nunique() < 2:
+                continue
+            if not (gr.min() <= borderline_gr <= gr.max()):
+                continue                                   # would be extrapolation
+            if int((gr <= borderline_gr).sum()) < blr_min_low_gr:
+                continue                                   # too little at the low extreme
+            slope, intercept, r, *_ = stats.linregress(gr, grp["assessor_score"])
+            if slope <= 0 or (r * r) < blr_min_r2:
+                continue                                   # wrong direction / no signal
+            cutoff = slope * borderline_gr + intercept
+            if not (0.0 <= cutoff <= 1.0):
+                continue                                   # implausible cutoff
+            return round(float(cutoff), 4), "blr"
+        elif method == "borderline":
+            if n == 0:
+                continue
+            b = grp.loc[grp["GR"] == borderline_gr, "assessor_score"]
+            if len(b) < bgm_min_borderline_n or (len(b) / n) < bgm_min_borderline_frac:
+                continue                                   # borderline group too small
+            return round(float(b.mean()), 4), "borderline"
+        elif method == "percentile":
+            vals = scoreCol.dropna() if scoreCol is not None else pd.Series(dtype=float)
+            if len(vals) < 3:
+                continue
+            return round(float(vals.quantile(percentile)), 4), "percentile"
+        else:
+            raise ValueError(f"Unknown flag method in chain: {method!r}")
+    return float("nan"), None
+
+
+def _flag_by_fallback(
+    folder_path, score_df, id_cols, chain, *,
+    borderline_gr=2, min_low_count=3, percentile=0.15,
+    date_regex=DEFAULT_DATE_REGEX, file_pattern=DEFAULT_FILE_PATTERN,
+    period=PERIOD_ALL, min_date=None, max_date=None,
+    ignore_code_list=None, min_item_count=0, include_code_list=None,
+    exclude_code_list=None,
+    blr_min_n=15, blr_min_r2=0.10, blr_min_low_gr=3,
+    bgm_min_borderline_frac=0.20, bgm_min_borderline_n=5,
+):
+    """Per-item-code flagging with a method fallback chain (e.g. blr -> borderline ->
+    percentile). Each code gets its cutoff from the first method whose usefulness check
+    passes; a code that qualifies for none is left uncounted (NaN). The chosen method per
+    code is attached to the returned thresholds as ``thresholds.attrs['flag_methods']``.
+    """
+    files = loadWeeklyFiles(folder_path, date_regex, file_pattern, period, min_date, max_date,
+                            ignore_code_list, min_item_count, verbose=False,
+                            includeCodeList=include_code_list)
+    code_cols = [c for c in score_df.columns if c not in id_cols and c != "Avg Score"]
+    frames = [df for _, df in files if not df.empty]
+    allRows = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    haveRows = (not allRows.empty) and {ITEM_CODE_COL, "assessor_score", "GR"}.issubset(allRows.columns)
+
+    cutoffs, methods = {}, {}
+    for c in code_cols:
+        if haveRows:
+            grp = (allRows.loc[allRows[ITEM_CODE_COL] == c, ["assessor_score", "GR"]]
+                   .apply(pd.to_numeric, errors="coerce").dropna())
+        else:
+            grp = pd.DataFrame(columns=["assessor_score", "GR"])
+        scoreCol = score_df[c] if c in score_df.columns else None
+        cut, m = _resolveCodeCutoff(
+            c, grp, scoreCol, chain, borderline_gr=borderline_gr, percentile=percentile,
+            blr_min_n=blr_min_n, blr_min_r2=blr_min_r2, blr_min_low_gr=blr_min_low_gr,
+            bgm_min_borderline_frac=bgm_min_borderline_frac,
+            bgm_min_borderline_n=bgm_min_borderline_n)
+        cutoffs[c], methods[c] = cut, m
+
+    thresholds = pd.Series(cutoffs, dtype=float).reindex(code_cols)
+    if exclude_code_list:
+        for c in [c for c in code_cols if matchesIgnoreCode(c, exclude_code_list)]:
+            thresholds.loc[c] = float("nan")
+            methods[c] = "excluded"
+    thresholds.attrs["flag_methods"] = methods
+
+    from collections import Counter
+    tally = Counter(m or "none" for m in methods.values())
+    print(f"Fallback flagging (chain: {' -> '.join(chain)}) — cutoff source per code: "
+          + ", ".join(f"{k}={v}" for k, v in tally.items()))
+    for c in code_cols:
+        cval = thresholds.get(c)
+        print(f"    {c}: {methods.get(c)}"
+              + (f" = {cval:.4f}" if pd.notna(cval) else " = (no cutoff)"))
+
+    def _count_low(row):
+        return sum(
+            1 for c in code_cols
+            if pd.notna(row[c]) and pd.notna(thresholds.get(c)) and row[c] <= thresholds[c]
+        )
+
+    result = score_df.copy()
+    result["low_count"] = result.apply(_count_low, axis=1).astype("Int64")
+    result["Pass/Fail"] = result["low_count"].apply(
+        lambda k: "Fail" if k >= min_low_count else "Pass")
+    return result, thresholds
+
+
+def flag_low_students(
+    score_df: pd.DataFrame,
+    method: FlagMethod | str = FlagMethod.PERCENTILE,
+    id_cols: list[str] | None = None,
+    min_low_count: int = 3,
+    # percentile-specific
+    percentile: float = 0.15,
+    # BLR-specific
+    folder_path: str | None = None,
+    borderline_gr: int = 2,
+    date_regex: str = DEFAULT_DATE_REGEX,
+    file_pattern: str = DEFAULT_FILE_PATTERN,
+    period: str = PERIOD_ALL,
+    min_date: str | None = None,
+    max_date: str | None = None,
+    ignore_code_list: list[str] | None = None,
+    min_item_count: int = 0,
+    include_code_list: list[str] | None = None,
+    exclude_code_list: list[str] | None = None,
+    fallback_chain: list[str] | None = None,
+    blr_min_n: int = 15,
+    blr_min_r2: float = 0.10,
+    blr_min_low_gr: int = 3,
+    bgm_min_borderline_frac: float = 0.20,
+    bgm_min_borderline_n: int = 5,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Unified interface for flagging low-performing students.
+
+    Parameters
+    ----------
+    method : "percentile" or "blr"
+        * **percentile** – flag if score <= per-date percentile in ≥ min_low_count dates.
+        * **blr** – flag if score <= BLR regression cutoff in ≥ min_low_count dates.
+    percentile : float
+        Only used when method="percentile".  Default 0.15 (bottom 15%).
+    folder_path : str
+        Required when method="blr" (needs raw files to compute regression).
+    borderline_gr : int
+        Global-rating value defining the borderline group (default 2).
+
+    Returns
+    -------
+    (flagged_df, thresholds) – the score table with Pass/Fail + low_count
+    columns, and a Series of per-date thresholds that were applied.
+    """
+    if id_cols is None:
+        id_cols = list(DEFAULT_ID_COLS)
+
+    # Per-code fallback chain takes over when set — each code's cutoff comes from the
+    # first method whose usefulness check passes (see _flag_by_fallback).
+    if fallback_chain:
+        if folder_path is None:
+            raise ValueError("fallback_chain needs folder_path to read GR/score rows.")
+        return _flag_by_fallback(
+            folder_path, score_df, id_cols, list(fallback_chain),
+            borderline_gr=borderline_gr, min_low_count=min_low_count, percentile=percentile,
+            date_regex=date_regex, file_pattern=file_pattern, period=period,
+            min_date=min_date, max_date=max_date, ignore_code_list=ignore_code_list,
+            min_item_count=min_item_count, include_code_list=include_code_list,
+            exclude_code_list=exclude_code_list,
+            blr_min_n=blr_min_n, blr_min_r2=blr_min_r2, blr_min_low_gr=blr_min_low_gr,
+            bgm_min_borderline_frac=bgm_min_borderline_frac,
+            bgm_min_borderline_n=bgm_min_borderline_n)
+
+    method = FlagMethod(method)
+
+    if method == FlagMethod.PERCENTILE:
+        return _flag_by_percentile(score_df, id_cols, percentile, min_low_count,
+                                   exclude_code_list=exclude_code_list)
+
+    if method in (FlagMethod.BLR, FlagMethod.BORDERLINE):
+        if folder_path is None:
+            raise ValueError(f"folder_path is required for {method.value} flagging")
+        return _flag_by_blr(
+            folder_path, score_df, id_cols, borderline_gr,
+            min_low_count, date_regex, file_pattern,
+            period, min_date, max_date, ignore_code_list, min_item_count,
+            include_code_list=include_code_list,
+            use_borderline_mean=(method == FlagMethod.BORDERLINE),
+            exclude_code_list=exclude_code_list,
+        )
+
+    raise ValueError(f"Unknown method: {method}")
+
+

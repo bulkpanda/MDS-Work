@@ -2,9 +2,11 @@
 
 > Computes per-student "at-risk" flags from a cohort's assessment forms and writes a multi-sheet, colour-coded Excel flagging dashboard (optionally a companion PDF).
 
+> **Changed since generation (2026-09-22).** Count-Pivot highlighting gained two modes in `COUNT_HIGHLIGHT_MODES` — `zeros` (`_colorPivotZeros`, red only on `count==0`) and `column_gradient` (`_colorPivotColumnGradient` + `_gradientHex`, per-column red→green percentile-rank heatmap); `dds2_sim` now defaults `countHighlightMode="zeros"`. New **Unique Item Codes** Summary column (`checklist_unique`, label "Unique Item Codes") and a `low_item_code_count` FlagSpec on `checklist_unique` vs `min_item_codes` (config `minItemCodes`, auto = mean − sdMultiplier·SD), red cross-highlight, added to `_OPT_IN_FLAGS` and to the `flags`+`highTierFlags` of `dds2_sim`/`boh2_sim`/`boh2_clinic`/`dds2_clinic`/`dds3_clinic` (BOH1 Sim via `boh2_sim`). Full detail: `_handover_docs/HANDOVER_unique_item_code_flag_and_cohort_ts_rolling_avg.md`.
+
 | | |
 |---|---|
-| **Lines of code** | 3412 *(was 2682 when this doc was generated — see §0)* |
+| **Lines of code** | 4141 *(was 2682 when this doc was generated — see §0)* |
 | **Top-level functions** | 40 (39 distinct names — `_itemCodeCounts` is defined twice) |
 | **Classes** | 3 (`FlagSpec`, `CustomFlagSpec`, `FlaggingConfig`) |
 | **Module constants** | 47 |
@@ -67,6 +69,25 @@ now the Operator-gated one.
 (borderline-GR auto) and are now **absolute** standards. Every other preset is unchanged.
 
 **Two bug fixes that move numbers on an unchanged call** — see §7.
+
+### 2026-10-01 — DDS3 reportable score pivot + count-based ES level flags
+
+- `buildSectionScorePivot(cohortDf, formType, mappingFile, groupBy, reportableItems=None)` — new kwarg; with `groupBy="item_code"` keeps only reportable codes (exact or numeric base before `-`/`/`), category-ordered columns, Overalls over reportable items only.
+- `_build_item_code_score_pivot_sheet` honours `config.itemScorePivotReportableOnly` (+ `config.reportableItems`, default `DDS3_REPORTABLE_ITEMS`) → sheet "Reportable Item Score Pivot".
+- `getFlagDf` adds `es_lvl1_count`…`es_lvl4_count`; thresholds dict adds `max_es_lvl1_count`, `max_es_lvl2_count`.
+- `FLAG_REGISTRY`: `high_es_lvl1_count` ("ES L1 #"), `high_es_lvl2_count` ("ES L2 #") — FlagSpec `above`, in `_OPT_IN_FLAGS`.
+- `FlaggingConfig`: `maxEsLvl1Count`, `maxEsLvl2Count`, `itemScorePivotReportableOnly`, `reportableItems` (in `copy()`/`describe()`); raises if a count flag is active with a `None` max.
+- `PRESETS["dds3_clinic"]`: `high_es_lvl1` → `high_es_lvl1_count` (`maxEsLvl1Count=1`, HIGH), `item_code_score_pivot` sheet added, `itemScorePivotReportableOnly=True`.
+- `DDS3_REPORTABLE_ITEMS`: `"LA"` removed (its `int()` sort broke Reportable Items / Item Scale Distribution).
+- Full detail: `_handover_docs/HANDOVER_dds3_reportable_score_pivot_es_lvl1_count.md`.
+
+### 2026-09-30 — `boh1_sim` preset
+
+New `PRESETS["boh1_sim"]` (after `boh2_sim`): same flags as `boh2_sim` but entrustment (`low_es`, `high_es_lvl1`) is **low tier**; sheets add `section_score_pivot` (Simulation → "Item Code Score Pivot"); `minChecklists`/`minClasses=None`. Used by `main.ipynb` cell 15 for BOH1 Simulation. See `_handover_docs/HANDOVER_boh1_sim_flagging_preset.md`.
+
+### 2026-09-30 — `low_professionalism` sheet
+
+New opt-in sheet builder `_build_low_professionalism_sheet` (registry key `low_professionalism`, in `_BOH2_ONLY_SHEETS` so not in `_ALL_SHEETS`) + helpers `_stripTags`, `_formItemCodes`. Writes "Professionalism {config.professionalismLevel|1}": one row per form with that PS — ID, Student, Melbourne date, Item Codes, GR, ES, PS, Assessor, Clinic, Assessor/Student Comments. Enabled in `boh1_sim` only. See `HANDOVER_boh1_sim_flagging_preset.md` §9.
 
 ### 2026-08-28 — DDS3 role-code normalisation in sheet builders
 
@@ -566,7 +587,7 @@ and is registered by short key in `SHEET_REGISTRY`. All of them **write into the
 *Lines 766–797.* Sheet **"Item Code GR Pivot"** / **"Section GR Pivot"** from `_buildGrPivot`. Cell colouring: **red below 2.5, amber below 3.0, green at 4.0 or above** (hard-coded, lines 786–791). Freeze panes `C4`.
 
 #### `_build_clinical_incidents_sheet(writer, flagDf, compDf, cohortDf, thresholds, cohort, formType, config, mappingFile=None)`
-*Lines 800–850.* Sheet **"Clinical Incidents"** — every `cohortDf` row whose `clinical_incident` is non-null and not blank after stripping, showing `student_number, student_name, datetimeutc (date only), assessor_name, clinical_incident, role, clinic`, sorted by student name then date. Column widths are keyed by field name (incident details 70 chars). **Requires** all seven columns to exist in `cohortDf` or raises `KeyError`.
+*Lines 800–850.* Sheet **"Clinical Incidents"** — every `cohortDf` row whose `clinical_incident` is non-null and not blank after stripping, showing `student_number, student_name, datetimeutc (date only), assessor_name, clinical_incident, role, clinic`, sorted by **date descending (newest first)**, student name as tiebreak *(changed 2026-09-22; was student-name then date)*. Column widths are keyed by field name (incident details 70 chars). **Requires** all seven columns to exist in `cohortDf` or raises `KeyError`.
 
 #### `_build_legend_sheet(writer, flagDf, compDf, cohortDf, thresholds, cohort, formType, config, mappingFile=None)`
 *Lines 853–981.* Sheet **"Legend"** — created via `writer.book.create_sheet` (so it lands at the end of the workbook regardless of position in `config.sheets`).

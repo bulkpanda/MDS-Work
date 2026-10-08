@@ -1,0 +1,944 @@
+# Handover Index — MDS Work / 2026
+
+**What this file is.** One place to see every handover document in this folder, newest first,
+so you can tell *which* doc to open without reading all of them. Each entry records the date,
+what the session actually changed, which code files it touched, the traps it found, and what it
+left unfinished.
+
+**Keeping it current.** Whenever a new handover document is written into `_handover_docs/`,
+add an entry here in the same session — newest at the top of both the table and the detail
+list — and move anything it resolved out of *Open items across all sessions* at the bottom.
+The handover doc holds the detail; this file holds the trail.
+
+---
+
+## At a glance
+
+| Date | Document | Scope | Cohorts | Main code files |
+|---|---|---|---|---|
+| 2026-09-22 | [HANDOVER_unique_item_code_flag_and_cohort_ts_rolling_avg.md](HANDOVER_unique_item_code_flag_and_cohort_ts_rolling_avg.md) | **Unique-item-code risk flag + Count-Pivot highlight modes + cohort time-series score parity** — flagging: two new Item Code Count Pivot highlight modes `zeros` (red only on 0s = missed weeks; new `dds2_sim` default) and `column_gradient` (per-column red→green heatmap); a **Unique Item Codes** Summary column (`checklist_unique` = distinct codes, scale-excluded) + `low_item_code_count` high-risk flag (`minItemCodes`, auto=mean−1.5·SD) added to `dds2_sim`/`boh2_sim`/`boh2_clinic`/`dds2_clinic`/`dds3_clinic` (BOH1 Sim via `boh2_sim`). Cohort time-series PDF: **rolling-avg(3)** line on the score scatter (Sim+Clinic, `_addRollingAvgToScatter`) + **Sim stream colour/legend/labels** (`streamCohort` threaded through) to match the V2 student report. Additive; `main.ipynb` not edited | DDS2/BOH2/DDS3/BOH1 | `flagging_utils.py`, `boh2_dds2_dds3_utils.py` |
+| 2026-09-16 | [HANDOVER_student_report_weakness_comments_and_toc.md](HANDOVER_student_report_weakness_comments_and_toc.md) | **DDS4/BOH3 student reports — weakness-over-time & by-item-code, all-comments, PDF cover contents + page numbers** — per-student PDF & Excel now show areas-for-improvement **per rotation and per form** (with item codes on the bars) and **which item codes carry them**, split into rotation-group panels (`setWeaknessRotationGroups`, `setWeaknessCodeTopN`; co-occurrence, not per-procedure). Every free-text field surfaced via `getAllStudentComments` (fixes assessor comments **missing from July** — DASH moved them from `multi-select.weakness-other` → `texts.additional_comments`): PDF supervisor+student tables (truncated to `PDF_COMMENT_MAXCHARS`), Excel **All Comments** sheet (full text). Student PDF gained a **clickable two-level contents cover + page numbers** (`_StudentTocDoc`+`multiBuild`); `buildEntrustmentTimeSeriesPdf` gained the weakness panels. Additive; `main.ipynb` not edited | DDS4, BOH3 (other cohorts unchanged — different data structure) | `boh3_dds4_utils.py` |
+| 2026-09-16 | [HANDOVER_dds3_interactive_timeseries_embed_and_fhy_shy_split.md](HANDOVER_dds3_interactive_timeseries_embed_and_fhy_shy_split.md) | **DDS3 interactive embedded time-series + FHY/SHY two-page split** (V2 report) — the cluttered per-session code labels are replaced by an **interactive** ECharts chart (hover reveals code/score/GR·ES/assessor/clinic, code filter, FHY/SHY tabs) **embedded inside the PDF as a file attachment** + an in-page **paperclip** annotation; the printable page keeps a clean, label-free preview. **On by default for DDS3 only** (`INTERACTIVE_TS_COHORTS`), others stay static. Separately, **any** stream (Sim/Clinic, all cohorts) now splits the time-series into an **FHY page + SHY page** at **15 Jun 2026** — only when both halves have forms. All additive: `_addTimeSeriesPageV2` unchanged; new kwargs `interactiveTimeSeries` / `tsSplit` / `tsSplitDate` on the V2 builders; interactive data reuses `student_report_html_utils._timeseriesBlock` so numbers match. Embed via `pikepdf`. `main.ipynb` not edited | **DDS3** interactive; FHY/SHY split cohort-generic (BOH1/BOH2/DDS1–3) | `boh2_dds2_dds3_utils.py` (reuses `student_report_html_utils.py`, `_assets/echarts.min.js`) |
+| 2026-09-15 | [HANDOVER_v2_dynamic_cover_contents.md](HANDOVER_v2_dynamic_cover_contents.md) | **V2 report dynamic cover / contents page** — the per-student PDF now opens with a cover listing exactly the sections present, in order, each with a one-line explanation and a real **page number**. Fully dynamic (add/remove a section → contents follow) via zero-size `_V2TocMark` markers + a `TableOfContents` resolved over a two-pass `doc.multiBuild`. `_V2DocTemplate.afterFlowable` notifies TOC entries; `_v2AddSection` drops the marker if a section renders nothing (no phantom entry / blank page). Banner moves to the cover; Summary becomes page 2 | all V2 cohorts (BOH1/BOH2/DDS1–3) | `boh2_dds2_dds3_utils.py` |
+| 2026-09-15 | [HANDOVER_student_report_interactive_html.md](HANDOVER_student_report_interactive_html.md) | **Interactive HTML student report** — new self-contained module `student_report_html_utils.py` renders one ECharts `.html` per student that mirrors the PDF V2 report page-for-page, with a Both/Sim/Clinic switch, chart hover, date-zoom, and reflection GR-filter + search. **Additive & reuse-only:** imports and *calls* the `*V2` data functions in `boh2_dds2_dds3_utils.py` so HTML numbers can't drift from the PDF; nothing in that module changed. Two layers (`prepareReportData` = data, `render*` = pure-Python HTML). Vendored `_assets/echarts.min.js` inlined into every file. Sample rendered from representative data (DB not reachable from the Cowork VM); numbers pending first live-DB validation. `main.ipynb` NOT edited (cell ready in the doc) | BOH2 (driver cohort-generic) | `student_report_html_utils.py` (new), `_assets/echarts.min.js` (new) |
+| 2026-09-15 | [HANDOVER_v2_sim_stream_labels_and_scatter_legend.md](HANDOVER_v2_sim_stream_labels_and_scatter_legend.md) | **V2 Sim time-series stream labels/colours + scatter legend & colour fix + BOH1 empty page** — DDS2 Sim session names (`2026-Week-15`, `Paeds…`, `FP-Week-04`, `Week-03`) shortened to `CD15/P1/FP4/E3` and coloured by stream w/ a legend (driven off `SIM_STREAMS`; Sim page only, generic). Fixed the all-**grey** BOH2 Sim (no-`codePatterns` streams now fall back to normal blue, not grey) and restored the **Clinic** legend keys (Complex/Smile Squad/missing) that the V2 rolling-avg re-legend was clobbering — now via labelled proxy artists. Fixed the **blank page after Procedures** in BOH1 (section PageBreak made conditional on the section rendering) | DDS2/BOH2/BOH1; legend fix cohort-generic | `boh2_dds2_dds3_utils.py` |
+| 2026-09-15 | [HANDOVER_v2_reflections_dynamic_composite.md](HANDOVER_v2_reflections_dynamic_composite.md) | **V2 report dropped comments (DDS2 clinic) + dynamic reflection composite** — the V2 "new comments" block (`_addReflectionCardsV2`) judged card-vs-collapsed-log from the single plain `reflection` key, so DDS2 clinic forms (student writes the *structured* keys, assessor comment in `reflection-student-*`/`additional-comments`) were dumped into the assist/support log with the comment truncated — **1,801 of 4,776** forms. Fixed the gate to use the full composite (both sides; collapse only when both trivial). Also made `getDataDf` build `*_reflection_full` **dynamically** from every `texts` comment key (known labels + humanised fallback for new/unknown keys; denylist `*signature`/`clinical-incident*`), before the Smile Squad swap — future-proof, and now catches the stray BOH1 `feedback` key the hardcoded list missed. Serves V1 + V2 | DDS2 Clinic reported; fix cohort-generic (BOH1/BOH2/DDS1–3) | `boh2_dds2_dds3_utils.py` |
+| 2026-09-09 | [HANDOVER_osce_dds4_dynamic_item_scoring.md](HANDOVER_osce_dds4_dynamic_item_scoring.md) | **DDS4 OSCE dynamic per-item scoring** — reworked the OSCE engine so each MC item is scored on its own number of options (different items can differ *within* one checklist, as in DDS4 Fixed/Removable Prosth). Points by **rank** (by `O`-key, not label — robust to the `"Unsatifactory"` typo / `Very Good` casing / per-checklist option maps): 4-level `4/3/2/0`, 3-level `2/1/0`, 2-level `1/0`. Each item normalised to `points/itemMax` and the **checklist score = mean of item fractions (equal weight)**. Fixed the hard-coded `MC1..MC10` cap (Paediatrics 14, Oral Surgery 13, Removable 12 were truncated). Cronbach α / item-total r now on normalised fractions; MC Item Stats / Legend / detail sheets made per-item & level-aware; `interGradeDiscrimination` handles mixed checklists. Uniform-level checklists are byte-identical to the old formula (DDS2 unchanged) | DDS4 (engine cohort-generic) | `osce_utils.py`, `osce_metrics.py`, `main.ipynb` |
+| 2026-09-09 | [HANDOVER_osce_stationwise_blr_analysis.md](HANDOVER_osce_stationwise_blr_analysis.md) | **OSCE station-wise workbooks + BLR/AMEE analysis** — new `osce_utils.py` + `osce_metrics.py` build TWO workbooks from the OSCE JSON: a **station workbook** (13 station×checklist detail sheets, abbreviated names, integer points coloured by label, GR reversed to 5=Excellent..1=Fail, Station Summary w/ grade counts + Fails(BLR), Assessors list) and an **analysis workbook** (Student×Station fail pivot w/ 3-colour BLR/Mean-2SD legend, BLR Analysis w/ banners + embedded 4-panel figures, Station Metrics per AMEE Guide 49 — overall α, α-if-deleted, R², discrimination, circuit/assessor η², grade counts, averages row — BLR Cut per Circuit, Assessor Analysis ANOVA hawks&doves, Standard Setting w/ fail counts, Assessor Grid red→green by assessor mean %). Score by LABEL not O-key; per-checklist 4/3-level points (4/3/2/0 · 2/1/0); ignore-list resolves student numbers→names via roster; 1-dp rounded cutoffs | DDS2 (code cohort-generic) | `osce_utils.py` (new), `osce_metrics.py` (new), `main.ipynb` |
+| 2026-09-09 | [HANDOVER_student_report_v2_redesign.md](HANDOVER_student_report_v2_redesign.md) | **Redesigned per-student PDF report (V2)** — additive parallel stack (`buildEntireCohortStudentReportsV2` → new `Individual Student Reports V2/` folder), originals untouched. Tinted-page theme; pies→stacked rating bars; procedures as Sim+Clinic side-by-side meter bars (class-avg tick + count/delta) with rounded pill chips for singles; readable Clinic-default spider; time-series kept + rolling-avg line + full-frame embed to restore x-tick alignment; GR-keyed reflection cards + collapsed assist log. **Data fixes:** checklist/composite codes re-mapped to their 3-digit section (kills the Miscellaneous over-count); patient age + outcomes counted on Operator forms only | BOH2 (generic) | `boh2_dds2_dds3_utils.py` |
+| 2026-08-28 | [HANDOVER_dds3_role_normalization_sheets.md](HANDOVER_dds3_role_normalization_sheets.md) | Fixed **empty `item_scale_dist` / `item_scale_donuts` sheets for DDS3 Clinic** — four sheet builders filtered Operator forms by the LABEL `"Operator"` while the v3 CAF stores role as the CODE `"O"`, so every form was dropped. Now fold role through `normalizeRole` in `reportable_items_pivot`, `item_scale_dist`, `operator_by_clinic`, `item_scale_donuts`, plus normalise the `clinical_incidents` Role display. Smoke-tested on real DDS3 rows: 0 → 7,789 responses over 21 items | DDS3 (fix is cohort-generic) | `flagging_utils.py` |
+| 2026-08-24 | [HANDOVER_nameSortKey_import_fix.md](HANDOVER_nameSortKey_import_fix.md) | Fixed `ImportError: cannot import name 'nameSortKey'` blocking the DDS4/BOH3 section of `main.ipynb`. The surname sort key `boh3_dds4_utils.py` imports (line 35) and calls (line 2491, entrustment time-series PDF) was never defined — added it to `general_utils.py`: `nameSortKey(name)` → casefolded `(surname, firstName)` 2-tuple, last-token surname heuristic mirroring `_surnameKey` | DDS4, BOH3 (function is cohort-generic) | `general_utils.py` |
+| 2026-08-19 | [HANDOVER_boh2_flagging_summary_declining_itempivot.md](HANDOVER_boh2_flagging_summary_declining_itempivot.md) | BOH2 Clinic flagging: two new **Summary columns** (Checklists — item-code count, `checklistCountMode` total/unique — and Classes = distinct dates), **Low+Declining flags** (`low_declining_es/gr/score`) replacing the standalone declining flags so a high-but-declining student no longer flags, verified Pt-Seen-Operator gate (already on), and a new **Item Code Score Pivot** sheet giving Clinic the per-item view Simulation had | BOH2 Clinic (Summary columns compute cohort-wide) | `flagging_utils.py` |
+| 2026-08-18 | [HANDOVER_dds2_clinic_flagging_fhy.md](HANDOVER_dds2_clinic_flagging_fhy.md) | DDS2 Clinic flagging FHY review: **role/patient CODE-vs-LABEL bug** (v3 `O`/`ISP` counted as nothing), Operator-gated Pt Seen per Config.xlsx, inclusive `<=` cutoffs (Pt Seen ≤ 11, ES ≤ 2, GR ≤ 3, PS ≤ 1.5), new **Section Score Pivot** sheet, FHY/SHY semester selector, `ignoreDates` for student-on-student days, **clinical incidents were ALWAYS empty** (the loader read one of two storage shapes — 159 incidents lost), and a `scoreWeighting` switch for the per-form vs per-item Score | DDS2 Clinic requested; 3 of 8 changes are cohort-wide fixes | `flagging_utils.py`, `boh2_dds2_dds3_utils.py`, `general_utils.py`, `main.ipynb` |
+| 2026-08-18 | [HANDOVER_cohort_timeseries_schedule_and_counts.md](HANDOVER_cohort_timeseries_schedule_and_counts.md) | Cohort time-series PDF: surname ordering, date range on the banner, timetable-driven Sim x ticks + purple missing-session dots, orange Smile Squad points (no more " SS" suffix), data-driven legend (no "Complex" on Sim), per-student Time Management axis, content-fitted Item Code counts table beside the charts on a widened page — Clinic only by default, with code variants merged | BOH2 (generic to BOH1/DDS1–3) | `boh2_dds2_dds3_utils.py`, `BOH2/BOH2 Sim Sessions 2026.xlsx` |
+| 2026-08-12 *(upd. 2026-08-18)* | [HANDOVER_dds2_weekly_sim_v3_multidate.md](HANDOVER_dds2_weekly_sim_v3_multidate.md) | Weekly Sim (now cohort-generic): v3 audit, DB-driven date discovery, multi-date build, semester cutoff, FHY/SHY/ALL periods, item-code ignore list, three-stream split (Paeds/FP/Endo) + BLR flagging fix, styled combined workbook, BOH2 onboarding, styled weekly sheets & 1-5 MC scale, **weekly-sheet column layout (§6e) + attendance/Forms/Session Summary (§6f), combined-workbook headers + risk_report shim (§6g)** | DDS2 + BOH2 (Simulation) | `general_utils.py`, `main.ipynb`, `risk_report.py`, `BOH2/*.xlsx` |
+| 2026-08-12 | [HANDOVER_student_excel_reports.md](HANDOVER_student_excel_reports.md) | Student Excel reports: flat per-form export + dashboard workbook with native charts | BOH3, DDS4 | `boh3_dds4_utils.py`, `main.ipynb` |
+| 2026-08-11 | [HANDOVER_v3_comments_and_summary_labels.md](HANDOVER_v3_comments_and_summary_labels.md) | Recovered dropped comment text and fixed junk Summary role/patient labels | BOH1, BOH2, DDS1–3 | `boh2_dds2_dds3_utils.py` |
+| 2026-08-10 | [HANDOVER_boh2_dds2_dds3_report_v3_and_timeseries.md](HANDOVER_boh2_dds2_dds3_report_v3_and_timeseries.md) | Time-series chart rework + full audit of the per-student report chain for v3 | BOH1, BOH2, DDS1–3 | `boh2_dds2_dds3_utils.py` |
+| 2026-08-04 | [boh_dds_cohort_reports_v3_handover.md](boh_dds_cohort_reports_v3_handover.md) | Cohort report chain migrated to `rawform_forms_v3`; user-confirmed working | BOH1, BOH2, DDS2, DDS3 | `boh2_dds2_dds3_utils.py`, `general_utils.py` |
+| 2026-08-04 | [boh2_dds2_dds3_cohort_reports_v3_handover.md](boh2_dds2_dds3_cohort_reports_v3_handover.md) | Companion technical record of the same migration (scale paths, item codes) | BOH1, BOH2, DDS2, DDS3 | `boh2_dds2_dds3_utils.py` |
+| 2026-08-03 | [finalyear_reporting_session_handover.md](finalyear_reporting_session_handover.md) | New Excel sheets, PBN/Leave enrichment, entrustment time-series PDF + HTML | BOH3, DDS4 | `boh3_dds4_utils.py` |
+| 2026-07-31 | [finalyear_v3_reports_handover.md](finalyear_v3_reports_handover.md) | BOH3/DDS4 cohort-summary PDF pipeline migrated to the v3 data shape | BOH3, DDS4 | `boh3_dds4_utils.py` |
+| 2026-07-29 | [rawforms_v3_separation_handover.md](rawforms_v3_separation_handover.md) | Built the two v3 separation tables; downstream rewiring deferred | all | `boh3_dds4_utils.py`, `general_utils.py`, `main.ipynb` |
+| 2026-07-02 | [flagging_system_handover.md](flagging_system_handover.md) | At-risk flagging architecture + DDS2 Clinic preset and info-only flags | all (DDS2 Clinic specific) | `flagging_utils.py`, `main.ipynb` |
+| not stated | [viva_gradio_handover.md](viva_gradio_handover.md) | Reference guide for the Viva live monitoring dashboard | n/a (Viva) | `viva_gradio.py` |
+| not stated | [scbd_gradio_handover.md](scbd_gradio_handover.md) | Reference guide for the SCBD live monitoring dashboard | n/a (SCBD) | `scbd_gradio.py` |
+
+---
+
+## Detail by document
+
+### 2026-09-22 · HANDOVER_unique_item_code_flag_and_cohort_ts_rolling_avg.md
+
+**Scope.** `flagging_utils.py` + `boh2_dds2_dds3_utils.py`; `main.ipynb` not edited (flagging cell 16, cohort time-series cell 11). Backups `_bak/flagging_utils.py.bak_20260922_004904`, `_bak/flagging_utils.py.bak_iccflags_20260922_015515`, `_bak/boh2_dds2_dds3_utils.py.bak_cohortts_20260922_010528`. Verified static (`py_compile`) + synthetic (no live DB).
+
+**Count-Pivot highlight modes.** `COUNT_HIGHLIGHT_MODES` += `zeros`, `column_gradient`. `_colorPivotZeros` reds only `count==0` (missed weeks); `_colorPivotColumnGradient` shades each cell by within-column percentile rank via `_gradientHex` (red→yellow→green). `dds2_sim` default `countHighlightMode="zeros"`; other presets unchanged; Section Count Pivot untouched.
+
+**Unique Item Codes flag.** New `low_item_code_count` FlagSpec on **`checklist_unique`** (distinct item codes, `scale…` excluded — NOT `checklist_total`) vs `min_item_codes` (auto = mean − sdMultiplier·SD, override `config.minItemCodes`). New Summary column labelled **"Unique Item Codes"** (after Checklists) with red cross-highlight; `minItemCodes` config field; added to `_OPT_IN_FLAGS`. Rolled into `flags`+`highTierFlags` of `dds2_sim`(minItemCodes=27), `boh2_sim`, `boh2_clinic`, `dds2_clinic`, `dds3_clinic`; BOH1 Sim inherits via `boh2_sim`.
+
+**Cohort time-series parity.** `buildCohortTimeSeriesPdf` gains `_addRollingAvgToScatter` (navy rolling-avg(3) over `_v2SessionMeanByDate`, Sim+Clinic, both layouts) and threads `simStreamCohort` into the scatter so DDS2 Sim gets stream colours/legend/`CD1/P1/FP1/E1` labels — matching the V2 student report. Kunal chose rolling-avg-only (no FHY/SHY split, labels kept). Rubric panels, item-code table, missing dots, half-year divider unchanged.
+
+**Gotchas.** `checklist_unique` (unique) vs `checklist_total` (total) — the flag uses unique; `_streamForCode` degrades to plain colouring if `general_utils` can't import (VM-only); the rolling line re-runs `ax.legend` reproducing `_drawScoresScatter`'s placement so stream keys survive.
+
+**Open.** Not run on live DB/Windows; `minItemCodes` left auto for the four non-`dds2_sim` presets.
+
+### 2026-09-16 · HANDOVER_student_report_weakness_comments_and_toc.md
+
+**Scope.** DDS4/BOH3 per-student PDF (`buildStudentPdf`) + Excel dashboard + cohort entrustment time-series PDF. `boh3_dds4_utils.py` only; `main.ipynb` not edited. Backups `_bak/boh3_dds4_utils.py.bak_20260916_184017` … `_20260916_204615`. Built/verified offline (DB not reachable from the VM); Kunal to confirm on live DDS4/BOH3.
+
+**Weakness analytics.** New queries `getStudentWeaknessTimeline`, `summariseWeaknessByRotation`, `getStudentWeaknessByCodeRotation`, `aggregateWeaknessByCode`, `getStudentWeaknessByItemCode` (+ `rotationSortKey`/`rotationNumber`/`weaknessRotationGroups`) over the 7 `assessor_data->'multi-select'->'weakness-*'` buckets. PDF: `plotWeaknessOverTime` (by-rotation w/ mean-entrustment overlay + per-form dated bars with item codes), `plotWeaknessByItemCodeGroups`, `buildStudentWeaknessSection`. Excel: data group `"weakness"`, sheets **Weakness Over Time** / **Weakness by Item Code** (per rotation group; table lists every code). Item-code figures are **co-occurrence** (per-form feedback), not per-procedure.
+
+**Rotation split & caps.** `WEAKNESS_ROTATION_GROUPS` (None → 1–3 / 4+) via `setWeaknessRotationGroups([...])`; `WEAKNESS_CODE_TOPN` (20) via `setWeaknessCodeTopN(n)` — drive **both** PDF & Excel. **Use the setters** (star-import gotcha). "Missing codes" = the top-N cap, not a bug (Excel table has all).
+
+**All comments + the July migration.** `getAllStudentComments` unions all `assessor_data.texts.*`, `student_data.texts.*`, and free-text multi-selects. Finding (from stream-parsing the raw CAF JSON): assessor free text moved from `multi-select.weakness-other` (**0 from Jul 2026**) to `texts.additional_comments` (537 Jul, 489 Aug) — old tables read only `weakness-other`, so comments looked missing; the category weakness tags still populate. PDF: `buildStudentCommentsTables` (supervisor table filtered to `PDF_SUPERVISOR_COMMENT_TYPES`; comments truncated to `PDF_COMMENT_MAXCHARS`=500). Excel: `_collectCommentData` → `getAllStudentComments`, sheet renamed **All Comments** (full text), added to `DASHBOARD_SHEETS`.
+
+**PDF cover / page numbers.** `_StudentTocMark`, `_StudentTocDoc`, `_makeStudentToc` (2 levels), `_studentPageDecorators`; `buildStudentPdf` opens with a clickable two-level `TableOfContents` (sections + per-table/chart sub-entries incl. the weakness pie, separate supervisor/student comment entries) and prints page numbers via `doc.multiBuild`. Import: `reportlab.platypus.tableofcontents.TableOfContents`.
+
+**Entrustment time-series PDF.** `buildEntrustmentTimeSeriesPdf` now appends each student's `plotWeaknessOverTime` panels (`figWidth` matches the wide page).
+
+**Gotchas.** `LayoutError` from an over-tall comment row (a table row can't split across pages; `createTable` wraps its Table in `KeepTogether`) → `_enableRowSplit` (splitInRow/repeatRows) for the by-item-code tables, and **truncation** for comments; `Utils.py` untouched. Setters, not bare reassignment. `weakness-other` empty from July (historical only).
+
+**Open.** Live-DB validation on real DDS4/BOH3; optionally thread `rotationGroups`/topN through the cohort builders as per-call params.
+
+### 2026-09-16 · HANDOVER_dds3_interactive_timeseries_embed_and_fhy_shy_split.md
+
+**Scope.** V2 per-student report time-series. Two features, both additive; `_addTimeSeriesPageV2` unchanged. `boh2_dds2_dds3_utils.py`, backup `_bak/boh2_dds2_dds3_utils.py.bak_20260916_004355`. Reuses `student_report_html_utils.py` (unchanged) + `_assets/echarts.min.js`.
+
+**Interactive embed (DDS3 default).** The static scatter piled every session's 3-digit item codes as text — worst for DDS3. Now, for cohorts in `INTERACTIVE_TS_COHORTS=("DDS3",)`, a **self-contained interactive ECharts HTML is embedded inside the PDF** as a file attachment (`pdf.attachments[name]` via `pikepdf`) with an on-page `/FileAttachment` **paperclip** annotation on the chart page; the printable page shows a clean, **label-free** preview + a callout. Hover reveals code/score/GR·ES/assessor/clinic; code filter (`5xx`, `4*`, `011`) with "N of M"; FHY/SHY tabs; rolling-avg(3). Interactive **data comes from `student_report_html_utils._timeseriesBlock`** and ECharts from `_sh._loadEcharts` → numbers can't drift from the HTML report or the PDF. A PDF page can't run hover in any mainstream viewer, so interactivity lives in the attachment (opens in a browser); one file to send.
+
+**FHY/SHY split (all cohorts).** `_v2SplitFhyShy` splits a stream at `TS_SPLIT_DATE=15 Jun 2026` (Melbourne): FHY before, SHY on/after — **two segments only when both halves have forms**. Static path (`_addTimeSeriesPageV2Split`) reuses `_addTimeSeriesPageV2` once per segment on **separate pages** (PageBreak between) so the ES/GR rubric panels split too; interactive path uses tabs. Applies to Sim and Clinic.
+
+**API / wiring.** New kwargs on `buildEntireCohortStudentReportsV2` **and** `buildStudentReportV2`: `interactiveTimeSeries` (None→DDS3 on, else off; True/False forces), `tsSplit` (default True), `tsSplitDate` (override boundary); `buildStudentReportV2` also takes `attachSink` (list the driver supplies + post-processes; None → interactive degrades to the static split page). Driver creates `attachSink=[]`, passes it, and calls `_v2EmbedInteractiveAttachments(filename, attachSink)` after `multiBuild`. Page for the paperclip captured by a zero-size `_V2AttachAnchor` flowable (final multiBuild pass wins). New defs: `_v2SplitFhyShy`, `_addTimeSeriesPageV2Split`, `_v2CleanPreviewImage`, `_v2InteractiveTsHtml`, `_V2_INTERACTIVE_TS_JS`, `_addTimeSeriesPageV2Interactive`, `class _V2AttachAnchor`, `_v2EmbedInteractiveAttachments`. Lazy imports (`student_report_html_utils`, `pikepdf`) avoid an import cycle / load-time dep.
+
+**Run.** `bu.buildEntireCohortStudentReportsV2(engine, "DDS3")` (interactive + split by default) / `…("DDS2")` (static + split) / `…("DDS3", interactiveTimeSeries=False)` / `…(…, tsSplit=False)`. Output unchanged: `{cohort}/Individual Student Reports V2/{n}.pdf`. `main.ipynb` NOT edited.
+
+**Decisions.** Additive; reuse the HTML report's data layer; attachment (not "live in page") because no viewer runs page JS — keeps it one file + works everywhere with an attachments panel; DDS3 preview label-free while other cohorts keep labels; capture the paperclip page rather than hard-code it.
+
+**Verification.** `py_compile` clean (container + device VM); AST checks pass; rendering proven on a container prototype (headless Chromium: hover, `5xx`→"12 of 85", tabs, embedded attachment + paperclip verified); glue verified against `student_report_html_utils` source. **NOT run vs live DB / on Windows** — the Cowork Linux VM lacks `win32com`, `arial.ttf` and the DB, so a full import can't complete there; Kunal runs the cell on the real machine.
+
+**Gotchas.** Attachment/paperclip depends on the PDF viewer (Acrobat/Foxit/Chromium OK; minimal/mobile viewers may hide attachments → use the standalone HTML report there). Split heading reads `"{stream} · {half} — Performance Over Time"` (keeps the Sim label-shortening trigger). ~1 MB/DDS3 file from inlined ECharts (CDN option not taken, to stay offline).
+
+**Open.** Live-DB number check vs PDF preview + HTML report; confirm the paperclip UX in the students' viewer; optional CDN-ECharts to shrink files.
+
+
+### 2026-09-15 · HANDOVER_v2_dynamic_cover_contents.md
+
+**Scope.** Added a dynamic cover/contents page (with page numbers) to the V2 per-student PDF. `boh2_dds2_dds3_utils.py`, backup `.bak_covertoc_20260915_140707`.
+
+**Mechanism.** Each section drops a zero-size `_V2TocMark` at the top of its content; `_V2DocTemplate(SimpleDocTemplate).afterFlowable` notifies `('TOCEntry', (level, text, self.page))`; a cover `TableOfContents` renders `title — explanation …… page`; `doc.multiBuild(..., onFirstPage=, onLaterPages=)` runs two passes so page numbers resolve. Helpers: `_V2TocMark`, `_V2DocTemplate`, `_v2TocText`, `_v2MakeTocFlowable`, `_v2AddSection` (appends marker + builder, drops the marker and skips the page-break when the section rendered nothing). New imports: `Flowable`, `TableOfContents`.
+
+**Wiring.** `buildStudentReportV2` gained `studentName`/`studentNumber`, builds the cover (intro + Contents + TOC + PageBreak) after the top spacer, and precedes every section (Summary always; Procedures if `procPanels`; Section / per-type Time Series / per-type Reflections via `_v2AddSection`) with a marker. `buildEntireCohortStudentReportsV2` switched `SimpleDocTemplate`→`_V2DocTemplate` and `doc.build`→`doc.multiBuild`, passing the name/number.
+
+**Decisions.** Banner now sits on the cover (page 1); Summary is page 2 without a banner (page 2+ never had one). Markers (not heading-text detection) because afterFlowable is unreliable for headings inside KeepTogether. multiBuild ≈ 2× layout time.
+
+**Verification.** Standalone reportlab: multiBuild+markers resolve page numbers, works with the page decorators, and matplotlib Image flowables survive both passes. `py_compile` clean; NOT run vs live DB.
+
+**Open.** Banner not repeated on content pages (by design); cover not applied to the cohort time-series PDF or V1 report.
+
+
+### 2026-09-15 · HANDOVER_student_report_interactive_html.md
+**Scope.** New module `student_report_html_utils.py` (+ vendored `_assets/echarts.min.js`) that turns the per-student PDF V2 report into an interactive, self-contained HTML per student.
+- **Additive/reuse-only:** imports `boh2_dds2_dds3_utils as bu` and calls the `*V2` data functions (`getDataDf`, `_computeSummaryMetrics`, `_v2OperatorClinicDf`, `explodeScoresToLong`/`_mergeSection`/`_v2RemapUnmappedSections`, `_v2SectionAggs`, `_v2EntCounts`/`_v2GrCounts`, `_v2SessionMeanByDate`, reflection helpers, `getCohortItemCodeAverages`). No number is re-implemented; `boh2_dds2_dds3_utils.py` is untouched.
+- **Two layers:** `prepareReportData(engine,cohort,sid,...)` → JSON dict; pure-Python `render*` → HTML. **One function per element** (+ paired `_ec*` JS builder), camelCase, colours from imported `V2_*` palette.
+- **Interactivity:** sticky Both/Sim/Clinic switch; 100%-stacked rating bars; procedures bars w/ class-avg diamond + ▲/▽ delta + single-code chips; two radars (score; GR/5+ES/4) + section table; time-series scatter + rolling-avg(3) + rubric line, with a `dataZoom` slider; GR-coloured reflection cards + GR chip filter + text search + assist/FTA log.
+- **Driver:** `buildEntireCohortStudentReportsHtml(engine,cohort)` → `{cohort}/Individual Student Reports HTML/{n}.html` (same gating/removed-student skips as `buildEntireCohortStudentReportsV2`; PDF folders untouched).
+- **Gotchas.** Self-contained ~1.05 MB/file (1 MB is the shared ECharts lib); `json.dumps(allow_nan=False)` so every new field must go through `_num()`; uses explicit `import ... as bu` (not import-star) so no `Table`/`Paragraph` collision.
+- **Open.** Validate numbers on the live DB vs the matching PDF V2 (recommend 1775573); decide on adding the run cell to `main.ipynb`; optional cohort index.html and a scatter section-filter.
+
+
+### 2026-09-15 · HANDOVER_v2_sim_stream_labels_and_scatter_legend.md
+
+**Scope.** Three V2 score-scatter / time-series changes in `boh2_dds2_dds3_utils.py` (backups `.bak_simstreamlabels_` → `.bak_simlegend_` → `.bak_emptysection_` 20260915).
+
+**1 — DDS2 Sim stream labels + colour.** The Sim "item code" is the weekly session name; spelled out it overlapped into a wall of text. New `SIM_STREAM_ABBREV` (CD/P/FP/E — CD=Cons Dent) + `SIM_STREAM_COLORS` (Okabe-Ito) + `_shortStreamItemCode`/`_streamForCode`/`_cohortStreamsSafe`; `streamCohort` threaded `buildStudentReportV2`→`_addTimeSeriesPageV2`(cohort, Sim-only)→`plotStudentScoresTimeSeries`→`_drawScoresScatter`. Labels become `CD15`/`P1`/`FP4`/`E3`, points coloured by stream, with a stream legend. Driven off `SIM_STREAMS.codePatterns`, so generic.
+
+**2 — Colour + legend fix.** Unmatched codes were coloured grey → BOH2 Sim (streams have no `codePatterns`) went all-grey. Now unmatched → normal `_getColor` (blue default / red Complex / orange Smile Squad); grey no longer used for points. Separately, the Clinic legend had lost Complex/Smile Squad/missing keys because `_addTimeSeriesPageV2` re-runs `ax.legend()` after the rolling-avg line, clobbering the hand-built legend. Fixed by adding invisible **labelled proxy** artists for every drawn colour + a single auto `ax.legend()`, so the re-collect keeps all keys. Caller legend now `ncol=2`/`fontsize=7.5` for Sim.
+
+**3 — BOH1 empty page.** `buildStudentReportV2` emitted an unconditional `PageBreak` after the Section even when `_addSectionPerformanceV2` rendered nothing (BOH1 Section is Sim; default `sectionStreams=("Clinic",)`). Now guarded by `len(elements)` before/after — no blank page after Procedures.
+
+**Verification.** `py_compile` OK; standalone renders confirm DDS2 stream labels, Clinic legend keys, and blue (not grey) BOH2 Sim. Module can't import in the bridge VM (`win32com`/scipy), so logic was reproduced faithfully in scratch; NOT run vs live DB.
+
+**Traps.** The Sim "line" is the rolling-avg in `uniColor` (unchanged). Stream colouring is Sim-only. BOH1 Sim section can be turned on with `sectionStreams=("Simulation",)`.
+
+**Open.** Not yet applied to `buildCohortTimeSeriesPdf` / V1 per-student report.
+
+
+### 2026-09-15 · HANDOVER_v2_reflections_dynamic_composite.md
+
+**Scope.** Fixed the V2 per-student report dropping comments (reported on DDS2 clinic) and made the reflection composite dynamic. `boh2_dds2_dds3_utils.py` only; backup `.bak_comments_20260915_051750`.
+
+**Root cause.** `_addReflectionCardsV2` classified card-vs-collapsed-log using the plain `student_reflection` column (single `texts->>'reflection'` key). DDS2 clinic students write into the structured keys (`reflection-what-did-well`/`-what-differently`/`-how-prepare`) and the assessor comment sits in `reflection-student-did-well`/`-improve`/`additional-comments`; a blank plain `reflection` (~half of DDS2 clinic forms) forced the row into the collapsed assist/support log with the real comment truncated to 110 chars from the plain `assessor_reflection`. 2,290 DDS2 clinic forms had an empty plain reflection but substantive text elsewhere (329 assessor-only).
+
+**Fix.** (1) `getDataDf` now overwrites `student_reflection_full`/`assessor_reflection_full` via `_applyDynamicReflectionComposites` — built from **every** `*_data['texts']` comment key by `_buildReflectionComposite` (known keys labelled+ordered from `STUDENT_/ASSESSOR_REFLECTION_TEXT_KEYS`, unknown keys auto-included with a humanised label), skipping the `_isReflectionTextKey` denylist (`*signature`, `clinical-incident*`). Runs **before** `applySmileSquadSwap` so SS reflections (not swapped) stay correct; feeds both V1 and V2. (2) `_addReflectionCardsV2` decides card-vs-log from the composites via `_v2VisibleReflection` (strips the bold `<b>Label: </b>` headings), collapsing only when **both** sides are trivial.
+
+**Verification.** DDS2 clinic (4,776 forms): now 4,268 cards / 608 genuine log rows; **1,801 reclassified old-log→card**. Denylist audit: only `assessor_signature` (772), `clinical-incident` (117), `clinical-incident-additional-details` (117) excluded — no comment key lost, no denied key leaks. `py_compile` OK. Not run end-to-end vs the live DB.
+
+**Traps.** Never judge "did they comment?" from the plain `student_reflection`/`assessor_reflection` columns (single key). Keep the rebuild before the swap. Denylist matches the key, not the word inside a value. The flagged-forms Excel export still uses the hardcoded SQL composite (unchanged).
+
+**Open.** Port the flagged-forms Excel export to the dynamic builder if new keys must appear there; user to regenerate a DDS2 clinic report and confirm.
+
+**Follow-up 2026-09-15.** The composite dropped raw reflection text into a reportlab Paragraph unescaped → DDS2 build crashed (`paraparser ... unclosed tags`) on a reflection containing `<`/`&`. Fixed by escaping label+value in `_buildReflectionComposite` (bold path); protects V2 cards + V1 table. Backup `.bak_reflescape_20260915_*`.
+
+
+### 2026-09-09 · HANDOVER_osce_dds4_dynamic_item_scoring.md
+
+**Scope.** Made OSCE grading **dynamic per MC item** for DDS4, in `osce_utils.py` + `osce_metrics.py` (driven from `main.ipynb` cell ~35). DDS4 checklists can give different items different option counts — even within one checklist (Fixed Prosth = 2- & 4-level; Removable Prosth = 2- & 3-level; Paediatrics all 2-level; the rest 4-level).
+
+**Key model decisions.** (1) An item's **level = number of O-keys in `extra_config.rubric[MCn]`** (excluding the `label` sub-key). (2) Points by **rank**, best→worst: 4-level `4/3/2/0`, 3-level `2/1/0`, 2-level `1/0` (`LEVEL_POINTS`/`LEVEL_MAX`). (3) Score by the answer **`key`**, not the label — labels are unreliable (`"Unsatifactory"` typo, `Very Good` vs `Very good`, and `extra_config.options` maps differ per checklist, e.g. Removable's 3-level has `O1=Satisfactory` as best). (4) **Equal weight:** each item → `frac = points/itemMax`; checklist `Score% = mean(answered fractions)×100`. (5) Item list read from `fields` (fixes the 10-item cap). New helpers `itemScale`/`checklistItemScales`/`checklistItems`/`levelsText` replace `checklistScale`; `buildStationSpecs` rows gain `frac[i]`, spec gains `items/itemLevel/itemMax/scales`.
+
+**Analysis.** `cronbachAlpha`/`itemTotalCorrs` now take the dynamic item list and run on **normalised fractions** (comparable across levels). `interGradeDiscrimination` keeps the raw-mark scale for uniform checklists but switches to the % scale (`maxMark=100`) for mixed ones. Sheets updated: detail (dynamic MC cols, cells coloured by fraction), MC Item Stats (per-item Level + best→worst counts), Checklist Legend (per-item level), Read Me.
+
+**Verification.** Hand-check (Fixed Prosth record → 65.0%); 3-level→`1/0.5/0`, 2-level→`1/0`; **uniform 4-level identical to the old `sum/(n×max)` for every row** (so DDS2-shaped checklists are unchanged); rank == old label scoring for standard labels. DDS4 BLR cuts: Fixed 87.3, Removable 79.3, Special Needs 79.5, Oral Surg 77.6, Health Promo 88.1, Paeds 96.5%.
+
+**Traps.** Score by `key`+rank, not label. `label` is a rubric sub-key, not an option. `maxPerItem` is `None` for a mixed checklist (only `interGradeDiscrimination` reads it). Points are read by rank position, so spacing (4/3/2/0) is not linear.
+
+**Open.** DDS2 could not be numerically re-verified — its flat records JSON was overwritten by the DDS4 pull and `OSCE/DDS2/backup.json` is a config/rounds structure, not records. Uniform equivalence proven analytically; the one divergence point is a partial item offering a *middle* option (e.g. Occlusal defined with only `O1`/`O3`=Borderline). Re-pull DDS2 OSCE JSON to diff if exact reproduction is needed.
+
+### 2026-09-09 · HANDOVER_osce_stationwise_blr_analysis.md
+
+**Scope.** New, self-contained OSCE reporting + psychometrics stack in two modules — `osce_utils.py` (865 lines) and `osce_metrics.py` (285 lines) — called from a new `main.ipynb` cell. `buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, ...)` reads `temp 2026 osce.json` and writes a station workbook and an analysis workbook plus embedded BLR/harshness PNGs.
+
+**Key model decisions.** (1) Score by the response **label**, never the `O`-key — the key is inconsistent across checklists (`O3` = Borderline in one, Unsatisfactory in another). (2) A **station carries multiple checklists** (13 combos across 5 stations); always key by (station, checklist). (3) Integer point scoring per level: 4-level VG/Sat/BL/Unsat = 4/3/2/0, 3-level VG/Sat/Unsat = 2/1/0 (only Occlusal is 3-level); MC cells coloured **by label**. (4) GR reversed to 5=Excellent..1=Fail so the BLR slope is positive and the cut is taken at GR=Borderline(2). (5) Cutoffs/scores rounded to **1 dp**; fail = `pct1(score) < cutPct`.
+
+**Analysis (AMEE Guide 49).** Overall test Cronbach α (stations as items), α-if-station-deleted, R², inter-grade discrimination (raw-mark slope vs max/10), number of failures, between-group η² by circuit and by assessor (hawks & doves via one-way ANOVA), plus BGM / Cohen / Mean-2SD / fixed cut comparators.
+
+**Extra views.** Student×Station fail pivot (red = below BLR, orange = below Mean-2SD, purple = below both, legend top-right); BLR Cut per Circuit matrix; Assessor Grid (student×station = assessor name, red→green fill by assessor mean %); Assessors list (50 unique).
+
+**Traps.** Single-grade circuit ⇒ null per-circuit cut (no GR variation, e.g. S5 Consent/Circuit 1). Output `.xlsx` often open in Excel ⇒ write to `…(refreshed).xlsx` sibling on `PermissionError`. `scipy` required. Ignore-list student numbers resolved to names via `studentEmailList.csv` (records are name-keyed). Module docs: `_docs/osce_utils.md`, `_docs/osce_metrics.md`.
+
+**Open.** Assessor-Grid gradient is global (conflates station difficulty vs assessor harshness) — per-station normalisation offered, not built. No ability-adjusted harshness model.
+
+
+### 2026-09-09 · HANDOVER_student_report_v2_redesign.md
+**Scope.** A visually redesigned per-student PDF report, built **additively** — every existing element-builder
+(`buildStudentReport`, `_addReflectionsTable`, `_addSectionPerformance`, `_addTimeSeriesPage`,
+`_addItemCodeCountsBarChart`, `_makeRatingsFigure`, `_computeSummaryMetrics`, `_mergeSection`) is untouched.
+New entry point `buildEntireCohortStudentReportsV2(engine, cohort, onlyStudents=None, sectionStreams=("Clinic",), …)`
+writes to a separate `{cohort}/Individual Student Reports V2/` folder.
+
+- **Layout (all new `*V2` helpers).** Whole-page grey tint via `_v2MakePageDecorators`; `_v2SummaryTable`
+  (zebra, right-aligned values, two-line compact rows for patient age/role/outcomes); `_makeRatingBarsFigureV2`
+  (four pies → two 100%-stacked bars with per-panel legends); `_addProceduresV2`/`_v2ProcPanel` (Sim+Clinic
+  side-by-side meter bars, class-average tick rounded to integer, count + coloured ▲/▽/= delta) with
+  `_v2ChipsImage` rounded pill chips for count-1 codes; `_addSectionPerformanceV2` (readable spider, Clinic
+  default, heading glued to first chart); `_addTimeSeriesPageV2` (original scatter+rubric kept, plus a thin
+  navy rolling-avg line, page-tint facecolor, larger `ratio=0.98`); `_addReflectionCardsV2`/`_v2ReflectionCard`
+  (GR-keyed cards + a collapsed assist/DA/FTA log).
+- **Data fixes (change numbers, V2 only).** `_v2RemapUnmappedSections` re-maps checklist/composite codes
+  (`BOH2 S2 115`, `36MO (532)`, `14MODB (534 577)`) to their **first 3-digit code** so they land in the real
+  section instead of Miscellaneous — verified against `item_section_mapping.xlsx`. `_v2OperatorClinicDf`
+  restricts **patient age distribution + patient outcomes** to Operator-role forms (role CODE `O`; `SO`/`OB`
+  excluded) by reusing `_computeSummaryMetrics` on the filtered frame.
+- **Traps found.** `bbox_inches='tight'` (inside `createPlotImage`) trims each figure independently and
+  desyncs the stacked scatter/rubric x-ticks → fixed with `_v2FullFigImage` (no-trim embed, identical
+  margins); DPI must be set on the *figure* (`dpi=200`) since `createPlotImage` takes no dpi; page tint needs
+  facecolor on figure AND axes; reportlab `<font backColor>` has no rounded corners so chips are a matplotlib
+  image; reflection card widths must subtract the inner 10px padding or the GR badge spills.
+- **Verification.** Each page rendered locally with dummy data and eyeballed; section re-map + Operator filter
+  verified against the real mapping file and role-code fallback. **Not yet run on live Postgres** — user runs
+  `buildEntireCohortStudentReportsV2(engine, "BOH2", onlyStudents=["1775573"])`. Original `_addTimeSeriesPage`
+  confirmed byte-identical to the pre-work backup.
+- **Open.** Section page is intentionally sparse (redesign parked for a later pass); Mean Patient Age still
+  counts all roles; consider promoting the 3-digit section re-map into `_mergeSection` for the original report.
+
+### 2026-08-28 · HANDOVER_dds3_role_normalization_sheets.md
+**Scope.** DDS3 Clinic's `Item Scale Distribution` and `Item Scale Donuts` sheets rendered empty because
+four sheet builders filter to Operator forms by the LABEL `"Operator"`, but the v3 CAF stores role as the
+CODE `"O"` (`SO`/`OB` for Support/Observer). Every Operator form failed the filter and was dropped. Same
+CODE-vs-LABEL bug the patient masks were fixed for on 2026-08-18; these builders were missed because
+`cohortDf["role"]` is never normalised in place. Only DDS3 renders these sheets
+(`dds2_clinic`/`boh2_clinic` exclude them), so the latent bug surfaced there first.
+
+- **Fix (`flagging_utils.py`).** `_buildItemCountPivot` (reportable_items_pivot), `_buildItemScaleDist`
+  (item_scale_dist), `_build_operator_by_clinic_sheet` (operator_by_clinic) and
+  `_build_item_scale_donut_sheet` (item_scale_donuts) now fold role through `normalizeRole` before the
+  Operator test. `_build_clinical_incidents_sheet` also normalises the displayed Role column (`O`→`Operator`).
+  Behaviour is identical for every role except `"O"`, which was the broken one.
+- **Verification.** Extracted the two parser helpers via AST and ran them on 600 real DDS3 CAF forms
+  (roles `{O:567, SO:33}`): old label test → 0 responses (reproduces the bug); after fix → item_scale_dist
+  7,789 responses over 21 items, donut op-set 567/600 (33 SO correctly excluded), reportable pivot 92
+  students. `py_compile` clean. Not yet run through `main.ipynb` on live Postgres.
+- **Caveat.** `operator_by_clinic` is commented out of the `dds3_clinic` sheet list but is now fixed and
+  safe to re-enable. A single normalise of `cohortDf["role"]` where `createFlaggingReport` builds the frame
+  would remove the footgun permanently; the per-builder guards make it unnecessary.
+
+### 2026-08-24 · HANDOVER_nameSortKey_import_fix.md
+**Scope.** One-function fix unblocking the DDS4/BOH3 section of `main.ipynb`. `boh3_dds4_utils.py`
+imports `nameSortKey` from `general_utils` (line 35) and calls it to order the entrustment
+time-series PDF pages A–Z by surname (line 2491), but the function was **never defined** anywhere —
+the code comment even says it should live in `general_utils`. Added it there (before `applyRosterOrder`).
+
+- **`nameSortKey(name)`** — takes a single display-name string, returns a casefolded 2-tuple
+  `(surname, firstName)`. Last whitespace token = surname, remainder = given name(s); handles
+  `None`/blank → `("", "")`. Callers append the student number as the tie-breaker:
+  `(*nameSortKey(name), number)`. Same surname heuristic as `boh2_dds2_dds3_utils._surnameKey`'s
+  no-roster fallback, but a simpler signature (no roster map) matching this call site.
+- **No notebook change.** The DDS4/BOH3 first cell now imports cleanly; behaviour is A–Z-by-surname
+  page order (previously the file could not import at all).
+- **Verification.** `py_compile` clean; unit spot-checks of the surname split + a case-insensitive
+  sort demo. Not yet run end-to-end against live Postgres.
+- **Caveat.** Surname = last token is a heuristic; compound/space-separated surnames may order on
+  the wrong key (cosmetic page order only). Roster-accurate ordering would need a `rosterMap`
+  threaded to this call site, as `orderStudentsBySurname` does.
+
+### 2026-08-19 · HANDOVER_boh2_flagging_summary_declining_itempivot.md
+**Scope.** Four BOH2 Clinic flagging changes, all in `flagging_utils.py`, mirroring style off the
+2026-08-18 DDS2 work. Backup `flagging_utils.py.bak_20260819_011822`. No notebook change — re-run
+cell 15 with `PRESETS["boh2_clinic"]`.
+
+- **Two new Summary columns.** *Checklists* = number of scored item-codes per student
+  (`checklist_total` counts repeats, `checklist_unique` counts distinct; `config.checklistCountMode`
+  = `"total"` default / `"unique"` picks which shows, header `Checklists (tot)`/`(uniq)`). *Classes*
+  (`n_classes`) = distinct session dates on the **Melbourne-local** date (same UTC trap as FHY/SHY).
+  Both computed in `getFlagDf` for every cohort; shown after the Forms column. `scale…` codes excluded.
+- **Low+Declining flags.** New `low_declining_es`/`gr`/`score` (`CustomFlagSpec`) fire only when the
+  metric is **below threshold AND** the slope is negative — a strong-but-dipping student no longer
+  flags. Reuse the existing `es`/`gr`/`score`/`slope` thresholds (Score follows `scoreWeighting`);
+  NaN slope = not declining. In `boh2_clinic` they **replace** the standalone `declining_*` in both
+  `flags` and `lowTierFlags`. Kept out of `_ALL_FLAGS`, so `clinic_full`/`at_risk_only` are unchanged.
+- **Pt Seen = Operator only** — no change, verified (`requireOperatorForPtSeen` defaults True and
+  boh2 doesn't override).
+- **Item Code Score Pivot** sheet — groups the 0–1 checklist score by `item_code` even for Clinic
+  (`buildSectionScorePivot(..., groupBy="item_code")`). New builder + shared `_writeScorePivotSheet`
+  renderer so it can't drift from the Section pivot; registered but kept out of `_ALL_SHEETS` and
+  added to `boh2_clinic` via `_sheetsWith(insertAfter="section_score_pivot")`. Skipped for Simulation.
+
+**Zero blast radius outside BOH2** — new flags/sheet are registered but excluded from the "all"
+lists and opted into by `boh2_clinic` alone. **Verified** by 28 assertions (truth table, exact
+checklist/class counts incl. the Melbourne boundary, config switch, full workbook read-back) plus a
+no-op regression proving every other preset is unchanged. No live DB.
+
+### 2026-08-18 · HANDOVER_dds2_clinic_flagging_fhy.md
+**Scope.** The DDS2 Clinic team's FHY review. Eight changes across `flagging_utils.py`,
+`boh2_dds2_dds3_utils.py`, `general_utils.py` and `main.ipynb` cell 15 (`createFlaggingReport`).
+Backups `flagging_utils.py.bak_20260818_062600` (pre-session) `…_064500` `…_071500` `…_090000`,
+`boh2_dds2_dds3_utils.py.bak_20260818_064500`, `general_utils.py.bak_20260818_064500`,
+`main.ipynb.bak13_20260818_062600`, `main.ipynb.bak14_20260818_090000`.
+
+- **BUG — role/patient stored as CODES.** `O`/`SO`/`OB` and `ISP`/`FTA`/… on the v3 template,
+  full labels on the older one. `getFlagDf` tested only the labels, so on a code-shaped pull
+  `operator_count`, `pct_operator` and `patient_seen` were **zero** and `low_pt_seen` fired on the
+  wrong students. `patient_fta` was accidentally safe (it matched the substring "FTA"). Fixed with
+  `normalizeRole` / `normalizePatientDetail`.
+- **Pt Seen requires role = Operator** (`Config.xlsx`, "All" row — students log Support-Operator
+  sessions with the patient attended too). `patientSeenMask`; forms with **no role field at all**
+  are exempt **per form**, so final-year DDS4/BOH3 keeps working. `requireOperatorForPtSeen=False`
+  reverts. Summary shows both `Pt Seen (Op)` and `Pt Seen (any)`.
+- **Inclusive thresholds.** `FlagSpec.direction` gained `below_eq`/`above_eq`;
+  `FlaggingConfig.inclusiveFlags` promotes a strict registry flag per run. `dds2_clinic` only:
+  ES ≤ 2, GR ≤ 3 (was 2.5), PS ≤ 1.5, Pt Seen ≤ 11 — ES/PS were cohort-relative and are now
+  absolute, so **expect more students flagged than July, by design**.
+- **New sheet `section_score_pivot`** — student × Section mean 0–1 checklist score, the score twin
+  of Section GR Pivot. `buildSectionScorePivot()`. Lands automatically in every `_ALL_SHEETS`
+  preset; `dds3_clinic` has an explicit list and did NOT get it.
+- **FHY/SHY selector.** `filterCohortDfByPeriod`, reusing `general_utils.resolvePeriod` /
+  `SEMESTER_SPLIT_DATE`, so clinic flagging and the weekly-sim chain split the year on the same
+  constant. Filters before scoring; suffixes the filename. `period="ALL"` = unchanged.
+- **`ignoreDates`** — `dropIgnoredDates` / `parseIgnoreDates` + `DDS2_CLINIC_IGNORE_DATES` (the
+  eight 2026 student-on-student days: 21/01, 29/01, 03/02, 10/02, 26/02, 02/03, 05/03, 16/03).
+  Generic; passed on the run line.
+- **BUG — clinical incidents never populated.** The v3 loader built `clinical_incident` from
+  `multi-select->'clinical-incident'` only; the 2026 templates use
+  `radio->'clinical-incident-occurred' = yes` plus `texts->'clinical-incident'`. **159 incidents
+  lost** (DDS2 Sim 40, DDS2 Clinic 35, BOH2 Clinic 32, BOH1 Sim 23, DDS1 Sim 20, BOH2 Sim 9) vs 87
+  rows on the array shape. Fixed at READ time (`clinicalIncidentSqlExpr`, used by `getDataDf` and
+  `getCriticalIncidentDf` — **repairs the current table with no reload**) and in the loader.
+  ~66 of the 159 are "yes" with no text → `"Yes (no details recorded)"`, which still counts.
+  Also fixed: `_build_clinical_incidents_sheet` raised `KeyError` on one missing context column and
+  killed the whole sheet silently.
+- **`scoreWeighting`** — `per_form` (default, historical) vs `per_item` for `avg_score`, and so for
+  `low_score` and the score threshold. Slopes stay per form deliberately. Measured on the real FHY
+  workbook: gap mean +0.021 / max 0.064, one student moves **43 rank places**, 8 flagged vs 6.
+
+**Gotchas.** The role/patient code maps are now duplicated in `flagging_utils` and
+`boh2_dds2_dds3_utils` — a new DASH code needs both. Period and ignore-date matching use the
+**Melbourne-local** date, never raw UTC. An unparseable ignore date raises; one matching no forms
+warns loudly. `saveFlagDfToExcel2` swallows per-sheet exceptions and only prints them — that is how
+the incidents `KeyError` hid. `getFlagDf`'s `forms` threshold still crashes on a single-student
+cohort (`int(NaN)`).
+
+**Open.** Not run against live Postgres. `Config.xlsx`'s "15/07/2026 AM technical problems" note
+still unhandled (needs a half-day filter). Whether `per_item` should become the default Score is
+undecided.
+
+### 2026-08-18 · HANDOVER_cohort_timeseries_schedule_and_counts.md
+**Scope.** Eight changes to `buildCohortTimeSeriesPdf` (the `for ft in ["Clinic","Simulation"]` loop
+in `main.ipynb` cell 11). Cohort BOH2; every change is cohort-generic. File:
+`boh2_dds2_dds3_utils.py`. Data: 15 FHY Tuesdays + a BREAK row added to
+`BOH2/BOH2 Sim Sessions 2026.xlsx` (ISO `week_no`, matching the SHY rows).
+Backups: `boh2_dds2_dds3_utils.py.bak_20260818_035857` (pre-change), `…_041958` and `…_060622`
+(the two same-day revisions), `BOH2/BOH2 Sim Sessions 2026.xlsx.bak_20260818_035857`.
+**Cell 11 unchanged** — everything is on by
+default.
+
+- Students in **surname** order via `orderStudentsBySurname` → `<COHORT>/<COHORT> Roster
+  <year>.xlsx`, falling back to the last name token. Roster and fallback keys sort in one list.
+- **Date range** on the first-page banner (`Covering 10 Feb 2026 – 18 Aug 2026`), accumulated across
+  the student loop and read after it because the banner is drawn by `doc.build()`.
+- **Simulation x ticks** = observed dates ∪ published timetable (`getScheduledSessionDates`);
+  timetabled sessions with no form get a **purple dot at y=0** on the scatter *and* all five rubric
+  panels. Observed dates off the timetable are never dropped; the timetable is capped at today.
+- **Smile Squad** points are **orange** (`SMILE_SQUAD_COLOR`), winning over the red "complex" rule,
+  and the old `" SS"` label suffix is gone (`SMILE_SQUAD_LABEL_SUFFIX = ""`) now that colour +
+  legend carry it. Applies to the per-student reports too (shared `_getColor`).
+- Legend built from **what was actually drawn**, so "Complex" disappears from Simulation charts with
+  no flag needed.
+- **Time Management** y-axis resolved per student by `rubricAxisMax`: `context_schema_snapshot`
+  scale definition → observed max → the old 5.0. A 2-level template now tops out at 2.5.
+- **Item Code counts table** (`Item Code | Count | Cohort Avg`, `getCohortItemCodeAverages` once per
+  PDF) laid out in the gutter **beside** the charts, so a student still fits on one page.
+  `itemCountsTable=` is a form-type selector — True / False / a tuple — defaulting to
+  `ITEM_COUNTS_FORM_TYPES = ("Clinic",)`, so **Simulation gets no table** (a sim session is one
+  task; the code list just restates the timetable).
+- Table codes are **normalised**: `BOH2 S2 011`, `011-COE` and `011` merge onto `011` with counts
+  added and cohort averages summed (exact — the mean of a sum is the sum of the means), while
+  codes with no 3-digit part (`LA`, `BOH-DD`) survive untouched. Counts table only; the scatter
+  already did this via `_shortItemCode`. Smile Squad forms **are** included in both the counts and
+  the average (`applySmileSquadSwap` re-derives `item_codes`; `_effChecklistsSrc` unions
+  student_data for BOH2) — there is no way to split them out.
+- Table columns are **content-fitted** (`_countsColumnWidths` measures each column with
+  `pdfmetrics.stringWidth`; `maxWidth` is a ceiling, not a target), so the table is ~141 pt with
+  the *headers* setting the widths rather than stretching the 3-char code column to ~55% of a
+  too-wide table. `fitColumns=False` restores the old stretched 3:1:1.3 ratio.
+- Page **widened 1.25×** only for a form type that actually gets a table; charts scale against a
+  snapshot of the original page size, so the graphs are unchanged. `pageWidthFactor=1.0` restores
+  the old page and stacks the table underneath.
+
+**Gotchas.** `addPlotImage`'s `pageSize` default is bound at **import** time — pass it explicitly.
+Table `LEFTPADDING`/`RIGHTPADDING` must match the `cellPad` the width measurement used, or
+reportlab's 6 pt default re-wraps cells that were measured as fitting.
+A `KeepTogether` inside a `Table` cell reports height `0xFFFFFF` and raises
+`LayoutError: tallest row 16777215` (hence `makeItemCodeCountsTable(asList=True)`).
+`getBannerDrawer` draws line 2 at a fixed 108 pt from the page top whatever the rectangle height, so
+a second line needs `bannerHeight≈116`; and the first-page spacer has only ~4 pt of slack — raising
+it past 76 pushes student 1's charts onto page 2.
+
+**Open.** Not run against live Postgres. FHY task names blank (unused). Only BOH2 has a roster and a
+Sim Sessions file, so those two features are BOH2-only in practice until the files are added.
+Smile Squad forms are pooled into the counts, not broken out. Normalisation merges on the 3-digit
+code alone, so a new checklist family reusing a code would merge silently — cross-check against
+`normalizeCodes=False` if one appears.
+
+### 2026-08-12 · HANDOVER_dds2_weekly_sim_v3_multidate.md
+**Scope.** DDS2 Weekly Sim workbooks: audited the v3 data pull, replaced the hand-maintained list
+of dates with DB-driven discovery, added batch building over a list of dates, and a semester
+cutoff. Cohort: DDS2 (`type='Simulation'`).
+Files: `general_utils.py` (`# DDS2 Weekly Sim` section), `main.ipynb` cells 36-37.
+Backups: `general_utils.py.bak_20260812_162331`, `main.ipynb.bak_20260812_162331`.
+
+- New API: `getWeeklySimDatesDDS2` (date | n_forms | n_students | week_keys),
+  `buildWeeklySimWorkbookDDS2` (one date), `buildWeeklySimReportsDDS2` (batch, returns a summary
+  frame with per-date status: built / skipped-exists / skipped-low-volume / skipped-out-of-range /
+  no-rows / planned / error).
+- `DDS2_SEMESTER_SPLIT_DATE = '2026-06-15'` is the default `minDate` (inclusive), so semester 1 is
+  never reconsidered; `minDate=None, maxDate='2026-06-14'` gives semester 1. `skipExisting=True`
+  by default, `dryRun=True` to preview, `minForms` drops catch-up days.
+- `createwhereStatementDDS2` now builds single-date **and** range clauses and is shared by every
+  weekly-sim query, so discovery and extraction cannot disagree about a date.
+- `standardizeWeekFormat` generalised: zero-pads the week number and normalises the separator for
+  *any* prefix, so semester 2's three families collapse correctly
+  (`Paeds 2026-Week-1` / `Paeds-2026-Week-2` -> `Paeds-2026-Week-01/02`, `FP-Week-3` ->
+  `FP-Week-03`, `Week-1` -> `Week-01`). Shared with `getChecklistBank`.
+- Semester 2 runs three sim sessions a week (Mon Paeds / Tue FP / Wed Week-xx), not one — 20 dates
+  by 12 Aug vs 15 across all of semester 1. That is what made the batch build worth having.
+
+- **FHY / SHY / ALL period selector** for everything that globs the Weekly Sim folder — sem 1 and
+  sem 2 workbooks share it, so BLR / combined / risk were pooling both. `resolvePeriod` +
+  `periodSuffixPath` in `general_utils.py`; `period`/`minDate`/`maxDate` threaded through
+  `loadWeeklyFiles` -> `buildWideDf`, `runBlrAnalysisForAllFiles`, `flag_low_students`/`_flag_by_blr`;
+  `exportCombinedNotebook` (still inline in cell 40) gained `period` + `suffix_out_path`.
+  Both halves derive from `DDS2_SEMESTER_SPLIT_DATE`, so `FHY + SHY == ALL` by construction.
+  `PERIOD` is set once in cell 36 and read by cells 39/40/41. FHY/SHY outputs are suffixed
+  `… (FHY).xlsx` / `… (SHY).xlsx`; ALL keeps the original filename.
+- The wide tables pivot on **item_code** and thresholds are per item code, so pooling semesters
+  mixed two different checklist populations: FHY flags 44 students, SHY 62, ALL 80 — ALL is not the
+  average, and ALL was the only option before. Risk bands are comparable only within a period.
+
+- **BLR flagging was silently flagging NOBODY (§6c) — fixed.** `_flag_by_blr` keyed its cutoffs by
+  DATE (from the filename) while the combined notebook pivots on ITEM CODE, so the reindex never
+  matched, every threshold was NaN and low_count was always 0. Percentile was unaffected.
+  Cutoffs are now computed PER ITEM CODE, pooling that code's rows across dates. **Any combined
+  workbook produced with method='blr' before 2026-08-17 passed everybody — regenerate it.**
+- Third flag method added: `FlagMethod.BORDERLINE` = mean score of the forms rated GR =
+  borderline_gr for that code (borderline-group average). On real FP data the three give
+  Fail counts of 11 (percentile) / 5 (blr) / 3 (borderline).
+- Repeated item codes take the student's **BEST** attempt (`aggfunc="max"`, now the explicit `agg`
+  parameter / `AGG` in cell 36). Verified 14/14 against the real FP repeats.
+- Combined workbook is now **styled**: navy frozen headers, fixed 1-5 red→green scale on GR and PR,
+  configurable level highlighting on GR and PR (`GR_HIGHLIGHT` / `PR_HIGHLIGHT`, default
+  {1:'red', 2:'amber'} — the original full 1-5 gradient saturated the sheet, 848/848 cells
+  coloured vs 96 now; 'scale' restores it), red only at/below the ACTIVE method's cutoff on
+  scores/scores_flagged, grey "not assessed" cells
+  (greyed after colouring so it can't be mistaken for a low score), and a leading **Description**
+  sheet documenting method, cutoffs, aggregation, scale, filters, colour key and every sheet.
+  Helpers `styleCombinedSheet` / `writeDescriptionSheet` / `highlightLevelCells` /
+  `resolveLevelColors` in general_utils,
+  matching the flagging_utils palette.
+- `printDuplicateItemStudents` returned None when a stream had no repeated item codes, so
+  `duplicates.to_excel(...)` killed that scope and every scope after it (and left a truncated
+  .xlsx). Now always returns a DataFrame. MIN_ITEM_COUNT makes it likelier by dropping the
+  low-count catch-up codes the repeats live on.
+- GOTCHA: `main.ipynb` uses `from general_utils import *`, which SKIPS underscore-prefixed names —
+  `_describeLevelColors` / `_describeRepeatColors` called from cell 40 raised NameError at
+  workbook-write time. Anything a cell calls must be public. py_compile/ast.parse won't catch it;
+  verify with a star-import simulation.
+- New **`assessors` sheet**: student x item code filled with assessor names (repeats joined by
+  ' | '), plus n_assessors / most_seen_assessor, and cells coloured where that student has seen
+  that assessor repeatedly (`ASSESSOR_REPEAT_HIGHLIGHT`, default {2:'amber', 3:'red'}). Pick the
+  threshold deliberately — on FP the default colours 49% of the grid, {3:'red'} colours 9%.
+  `buildAssessorPivot` / `highlightRepeatAssessors` in general_utils.
+- Scope naming consolidated into cell 36 (`streamScopes()` / `scopedPath()`) after cell 40 and
+  cell 41 drifted onto different filenames and the risk report skipped every stream.
+
+- **Cohort-generic as of 2026-08-17 (§6d)** — BOH2 moved to weekly sim. `SIM_STREAMS` is keyed
+  by cohort and a stream routes EITHER by codePatterns (DDS2: three subjects share a day-space)
+  OR by date range alone with `codePatterns=None` (BOH2: one Tuesday session whose item code is
+  the free-text task name). All DDS2-suffixed functions renamed cohort-neutral with aliases kept;
+  `COHORT` set once in cell 36 drives folders, filenames and SQL.
+- BOH2 verification: 7 held SHY sessions ALL matched the supplied schedule (9 future, 1 stray
+  Wed form); every session is a Tuesday with one checklist bar the choice weeks; 15 counting
+  sessions = the stated year-end target. Reference files `BOH2/BOH2 Sim Sessions 2026.xlsx` and
+  `BOH2/BOH2 Roster 2026.xlsx` + `loadSessionSchedule`/`loadRoster`/`compareSessionsToSchedule`/
+  `applyRosterOrder` (last-name ordering, not deidentified, both mismatch directions reported).
+- DATA ISSUES: Jackie Tran's ID transposed (roster 1745117 vs DASH 1475117); `Test1 Student1`
+  in BOH2 data and not on roster; the choice weeks are 27 and 38 (not "30 and 38" as stated);
+  `fetched_rows 2026 caf.xlsx` truncates 3 BOH2 rows at Excel's 32,767-char cell limit.
+- NOT DONE: `risk_report` selects columns by substring ('Week'), which BOH2 task names lack, so
+  the risk report is skipped for BOH2 with a message. Needs an explicit column list to fix.
+- TRAP: `getWeeklySimDataSql` has THREE CTE where-clauses — threading cohort into one gave a
+  query that found dates but returned no rows.
+- **Weekly sheets styled and rescaled (§6d.6).** `WEEKLY_MC_SCALES` gives the MC columns either
+  the historical 0-1 values or 1-5 (`mcScale='1-5'`); `resolveMcScale` resolves name/dict/None.
+  NOT a linear rescale — O5 is 0.00 vs 1 — so `runBlrAnalysis` item statistics and Cronbach's
+  alpha move with it, but flagging reads `Assessor Score` (always 0-1 from SQL) so Pass/Fail
+  does not. Don't mix scales in one folder. `styleWeeklySheet` adds navy header, freeze panes
+  after the identity columns (`WEEKLY_FREEZE_AFTER`), GR levels
+  (`WEEKLY_GR_HIGHLIGHT` = {1:red, 2:amber, 5:green}) and MC levels keyed BY SCALE
+  (`WEEKLY_MC_HIGHLIGHT_BY_SCALE` — 1 is worst on 1-5 and best on 0-1, so a single fixed map
+  would invert). Passing `roster=` orders weekly sheets by last name too. Cell 36 flags
+  `WEEKLY_MC_SCALE` / `WEEKLY_STYLE` / `WEEKLY_ORDER_BY_ROSTER` / `WEEKLY_GR_LEVELS` /
+  `WEEKLY_MC_LEVELS`, all BOH2-only by default so DDS2 output is unchanged.
+- **Weekly-sheet column layout changed 2026-08-18 (§6e).** The per-date sheet is now
+  `Student Number | [Last Name | First Name] | Student Name | Assessor Name | Subject |
+  Item Code | GR | TS | CS | PS | PR | PEC | MC1…MCn | Assessor Score | Student Score |
+  Clinical Incident | Assessor Reflection | Student Reflection` — `student_email` / `date` /
+  `assessmentid` / `form_code` dropped, the MC block moved to sit before `Assessor Score`, and
+  headers relabelled to Title Case. One new function, `formatWeeklySheet(df, dropCols, labels,
+  mcBefore)`, applied to a COPY at the very end of `buildWeeklySimWorkbook` — after
+  `applyRosterOrder` (which needs snake_case) and before `styleWeeklySheet` (which needs the
+  written frame). Config: `WEEKLY_SHEET_DROP_COLS` / `WEEKLY_SHEET_COLUMN_LABELS` /
+  `WEEKLY_SHEET_MC_BEFORE`; `dropCols=[], labels={}, mcBefore=False` restores the old layout.
+  `loadWeeklyFiles` applies the inverse map on read, so old and new workbooks coexist in one
+  folder and everything downstream still sees `student_number` / `item_code` / `assessor_score`
+  — **nothing needs rebuilding**. `returnDf=True` now returns the WRITTEN frame, not the raw
+  pull. `subject` was kept against the original request because cell 39 guards on it to emit
+  `subject_mismatches`; `GR/TS/CS/PS/PR/PEC` kept as acronyms because `addAssessmentCharts`,
+  `styleWeeklySheet` and `runBlrAnalysis` all key off the literal `'GR'`.
+- **Weekly-sheet attendance added 2026-08-18 (§6f).** Roster students with no data get a blank,
+  greyed row carrying only number and name, sorted inline in last-name order so the sheet doubles
+  as an attendance register; a student with more than one form gets an amber student-number cell.
+  Needs a roster file, so BOH2 gets absentee rows and DDS2 (no roster) gets the summary only.
+  **A per-row `Forms` column shipped first and was removed the same day (§6f.8)** — same number
+  down every row, and the Session Summary already names both groups. `addForms=True` restores it.
+  The count itself is still computed every build (distinct `assessmentid`, NOT rows — a DDS2 form
+  with three checklists is ONE form on three rows) and feeds `stats['duplicateIds']`, which must
+  be PASSED to `styleWeeklySheet`: by styling time `formatWeeklySheet` has dropped `assessmentid`,
+  so recomputing there would count rows and be wrong. Greyed rows are identified by a blank
+  `Item Code` — a real row can never have one, since the extraction query inner-joins the
+  checklist CTE. New `Session Summary` sheet between Sheet1
+  and Charts: Expected / Assessed / Not assessed / More than one form, plus the named students
+  (`sessionSummaryLines` + `writeDescriptionSheet(index=None)` — that param is new, `index=0`
+  keeps the combined workbook first-sheet behaviour). Styling: whole row grey at `Forms = 0`,
+  `WEEKLY_FORMS_HIGHLIGHT = {0:'grey', 2:'amber', 3:'red'}` on the cell (EXACT-value match, so 3
+  is not "3 or more"). **Placeholders carry no `item_code`, and `loadWeeklyFiles` drops those rows
+  and the `Forms` column** — otherwise an absent student would reach the combined workbook with
+  all-blank scores and be scored **Pass**. `addForms=False, addAbsent=False` reproduces the
+  §6e-only sheet exactly (now `addAbsent=False, summarySheet=False`).
+- **Real BOH2 SHY finding (§6f.7):** six of the seven SHY sessions are exactly one form for all
+  49 students. Only 2026-06-30 differs — 7 students with no data, and 1535538 Qiwen Xue with two
+  forms. Verified downstream unchanged on the same 7 workbooks: `loadWeeklyFiles`, `buildWideDf`
+  (49 × 11) and `flag_low_students` all `assert_frame_equal` identical.
+- **Combined workbook relabelled to match, 2026-08-18 (§6g).** The weekly renames did NOT break
+  the combined report — `loadWeeklyFiles` reverses them, proven byte-identical — but the two
+  workbooks then disagreed on header style, so the combined one was relabelled the same way.
+  `formatCombinedSheet(df, idCols, labels, protect) -> (out, outIdCols)` +
+  `COMBINED_SHEET_COLUMN_LABELS` (weekly map plus low_count/n_attempts/dates/scores/
+  missing_item_codes/n_forms/n_assessors/most_seen_*/stream/expected_subject). **Use the returned
+  idCols** — styleCombinedSheet locates columns by name and would silently colour the wrong ones.
+  ITEM-CODE COLUMNS ARE NEVER RENAMED (thresholds is indexed by them, risk_report finds weeks by
+  substring). `n_forms` -> "Total Forms" not "Forms", because the weekly sheet's `Forms` means
+  something else. `styleCombinedSheet`'s inline `meta` set became `COMBINED_META_COLS` carrying
+  BOTH spellings — otherwise `Low Count` falls through as a value column and gets threshold
+  colouring, silently. Cell 39 gained `sheet_labels=None`; `sheet_labels={}` restores snake_case.
+- **`risk_report.py` needed a shim and it is load-bearing.** It hard-codes `student_number` (19x),
+  `student_name` (9x) and `missing_item_codes`; the UNMODIFIED module raises
+  `KeyError: 'student_number'` on a new-format workbook. Fix: `_COMBINED_HEADER_ALIASES` +
+  `_normaliseHeaders` applied in `_loadSheets`, the single read point. The map is DUPLICATED, not
+  imported, to keep `risk_report` standalone — **keep the two in step**.
+- **Verified on 11 real DDS2 FP workbooks:** the real cell-39 function (pulled out with
+  `ast.get_source_segment`) run both ways; all 8 sheets `assert_frame_equal` identical after
+  mapping headers back; item codes untouched; 149/255/115 coloured cells at identical positions;
+  `freeze_panes = C2` both. risk_report loads BOTH, analytics frame identical (106 students x 33),
+  same split High 7 / Moderate 38 / Watch 30 / OK 31.
+- **Subject mismatch gave 337 false positives on BOH2 (§6d.7) — fixed.** `getSubjectMismatches`
+  classified with `streamForItemCode`, which cannot answer for a date-range stream, so every
+  row came back `stream=None` and was flagged. New `streamForDate` (narrowest window wins) plus
+  a `usesCodes = any(c.get('codePatterns') …)` branch. BOH2 SHY now 8 rows, all real
+  `ORAL20003`; DDS2 unchanged at 76. The axis is chosen per cohort, not per stream.
+
+- **Stream split (§6b).** Semester 2 DDS2 sim is THREE parallel subjects on three weekdays:
+  Paediatric Dentistry (DENT90146, Mon from 13 Jul, `Paeds*`), Fixed Prosthodontics (DENT90148,
+  Tue from 30 Jun, `FP-Week-*`) and Endodontics (DENT90148, Wed from 30 Jun, `Week-*`) — plus
+  semester 1 (`2026-Week-*`). `DDS2_SIM_STREAMS` registry + `resolveStreams` /
+  `streamForItemCode` / `weeklySimFolder(s)` / `weeklySimOutFolder` / `weeklySimOutPath`.
+  Each stream builds into its own subfolder of Weekly Sim (sem 1 stays in the base folder) and
+  gets its own combined / BLR / risk set; `POOLED` adds an all-streams view.
+- **Routing is by ITEM CODE, never subject code.** Students pick the subject and get it wrong:
+  76/1859 sem-2 forms are mis-tagged (FP and Endo also SHARE DENT90148, so subject cannot
+  separate them even when right). Item code agrees with weekday almost perfectly. New
+  `getSubjectMismatchesDDS2` writes the mis-tagged forms to a workbook so they can be chased.
+- Catch-ups route by code too — a stray FP form filled on a Paeds Monday lands in Fixed
+  Prosthodontics under its real date, flagged `*off-day`. Conservation verified exact
+  (3,471 rows built = 3,471 classified, zero cross-stream duplicates, 8 unclassified rows
+  reported not dropped). `loadWeeklyFiles` now accepts a LIST of folders for pooled reads.
+
+- **`ignoreCodeList` + `minItemCount`** on the same funnel (§7.6): exclude item codes from the
+  combined notebook and BLR. `matchesIgnoreCode` uses case-insensitive fnmatch globs
+  (`'2026-Week-*'`, `'Paeds*'`, `'*-Week-0?'`) with BOTH sides normalised through
+  `standardizeWeekFormat`, so the raw spelling `'Paeds 2026-Week-1'` matches. `minItemCount=N`
+  auto-drops codes sat by fewer than N distinct students across the period — the point being that
+  a one-student code otherwise gets its own percentile threshold computed over n=1.
+  Filtering happens in `loadWeeklyFiles`, so an ignored code gets no column, no threshold, no
+  `low_count` contribution and no place in the BLR regression. Drops are always printed with a
+  reason; dates emptied by the filter are removed and named. `IGNORE_CODES` / `MIN_ITEM_COUNT`
+  live in cell 36, default to drop-nothing. Does NOT affect workbook building.
+- `loadWeeklyFiles` now also normalises `item_code` **on load** (identity for every workbook
+  currently on disk — verified), so older workbooks line up and the ignore list needs one spelling.
+
+**Gotchas.** `datetimeutc` is stored as Melbourne *midnight* (13:00Z AEDT / 14:00Z AEST), so
+`::date` only yields the human-facing session date while the Postgres session `TimeZone` is
+Australia/Melbourne — under UTC every workbook shifts a day. Item codes sit at the top level of
+`assessor_data` next to the five standard buckets, so any `jsonb_each` harvest must exclude
+`radio/texts/scales/checklists/multi-select` **and** `scale-%`. `createwhereStatementDDS2`'s `date`
+default changed from `'2026-04-13'` to `None`. Regenerating `DDS2/Checklist_Bank Simulation.xlsx`
+is needed for the new sem-2 keys. For split builds `minForms` must be 1, not 20 — a one-form day
+inside a stream is a real catch-up. The `(All streams)` suffix on pooled outputs is load-bearing:
+semester 1's folder IS the base folder, so without it the pooled combined workbook overwrites the
+semester-1 one (caught in verification). Full list in §9 of the doc.
+
+**Verified.** Uniquely for the v3 work so far, this was run against a real PostgreSQL 16 loaded
+with all 3,583 replayed 2026 DDS2 Simulation payloads: all five generated statements executed, the
+full 20-date batch built 17 workbooks with 0 errors, and rebuilding 2026-05-25 reproduced the
+existing workbook exactly (44 identical columns, 104/104 rows, zero differences in every scale,
+Assessor Score and MC column; the 11 `Student Score` differences are late student self-assessments,
+not a regression). The period work was verified separately: 33 mixed workbooks in one folder, FHY/SHY/ALL partitioning exactly (15/18/33 dates, disjoint, union complete), cells 39-41 run for all three periods, and the new `period='ALL'` output compared sheet-by-sheet with the pre-change code — all six sheets identical. The ignore list was verified on the same corpus (glob/case/normalised matching, exact expected drops for `2026-Week-*` and `minItemCount=5`, emptied-date handling, degenerate `['*']` returning None not raising) and the no-op regression re-run against the ORIGINAL pre-period cell 40 — identical again. Still not run against the user's own `localhost` Postgres.
+
+**Open.** Not yet run on the user's DB — first run should use `dryRun=True`.
+`DDS2/Checklist_Bank Simulation.xlsx` not regenerated. `exportCombinedNotebook` stays inline in
+cell 40 (user's preference), so it is the one piece not covered by `py_compile`.
+
+### 2026-08-12 · HANDOVER_student_excel_reports.md
+**Scope.** Added per-student Excel deliverables alongside the PDF reports, prompted by a DDS4
+student wanting to compare feedback across all her forms. Cohorts: BOH3, DDS4.
+Files: `boh3_dds4_utils.py` (new "section 9", ~1,800 lines), `main.ipynb` (3 cells).
+Backup: `boh3_dds4_utils.py.bak_20260812_181136`.
+
+- Two deliverables per student: `<id>_forms.xlsx` (one curated row per form, grouped header band)
+  and `<id>.xlsx` (dashboard workbook mirroring the PDF, with native editable Excel charts).
+- Sheet registry `STUDENT_SHEETS` — one `_sheet*` function per sheet; `sheets=[...]` chooses tabs
+  and their order. Only the data groups those sheets declare are queried.
+- Dashboard reuses the PDF's own query functions, so Excel and PDF numbers cannot drift. Three new
+  queries only: `getStudentFormExport`, `getStudentSelfChecklist`, `getStudentTrendDetail`.
+- Curated columns only — `_EXPORT_FORBIDDEN_COLS` + `_assertNoRawColumns` block JSON blobs,
+  `*_config`, snapshots, internal IDs and e-mails.
+- `getStudentInfo()` resolves a student number to (cohort, number, name) with a readable
+  `LookupError` instead of the `IndexError` from filtering and taking `.iloc[0]`.
+
+**Gotchas.** `chart.plotVisOnly` is not an openpyxl attribute — the real one is
+`visible_cells_only`, and with hidden source columns the wrong one renders an empty chart.
+Clustered bars need an explicit `overlap` or the series draw on top of each other. Excel column
+widths are per *sheet*, so one column shape per sheet. openpyxl does not restore chart sizes on
+re-read — check `xl/drawings/drawing*.xml`. Full table in §8 of the doc.
+
+**Found.** The checklist definition lives at `student_config->'checklists'->'selected'->…`, one
+level deeper than the rest of the file assumes; the bare path returns NULL. The answer side is
+*not* nested. Stored answers may be O-codes or literal labels, resolved via the form's own
+`extra_config.options.student` map.
+
+**Open.** `INDIVIDUAL_MC_SQL` / `STUDENT_MC_SQL` hit both halves of that bug (see below).
+Four sheets are duplicated across the two workbooks by design — de-duplication offered, not chosen.
+Mailer still only picks up `.pdf`. Cohort-wide run and a check in genuine Excel both outstanding.
+
+### 2026-08-11 · HANDOVER_v3_comments_and_summary_labels.md
+**Scope.** Fixed dropped comment/reflection text and junk Summary role/patient labels in v3
+student reports. Cohorts: BOH1, BOH2, DDS1–3. File: `boh2_dds2_dds3_utils.py`.
+
+- Composite reflection columns (`student_reflection_full`, `assessor_reflection_full`) in
+  `getDataDf` pull **all** text keys, not just `reflection`.
+- `getFlaggedFormDetails` uses the same composite plus a relaxed filter, so structured-only
+  comments are no longer dropped.
+- `_computeSummaryMetrics` hides Role Counts / Patient Details for Simulation forms
+  (clinic-only fields) and shows full labels for Clinic.
+- `_labelMapFromSnapshots` reads code→label maps dynamically from `context_schema_snapshot`
+  per form, with fallback constants.
+
+**Gotchas.** Composite reflections go to reportlab `Paragraph` **unescaped** — a `<` or `&` in a
+comment can break the markup. Separation-layer scalar columns still hold plain reflection only.
+
+**Open.** Clinic Type / interpreter full names are in the same snapshot but not wired up.
+Simulated only, never run against live Postgres.
+
+### 2026-08-10 · HANDOVER_boh2_dds2_dds3_report_v3_and_timeseries.md
+**Scope.** Time-series chart rework plus an audit of the whole per-student report chain against
+`rawform_forms_v3`. Cohorts: BOH1, BOH2, DDS1–3. File: `boh2_dds2_dds3_utils.py`.
+
+- Fixed the `calcScore` role gate that silently dropped every `role="O"` form — the cause of the
+  "scatter only shows July" symptom.
+- `buildCohortTimeSeriesPdf` / `_addTimeSeriesPage` moved to a categorical, equidistant date
+  x-axis with shared `xCategories`.
+- Added a `combined=` layout toggle threaded through the report builders.
+- Verified the v3 scale/role structure against a real 19,197-form pull; OB/SO are excluded from
+  scoring only.
+
+**Gotchas.** The old gate compared against the literal `"Operator"` but DASH stores `O`/`OB`/`SO`/
+`None`. `getInsertSqlRawform_forms_v3` reads bare `scales->'patient_complexity'` instead of the
+prefixed key. Dead v2 DDL in `general_utils.py` points at the v3 table name with v2 columns.
+
+**Open.** `_mergeSection` is label-keyed and may miscategorise if v3 labels drift from
+`item_section_mapping.xlsx`. Not run against live Postgres.
+
+### 2026-08-04 · boh_dds_cohort_reports_v3_handover.md
+**Scope.** Migrated the BOH1/BOH2/DDS2/DDS3 cohort report SQL chain and checklist definitions to
+`rawform_forms_v3`; confirmed working by the user. Files: `boh2_dds2_dds3_utils.py`,
+`general_utils.py`.
+
+- **Corrects its predecessor:** scales use prefixed nested keys
+  (`assessor_data->'scales'->'scale-x'->>'key'`), *not* bare keys.
+- Checklist item/MC definitions repointed to the `assessor_config` / `student_config` columns.
+- Item-code enumeration excludes the 5 standard JSON buckets and `scale-%`.
+- BOH1/BOH2 student-data fallback (`_effScalesSrc` / `_effChecklistsSrc`), cohort-gated by
+  `STUDENT_FALLBACK_COHORTS`.
+
+**Gotchas.** Cell 6 of `main.ipynb` must be re-run with `replaceExisting=True` to backfill the new
+config columns, or the checklist explorers come back empty. Multi-reflection forms leave the
+reflection columns NULL. Fixed a `general_utils.py` bug reading a bare `patient_complexity` key.
+
+**Open.** Reflection multi-key coalescing not implemented. Dead v2 functions still present.
+`boh1_utils.py`, `assessor_analysis.py`, `webapp/var.py` not yet audited.
+
+### 2026-08-04 · boh2_dds2_dds3_cohort_reports_v3_handover.md
+**Scope.** Companion technical record of the same migration. File: `boh2_dds2_dds3_utils.py`.
+
+- Rewrote scale-path SQL in `getStudentScaleSummary`, `getStudentItemCodeDf`,
+  `getFlaggedFormDetails`, `getDataDf`.
+- Bucket-exclusion logic added to the `getDataDf` lateral join and `calcScore`.
+- `formsTable` default flipped to `rawform_forms_v3` file-wide except two checklist explorers.
+- Global rating deliberately kept separate from the level-scale summary.
+
+**Gotchas.** `getChecklistItems` / `getChecklistMcTexts` still read the v2
+`checklists->'fields'/'name'` shape. The Description column is now NULL under v3 (confirmed
+unused). Verification was static against 4 sample rows.
+
+### 2026-08-03 · finalyear_reporting_session_handover.md
+**Scope.** New Excel sheets, PBN/Leave enrichment, entrustment time-series PDF + interactive HTML,
+and student-report v3 fixes. Cohorts: BOH3, DDS4. File: `boh3_dds4_utils.py`.
+
+- Student ID / Rotation columns on the Incidents & Concerns sheets; rotation-split (R1–3, R4–6)
+  Entrustment sheets with incident and concern counts.
+- Reusable Excel formatter `formatSummaryExcel` (navy header, zebra banding, conditional highlights).
+- `addPbnLeaveColumns` adds PBN counts and VIC working-day leave; leave source switched to the raw
+  Qualtrics export because the previous file had corrupted dates.
+- Entrustment time-series PDF (worst-first, ES1 bookmarks) plus a self-contained Plotly HTML version.
+- Sections 7 & 8 (Excel textual report, individual entry report) migrated to `dds4_boh3_forms_v3`.
+
+**Gotchas.** Adding columns broke a fixed-width reportlab table — drop them before `createTable`.
+openpyxl conditional-format fills need `PatternFill(bgColor=…)`, not `fgColor`.
+
+**Open.** Recorded a blocker: DDS4 reports rendering empty patient/entrustment data while BOH3 was
+fine. *(Superseded — DDS4 reports have since been produced successfully.)*
+
+### 2026-07-31 · finalyear_v3_reports_handover.md
+**Scope.** BOH3/DDS4 cohort-summary PDF pipeline migrated to the v3 data shape; student-level
+functions left for later. File: `boh3_dds4_utils.py`.
+
+- 40 functions' `formsTable` default flipped; 23 scale reads changed from `->>'scale'` to `->>'key'`.
+- patient_data field names converted camelCase → snake_case throughout.
+- 19 `jsonb_typeof='array'` guards added before array expansion.
+- CAF checklist scoring fixed for the v3 object shape; `getItemCodeDescriptionMap` now sources
+  descriptions from `context_schema_snapshot`.
+- Clinic code→name standardisation, title-casing, rotation-range banner subtitle, entrustment NaN
+  crash fixed by gating to S1–S4.
+
+**Gotchas.** Always guard `jsonb_typeof(x)='array'` before expanding. Use `jsonb_each`, not
+`jsonb_each_text`, when values are objects.
+
+**Open.** Student-level report functions were still v2-shape at the time *(since migrated)*.
+Rotation column persistence (`R6` vs `Rotation 6`) unresolved.
+
+### 2026-07-29 · rawforms_v3_separation_handover.md
+**Scope.** Built and wired the two v3 form-separation tables; downstream report rewiring explicitly
+deferred. Cohorts: all. Files: `boh3_dds4_utils.py`, `general_utils.py`, `main.ipynb`.
+
+- Two-table split kept: `dds4_boh3_forms_v3` (final year) and `rawform_forms_v3` (everyone else).
+  A consolidated single-table attempt was scrapped.
+- `rawform_forms_v3` collapses patient fields into `patient_data` JSONB and adds
+  `context_schema_snapshot` and `assessor_email`.
+- Scales stored in the nested shape only; checklists kept nested **and** flattened to top level
+  for backward-compatible item-code reads.
+
+**Gotchas.** ⚠️ **This doc's §2a/§7.2 claim that scales use bare keys is WRONG** — corrected by the
+2026-08-04 docs. Its "affected lines" list is also not exhaustive. Checklist bucket keys now sit at
+top level alongside flattened item codes, so item-code reads must exclude them.
+
+### 2026-07-02 · flagging_system_handover.md
+**Scope.** At-risk flagging architecture plus the DDS2 Clinic team's preset. Files:
+`flagging_utils.py`, `main.ipynb` cell 22.
+
+- Registry pattern: `FLAG_REGISTRY` / `SHEET_REGISTRY`, `FlaggingConfig`, presets
+  (`clinic_full`, `dds2_clinic`, …).
+- New `low_pt_seen` and `high_es_lvl1` flags, plus an `info_flags` mechanism — shown but excluded
+  from `risk_score`.
+- `dds2_clinic` preset: drops `low_ts`/`high_fta`, adds the two new flags, makes `low_cs` info-only.
+
+**Gotchas.** `low_pt_seen` needs a `patient_seen` column; without it the threshold falls back to
+0.0 and the flag never fires. `info_flags` entries must also appear in `flags`.
+`saveFlagDfToExcel2` / `getFlagDf` signatures changed — old calls with threshold kwargs break.
+
+### undated · viva_gradio_handover.md
+**Scope.** Reference guide for the Viva live monitoring dashboard. File: `viva_gradio.py`.
+Same architecture as the SCBD dashboard, with `_build_combined_comments()` merging general and
+per-domain comments, an MC Response Distribution stacked bar, and a `GR_int` field for correct
+numeric sorting. See also the `viva_gradio.py` section of `CLAUDE.md` for the JS/modal decisions.
+
+**Gotchas.** The MC tally sweeps any non-`scale`-prefixed dict key. Comments cells are capped at
+72px. Date filtering parses naive local time against UTC-aware API datetimes — off-by-one-day risk.
+
+### undated · scbd_gradio_handover.md
+**Scope.** Reference guide for the SCBD live monitoring dashboard. File: `scbd_gradio.py`.
+Server-side API calls remove the need for `scbd_proxy.py` and CORS workarounds; `gr.State` caches
+rows so filtering re-renders without refetching; CSV export mirrors filters and is UTF-8-BOM for
+Excel.
+
+**Gotchas.** `gr.Timer` needs Gradio ≥ 4.16. The timer's init value and the dropdown default must
+reference the same `DEFAULT_INTERVAL` or auto-refresh won't start. Same UTC-vs-local date risk.
+
+---
+
+## Open items across all sessions
+
+Carried forward from the docs above. Remove a line here when a later session closes it.
+
+**Unique-item-code flag + cohort time-series parity (2026-09-22)**
+- Not run on live Postgres / Windows (Cowork VM can't reach the DB). Confirm the Unique Item Codes
+  flag counts, the zeros-highlighted Item Code Count Pivot, and the cohort-PDF Sim stream colours +
+  rolling-avg line on real DDS2/BOH2/DDS3/BOH1 output.
+- `minItemCodes` is auto (mean − 1.5·SD) for `boh2_sim`/`boh2_clinic`/`dds2_clinic`/`dds3_clinic`;
+  set a fixed cutoff once seen against live data (`dds2_sim` uses 27).
+
+**DDS3 interactive embedded time-series + FHY/SHY split (2026-09-16)**
+- Not yet run against the live DB / on Windows (Cowork VM can't import the module: no `win32com`,
+  no `arial.ttf`, no DB). Run one DDS3 student first and check the embed numbers vs the PDF preview
+  and the HTML report.
+- Confirm the in-page paperclip / attachments panel opens the chart in the PDF viewer students use;
+  minimal/mobile viewers may hide attachments (fall back to the standalone HTML report there).
+- Each DDS3 PDF grows ~1 MB from inlined ECharts; a CDN-load option would shrink files but needs
+  internet when the HTML opens.
+
+**Data / SQL**
+- `INDIVIDUAL_MC_SQL` and `STUDENT_MC_SQL` in `boh3_dds4_utils.py` read the checklist config at the
+  bare path, so "Full MC Text" comes back NULL, and they score directly off the literal rating text,
+  which yields NULL if the answer is stored as an O-code. *(Raised 2026-08-12, awaiting go-ahead.)*
+- `getInsertSqlRawform_forms_v3` in `general_utils.py` extracts bare `scales->'patient_complexity'`
+  instead of `scale-patient-complexity` → always NULL.
+- Dead v2 DDL / insert functions in `general_utils.py` target the v3 table name with v2 columns.
+- Reflection multi-key coalescing not implemented in the separation layer.
+- Rotation column persistence: raw `R6` vs `Rotation 6`.
+
+**Not yet audited for v3**
+- `boh1_utils.py`, `assessor_analysis.py`, `webapp/var.py`.
+- `getChecklistItems` / `getChecklistMcTexts` still read the v2 checklist shape.
+
+**Robustness**
+- Composite reflection text reaches reportlab unescaped — `<` or `&` in a comment can break markup.
+- `_mergeSection` is label-keyed; v3 label drift would silently miscategorise item codes.
+- Clinic Type / interpreter full-name maps available in `context_schema_snapshot` but not wired in.
+- Gradio dashboards: naive local-time date filtering against UTC-aware API datetimes.
+
+**Student Excel reports (2026-08-12)**
+- Four sheets duplicated between the two workbooks; `kind="both"` also runs the export queries twice.
+- `StudentReportMailer` only attaches `.pdf` — extend it if the xlsx files are to be sent out.
+- Appearance confirmed only through LibreOffice's renderer, never genuine Excel.
+
+**DDS2 Weekly Sim (2026-08-12)**
+- Not yet run against the user's live Postgres; first run should be `dryRun=True`.
+- Three item codes (`positioning`, `DDS2-MAR-31`, `19-Jan-SIM`, 8 rows) belong to no stream and
+  are reported but never built.
+- No cross-stream summary workbook (a student's Paeds vs FP vs Endo side by side) — deferred.
+- Combined workbooks generated with method='blr' before 2026-08-17 flagged nobody; regenerate.
+- 'borderline' yields no cutoff for a code where nobody was rated GR = borderline_gr (reported).
+- `DDS2_SIM_STREAMS` hard-codes 2026 dates and checklist families; needs a new entry each year.
+- ~~Sem 1 / sem 2 pooled by the folder glob~~ — RESOLVED same day by the FHY/SHY/ALL period
+  selector. Remaining caveat: risk bands are comparable only within a period, not across them.
+- `DDS2/Checklist_Bank Simulation.xlsx` still holds pre-normalisation keys (`FP-Week-3`,
+  `Paeds 2026-Week-1`); re-run cell 38 to regenerate.
+- **(2026-08-18)** Workbooks already on disk keep the pre-18-Aug column layout. Harmless —
+  `loadWeeklyFiles` reads both — but rebuild with cell 37's `REBUILD = True` (narrow `STREAM`
+  first) if you want the folder consistent.
+- **(2026-08-18)** The new sheet layout has not been run against the live database, only
+  against a synthetic frame with the identical column set.
+- **(2026-08-18)** `subject` is still in the weekly sheet although the request was to drop it —
+  cell 39's `subject_mismatches` guard depends on it. One word in `WEEKLY_SHEET_DROP_COLS`.
+- **(2026-08-18)** Scale acronyms `GR/TS/CS/PS/PR/PEC` left unexpanded; expanding them is a
+  four-place change (label map + `addAssessmentCharts` + `styleWeeklySheet` + `runBlrAnalysis`).
+- **(2026-08-18)** Workbooks built during the few hours the `Forms` column was on still have it;
+  harmless, `loadWeeklyFiles` strips it either way.
+- **(2026-08-18)** Absentee rows need a roster file; only BOH2 has one. Add
+  `DDS2/DDS2 Roster 2026.xlsx` in `loadRoster`'s shape to enable them for DDS2.
+- **(2026-08-18)** Combined workbooks already on disk keep snake_case headers; rerun cell 39 for
+  a consistent set. `risk_report` reads either.
+- **(2026-08-18)** `risk_report.py` duplicates the combined label map and will drift; a shared
+  constants module would fix it without costing `risk_report` its standalone property.
+- **(2026-08-18)** `flagging_utils.py` workbooks were NOT relabelled — outside the weekly-sim
+  chain, not asked for, and will now look different from the weekly and combined workbooks.
+- **(2026-08-18)** No across-sessions attendance view ("who has missed the most this semester") —
+  the Session Summary covers one session at a time.
+- **(2026-08-18)** Nothing reconciles `Forms = 0` against leave applications automatically, even
+  though `Combined_Leave_Report.xlsx` exists; a roster `notes` value is the only context that
+  reaches the sheet.
+
+**Cohort time-series PDF (2026-08-18)**
+- Not yet run against the user's live Postgres — check one BOH2 Simulation page: purple dots should
+  match the sessions that student actually missed, and `Cohort Avg` should match the bar chart in
+  the same student's individual report.
+- FHY task names are blank in `BOH2/BOH2 Sim Sessions 2026.xlsx`; nothing reads them today.
+- Only BOH2 has `<COHORT> Roster 2026.xlsx` / `<COHORT> Sim Sessions 2026.xlsx`, so surname ordering
+  falls back to the last name token elsewhere and the timetable features are BOH2-only. Adding the
+  files turns both on with no code change.
+- The 1.25× page may be awkward to print; `pageWidthFactor=1.0` restores the old width but then each
+  student takes two pages.
+- Smile Squad forms are counted in the Item Code table but not broken out; a "how many were SS"
+  view would need a fourth column or a second table.
+- Item-code normalisation merges on the 3-digit code alone — a new checklist family reusing a code
+  would merge silently. Cross-check against `normalizeCodes=False` if one appears.
+
+**BOH2 Clinic flagging (2026-08-19)**
+- Not yet run against the user's live Postgres. Re-run `main.ipynb` cell 15 with
+  `PRESETS["boh2_clinic"]` and check §6 of the handover — Summary should gain *Checklists* + *Classes*,
+  the `↓ES/↓GR/↓Score` columns become `Low+↓…` (expect fewer low-risk flags), and an *Item Code Score
+  Pivot* sheet appears after *Section Score Pivot*.
+- BOH2-only by request. DDS2/DDS3 still use the standalone `declining_*` flags and have no Item Code
+  Score Pivot — a two-line change per item to mirror if the team asks.
+- `Classes` and the checklist counts assume UTC storage (Melbourne-local conversion) and exclude
+  `scale…` codes — both must be revisited if a future puller changes either.
+
+**DDS2 Clinic flagging (2026-08-18)**
+- Not yet run against the user's live Postgres. Re-run `main.ipynb` cell 15 and check §9 of the
+  handover — `Pt Seen` should DROP, `Operator`/`% Oper` may jump from 0, and clinical incidents
+  should appear for the first time (35 DDS2 Clinic forms in the 2026 data).
+- `rawform_forms_v3.clinical_incident` stays NULL for radio+text rows until the table is reloaded.
+  Reports are correct without it (read-time resolution), so a reload is optional — but the stored
+  column is still wrong for anything querying it directly.
+- `Config.xlsx`'s DDS2 note — "15/07/2026 AM technical problems, do not penalise AM students" — is
+  still not handled anywhere in the flagging path. `ignoreDates` drops a WHOLE day; a half-day
+  exclusion needs a time-of-day filter that doesn't exist yet.
+- The role → label and patient-detail → label maps are now duplicated in `flagging_utils.py` and
+  `boh2_dds2_dds3_utils.py`. A new DASH code must be added to both, or the two will disagree.
+- `dds3_clinic` did not pick up the new `section_score_pivot` sheet — it has an explicit sheet list
+  rather than `_ALL_SHEETS`. One string to add if DDS3 wants it.
+- `dds3_clinic` / `boh2_clinic` still use strict `<` and the old auto thresholds; only DDS2 was
+  specified.
+- Whether **per item** should be the default Score definition is unresolved. Arguably the better
+  measure, but it moves `low_score` for every cohort and breaks comparability with the July
+  workbook. On DDS2 FHY it is 8 flagged versus 6.
+- `getFlagDf`'s `forms` threshold does `int(mean - std)` and raises `ValueError: cannot convert
+  float NaN to integer` on a single-student cohort — reachable with a narrow
+  `filters={"clinic": …}`. Pre-existing, not fixed.
+- `saveFlagDfToExcel2` catches and prints per-sheet exceptions rather than raising. A sheet missing
+  from a workbook is a printed line that is easy to scroll past.
+
+**Verification**
+- Most v3 migration work was verified by simulation against sample rows rather than against live
+  Postgres. Spot-check before relying on a new report in production.
+- The 2026-08-18 flagging work was verified by 136 assertions over synthetic frames with the exact
+  `getDataDf` column set, a nine-preset no-op regression against the pre-session module, and
+  `sqlglot` PostgreSQL parsing of every modified query — but never executed against live data.

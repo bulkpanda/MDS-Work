@@ -1,0 +1,281 @@
+# HANDOVER — DDS1 Periodontics (PE) coordinator progress report
+
+**Date:** 2026-09-24
+**Cohort / subject:** DDS1 · DENT90141 · Periodontics preclinical sessions PE-01 … PE-06
+**New code:** `dds1_pe_utils.py` (project root). No existing file edited. `main.ipynb` **not edited** (the cell to add is in §9).
+**Output:** `DDS1/DDS1 PE Progress Report.xlsx`
+**Data source:** `temp 2026 caf.json` (DASH CAF export, 1,308 DDS1 assessments, pulled 2026-09-24)
+
+---
+
+## 1. Purpose
+
+Before this there was one marking-sheet workbook **per session** (`DDS1/DDS1 Perio.xlsx` = PE-01, `DDS1_PE02–05.xlsx`), and no way to see a student across sessions. Coordinators asked for a report that shows **how each student is progressing**. Requirements, in the user's words and choices:
+
+- An Excel workbook (chosen over HTML/PDF).
+- A progress grid with trends, flags, a criterion × session heatmap, and self vs assessor.
+- **For each student, how they are progressing on each checklist item.** The items are fixed, so this is a pivot of MC × date per student plus a graph with one line per checklist item.
+- Scoring must **reuse the rules in the PE0x marking sheets**.
+- Code lives in a **new `dds1_pe_utils.py`**.
+
+---
+
+## 2. Architecture
+
+```
+temp 2026 caf.json
+   │  loadPeForms()          filter cohort, drop excluded + test accounts, route by CHECKLIST CODE
+   ▼
+roster (105) + forms (list: student × PE code, raw form attached)
+   │  scorePeForms()         one form per student×session → item levels → Equal % / Prop %
+   ▼
+formsDf (student×session) · itemsDf (long, assessor+student side) · adjustDf · dupDf
+   │  buildPeTables()        session summary · within-session z · trend · flags · self gap
+   ▼
+sessDf · progDf (one row per student, wide per session)
+   │  buildDds1PeProgressReport()   openpyxl workbook (11 sheets, 2 hidden)
+   ▼
+DDS1/DDS1 PE Progress Report.xlsx
+```
+
+It is self-contained: only stdlib, `numpy`, `pandas` and `openpyxl`. It does **not** import `general_utils` at module level. It tries `from general_utils import EXCLUDED_STUDENT_NUMBERS` inside `_excludedStudents()` and falls back to `{40029860}`, because `general_utils` pulls in psycopg/sqlalchemy.
+
+`__all__` is declared, so `from dds1_pe_utils import *` exports exactly:
+`PE_SESSIONS, PE_ITEMS, PE_FLAG_CONFIG, PE_MARKED_MIN_FRACTION, loadPeForms, scorePeForms, buildPeTables, validatePeScoring, buildDds1PeProgressReport`.
+`Font` is imported as `_XlFont` (the reportlab collision rule). No other reportlab-colliding names are imported. The AST duplicate-import check is clean.
+
+---
+
+## 3. Data shape (payload)
+
+Each assessment in the JSON is `{id, datetime, type, student{first_name,last_name,email,student_number}, cohort, subject, forms[]}`. The PE forms carry this `form_context`:
+
+```json
+{"subject": "6", "datetime": "2026-08-07",
+ "checklists": [{"code": "PE-03", "quantity": 1}],
+ "clinic_type": "PE", "teeth_quadrant": ""}
+```
+
+The form has no role or patient fields. The assessor side (`assessor_data`) looks like this:
+
+```json
+{"scales": {"scale-global-rating": {"key": "3", "value": "Developing"},
+            "scale-professionalism": {"key": "1", "value": "Level 1: Attends ..."},
+            "scale-practice-readiness": {"key": "2", "value": "Level 2: Student requires constant supervision ..."}},
+ "checklists": {"PE-03": {"MC1": {"key": "O2", "value": "Competent (4)"},
+                          "MC4": {"key": "O2", "value": "Competent (4)"} }},
+ "texts": {"reflection": "Work harder."}}
+```
+
+`student_data.checklists[code]` has the **same MC keys**, which is the student's self-assessment. It feeds the Self vs Assessor sheet.
+
+Config comes from `assessor_config.checklists.selected[code]` (and `student_config…` for the student side):
+
+- `fields` — MC → criterion name.
+- `extra_config.options.assessor` — `O1..O5` → "Exemplary (5)" … "Starting (1)". PE-01 uses `O1..O3` = Competent / Emerging / Starting.
+- `extra_config.row_config[MC].disabled_options.assessor` — options **not allowed** for that row. **This defines each item's levels.**
+- `extra_config.rubric.assessor[MC][Ox]` — descriptor text, e.g. Damage `O1 No damage / O2 Minor / O3 Major`.
+- `extra_config.headers[MC]` — section titles (Ergonomics / Instrument Handling / Quality of Scaling / Damage).
+
+Scales: GR 1–5 (Starting → Exemplary), Readiness 1–4, Professionalism 1–2.
+
+### Session content (from the configs)
+
+| Code | Short | Date | Title | Items in form | Items **scored** |
+|---|---|---|---|---|---|
+| PE-01 | S1 | 10 Jul | Intro + benchtop debridement Q1&2 | 8 (Ergonomics + Instr. Handling) | 7 (no Cheek retraction) |
+| PE-02 | S2 | 24 Jul | Debridement Q1&2 | 14 | 8 (Ergonomics + Instr. Handling only) |
+| PE-03 | S3 | 07 Aug | Practice test Q1&2 | 5 (3 debridement + 2 damage) | 5 |
+| PE-04 | S4 | 21 Aug | Debridement Q3&4 | 14 | 14 |
+| PE-05 | S5 | 04 Sep | Universal curettes & scalers | 14 | 14 |
+| PE-06 | S6 | 18 Sep | Preclinical test | 14 | 14 *(assumed)* |
+
+---
+
+## 4. Scoring rules (reproduce the published sheets)
+
+### 4.1 Item level
+
+The valid options for a row are `options − disabled_options`, ordered O1 (best) → On (worst). **Level = rank from the bottom**, so best = number of valid levels and worst = 1. The denominator is the number of valid levels:
+
+| Criterion (S2+) | Valid keys | Denom |
+|---|---|---|
+| Seating, Posture, Infection control, Instrument use, Cheek retraction | O2, O4, O5 | /3 |
+| Lighting, Angulation, Finger rests | O2, O5 | /2 |
+| Debridement × 4 | O1–O5 | /5 |
+| Damage tissue / tooth | O1, O2, O3 (No / Minor / Major) | /3 |
+
+Item % = level ÷ denom × 100.
+
+### 4.2 Out-of-rubric selections (`_scoreOption`)
+
+Assessors sometimes pick a disabled option (DASH does not always enforce `row_config`). There were 490 such cells in 2026.
+
+- **`rule="down"` (default, S2–S6):** use the nearest valid level **at or below** the selection. If nothing valid is below, use the lowest valid level. So Developing (O3) becomes Emerging (2) on /3 items and Starting (1) on /2 items. Damage O4 (Emerging) becomes Major (1). This matches the "Flagged Adjustments" sheets exactly.
+- **`rule="up"` (S1 only, `PE_SESSIONS['PE-01']['adjustRule']`):** the published S1 sheet counted the disabled middle option O2 on the /2 items as the **top** level. Proof: Lighting avg 1.95 = 82 O1 + 12 O2 counted as 2. This rule keeps S1 equal to the marks already published.
+
+Every adjustment is logged on the **Adjustments** sheet (original → mapped).
+
+### 4.3 Session %
+
+- **Equal** = mean of item % over the scored items.
+- **Proportional** = Σ item% × weight ÷ Σ weight, with weights in `PE_SESSIONS[code]['propWeights']`. These were copied from each sheet's Criterion Summary:
+
+```python
+PE-01: seating 12.5, posture 12.5, lighting 12.5, infection 25, instrUse 12.5, angulation 12.5, fingerRests 12.5
+PE-02: seating 10, posture 10, lighting 10, infection 20, instrUse 20, angulation 10, fingerRests 10, cheek 10
+PE-03: debIncisor 20, debPremolar 20, debMolar 40, dmgTissue 10, dmgTooth 10
+PE-04/05/06: ergonomics 6.25×4, instrUse/angulation/fingerRests 12.5, cheek 2.5, debridement 6.25×4, damage 5×2
+```
+
+Session weightages: 4 / 8 / 10 / 8 / 8 %. PE-06 is **TBC**.
+
+### 4.4 Validation (`validatePeScoring`)
+
+| Session | Equal (calc) | Equal (sheet) | Prop (calc) | Prop (sheet) | Per-student diffs |
+|---|---|---|---|---|---|
+| S1 | 73.24 | — | **74.88** | 74.88 | 0 |
+| S2 | 77.31 | 77.53 | 77.82 | 77.98 | 0 of 99 (+3 students scored after the sheet was built) |
+| S3 | 58.75 | 58.75 | 55.04 | 55.04 | 0 |
+| S4 | 79.88 | 79.88 | 80.65 | 80.65 | 0 |
+| S5 | 82.18 | 82.18 | 83.20 | 83.20 | 0 |
+
+The S2 class mean differs only because three students' S2 forms were assessor-submitted after 7 Aug, when the sheet was built (1325619, 1351026, 1795977).
+
+---
+
+## 5. Data traps found (important)
+
+1. **PE forms saved with the wrong clinic type.** At least 4 PE-02 forms have `clinic_type: "CD"` (the student picked Cons Dent). Filtering on `clinic_type == "PE"` lost them. **Always route by checklist code** (`form_context.checklists[].code`), the same principle as the DDS2 sim streams.
+2. **Duplicate forms per student × session.** There were 17 in 2026, 5 with both forms assessor-submitted (e.g. 1420088 and 1268585 on PE-02). The kept form is the one that is assessor-submitted, then student-submitted, then **latest `created_at`**. The first version used `updated_at`, which picked an old duplicate touched on 21 Aug and disagreed with the published sheet. Duplicates are listed on the Adjustments sheet (columns K–Q).
+3. **Test account.** `test.student@student.unimelb.edu.au`, No 1234567 (Config.xlsx) is in DDS1 with 5 junk PE-01 forms. It is dropped by `_isTestAccount`.
+4. **Dates.** `form_context.datetime` is either `YYYY-MM-DD` or a UTC timestamp (`2026-07-23T14:00:00Z` = 24 Jul Melbourne). It is converted to a Melbourne-local date. The session is identified by **code**, never by date: one PE-04 form is dated 7 Aug.
+5. **PE-06 (18 Sep) has 0 assessor-submitted forms** (60 student-only, 40 opened). Its column shows *Awaiting marking* and missing S6 forms are **not** flagged until ≥ 50% of the roster is scored (`PE_MARKED_MIN_FRACTION`).
+6. **pandas ≥ 3** turns `None` into `NaN` in object columns. The `latestCode` lookup is NaN-safe; the first run crashed with `KeyError: 'assessorComment_nan'`.
+7. **LibreOffice draws `#N/A` chart points at 0.** Excel leaves a gap. The Tracker uses `NA()` on purpose; view it in Excel.
+
+---
+
+## 6. Workbook contents
+
+| Sheet | What it shows |
+|---|---|
+| **Read Me** | Method, flag thresholds, assumptions and data counts (generated from the live config). |
+| **Overview** | One row per session: date, weightage, roster / scored / pending / opened-only / no form, mean / median / SD Equal %, mean Prop %, mean self %, mean GR / PR, GR 1–5 and PR 1–4 counts, status. Plus a line chart of cohort mean Equal / Prop / self % by session. |
+| **Progress Grid** | One row per student (by surname): session % S1–S6 (colour scale **relative within each session**; "missing" / "pending" in red italics), GR per session, PR per session, sessions scored, mean %, latest %, mean z, trend (z slope), change vs earlier (z), self − assessor gap, Flag, Reasons. Autofilter; frozen panes. |
+| **Flags** | Flagged students only: RED first, then AMBER, sorted by mean z. Shows reasons as bullets plus the latest assessor comment. The header shows counts (current: **RED 27 · AMBER 18 of 105**). |
+| **Student Tracker** | **Pick a student from the dropdown (yellow cell).** It shows (1) a session summary (status, Equal %, Prop %, cohort mean, self %, GR, PR, assessor); (2) **item × session pivot of item %** with red = bottom level, green = top and amber in between; (3) raw level (`2/3`); (4) assessor comment and student reflection per session. There are five native charts: student vs cohort session %, and **one chart per section with one line per checklist item** (Ergonomics, Instrument Handling, Quality of Scaling, Damage). Everything is live formulas over the hidden sheets. |
+| **Item Pivot** | Every student × 14 items × session, as item % (coloured) and raw level, plus a count of items at the bottom level. Filterable (e.g. filter Item = "Finger rests"). Hidden column A is the lookup key `studentNumber|itemId`. |
+| **Criterion x Session** | Cohort mean item % per session (red → green), % at bottom level, n; section means table and chart. |
+| **Self vs Assessor** | Per student and session: self % − assessor % (blue = under-rates, orange = over-rates), mean gap and pattern (Over-estimates / Under-estimates / Calibrated at ±15 pts, ≥ 2 sessions). Also the cohort mean gap by item. |
+| **Adjustments** | Out-of-rubric selections → mapped level (both sides), plus duplicate forms and which one was kept. |
+| TrackerData *(hidden)* | One row per student: `{eq, prop, gr, pr, status, assessor, assessorComment, studentComment, selfEq}_{code}`. |
+| Lists *(hidden)* | Dropdown source: `Last, First (number)`. |
+
+### Tracker formula pattern
+
+```excel
+G3  =IFERROR(INDEX(TrackerData!$A$2:$A$106,MATCH($B$3,TrackerData!$B$2:$B$106,0)),"")
+item cell =IFERROR(IF(INDEX('Item Pivot'!$G$5:$G$1474,MATCH($G$3&"|"&$A14,'Item Pivot'!$A$5:$A$1474,0))="",NA(),
+                     INDEX('Item Pivot'!$G$5:$G$1474,MATCH($G$3&"|"&$A14,'Item Pivot'!$A$5:$A$1474,0))),NA())
+```
+
+`NA()` rather than `""` keeps missing sessions out of the line charts; an empty string would plot as 0. The conditional formats on the % block read the raw-level block (`LEFT(x,2)="1/"` → red; numerator = denominator → green). Charts use `from_rows=True`, `display_blanks="gap"` and `visible_cells_only=False`, because column A is hidden.
+
+---
+
+## 7. Trend and flag logic
+
+Sessions are **not comparable on raw %**. S1 has 7 items, S2 excludes scaling, and S3 is a scaling-only practice test with a mean of 59%. So individual trends use the **within-session z-score**: (student Equal % − session mean) ÷ session SD.
+
+- **Trend** = slope of z across the scored sessions (needs ≥ 3).
+- **Change** = latest z − mean of earlier z (needs ≥ 3).
+
+`PE_FLAG_CONFIG` (edit, or pass `flagConfig={...}`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `lowPercentile` | 0.15 | "Low" = at or below the 15th percentile of that session |
+| `minLowSessions` | 2 | **RED**: low in ≥ 2 marked sessions |
+| `safetyMinCount` | 1 | **RED**: bottom level on Infection control ("No mask or gloves…") or Instrument use ("Dangerous") |
+| `damageRedSessions` | 2 | **RED**: Major damage in ≥ 2 sessions; **AMBER** once, only if it was in the latest session |
+| `missRed` | 2 | **RED**: no scored form for ≥ 2 marked sessions; AMBER for 1 |
+| — | — | **RED**: no PE forms at all (3 students: Ang, Gupta, Molon — check enrolment) |
+| `declineZ` | −0.75 | **AMBER**: change in z ≤ −0.75 |
+| `latestGrMax` | 2 | **AMBER**: latest GR ≤ 2 |
+| `latestPrMax` | 1 | **AMBER**: latest Readiness = 1 |
+| `selfGapPts` / `minSelfSessions` | 15 / 2 | **AMBER**: self ≥ 15 pts above the assessor on average |
+| (single low session) | — | **AMBER** only when it is the **latest** session |
+
+Tuning history: the first pass flagged 55 RED + 21 AMBER, because any Major damage counted as a safety event. Major damage is 12–17% per session on the typodont, so it was noise. The second pass gave 27 RED + 56 AMBER, driven by single-session lows. The final settings give **27 RED + 18 AMBER**.
+
+---
+
+## 8. API
+
+```python
+roster, forms = loadPeForms(jsonPath, cohort="DDS1", excludeStudents=None, sessions=None)
+formsDf, itemsDf, adjustDf, dupDf = scorePeForms(forms, sessions=None)
+sessDf, progDf, fd = buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None)
+validatePeScoring(formsDf, expected=None)          # → DataFrame calc vs published means
+out = buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
+                                outPath="DDS1/DDS1 PE Progress Report.xlsx",
+                                cohort="DDS1", subject="DENT90141",
+                                excludeStudents=None, flagConfig=None, sessions=None, verbose=True)
+# out: dict(roster, formsDf, itemsDf, adjustDf, dupDf, sessDf, progDf)
+```
+
+Key columns:
+
+- `itemsDf`: `studentNumber, code, side, itemId, mc, level, denom, pct, optionKey, label`
+- `formsDf`: `studentNumber, code, formId, date, assessor, status, subStudent, subAssessor, gr, pr, prof, assessorComment, studentComment, eq, prop, selfEq, selfProp`
+- `progDf`: wide `<field>_<code>` columns plus `nScored, meanEq, latestCode, latestEq, latestGr, latestPr, meanZ, zSlope, zChange, selfGap, nSelf, flag, reasons, safety, damageSessions, lowSessions, missingSessions`
+
+Status values: `Scored` (assessor submitted), `Assessor pending` (student only), `Form opened, not submitted`, `No form`.
+
+---
+
+## 9. How to run (notebook cell to add — not yet added)
+
+```python
+from dds1_pe_utils import *
+out = buildDds1PeProgressReport("temp 2026 caf.json", "DDS1/DDS1 PE Progress Report.xlsx")
+out["progDf"].query("flag == 'RED'")[["lastName", "firstName", "reasons"]]
+```
+
+Refresh `temp 2026 caf.json` first (same pull as the other CAF reports). Then re-run the cell; it overwrites the workbook.
+
+Example: after PE-06 is marked, if the test uses different weights:
+
+```python
+PE_SESSIONS["PE-06"]["propWeights"] = {...}; PE_SESSIONS["PE-06"]["weightage"] = 20
+buildDds1PeProgressReport(...)
+```
+
+---
+
+## 10. Design decisions
+
+- **Excel, not HTML:** it matches the coordinators' existing flagging workbooks, and they can filter and annotate it.
+- **One Tracker sheet with a dropdown** instead of 105 per-student sheets. It keeps the file small (≈ 275 KB) and gives one place to look. The per-student data is still all visible, statically, on Item Pivot.
+- **Four section charts instead of one 14-line chart:** 14 lines, many sitting at 100%, were unreadable. Within a section, lines use one colour family plus different dash styles.
+- **Canonical item ids** (`PE_ITEMS`) keyed on the **criterion name**, not the MC number. The same criterion has different MC numbers across sessions (PE-03 MC1 = debridement incisor; PE-05 MC1 = seating).
+- **Relative colour scale** on the grid, because absolute % would paint all of S3 red.
+- **Nothing written to Postgres;** this reads the JSON only.
+
+---
+
+## 11. Open items
+
+- **PE-06 scheme and weightage:** it is assumed to equal S4/S5. Confirm once the preclinical test marking sheet exists, then re-run after assessors submit (currently 0 of 105).
+- **3 DDS1 students with no PE forms** (Ang 1268191, Gupta 1313675, Molon 1682850): enrolment or stream check needed. They are flagged RED.
+- The flag thresholds are a first proposal; the coordinators should review them.
+- Not yet added to `main.ipynb` (per the project's ask-before-edit rule).
+- Could also be driven from `rawform_forms_v3` instead of the JSON if a DB-backed refresh is preferred.
+
+---
+
+## 12. Change log
+
+- **2026-09-24 (rev 2):** all charts (`_lineChart`) now 16 × 10 cm, with the legend at the **top, outside the plot area** (`legend.position="t"`, `legend.overlay=False`), so it no longer overlaps the x-axis tick labels. Student Tracker section charts were re-spaced for the bigger size (22-row pitch, 11-column offset). The comments table was moved 4 rows further down (`r3 = rawLast + 6`). Backup: `_bak/dds1_pe_utils.py.bak_20260924_015720`.
+- **2026-09-24 (rev 3):** the legend was colliding with the title. Every chart now uses fixed manual layouts (fractions of chart height): title 0–0.10, legend `ManualLayout(y=0.15, h=0.13)`, plot inner area `y=0.36, h=0.45`, x ticks below. **Gotcha:** openpyxl discards `chart.plot_area.layout` on save; set **`chart.layout`** instead (it is written into `<c:plotArea><c:layout>`). Imports `Layout`/`ManualLayout` as `_XlLayout`/`_XlManualLayout`. Backup: `_bak/dds1_pe_utils.py.bak_20260924_030432`.

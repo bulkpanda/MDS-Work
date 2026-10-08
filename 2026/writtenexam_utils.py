@@ -64,6 +64,7 @@ Used from main.ipynb, e.g.:
 
 import os
 import re
+from html import escape as _xmlEscape
 import pandas as pd
 
 from reportlab.lib.pagesizes import A4
@@ -540,7 +541,7 @@ def _score_table(sections, row_data, cohort_avg, total_col_label, total_max, tot
         pct = (score / max_pts * 100) if (max_pts and not missing) else None
         score_text = "&mdash; (not submitted)" if missing else f"{score:.2f}/{max_pts:.2f}"
         pct_text = "&mdash;" if pct is None else f"{pct:.2f}%"
-        row = [Paragraph(sec["name"], styles["td"]), Paragraph(score_text, styles["td"])]
+        row = [Paragraph(_xmlEscape(sec["name"], quote=False), styles["td"]), Paragraph(score_text, styles["td"])]  # escape "&" (e.g. "Q&A")
         if show_cohort_avg:
             avg = cohort_avg[sec["name"]]
             row.append(Paragraph(f"{avg:.2f}/{max_pts:.2f}", styles["td"]))
@@ -769,8 +770,10 @@ def generate_all_written_exam_reports(input_file, output_dir, course_code, exam_
 # It returns the same `loaded` dict shape used by generate_student_pdf(), so
 # all of the PDF rendering above is reused unchanged.
 
-ORAL_SECTION_MAX = 5.0          # each rubric criterion is scored out of 5
-ORAL_TOTAL_MAX   = 20.0         # four criteria -> out of 20
+ORAL_SECTION_MAX = 5.0          # default criterion max (overridden by "Out of N" sub-headers)
+ORAL_TOTAL_MAX   = 20.0         # default total max (overridden by the "Out of N" total header)
+
+_ORAL_SUBHEADER_KEYS = ("family name", "last name")   # DDS2 uses "Family Name", DDS3 "Last name"
 
 
 def _oral_find_idx(title_row, sub_row, keywords, exact_sub=None):
@@ -789,6 +792,16 @@ def _oral_find_idx(title_row, sub_row, keywords, exact_sub=None):
     return None
 
 
+def _oral_out_of(v):
+    """'Out of 25' -> 25.0, anything else -> None."""
+    m = re.match(r"^\s*out of\s*([\d.]+)\s*$", str(v), re.I) if v is not None else None
+    return float(m.group(1)) if m else None
+
+
+def _oral_blank(v):
+    return v is None or (isinstance(v, float) and pd.isna(v)) or (isinstance(v, str) and not v.strip())
+
+
 def _load_email_map(email_list_csv):
     """Read studentEmailList.csv into {student_number(str): email}."""
     df = pd.read_csv(email_list_csv, dtype=str)
@@ -803,59 +816,95 @@ def load_oral_presentation_results(input_file, sheets=None, email_map=None,
                                    total_max=ORAL_TOTAL_MAX):
     """
     Parse a group-presentation rubric workbook into a `loaded` dict compatible
-    with generate_student_pdf().
+    with generate_student_pdf(). Handles both known layouts:
+
+      * DDS2 2026  - "Family Name / Preferred Name / Student ID", 4 criteria, Total "Out of 20"
+      * DDS3 2026  - "Legal name / Last name / Preferred name", group code + email (no
+                     student number), 5 criteria (one sub-header blank), Total "Out of 25",
+                     scores in vertically merged cells, a second per-student
+                     "Percentage grade" column (IGNORED - group % is used for everyone).
+
+    Criterion columns = every titled column from the first "Out of N" criterion
+    up to (not incl.) the Total column, so a blank "Out of 5" cell no longer drops
+    a criterion. Maxima are read from the "Out of N" sub-headers.
+
+    Grouping: a row with a Total value starts a new group; every following row
+    up to the next scored row is a member. Members inherit the group's scores,
+    the FIRST "Percentage grade" column, all supervisors listed for the group
+    (joined) and all comment lines (joined).
 
     sheets      - list of sheet names to include (default: all sheets).
-    email_map   - {student_id(str): email}; when given, an "email" column is
-                  populated and used as the report's id line.
+    email_map   - {student_id(str): email}; used when the sheet has no email column.
 
-    Returns the standard loaded dict (students / sections / total_col /
-    total_pct_col / total_max / name_col / id_col / comments_col /
-    supervisor_col / cohort_avg / cohort_avg_pct / mode="oral").
-    Every member row of a group carries that group's scores, percentage,
-    supervisor and combined comments.
+    Returns the standard loaded dict (mode="oral").
     """
     xls = pd.ExcelFile(input_file)
     sheet_names = sheets or xls.sheet_names
 
     records = []
     section_titles = None
+    sec_max_found, tot_max_found = None, None
 
     for sh in sheet_names:
         raw = pd.read_excel(input_file, sheet_name=sh, header=None)
         rows = raw.values.tolist()
 
-        # locate the sub-header row (the one holding "Family Name")
+        # sub-header row = the one holding "Family Name" / "Last name"
         sub_i = None
-        for i in range(min(6, len(rows))):
-            if any(str(v).strip().lower() == "family name" for v in rows[i] if v is not None):
+        for i in range(min(8, len(rows))):
+            if any(str(v).strip().lower() in _ORAL_SUBHEADER_KEYS for v in rows[i] if v is not None):
                 sub_i = i
                 break
-        if sub_i is None:
+        if sub_i is None or sub_i == 0:
+            print(f"[oral] sheet '{sh}': header row not found - skipped")
             continue
         title_row = rows[sub_i - 1]
         sub_row = rows[sub_i]
+        ncol = max(len(title_row), len(sub_row))
+        txt = lambda row, j: str(row[j]).strip() if j < len(row) and not _oral_blank(row[j]) else ""
 
-        fam_idx  = _oral_find_idx(title_row, sub_row, ["family name"])
+        fam_idx  = _oral_find_idx(title_row, sub_row, ["family name", "last name"])
         pref_idx = _oral_find_idx(title_row, sub_row, ["preferred name"])
         id_idx   = _oral_find_idx(title_row, sub_row, ["student id"])
         sup_idx  = _oral_find_idx(title_row, sub_row, ["supervisor"])
-        total_idx = _oral_find_idx(title_row, sub_row, None, exact_sub="out of 20")
-        pct_idx  = _oral_find_idx(title_row, sub_row, ["percentage"])
+        pct_idx  = _oral_find_idx(title_row, sub_row, ["percentage"])   # FIRST % column = group %
 
-        # the four "Out of 5" criterion columns, left-to-right
-        sec_idxs = [j for j in range(len(sub_row))
-                    if sub_row[j] is not None and str(sub_row[j]).strip().lower() == "out of 5"]
+        # "Out of N" columns: the largest N is the Total, the rest are criteria
+        outs = {j: _oral_out_of(sub_row[j]) for j in range(len(sub_row)) if _oral_out_of(sub_row[j])}
+        if not outs:
+            print(f"[oral] sheet '{sh}': no 'Out of N' score columns - skipped")
+            continue
+        total_idx = max(outs, key=lambda j: (outs[j], j))
+        crit_outs = [j for j in outs if j != total_idx]
+        first_crit = min(crit_outs) if crit_outs else None
+        sec_idxs = [j for j in range(first_crit, total_idx) if txt(title_row, j)] if first_crit is not None else []
+        s_max = outs[crit_outs[0]] if crit_outs else section_max
+        sec_max_found = sec_max_found or s_max
+        tot_max_found = tot_max_found or outs[total_idx]
 
-        # Comments column: the header cell ("Comments") can sit one column to
-        # the left of where the free-text actually lives (merged/shifted cell).
-        # So resolve it by the data: of the columns at/after the "Comments"
-        # header, pick the one holding the most long free-text strings.
-        com_hdr = _oral_find_idx(title_row, sub_row, ["comment"])
+        # email column (DDS3 has one, no header) - detect by '@' in values
         data_rows = rows[sub_i + 1:]
+        email_idx = None
+        for j in range(ncol):
+            n_at = sum(1 for r in data_rows if j < len(r) and isinstance(r[j], str) and "@" in r[j])
+            if n_at >= 3:
+                email_idx = j
+                break
+        # group-code column (e.g. DDS2-Grp-01-A) - used as id when there's no student number
+        code_idx = None
+        for j in range(ncol):
+            n_code = sum(1 for r in data_rows if j < len(r) and isinstance(r[j], str)
+                         and re.match(r"^[A-Z]+\d*-Grp-\d+", r[j].strip()))
+            if n_code >= 3:
+                code_idx = j
+                break
+
+        # Comments column: header may sit one column left of the text - pick the
+        # column at/after the header holding the most free-text strings.
+        com_hdr = _oral_find_idx(title_row, sub_row, ["comment"])
         if com_hdr is not None:
             best, best_n = com_hdr, -1
-            for j in range(com_hdr, (com_hdr + 3)):
+            for j in range(com_hdr, com_hdr + 3):
                 n = sum(1 for r in data_rows
                         if j < len(r) and isinstance(r[j], str) and len(r[j].strip()) > 3)
                 if n > best_n:
@@ -863,84 +912,72 @@ def load_oral_presentation_results(input_file, sheets=None, email_map=None,
             com_idx = best
         else:
             com_idx = None
+
+        titles = [_clean_section_name(title_row[j]) for j in sec_idxs]
         if section_titles is None:
-            section_titles = [_clean_section_name(title_row[j]) for j in sec_idxs]
+            section_titles = titles
+        elif titles != section_titles:
+            print(f"[oral] WARNING sheet '{sh}': criterion titles differ from first sheet: {titles}")
 
-        # walk data rows, grouping by score-bearing header rows
         cur = None
-        for r in rows[sub_i + 1:]:
-            sid = r[id_idx] if id_idx is not None and id_idx < len(r) else None
-            if all((v is None or (isinstance(v, float) and pd.isna(v))) for v in r):
+        for r in data_rows:
+            if all(_oral_blank(v) for v in r):
                 continue
-            has_score = total_idx is not None and total_idx < len(r) and \
-                        r[total_idx] is not None and not (isinstance(r[total_idx], float) and pd.isna(r[total_idx]))
-
-            if has_score:
-                # start a new group
-                cur = {
-                    "scores": [r[j] if j < len(r) else None for j in sec_idxs],
-                    "total": r[total_idx],
-                    "pct": r[pct_idx] if pct_idx is not None and pct_idx < len(r) else None,
-                    "supervisor": (str(r[sup_idx]).strip() if sup_idx is not None
-                                   and sup_idx < len(r) and r[sup_idx] is not None else ""),
-                    "comments": [],
-                    "members": [],
-                }
+            if total_idx < len(r) and not _oral_blank(r[total_idx]):
+                cur = {"sheet": sh,
+                       "scores": [r[j] if j < len(r) else None for j in sec_idxs],
+                       "total": r[total_idx],
+                       "pct": r[pct_idx] if pct_idx is not None and pct_idx < len(r) else None,
+                       "supervisors": [], "comments": [], "members": []}
                 records.append(cur)
-
             if cur is None:
                 continue
 
-            # collect this row's comment (belongs to the current group)
-            if com_idx is not None and com_idx < len(r) and not pd.isna(r[com_idx]):
-                ctext = str(r[com_idx]).strip()
-                if ctext and ctext.lower() != "nan":
-                    cur["comments"].append(ctext)
+            sup = txt(r, sup_idx) if sup_idx is not None else ""
+            if sup and sup not in cur["supervisors"]:
+                cur["supervisors"].append(sup)
+            ctext = txt(r, com_idx) if com_idx is not None else ""
+            if ctext and ctext.lower() != "nan":
+                cur["comments"].append(ctext)
 
-            # register a member if this row has a student id
-            if sid is not None and not (isinstance(sid, float) and pd.isna(sid)):
-                fam = str(r[fam_idx]).strip() if fam_idx is not None and not pd.isna(r[fam_idx]) else ""
-                pref = str(r[pref_idx]).strip() if pref_idx is not None and not pd.isna(r[pref_idx]) else ""
-                sid_str = str(sid)
-                if sid_str.endswith(".0"):
-                    sid_str = sid_str[:-2]
-                cur["members"].append({
-                    "name": f"{pref} {fam}".strip(),
-                    "id": sid_str,
-                })
+            sid = txt(r, id_idx) if id_idx is not None else ""
+            sid = sid[:-2] if sid.endswith(".0") else sid
+            email = txt(r, email_idx) if email_idx is not None else ""
+            code = txt(r, code_idx) if code_idx is not None else ""
+            if sid or email:                       # a member row
+                fam = txt(r, fam_idx) if fam_idx is not None else ""
+                pref = txt(r, pref_idx) if pref_idx is not None else ""
+                cur["members"].append({"name": f"{pref} {fam}".strip(),
+                                       "id": sid or code or email,
+                                       "email": email or (email_map or {}).get(sid, "")})
 
-    # flatten groups -> one row per member, carrying group score + comments
+    if section_titles is None:
+        raise ValueError(f"No oral-presentation sheet could be parsed in {input_file}")
+
     flat = []
     for g in records:
         combined = re.sub(r"\s+", " ", " ".join(g["comments"])).strip()
         for m in g["members"]:
-            row = {
-                "name": m["name"],
-                "id": m["id"],
-                "email": (email_map or {}).get(m["id"], ""),
-                "supervisor": g["supervisor"],
-                "comments": combined,
-                "total": g["total"],
-                "pct": g["pct"],
-            }
+            row = {"name": m["name"], "id": m["id"], "email": m["email"],
+                   "supervisor": ", ".join(g["supervisors"]),
+                   "comments": combined, "total": g["total"], "pct": g["pct"],
+                   "sheet": g["sheet"]}
             for k, sc in enumerate(g["scores"]):
                 row[f"__sec{k}"] = sc
             flat.append(row)
 
     students = pd.DataFrame(flat)
-
-    sections = [{"name": title, "score_col": f"__sec{k}", "pct_col": None,
-                 "max_points": section_max}
+    sec_max = sec_max_found or section_max
+    sections = [{"name": title, "score_col": f"__sec{k}", "pct_col": None, "max_points": sec_max}
                 for k, title in enumerate(section_titles)]
-
-    id_col = "email" if (email_map and students["email"].astype(bool).any()) else "id"
+    id_col = "email" if students["email"].astype(bool).any() else "id"
 
     return {
         "students": students,
         "sections": sections,
         "total_col": "total",
         "total_pct_col": "pct",
-        "total_max": total_max,
+        "total_max": tot_max_found or total_max,
         "name_col": "name",
         "id_col": id_col,
         "comments_col": "comments",
@@ -1002,6 +1039,7 @@ def generate_all_oral_presentation_reports(input_file, output_dir, course_code, 
         total_pct = float(row["pct"]) if pd.notna(row["pct"]) else (total_score / loaded["total_max"] * 100)
         summary_rows.append({
             "name": student_name, "id": student_id,
+            "email": row.get("email", ""),          # student e-mail (sheet column or email_map lookup)
             "total_score": total_score, "total_max": loaded["total_max"],
             "total_pct": total_pct, "grade": compute_grade(total_pct, grade_bands),
             "supervisor": row["supervisor"], "file": out_path,

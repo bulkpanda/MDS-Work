@@ -183,7 +183,8 @@ Student numbers excluded from cohort statistics and report generation.
 ```python
 BOH2_REMOVED_STUDENTS = [1352051, 1606158, 1605793, 1617958, 1605538]
 DDS2_REMOVED_STUDENTS = [1270152, 1155940, 914405]
-BOH1_REMOVED_STUDENTS = [1895048, 1895910, 1904651]
+BOH1_REMOVED_STUDENTS = [1895048, 1895910, 1904651,
+                         1639983, 1756946, 1766318, 1895683, 1840287]  # +5 on 2026-09-30
 REMOVE_STUDENTS_DICT  = {"BOH1": BOH1_REMOVED_STUDENTS, "BOH2": BOH2_REMOVED_STUDENTS,
                          "DDS2": DDS2_REMOVED_STUDENTS, "DDS3": []}
 ```
@@ -192,7 +193,8 @@ REMOVE_STUDENTS_DICT  = {"BOH1": BOH1_REMOVED_STUDENTS, "BOH2": BOH2_REMOVED_STU
 |---|---|---|
 | `BOH2_REMOVED_STUDENTS` | `list[int]`, 5 | Checked directly at `boh2_dds2_dds3_utils.py:2172` (`if cohort == 'BOH2' and studentNumber in variableUtils.BOH2_REMOVED_STUDENTS: …`). |
 | `DDS2_REMOVED_STUDENTS` | `list[int]`, 3 | Same pattern at `boh2_dds2_dds3_utils.py:2174`. |
-| `BOH1_REMOVED_STUDENTS` | `list[int]`, 3 | Referenced **only** through `REMOVE_STUDENTS_DICT`; no direct call site. |
+| `BOH1_REMOVED_STUDENTS` | `list[int]`, 8 (5 added 2026-09-30: Popal, Zou, Ellis, Kaur, Oukal — see `HANDOVER_boh1_sim_flagging_preset.md`) | Referenced **only** through `REMOVE_STUDENTS_DICT`; no direct call site. |
+| `EXCLUDED_STUDENT_NUMBERS` | `list[int]` = `list(BOH1_REMOVED_STUDENTS)` (added 2026-09-30) | Students removed **completely**: `main.ipynb` cell 6 deletes them from `rawform_forms_v3` via `general_utils.getDeleteStudentsSql`. See `HANDOVER_boh1_sim_flagging_preset.md` §8. |
 | `REMOVE_STUDENTS_DICT` | `dict[str, list[int]]`, 4 keys | Cohort → removal list, with a `.get(cohort, [])` fallback. Used at `boh2_dds2_dds3_utils.py:888` and `main.ipynb:292`. Note it covers only BOH1/BOH2/DDS2/DDS3 — DDS1, DDS3(non-empty), BOH3, DDS4 have no entry. |
 
 ### 3.7 Schema-loader state (lines 106, 155–156, 187, 195, 202)
