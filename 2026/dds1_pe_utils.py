@@ -52,6 +52,14 @@ __all__ = [
     "TASK7_BANDS", "TASK7_LAYOUT", "TASK7_SECTIONS", "TASK7_SECTION_MAX",
     "scoreTask7Section", "scoreTask7Checklist", "scoreTask7Forms", "task7FormPercent",
     "validateTask7Scoring",
+    "TASK7_CORE_SECTIONS", "CD_SECTION_CODE_RE", "CD_HEADER_SECTIONS", "isCdSectionCode",
+    "cdLayoutFromConfig",
+    # Cons Dent section-scores workbook — 2026-10-27
+    "CD_CAF_PATH", "CD_CODE_GROUPS", "loadCdBands", "cdBands", "cdCodeGroup", "collectCdForms",
+    "listCdCodeStructure", "buildCdSectionScoresWorkbook", "compareCdSectionWorkbooks",
+    # Student-report PE form % (Weighting sheet + lenient/strict levels) — 2026-10-27
+    "PE_WEIGHTS_PATH", "PE_LENIENT_CODES", "loadPeWeights", "peLevelPoints", "peFormPercent",
+    "peSectionScores",
 ]
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -349,6 +357,175 @@ def validatePeScoring(formsDf, expected=None):
             out.append(dict(code=code, eqCalc=s.loc[code, "eq"], eqSheet=eq,
                             propCalc=s.loc[code, "prop"], propSheet=prop))
     return pd.DataFrame(out)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 3b. Student-report PE form % (2026-10-27)
+# ────────────────────────────────────────────────────────────────────────────
+# Used by the DDS1 V2 student report PE time-series panel (boh2_dds2_dds3_utils.
+# _v2ApplyPeScores). Separate from scorePeForms / PE_SESSIONS, which the PE Progress
+# Report workbook keeps using unchanged.
+#   weights : "Weighting" sheet of DDS1/DDS1 Perio DASH Forms.xlsx (Session N = PE-0N);
+#             blank cell = item not scored that session.
+#   levels  : level = rank among the item's ENABLED options (row_config disabled removed).
+#             Lenient (PE_LENIENT_CODES): rank 1..n out of n.
+#             Strict (all later codes)  : 2-level 0/1 of 1, 3-level 0/1/2 of 2,
+#                                         4+ levels: bottom 0, others keep rank, out of n
+#                                         (e.g. 5-level 0/2/3/4/5 of 5).
+#   form %  : sum(points/max x weight) / sum(weights of answered items) x 100.
+PE_WEIGHTS_PATH = "DDS1/DDS1 Perio DASH Forms.xlsx"
+PE_LENIENT_CODES = ("PE-01", "PE-02", "PE-03", "PE-04")
+
+# Weighting-sheet row label -> PE_ITEMS id
+_PE_WEIGHT_ROW_TO_ITEM = {
+    "seating + head position": "seating", "posture": "posture",
+    "lighting and visibility": "lighting", "infection control": "infection",
+    "appropriate instrument use": "instrUse", "instrument angulation": "angulation",
+    "finger rests": "fingerRests", "cheek retraction": "cheek",
+    "incisor": "debIncisor", "canine": "debCanine", "premolar": "debPremolar", "molar": "debMolar",
+    "tissue": "dmgTissue", "tooth": "dmgTooth",
+}
+
+def _wRow(a, b, c, d, e, f, g, h, i):
+    return dict(zip([f"PE-0{n}" for n in range(1, 10)], (a, b, c, d, e, f, g, h, i)))
+
+# Fallback copy of the Weighting sheet (read 2026-10-27) — used only if the workbook can't be read.
+_PE_WEIGHT_ROWS_FALLBACK = {
+    "seating":     _wRow(12.5, 10, None, 6.25, 3.75, 3, 10, 3.75, 4),
+    "posture":     _wRow(12.5, 10, None, 6.25, 3.75, 3, 10, 3.75, 4),
+    "lighting":    _wRow(12.5, 10, None, 6.25, 3.75, 3, 10, 3.75, 4),
+    "infection":   _wRow(25, 20, None, 6.25, 3.75, 3, 5, 3.75, 4),
+    "instrUse":    _wRow(12.5, 20, None, 12.5, 7.5, 3, 20, 7.5, 4),
+    "angulation":  _wRow(12.5, 10, None, 12.5, 7.5, 3, 20, 7.5, 4),
+    "fingerRests": _wRow(12.5, 10, None, 12.5, 7.5, 3, 20, 7.5, 4),
+    "cheek":       _wRow(None, 10, None, 2.5, 2.5, 3, 5, 2.5, 4),
+    "debIncisor":  _wRow(None, None, 20, 6.25, 10, 10, None, 7, 8),
+    "debCanine":   _wRow(None, None, None, 6.25, 10, 14, None, 11, 12),
+    "debPremolar": _wRow(None, None, 20, 6.25, 10, 16, None, 12, 14),
+    "debMolar":    _wRow(None, None, 40, 6.25, 20, 26, None, 20, 24),
+    "dmgTissue":   _wRow(None, None, 10, 5, 5, 5, None, 5, 5),
+    "dmgTooth":    _wRow(None, None, 10, 5, 5, 5, None, 5, 5),
+}
+_PE_WEIGHTS_CACHE = {}
+
+
+def _pivotWeights(rows):
+    out = {}
+    for itemId, byCode in rows.items():
+        for code, w in byCode.items():
+            if isinstance(w, (int, float)):
+                out.setdefault(code, {})[itemId] = float(w)
+    return out
+
+
+def loadPeWeights(path=None, refresh=False):
+    """{code: {itemId: weight}} from the Weighting sheet (cached); falls back to the
+    built-in copy if the workbook / sheet can't be read."""
+    path = path or PE_WEIGHTS_PATH
+    if path in _PE_WEIGHTS_CACHE and not refresh:
+        return _PE_WEIGHTS_CACHE[path]
+    try:
+        from openpyxl import load_workbook
+        ws = load_workbook(path, data_only=True, read_only=True)["Weighting"]
+        rows, sessCols = {}, None
+        for r in ws.iter_rows(values_only=True):
+            cells = list(r)
+            if sessCols is None:   # header row: "Session N: ..." columns
+                found = {i: int(m.group(1)) for i, c in enumerate(cells)
+                         if isinstance(c, str) and (m := re.match(r"\s*Session\s+(\d+)", c))}
+                if found:
+                    sessCols = found
+                continue
+            label = next((_norm(c) for c in cells if isinstance(c, str) and _norm(c)), "")
+            itemId = _PE_WEIGHT_ROW_TO_ITEM.get(label)
+            if itemId and itemId not in rows:
+                rows[itemId] = {f"PE-{n:02d}": cells[i] for i, n in sessCols.items() if i < len(cells)}
+        weights = _pivotWeights(rows)
+        if not weights:
+            raise ValueError("no weights parsed")
+    except Exception:
+        weights = _pivotWeights(_PE_WEIGHT_ROWS_FALLBACK)
+    _PE_WEIGHTS_CACHE[path] = weights
+    return weights
+
+
+def peLevelPoints(rank, nLevels, strict):
+    """(points, max) for an item level. rank 1 = worst ... nLevels = best."""
+    if not strict:
+        return rank, nLevels
+    if nLevels <= 3:
+        return rank - 1, nLevels - 1
+    return (0 if rank == 1 else rank), nLevels
+
+
+def _asDict(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _peAnswers(assessorData, code):
+    """{MC: optionKey} for one PE code — v3 checklists bucket first, then the
+    flattened top-level item-code entry. Values may be {'key': 'O2', ...} or 'O2'."""
+    ad = _asDict(assessorData)
+    raw = (_asDict(ad.get("checklists")).get(code)) or ad.get(code) or {}
+    raw = _asDict(raw)
+    out = {}
+    for mc, v in raw.items():
+        key = v.get("key") if isinstance(v, dict) else v
+        if _oNum(key) is not None:
+            out[mc] = key
+    return out
+
+
+def peFormPercent(assessorData, assessorConfig, code, weights=None, lenientCodes=None,
+                  returnItems=False):
+    """Weighted % (0-100) for one PE checklist on one form, or None when no weighted
+    item was answered. Out-of-rubric picks map DOWN to the nearest valid level (PE-01: UP,
+    as its published sheet). returnItems=True -> (pct, itemRows)."""
+    code = str(code).strip()
+    weights = (weights if weights is not None else loadPeWeights()).get(code) or {}
+    lenientCodes = PE_LENIENT_CODES if lenientCodes is None else lenientCodes
+    strict = code not in lenientCodes
+    meta = _checklistMeta({"assessor_config": _asDict(assessorConfig)}, code, "assessor") or {}
+    rule = (PE_SESSIONS.get(code) or {}).get("adjustRule", "down")
+    num = den = 0.0
+    items = []
+    for mc, key in _peAnswers(assessorData, code).items():
+        m = meta.get(mc)
+        if not m or m["itemId"] not in weights:
+            continue
+        rank, n, adj = _scoreOption(key, m["valid"], rule)
+        if rank is None:
+            continue
+        pts, mx = peLevelPoints(rank, n, strict)
+        if not mx:
+            continue
+        w = weights[m["itemId"]]
+        num += pts / mx * w
+        den += w
+        items.append(dict(mc=mc, itemId=m["itemId"], key=key, adjusted=adj, points=pts, max=mx, weight=w))
+    pct = (100.0 * num / den) if den else None
+    return (pct, items) if returnItems else pct
+
+
+def peSectionScores(assessorData, assessorConfig, code, weights=None, lenientCodes=None):
+    """(formPct, {section: (marks, weight)}) for one PE checklist on one form, sections in
+    PE_SECTIONS order (Ergonomics, Instrument Handling, Quality of Scaling, Damage).
+    marks = sum(points/max x weight) of the section's answered weighted items, weight = their
+    weight sum, so the sections add up to the form total. A section with no weighted answered
+    item is absent ("not assessed this session")."""
+    pct, items = peFormPercent(assessorData, assessorConfig, code, weights=weights,
+                               lenientCodes=lenientCodes, returnItems=True)
+    secs = {}
+    for it in items:
+        sec = PE_ITEMS[it["itemId"]][1]
+        m, w = secs.get(sec, (0.0, 0.0))
+        secs[sec] = (m + it["points"] / it["max"] * it["weight"], w + it["weight"])
+    return pct, {k: secs[k] for k in PE_SECTIONS if k in secs}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1395,9 +1572,38 @@ TASK7_BANDS = {
     "matrixTofflemire": {1: (2, 2),                     3: (1.5, 1),    4: (1, 0.5),   5: (0.5, 0)},
     "restComposite":    {1: (10, 10), 2: (9.75, 8.75), 3: (8.5, 6),    4: (6.5, 4),   5: (4.5, 0)},
     "restAmalgam":      {1: (10, 10), 2: (9.75, 8.75), 3: (8.5, 6),    4: (6.5, 4),   5: (4.5, 0)},
+    # 2026-10-27 — from DDS1 Cons Dent CAF.xlsx rubric tabs (2 / 1.5-1 / <=0.5; cols 1, 3, 5)
+    "caoh":             {1: (2, 2),                     3: (1.5, 1),                   5: (0.5, 0)},
+    "liner":            {1: (2, 2),                     3: (1.5, 1),                   5: (0.5, 0)},
 }
-TASK7_SECTIONS = ("Isolation", "Preparation", "Matrix", "Restoration")
-TASK7_SECTION_MAX = {"Isolation": 2, "Preparation": 10, "Matrix": 2, "Restoration": 10}
+# Canonical section order (rows of the section page). CaOH cement / Liner or base only
+# exist on some forms (AP1/AP2 today; Task 8.1/8.2 + practice per the CAF sheet).
+TASK7_SECTIONS = ("Isolation", "Preparation", "CaOH cement", "Liner or base", "Matrix", "Restoration")
+TASK7_CORE_SECTIONS = ("Isolation", "Preparation", "Matrix", "Restoration")
+TASK7_SECTION_MAX = {"Isolation": 2, "Preparation": 10, "CaOH cement": 2, "Liner or base": 2,
+                     "Matrix": 2, "Restoration": 10}
+
+# Cons Dent codes scored by section (2026-10-27): Task 7.x / 8.x, mock (MA3 ...), practice
+# (P1 ...) and additional practice (AP1 ...). Their sections are read from each form's OWN
+# checklist headers (cdLayoutFromConfig) — falls back to TASK7_LAYOUT when no config.
+CD_SECTION_CODE_RE = re.compile(r"^(Task\s*[78]\.\d+|MA\d+|P\d+|AP\d+)$", re.I)
+# form section-header title (normalised) -> (section, bandKey)
+CD_HEADER_SECTIONS = {
+    "isolation": ("Isolation", "isolation"),
+    "preparation - adhesive": ("Preparation", "prepAdhesive"),
+    "preparation - amalgam": ("Preparation", "prepAmalgam"),
+    "calcium hydroxide cement": ("CaOH cement", "caoh"),
+    "liner or base": ("Liner or base", "liner"),
+    "sectional matrix placement": ("Matrix", "matrixSectional"),
+    "tofflemire placement": ("Matrix", "matrixTofflemire"),
+    "restoration - composite": ("Restoration", "restComposite"),
+    "restoration - amalgam": ("Restoration", "restAmalgam"),
+}
+
+
+def isCdSectionCode(code):
+    """True for Cons Dent codes scored by section (Task 7.x/8.x, MA*, P*, AP*)."""
+    return bool(CD_SECTION_CODE_RE.match(str(code or "").strip()))
 
 
 def _t7Mcs(a, b):
@@ -1414,6 +1620,11 @@ TASK7_LAYOUT = {
     "Task 7.1": _T7_ADHESIVE, "Task 7.4": _T7_ADHESIVE,
     "Task 7.2": _T7_AMALGAM,  "Task 7.5": _T7_AMALGAM,
     "Task 7.3": [("Isolation", "isolation", _t7Mcs(1, 4)), ("Restoration", "restAmalgam", _t7Mcs(5, 11))],
+    # Task 8 (2026-10-27): same checklist bank forms as Task 7 — 8.2/8.3/8.4 are field-for-field
+    # the adhesive 7.1/7.4 form, 8.1 the amalgam 7.2 form (fields, disabled options, headers
+    # identical) -> same band tables / sections.
+    "Task 8.1": _T7_AMALGAM,
+    "Task 8.2": _T7_ADHESIVE, "Task 8.3": _T7_ADHESIVE, "Task 8.4": _T7_ADHESIVE,
 }
 
 
@@ -1435,7 +1646,7 @@ def _t7Snap(col, band):
 def scoreTask7Section(items, bandKey):
     """Score ONE section. items: list of checklist cells (one per criterion, in order).
     Returns the section score (float) or None when the section is Incomplete."""
-    band = TASK7_BANDS[bandKey]
+    band = cdBands().get(bandKey) or TASK7_BANDS[bandKey]   # CAF workbook bands (2026-10-27)
     cols = []
     for it in items:
         k = _t7OptionKey(it)
@@ -1453,11 +1664,57 @@ def scoreTask7Section(items, bandKey):
     return float(max(score, lower))
 
 
-def scoreTask7Checklist(code, checklist):
+def cdLayoutFromConfig(cfg):
+    """[(section, bandKey, [MCs])] from one checklist config's section headers: every MC
+    belongs to the most recent recognised section header (CD_HEADER_SECTIONS); sub-headers
+    ('Caries Removal', 'Assembly and use of components' ...) are ignored. [] if none found."""
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except ValueError:
+            return []
+    if not isinstance(cfg, dict):
+        return []
+    fields = cfg.get("fields") or {}
+    headers = (cfg.get("extra_config") or {}).get("headers") or {}
+    mcs = sorted(fields, key=lambda m: int(re.sub(r"\D", "", m) or 0))
+    layout, cur = [], None
+    for mc in mcs:
+        for h in headers.get(mc) or []:
+            hit = CD_HEADER_SECTIONS.get(_norm((h or {}).get("title")))
+            if hit:
+                cur = [hit[0], hit[1], []]
+                layout.append(cur)
+                break
+        if cur is not None:
+            cur[2].append(mc)
+    return [tuple(x) for x in layout if x[2]]
+
+
+def _cdLayout(code, row=None):
+    """Section layout for *code* on one form row: from the form's assessor_config headers when
+    present, else TASK7_LAYOUT."""
+    code = str(code).strip()
+    if row is not None and hasattr(row, "get"):
+        cfg = row.get("assessor_config")
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except ValueError:
+                cfg = None
+        if isinstance(cfg, dict):
+            sel = ((cfg.get("checklists") or {}).get("selected") or {}).get(code)
+            lay = cdLayoutFromConfig(sel)
+            if lay:
+                return lay
+    return TASK7_LAYOUT.get(code)
+
+
+def scoreTask7Checklist(code, checklist, layout=None):
     """Score every section of one Task 7 checklist ({'MC1': {'key': 'O1', ...}, ...}).
     Returns [{section, score, maxScore, pct, complete, nReviewed, nCriteria}, ...]
     in TASK7_LAYOUT order, or [] when *code* is not a Task 7 code."""
-    layout = TASK7_LAYOUT.get(str(code).strip())
+    layout = layout or TASK7_LAYOUT.get(str(code).strip())
     if not layout or not isinstance(checklist, dict):
         return []
     out = []
@@ -1472,6 +1729,7 @@ def scoreTask7Checklist(code, checklist):
             "nReviewed": sum(1 for i in items if _t7OptionKey(i) not in (None, "O6")),
             "nCriteria": len(mcs),
         })
+        out[-1]["attempted"] = out[-1]["nReviewed"] > 0   # all Not Reviewed -> not attempted ("–")
     return out
 
 
@@ -1495,7 +1753,8 @@ def _t7Checklists(row, checklistsCol="checklists"):
             val = ad.get("checklists") if isinstance(ad.get("checklists"), dict) and ad.get("checklists") else ad
     if not isinstance(val, dict):
         return {}
-    return {k: v for k, v in val.items() if str(k).strip() in TASK7_LAYOUT and isinstance(v, dict)}
+    return {k: v for k, v in val.items()
+            if (str(k).strip() in TASK7_LAYOUT or isCdSectionCode(k)) and isinstance(v, dict)}
 
 
 def scoreTask7Forms(df, dateCol="datetimeutc", checklistsCol="checklists", formIdCol=None,
@@ -1507,7 +1766,7 @@ def scoreTask7Forms(df, dateCol="datetimeutc", checklistsCol="checklists", formI
     datetime, task ('7.1'...), code, section, score, maxScore, pct, complete,
     nReviewed, nCriteria. Empty DataFrame when no Task 7 forms."""
     cols = ["formKey", "date", "datetime", "task", "code", "section", "score", "maxScore",
-            "pct", "complete", "nReviewed", "nCriteria"]
+            "pct", "complete", "nReviewed", "nCriteria", "attempted"]
     if df is None or len(df) == 0:
         return pd.DataFrame(columns=cols)
     if formIdCol is None:
@@ -1523,7 +1782,7 @@ def scoreTask7Forms(df, dateCol="datetimeutc", checklistsCol="checklists", formI
         dt = dt.tz_convert(tz)
         key = row[formIdCol] if formIdCol else idx
         for code, cl in cls.items():
-            for s in scoreTask7Checklist(code, cl):
+            for s in scoreTask7Checklist(code, cl, layout=_cdLayout(code, row)):
                 rows.append({"formKey": f"{key}|{code}", "date": dt.strftime("%Y-%m-%d"), "datetime": dt,
                              "task": str(code).replace("Task", "").strip(), "code": code, **s})
     if not rows:
@@ -1579,3 +1838,489 @@ def validateTask7Scoring(jsonPath="temp 2026 caf.json",
                 else:
                     bad.append(((r[fi], code, section), want, got))
     return ok, len(bad), bad
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Cons Dent SECTION-SCORES WORKBOOK (added 2026-10-27)
+# Rebuilds DDS1/DDS1_Task7_section_scores.xlsx from the CAF JSON export, for any
+# selection of Cons Dent codes (Task 7.x, Task 8.x, mock MA*, practice P*, additional
+# practice AP*). Same deductive band scoring as the student reports (scoreTask7Section);
+# band tables are read from DDS1/DDS1 Cons Dent CAF.xlsx (loadCdBands, TASK7_BANDS =
+# fallback); each form's sections come from its own checklist headers (cdLayoutFromConfig).
+#
+#   listCdCodeStructure("temp 2026 caf.json")                       # what codes / sections exist
+#   buildCdSectionScoresWorkbook("temp 2026 caf.json", include=("task7",))
+#   buildCdSectionScoresWorkbook("temp 2026 caf.json", include=("task7", "task8", "mock"))
+#   buildCdSectionScoresWorkbook("temp 2026 caf.json", include="all")
+#   buildCdSectionScoresWorkbook("temp 2026 caf.json", include=["Task 7.1", "MA3", r"^AP\d+$"])
+# ════════════════════════════════════════════════════════════════════════════
+CD_CAF_PATH = "DDS1/DDS1 Cons Dent CAF.xlsx"
+# bandKey -> rubric tab in the CAF workbook
+CD_BAND_TABS = {
+    "isolation": "Isolation", "prepAdhesive": "Preparation - adhesive",
+    "prepAmalgam": "Preparation - amalgam", "caoh": "Calcium hydroxide cement",
+    "liner": "Liner or base", "matrixSectional": "Sectional matrix placement",
+    "matrixTofflemire": "Tofflemire placement", "restComposite": "Restoration - composite",
+    "restAmalgam": "Restoration - amalgam",
+}
+CD_BAND_LABELS = {
+    "isolation": "Isolation (/2)", "prepAdhesive": "Preparation - adhesive (/10)",
+    "prepAmalgam": "Preparation - amalgam (/10)", "caoh": "Calcium hydroxide cement (/2)",
+    "liner": "Liner or base (/2)", "matrixSectional": "Sectional matrix (/2)",
+    "matrixTofflemire": "Tofflemire (/2)", "restComposite": "Restoration - composite (/10)",
+    "restAmalgam": "Restoration - amalgam (/10)",
+}
+# code-type groups for `include=` (order = sheet order)
+CD_CODE_GROUPS = {
+    "task7":      (r"^Task\s*7\.\d+$", "Task 7"),
+    "task8":      (r"^Task\s*8\.\d+$", "Task 8"),
+    "mock":       (r"^MA\d+$", "Mock assessment"),
+    "practice":   (r"^P\d+$", "Practice"),
+    "additional": (r"^AP\d+$", "Additional practice"),
+}
+_CD_BANDS_CACHE = {}
+
+
+def _cdNum(s):
+    try:
+        return float(str(s).replace("\xa0", " ").strip())
+    except ValueError:
+        return None
+
+
+def _cdParseBandCell(v):
+    """'10' -> ('eq', 10); '9.75 – 9' -> ('range', 9.75, 9); '≤ 0.5' -> ('le', 0.5)."""
+    s = str(v).replace("\xa0", " ").strip()
+    if not s:
+        return None
+    if s.startswith("≤"):
+        x = _cdNum(s[1:])
+        return ("le", x) if x is not None else None
+    m = re.match(r"^([\d.]+)\s*[–\-]\s*([\d.]+)$", s)
+    if m:
+        return ("range", float(m.group(1)), float(m.group(2)))
+    x = _cdNum(s)
+    return ("eq", x) if x is not None else None
+
+
+def _cdBandsFromSheet(ws):
+    """{column 1-5: (upper, lower)} from one rubric tab: the band row is the LAST row whose
+    cells sit under the '1 2 3 4 5' column header row; '≤ x' lower = next column's upper (0 last)."""
+    hdrCols = None
+    for row in ws.iter_rows():
+        cells = [c for c in row if c.value not in (None, "")]
+        if len(cells) >= 4 and [str(c.value).strip()[:1] for c in cells[:4]] == ["1", "2", "3", "4"]:
+            hdrCols = {c.column: i + 1 for i, c in enumerate(cells[:5])}
+            hdrRow = cells[0].row
+            break
+    if not hdrCols:
+        return None
+    band = None
+    for row in ws.iter_rows(min_row=hdrRow + 1):
+        parsed = {hdrCols[c.column]: _cdParseBandCell(c.value) for c in row
+                  if c.column in hdrCols and c.value not in (None, "")}
+        if parsed and 1 in parsed and parsed[1] and parsed[1][0] == "eq" and all(parsed.values()):
+            band = parsed
+    if not band:
+        return None
+    cols = sorted(band)
+    out = {}
+    for i, col in enumerate(cols):
+        p = band[col]
+        if p[0] == "eq":
+            out[col] = (p[1], p[1])
+        elif p[0] == "range":
+            out[col] = (p[1], p[2])
+        else:
+            nxt = next((band[c] for c in cols[i + 1:]), None)
+            out[col] = (p[1], (nxt[1] if nxt else 0.0))
+    return out
+
+
+def loadCdBands(path=None, refresh=False):
+    """{bandKey: {col: (upper, lower)}} read from the CAF workbook rubric tabs (cached).
+    Any tab that can't be read falls back to TASK7_BANDS."""
+    path = path or CD_CAF_PATH
+    if path in _CD_BANDS_CACHE and not refresh:
+        return _CD_BANDS_CACHE[path]
+    bands = {k: dict(v) for k, v in TASK7_BANDS.items()}
+    try:
+        import warnings
+        from openpyxl import load_workbook
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wb = load_workbook(path, data_only=True)
+        for key, tab in CD_BAND_TABS.items():
+            if tab in wb.sheetnames:
+                b = _cdBandsFromSheet(wb[tab])
+                if b:
+                    bands[key] = {c: (float(u), float(l)) for c, (u, l) in b.items()}
+    except Exception:
+        pass
+    _CD_BANDS_CACHE[path] = bands
+    return bands
+
+
+def cdBands():
+    """Active band tables for scoring (CAF workbook, else TASK7_BANDS)."""
+    return loadCdBands()
+
+
+def cdCodeGroup(code):
+    """Group key ('task7', 'task8', 'mock', 'practice', 'additional') or None."""
+    c = str(code or "").strip()
+    for g, (pat, _) in CD_CODE_GROUPS.items():
+        if re.match(pat, c, re.I):
+            return g
+    return None
+
+
+def _cdSelector(include):
+    """Predicate for include= : 'all' | group key | exact code | regex, or an iterable of these."""
+    if include is None or include == "all":
+        return lambda c: cdCodeGroup(c) is not None
+    items = [include] if isinstance(include, str) else list(include)
+    tests = []
+    for it in items:
+        it = str(it).strip()
+        if it.lower() in CD_CODE_GROUPS:
+            tests.append(lambda c, g=it.lower(): cdCodeGroup(c) == g)
+        elif it.lower() == "all":
+            tests.append(lambda c: cdCodeGroup(c) is not None)
+        elif re.search(r"[\^\$\\\[\]\*\+\?]", it):
+            tests.append(lambda c, rx=re.compile(it, re.I): bool(rx.match(c)))
+        else:
+            tests.append(lambda c, x=it.lower(): c.lower() == x)
+    return lambda c: any(t(str(c).strip()) for t in tests)
+
+
+def _cdCodeSortKey(code):
+    g = cdCodeGroup(code)
+    order = list(CD_CODE_GROUPS).index(g) if g in CD_CODE_GROUPS else 99
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", str(code))]
+    return (order, nums, str(code))
+
+
+def _iterCohortRecords(jsonPath, cohort):
+    """Yield CAF records of *cohort* — streams with ijson when installed (large exports)."""
+    try:
+        import ijson
+        with open(jsonPath, "rb") as fh:
+            for r in ijson.items(fh, "item", use_float=True):
+                if r.get("cohort") == cohort:
+                    yield r
+    except ImportError:
+        with open(jsonPath, encoding="utf-8") as fh:
+            for r in json.load(fh):
+                if r.get("cohort") == cohort:
+                    yield r
+
+
+def _cdTexts(data, keys):
+    t = (data or {}).get("texts") or {}
+    return "\n\n".join(str(t[k]).strip() for k in keys if str(t.get(k) or "").strip()) or None
+
+
+def collectCdForms(jsonPath="temp 2026 caf.json", cohort="DDS1", include=("task7", "task8"),
+                   submittedOnly=True, excludeStudents=None):
+    """One dict per (form x selected Cons Dent code), scored by section. Keys: code, group,
+    name, date, datetime, student, studentNumber, assessor, submitted, layout, answers
+    {MC: key}, fields {MC: criterion}, sections [scoreTask7Checklist rows], reflection,
+    comments, incident, recordId, formId, nRecords (records read)."""
+    sel = _cdSelector(include)
+    excl = _excludedStudents(excludeStudents)
+    out, nRec = [], 0
+    for r in _iterCohortRecords(jsonPath, cohort):
+        nRec += 1
+        st = r.get("student") or {}
+        sn = str(st.get("student_number", "")).strip()
+        if not sn or sn in excl or _isTestAccount(st):
+            continue
+        name = f"{(st.get('first_name') or '').strip()} {(st.get('last_name') or '').strip()}".strip()
+        for f in r.get("forms") or []:
+            sub = bool(f.get("submitted_by_assessor"))
+            if submittedOnly and not sub:
+                continue
+            fc = f.get("form_context") or {}
+            sels = ((f.get("assessor_config") or {}).get("checklists") or {}).get("selected") or {}
+            ad = f.get("assessor_data") or {}
+            cls = ad.get("checklists") or {}
+            codes = [c.get("code") for c in fc.get("checklists") or []]
+            for code in dict.fromkeys(str(c).strip() for c in codes if c):
+                if not sel(code):
+                    continue
+                cfg = sels.get(code) or {}
+                layout = cdLayoutFromConfig(cfg) or TASK7_LAYOUT.get(code)
+                if not layout:
+                    continue
+                cl = cls.get(code) if isinstance(cls.get(code), dict) else {}
+                answers = {mc: _t7OptionKey(v) for mc, v in cl.items()}
+                dtRaw = fc.get("datetime") or r.get("datetime")
+                dt = pd.Timestamp(dtRaw)
+                dt = (dt.tz_localize("UTC") if dt.tzinfo is None else dt).tz_convert(_MELB)
+                out.append(dict(
+                    code=code, group=cdCodeGroup(code), name=cfg.get("name"),
+                    date=dt.strftime("%Y-%m-%d"), datetime=dt, student=name, studentNumber=sn,
+                    assessor=(f.get("assessor_name") or "").strip(), submitted=sub,
+                    layout=layout, answers=answers,
+                    fields={mc: str(v).strip() for mc, v in (cfg.get("fields") or {}).items()},
+                    sections=scoreTask7Checklist(code, cl, layout=layout),
+                    reflection=_cdTexts(f.get("student_data"), ("reflection",)),
+                    comments=_cdTexts(ad, [k for k in (ad.get("texts") or {})
+                                           if not str(k).startswith("clinical-incident")]),
+                    incident=_cdTexts(ad, ("clinical-incident-additional-details",)),
+                    recordId=r.get("id"), formId=f.get("id")))
+    for o in out:
+        o["nRecords"] = nRec
+    return out
+
+
+def _cdLayoutText(layout):
+    parts = []
+    for sec, bandKey, mcs in layout:
+        lab = CD_BAND_LABELS.get(bandKey, sec).split(" (")[0]
+        parts.append(f"{lab} {mcs[0]}–{mcs[-1]}" if len(mcs) > 1 else f"{lab} {mcs[0]}")
+    return " | ".join(parts)
+
+
+def listCdCodeStructure(jsonPath="temp 2026 caf.json", cohort="DDS1", include="all", forms=None):
+    """DataFrame — one row per Cons Dent code: group, name, forms, submitted, layout variants,
+    MC count and sections (band table + MC range) as read from the forms' checklist headers.
+    Pass forms=collectCdForms(..., submittedOnly=False) to reuse an already-read export."""
+    forms = forms if forms is not None else collectCdForms(jsonPath, cohort, include, submittedOnly=False)
+    rows = []
+    for code in sorted({f["code"] for f in forms}, key=_cdCodeSortKey):
+        fs = [f for f in forms if f["code"] == code]
+        lays = Counter(_cdLayoutText(f["layout"]) for f in fs)
+        main = lays.most_common(1)[0][0]
+        rows.append(dict(code=code, group=CD_CODE_GROUPS.get(cdCodeGroup(code), ("", ""))[1],
+                         name=Counter(f["name"] for f in fs).most_common(1)[0][0],
+                         forms=len(fs), submitted=sum(f["submitted"] for f in fs),
+                         students=len({f["studentNumber"] for f in fs}),
+                         layoutVariants=len(lays), nMCs=max(len(f["fields"]) for f in fs),
+                         sections=main))
+    return pd.DataFrame(rows)
+
+
+# --- workbook styling (matches DDS1_Task7_section_scores.xlsx) ---
+_CD_HDR_FILL = PatternFill("solid", start_color="1F3864", end_color="1F3864")
+_CD_OK_FILL = PatternFill("solid", start_color="E2EFDA", end_color="E2EFDA")
+_CD_INC_FILL = PatternFill("solid", start_color="F4B0A0", end_color="F4B0A0")
+_CD_OPT_FILLS = {k: PatternFill("solid", start_color=c, end_color=c) for k, c in
+                 {"O1": "E2EFDA", "O2": "FFF2CC", "O3": "FCE4D6", "O4": "F8CBAD",
+                  "O5": "F4B0A0", "O6": "F2F2F2"}.items()}
+_CD_CENTER = Alignment(horizontal="center")
+
+
+def _cdHeader(ws, headers, widths):
+    ws.append(headers)
+    for c in ws[1]:
+        c.fill = _CD_HDR_FILL
+        c.font = _XlFont(bold=True, color="FFFFFF")
+        c.alignment = Alignment(wrap_text=True, vertical="center")
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+
+
+def _cdScoreVal(s):
+    if s is None:
+        return "Incomplete"
+    return int(s) if float(s).is_integer() else float(s)
+
+
+def _cdFmt(s):
+    return f"{s:g}"
+
+
+def buildCdSectionScoresWorkbook(jsonPath="temp 2026 caf.json", outPath=None, cohort="DDS1",
+                                 include=("task7", "task8"), submittedOnly=True,
+                                 codeStructureSheet=True, excludeStudents=None):
+    """Write the Cons Dent section-scores workbook for the selected codes and return its path.
+
+    include : 'all', a group key ('task7', 'task8', 'mock', 'practice', 'additional'), an exact
+              code ('Task 7.1', 'MA3'), a regex (r'^P\\d+$'), or a list mixing these.
+    Sheets  : one per code (one row per form: section scores + 'n/N reviewed', MC option keys,
+              reflection / comments / clinical incident, record_id, form_id) · Consolidated
+              (student x code: every completed score per section, task_complete, n_forms) ·
+              Code_Structure (optional) · Band_Tables · Criteria_Legend · Method_&_Caveats.
+    Default outPath: DDS1/DDS1_CD_section_scores (<groups>).xlsx."""
+    allForms = collectCdForms(jsonPath, cohort, include, False, excludeStudents)   # one read of the export
+    forms = [f for f in allForms if f["submitted"]] if submittedOnly else allForms
+    if not forms:
+        raise ValueError(f"No {cohort} forms matched include={include!r}")
+    codes = sorted({f["code"] for f in forms}, key=_cdCodeSortKey)
+    if outPath is None:
+        groups = [g for g in CD_CODE_GROUPS if any(cdCodeGroup(c) == g for c in codes)]
+        tag = "all" if include == "all" else "+".join(CD_CODE_GROUPS[g][1] for g in groups)
+        outPath = f"DDS1/DDS1_CD_section_scores ({tag}).xlsx"
+    bands = cdBands()
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # --- one sheet per code ---
+    codeLayouts = {}
+    for code in codes:
+        fs = sorted([f for f in forms if f["code"] == code],
+                    key=lambda f: (f["student"], f["date"]))
+        layout = Counter(json.dumps(f["layout"]) for f in fs).most_common(1)[0][0]
+        layout = [tuple(x) for x in json.loads(layout)]
+        codeLayouts[code] = layout
+        nMc = max(max((int(re.sub(r"\D", "", m)) for m in f["fields"]), default=0) for f in fs)
+        mcs = [f"MC{i}" for i in range(1, nMc + 1)]
+        secHdr = []
+        for sec, _, _ in layout:
+            secHdr += [f"{sec} /{TASK7_SECTION_MAX[sec]:g}", f"{sec} reviewed"]
+        headers = (["date", "student", "student_number", "assessor", "submitted"] + secHdr + mcs +
+                   ["student_reflection", "assessor_comments", "clinical_incident", "record_id", "form_id"])
+        widths = ([13, 22, 13, 20, 13] + [13, 10] * len(layout) + [6.5] * len(mcs) + [55, 60, 40, 13, 13])
+        ws = wb.create_sheet(str(code).replace(" ", "_")[:31])
+        _cdHeader(ws, headers, widths)
+        for f in fs:
+            bySec = {s["section"]: s for s in f["sections"]}
+            secVals = []
+            for sec, _, _ in layout:
+                s = bySec.get(sec)
+                secVals += ([_cdScoreVal(s["score"]), f"{s['nReviewed']}/{s['nCriteria']}"]
+                            if s else ["—", "—"])
+            ws.append([f["date"], f["student"], f["studentNumber"], f["assessor"], f["submitted"]] +
+                      secVals + [f["answers"].get(m) for m in mcs] +
+                      [f["reflection"], f["comments"], f["incident"], f["recordId"], f["formId"]])
+            r = ws.max_row
+            for i in range(len(layout)):
+                c = ws.cell(r, 6 + 2 * i)
+                if c.value != "—":
+                    c.fill = _CD_INC_FILL if c.value == "Incomplete" else _CD_OK_FILL
+                    c.font = _XlFont(bold=True)
+                    c.alignment = _CD_CENTER
+            for j in range(len(mcs)):
+                c = ws.cell(r, 6 + 2 * len(layout) + j)
+                if c.value in _CD_OPT_FILLS:
+                    c.fill = _CD_OPT_FILLS[c.value]
+                    c.alignment = _CD_CENTER
+
+    # --- Consolidated ---
+    secCols = [s for s in TASK7_SECTIONS if any(s == x[0] for l in codeLayouts.values() for x in l)]
+    ws = wb.create_sheet("Consolidated")
+    _cdHeader(ws, ["student", "student_number", "task"] + secCols + ["task_complete", "n_forms", "n_completed"],
+              [22, 13, 13] + [22] * len(secCols) + [13, 10, 12])
+    keyRows = defaultdict(list)
+    for f in forms:
+        keyRows[(f["student"], f["studentNumber"], f["code"])].append(f)
+    for (name, sn, code) in sorted(keyRows, key=lambda k: (k[0], _cdCodeSortKey(k[2]))):
+        # stable sort: same-session forms keep DASH export order (matches the 2026-09 workbook)
+        fs = sorted(keyRows[(name, sn, code)], key=lambda f: f["datetime"])
+        laySecs = [x[0] for x in codeLayouts[code]]
+        vals, allDone, nDone = [], True, 0
+        for sec in secCols:
+            if sec not in laySecs:
+                vals.append("—")
+                continue
+            done = [s["score"] for f in fs for s in f["sections"] if s["section"] == sec and s["complete"]]
+            vals.append("; ".join(_cdFmt(x) for x in done) if done else "Incomplete")
+            allDone &= bool(done)
+            nDone += len(done)
+        # n_forms = forms for this student x code; n_completed = completed section scores listed
+        # (the 2026-09 workbook's "n_forms" column actually held this count)
+        ws.append([name, sn, code] + vals + ["Yes" if allDone else "No", len(fs), nDone])
+        r = ws.max_row
+        for i in range(len(secCols)):
+            c = ws.cell(r, 4 + i)
+            c.fill = _CD_INC_FILL if c.value == "Incomplete" else _CD_OK_FILL
+            if c.value == "Incomplete":
+                c.font = _XlFont(bold=True)
+        c = ws.cell(r, 4 + len(secCols))
+        if c.value == "Yes":
+            c.fill, c.font = _CD_OK_FILL, _XlFont(bold=True)
+
+    # --- Code_Structure ---
+    if codeStructureSheet:
+        cs = listCdCodeStructure(forms=allForms)
+        ws = wb.create_sheet("Code_Structure")
+        _cdHeader(ws, list(cs.columns), [11, 18, 52, 8, 10, 10, 14, 8, 110])
+        for row in cs.itertuples(index=False):
+            ws.append(list(row))
+
+    # --- Band_Tables ---
+    ws = wb.create_sheet("Band_Tables")
+    _cdHeader(ws, ["section", "col1 (perfect)", "col2", "col3", "col4", "col5"], [32, 13, 13, 13, 13, 13])
+    usedBands = [k for k in CD_BAND_LABELS if any(k == x[1] for l in codeLayouts.values() for x in l)]
+    for k in usedBands:
+        b = bands[k]
+        ws.append([CD_BAND_LABELS[k], _cdScoreVal(b[1][0])] +
+                  [(f"{_cdFmt(b[c][0])}-{_cdFmt(b[c][1])}" if c in b else "disabled") for c in range(2, 6)])
+
+    # --- Criteria_Legend ---
+    ws = wb.create_sheet("Criteria_Legend")
+    _cdHeader(ws, ["task", "criterion", "section", "description"], [13, 13, 28, 70])
+    for code in codes:
+        f0 = next(f for f in forms if f["code"] == code)
+        secOf = {m: sec for sec, _, ms in codeLayouts[code] for m in ms}
+        for m in sorted(f0["fields"], key=lambda x: int(re.sub(r"\D", "", x) or 0)):
+            ws.append([code, m, secOf.get(m, "—"), f0["fields"][m]])
+
+    # --- Method_&_Caveats ---
+    ws = wb.create_sheet("Method_&_Caveats")
+    _cdHeader(ws, ["topic", "detail"], [18, 110])
+    notes = [
+        ("Scoring method", "Each section scored independently using its OWN band table (see Band_Tables), "
+                           "read from DDS1 Cons Dent CAF.xlsx rubric tabs."),
+        ("Deductions", "Most-severe error sets the band (upper limit=start), NOT itself deducted. Every other "
+                       "error deducts 0.25 (col2/3) or 0.5 (col4/5). Floored at band lower limit."),
+        ("Option keys", "O1=Satisfactory(1) O2/O3=Needs improvement(2/3) O4=Unsatisfactory(4) "
+                        "O5=Critical error(5) O6=Not Reviewed(ignored)."),
+        ("Incomplete", "A section shows Incomplete until EVERY criterion is assessed (no O6/blank)."),
+        ("Sections", "Each form's sections are read from its own checklist headers (Isolation, Preparation, "
+                     "CaOH cement, Liner or base, Matrix, Restoration); '—' = section not on that form."),
+        ("Repeats", "One row per form on code sheets; Consolidated lists every completed instance per "
+                    "section (dates omitted)."),
+        ("Task complete", "Consolidated task_complete=Yes when every section of the code is done at least once "
+                          "(possibly across forms). n_forms = forms for that student x code; n_completed = "
+                          "number of completed section scores listed."),
+        ("/2 lower limits", "Where a rubric gives only upper limits (≤ x), the lower limit is the next "
+                            "column's upper (2->1.5->1->0.5->0)."),
+        ("Disabled columns", "Sectional / CaOH / Liner disable col2&4; Tofflemire col2. Stray disabled-column "
+                             "picks snapped to nearest band."),
+        ("Not captured", "Per-surface errors, 'Previously assessed' linking, multi-examiner editing are pending "
+                         "DASH changes."),
+        ("Status", "Known data gaps remain - not for Pass/Fail decisions."),
+        ("Selection", f"include={include!r} -> {', '.join(codes)}; "
+                      f"{'assessor-submitted forms only' if submittedOnly else 'all forms'}."),
+        ("Generated", f"Rebuilt from {jsonPath} ({forms[0]['nRecords']} {cohort} records) on "
+                      f"{datetime.now():%Y-%m-%d %H:%M} by dds1_pe_utils.buildCdSectionScoresWorkbook."),
+    ]
+    for t, d in notes:
+        ws.append([t, d])
+        ws.cell(ws.max_row, 2).alignment = Alignment(wrap_text=True, vertical="top")
+    wb.save(outPath)
+    return outPath
+
+
+def compareCdSectionWorkbooks(newPath, oldPath="DDS1/DDS1_Task7_section_scores.xlsx"):
+    """Cell-by-cell check of section scores / reviewed counts between two section-scores
+    workbooks, matched on (sheet, form_id). Returns dict of counts + mismatch list."""
+    from openpyxl import load_workbook
+    a, b = load_workbook(newPath, read_only=True), load_workbook(oldPath, read_only=True)
+    res = dict(match=0, mismatch=0, onlyNew=0, onlyOld=0, details=[])
+    for name in b.sheetnames:
+        if name not in a.sheetnames or not name[:1].isalpha() or name in (
+                "Consolidated", "Band_Tables", "Criteria_Legend", "Method_&_Caveats", "Code_Structure"):
+            continue
+        def rows(ws):
+            it = ws.iter_rows(values_only=True)
+            h = list(next(it))
+            return h, {r[h.index("form_id")]: r for r in it}
+        ha, ra = rows(a[name])
+        hb, rb = rows(b[name])
+        cols = [c for c in hb if c in ha and (str(c).endswith("reviewed") or " /" in str(c))]
+        res["onlyNew"] += len(set(ra) - set(rb))
+        res["onlyOld"] += len(set(rb) - set(ra))
+        for fid in set(ra) & set(rb):
+            for c in cols:
+                va, vb = ra[fid][ha.index(c)], rb[fid][hb.index(c)]
+                if va == vb or (isinstance(va, (int, float)) and isinstance(vb, (int, float)) and abs(va - vb) < 1e-9):
+                    res["match"] += 1
+                else:
+                    res["mismatch"] += 1
+                    res["details"].append((name, fid, c, vb, va))
+    return res

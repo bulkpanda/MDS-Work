@@ -29,7 +29,7 @@
 | `normalizeRole(value)` | `'Operator'` / `'Support Operator'` / `'Observation'` / `None` | Folds the v3 CODE spelling (`O`/`SO`/`OB`) and the older LABEL spelling to one form. Unknown values pass through stripped, not dropped. |
 | `normalizePatientDetail(value)` | `'I saw a patient'` / … / `None` | Same for `ISP`/`FTA`/`PCW`/`NPB`/`UBP`. |
 | `patientSeenMask(grp, requireOperator=True)` | boolean Series | Forms counting as "a patient was seen": patient attended **and** role = Operator. Forms with **no role field at all** (final-year templates) are exempt *per form*. |
-| `filterCohortDfByPeriod(cohortDf, period, minDate, maxDate, dateCol, tz)` | `(df, label, (min, max))` | FHY / SHY / ALL semester filter on the **Melbourne-local** date. |
+| `filterCohortDfByPeriod(cohortDf, period, minDate, maxDate, dateCol, tz)` | `(df, label, (min, max))` | FHY / SHY / ALL semester filter (plus Q1–Q4 and quarter ranges since 2026-10-27) on the **Melbourne-local** date. |
 | `parseIgnoreDates(values, defaultYear=None)` | sorted `'YYYY-MM-DD'` list | ISO, day-first slash/dash, written and date objects. **Raises** on an unparseable entry. |
 | `dropIgnoredDates(cohortDf, ignoreDates, …)` | `(df, parsedDates)` | Removes whole sessions. **Warns loudly** when a listed date matches no forms. |
 | `buildSectionScorePivot(cohortDf, formType, mappingFile)` | `(pivot, groupCol, counts)` | Student × Section mean 0–1 checklist score, with both Overall columns. |
@@ -69,6 +69,26 @@ now the Operator-gated one.
 (borderline-GR auto) and are now **absolute** standards. Every other preset is unchanged.
 
 **Two bug fixes that move numbers on an unchanged call** — see §7.
+
+### 2026-10-27 — Quarterly PRP periods
+
+`filterCohortDfByPeriod` (and so the notebook's PRP wrapper `createFlaggingReport(..., period=...)`) now accepts **quarters** `'Q1'`..`'Q4'` and **quarter ranges** `'Q2-Q3'`, via `general_utils.resolvePeriod` — no logic change in this module, only the docstring and the Legend "Period" row text (now says "inclusive").
+
+| Period | Dates (inclusive, Melbourne local date) | Output filename suffix |
+|---|---|---|
+| Q1 | start of year → 04/04/2026 (day before Easter Sunday 05/04) | `(Q1)` |
+| Q2 | 05/04 → 14/06 | `(Q2)` |
+| Q3 | 15/06 → 04/09 | `(Q3)` |
+| Q4 | 05/09 → 02/11 | `(Q4)` |
+| `Q2-Q3` etc. | first quarter start → last quarter end | `(Q2-Q3)` |
+
+```python
+createFlaggingReport("DDS2", "Clinic", config=PRESETS["dds2_clinic"], period="Q4",
+                     ignoreDates=DDS2_CLINIC_IGNORE_DATES)   # -> DDS2 Clinic Flagging (2026) (Q4).xlsx
+createFlaggingReport("DDS2", "Clinic", config=PRESETS["dds2_clinic"], period="Q2-Q3")
+```
+
+`thresholds["period_label"]` carries `'Q4'` / `'Q2-Q3'`; the Legend sheet prints the resolved min..max dates. Forms after 02/11 belong to no quarter. Thresholds that are cohort-relative are recomputed on the quarter's forms only; absolute count thresholds (`minPtSeen`, `minForms` …) are **not** scaled — pass smaller values via `.copy(...)` for a quarter.
 
 ### 2026-10-01 — DDS3 reportable score pivot + count-based ES level flags
 

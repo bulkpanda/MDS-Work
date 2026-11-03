@@ -259,7 +259,7 @@ Background (source comment L118–134): Smile Squad clinic sessions have no sepa
 
 1. Short-circuits on `None`/empty frames, non-`SMILE_SQUAD_COHORTS` cohorts, and frames without a `clinic` column.
 2. Builds `mask = df["clinic"].apply(isSmileSquadClinic)`; returns early if no row matches.
-3. `df = df.copy()`; for the masked index, swaps `student_data` ↔ `assessor_data` and `submitted_by_student` ↔ `submitted_by_assessor` via a `.values` assignment.
+3. `df = df.copy()`; **(2026-10-22)** first records the pre-swap DASH flags as `submitted_by_student_raw` / `submitted_by_assessor_raw` and adds a boolean `is_smile_squad` column (only if not already present); then, for the masked index, swaps `student_data` ↔ `assessor_data` and `submitted_by_student` ↔ `submitted_by_assessor` via a `.values` assignment. `_computeSummaryMetrics` prefers the `*_raw` columns so `# Student / # Assessor Submitted` match DASH, and reports `# Smile Squad (self-assessed)`.
 4. Re-derives every column in `SMILE_SQUAD_SCALE_COLUMNS` from the **new** assessor side using `_scaleKeyFromData` (the SQL-derived values were computed pre-swap and would otherwise stay NULL, leaving every rubric panel blank). Int columns are coerced with `pd.to_numeric(..., errors="coerce")` and the whole column is cast to `float`; the rest are cast to `object`.
 5. Re-derives `item_codes` **cell by cell** with `df.at[...]` — the comment at L260 notes that `.loc` broadcasting mangles list values.
 6. The reflection columns are deliberately **not** swapped: on a Smile Squad form the single reflection text is written by the student, so it belongs in the "Student Reflection" column.
@@ -921,7 +921,7 @@ cohortDf["scores"] = cohortDf.apply(lambda row: calcScore(row, SCORE_MAP), axis=
 
 **Behaviour**
 
-1. `# Forms`, `# Assessor Submitted`, `# Student Submitted` are computed over the **unfiltered** frame.
+1. `# Forms`, `# Assessor Submitted`, `# Student Submitted` are computed over the **unfiltered** frame. **(2026-10-22)** The two submitted counts read `submitted_by_assessor_raw` / `submitted_by_student_raw` when those columns exist (written by `applySmileSquadSwap` before its flag flip) so they match DASH; otherwise the live flags. A `# Smile Squad (self-assessed)` row (`is_smile_squad.sum()`) is appended after them, only when > 0. Scale/GR/incident metrics below are unaffected — still the post-swap `adf`.
 2. All remaining metrics use `adf = df[df["submitted_by_assessor"]]`. When that is empty, returns a short OrderedDict with `Avg Global Rating = "N/A"` and `Critical Incidents = "0"`.
 3. `Avg Global Rating` is `f"{mean:.2f}/5"`; `Critical Incidents` counts rows with a non-null `clinical_incident`.
 4. When `patientInfo` and **not** `isSimulation`: clips `patient_age` to 0–120 for the mean, buckets ages into `0-6` / `7-17` / `18+` (buckets are computed on the **unclipped** column), and adds `Role Counts` and `Patient Details` using label maps read **dynamically** from `df["context_schema_snapshot"]` (falling back to `ROLE_LABELS_FALLBACK` / `PATIENT_DETAIL_LABELS_FALLBACK`).

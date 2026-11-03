@@ -16,6 +16,8 @@
 
 ---
 
+> **2026-10-27** — **quarter periods.** `resolvePeriod` now also accepts `'Q1'`..`'Q4'` and contiguous quarter ranges (`'Q2-Q3'`, `'Q2:Q3'`, `'Q2–Q3'`, `'Q2-3'`). New constants `PERIOD_Q1..Q4`, `EASTER_SUNDAY_DATE`, `QUARTER3_END_DATE`, `QUARTER4_END_DATE` and new function `getQuarterBounds(splitDate=None)`. FHY/SHY/ALL unchanged. See §3.4 and §5.9.
+
 > **2026-09-30** — re-added `getDeleteStudentsSql(tableName, studentNumbers=None, colName="student_number")` (after `getDeleteSql`): returns `DELETE FROM … WHERE student_number IN (…)` for `EXCLUDED_STUDENT_NUMBERS` (from variableUtils), `""` if empty. Called in cell 6 `processForms()`. See `_handover_docs/HANDOVER_boh1_sim_flagging_preset.md` §8.
 
 ## 1. Purpose and role in the pipeline
@@ -101,6 +103,10 @@ WEEKLY_SIM_SCORE_MAP = {
 | `PERIOD_FHY` | `str` | `"FHY"` | Line 1361. First half year — dates strictly **before** `DDS2_SEMESTER_SPLIT_DATE`. |
 | `PERIOD_SHY` | `str` | `"SHY"` | Line 1362. Second half year — dates **on/after** the split. |
 | `PERIOD_ALL` | `str` | `"ALL"` | Line 1363. Whole year, no date filter (the original behaviour). |
+| `PERIOD_Q1` … `PERIOD_Q4` | `str` | `"Q1"` … `"Q4"` | *2026-10-27.* Quarter labels; bounds from `getQuarterBounds`. |
+| `EASTER_SUNDAY_DATE` | `str` | `"2026-04-05"` | *2026-10-27.* First day of Q2 (Q1 ends the day before, 2026-04-04). Update each year. |
+| `QUARTER3_END_DATE` | `str` | `"2026-09-04"` | *2026-10-27.* Last day of Q3; Q4 starts the day after. |
+| `QUARTER4_END_DATE` | `str` | `"2026-11-02"` | *2026-10-27.* Last day of Q4. Forms after this are in SHY/ALL but in **no** quarter. |
 
 ---
 
@@ -730,13 +736,30 @@ The comment block at lines 1351–1360 explains why this exists: semester 1 and 
 
 **Behaviour** — `dayBeforeSplit` = split − 1 day. Bounds are `FHY → (None, dayBeforeSplit)`, `SHY → (splitDate, None)`, `ALL → (None, None)`. An unrecognised period raises `ValueError(f"Unknown period {period!r} — use 'FHY', 'SHY' or 'ALL'.")`. The override is `_asDateStr(minDate) or bounds[0]`, so a falsy explicit value falls back to the period bound.
 
-**Calls** — `general_utils:_asDateStr`. **Called by** — `general_utils:periodSuffixPath`, `general_utils:loadWeeklyFiles`; `main.ipynb`.
+**Calls** — `general_utils:_asDateStr`, `general_utils:getQuarterBounds`. **Called by** — `general_utils:periodSuffixPath`, `general_utils:loadWeeklyFiles`, `flagging_utils:filterCohortDfByPeriod`; `main.ipynb`.
+
+**2026-10-27 — quarters and quarter ranges.** `period` also accepts `'Q1'`..`'Q4'` (case-insensitive) and a contiguous range matching `Q<a>\s*[-–:]\s*Q?<b>` (e.g. `'Q2-Q3'`, `'q2:q3'`, `'Q2–3'`). A range is normalised to the label `'Q<a>-Q<b>'` (`'Q2-Q2'` → `'Q2'`) and spans the first quarter's start to the last quarter's end. A backwards range (`'Q3-Q1'`) raises `ValueError("… runs backwards — use 'Q1-Q3'.")`; any other unknown value raises `ValueError("Unknown period … use 'FHY', 'SHY', 'ALL', 'Q1'..'Q4' or a quarter range like 'Q2-Q3'.")`. Explicit `minDate`/`maxDate` still win.
+
+| `period` | Returns `(minDate, maxDate, label)` |
+|---|---|
+| `'Q1'` | `(None, '2026-04-04', 'Q1')` |
+| `'Q2'` | `('2026-04-05', '2026-06-14', 'Q2')` |
+| `'Q3'` | `('2026-06-15', '2026-09-04', 'Q3')` |
+| `'Q4'` | `('2026-09-05', '2026-11-02', 'Q4')` |
+| `'Q2-Q3'` | `('2026-04-05', '2026-09-04', 'Q2-Q3')` |
+| `'Q1:Q2'` | `(None, '2026-06-14', 'Q1-Q2')` — identical dates to FHY |
+
+Design: Q2 end / Q3 start hinge on `SEMESTER_SPLIT_DATE` (15 June = "mid June"), so Q1+Q2 == FHY and Q3 begins with SHY; moving the split moves both. Q1 is open at the start (like FHY) so the year's first forms are never lost.
+
+#### `getQuarterBounds(splitDate=None)`
+
+*Added 2026-10-27.* Returns `{'Q1': (None, '2026-04-04'), 'Q2': ('2026-04-05', dayBefore(split)), 'Q3': (split, QUARTER3_END_DATE), 'Q4': (dayAfter(QUARTER3_END_DATE), QUARTER4_END_DATE)}` — inclusive `'YYYY-MM-DD'` bounds, `None` = open. `splitDate` defaults to `SEMESTER_SPLIT_DATE`. **Called by** — `resolvePeriod`.
 
 #### `periodSuffixPath(path, period=PERIOD_ALL)`
 
 *Lines 1392–1400.* `'…/x.xlsx'` + `'SHY'` → `'…/x (SHY).xlsx'`.
 
-**Returns** — `str`. `ALL`/`None` returns `path` unchanged, so existing whole-year filenames (and anything downstream pointing at them) keep working exactly as before.
+**Returns** — `str`. Quarters/ranges suffix the same way: `'(Q4)'`, `'(Q2-Q3)'`. `ALL`/`None` returns `path` unchanged, so existing whole-year filenames (and anything downstream pointing at them) keep working exactly as before.
 
 **Behaviour** — resolves the label via `resolvePeriod(period)` (dates are discarded), then `os.path.splitext` + f-string. Note it validates the period as a side effect, so an unknown period raises here too.
 

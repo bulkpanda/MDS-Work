@@ -145,6 +145,15 @@ if patientInfo and clinicMetrics:
 **Root cause.** `Utils.addPlotImage`→`createPlotImage` saves with **`bbox_inches='tight'`**, which trims each figure to its own content. The scatter's y-label/legend differ in width from the rubric's, so tight-trim removed different left margins; scaled to the same width afterwards, the plot rectangles started at different fractions.
 **Fix.** `_v2FullFigImage(fig, ratio)` embeds the figure **without** tight-trimming (`fig.savefig(buf, facecolor=fig.get_facecolor())`, no `bbox_inches`). Both time-series figures are figsize-14 wide with identical `subplots_adjust(left=0.09, right=0.985, …)`, so the full-frame images have the plot rectangle at the same fraction → **perfect alignment** (verified by stacking both PNGs). Used for both the scatter and the rubric image in `_addTimeSeriesPageV2` only.
 
+### 4d. Form counts reported pre-Smile-Squad-swap (2026-10-22) — `applySmileSquadSwap` / `_computeSummaryMetrics`
+**Symptom.** A BOH2 student (1755988) compared the report's `# Student Submitted` / `# Assessor Submitted` with DASH and found them "switched". Labels were correct; the cause was `applySmileSquadSwap` (default `smileSquadSwap=True` in `getDataDf`), which flips `submitted_by_student` ↔ `submitted_by_assessor` for every `clinic == "SS"` row so SS forms survive the `submitted_by_assessor` filters. Side effect: every self-assessed Smile Squad form was counted as assessor-submitted and dropped from student-submitted (report showed 115 / 104 where DASH shows fewer assessor, more student).
+**Fix (serves V1 and V2 — both share `_computeSummaryMetrics`).**
+- `applySmileSquadSwap` now records, *before* swapping, `submitted_by_student_raw`, `submitted_by_assessor_raw` (copies of the DASH flags) and a boolean `is_smile_squad` column. The swap itself is unchanged, so rubric/scatter/section/item-code panels still include SS forms.
+- `_computeSummaryMetrics` counts `# Assessor Submitted` / `# Student Submitted` from the `*_raw` columns when present (falls back to the live flags for frames that never went through the swap — other cohorts, `smileSquadSwap=False`). Adds a `# Smile Squad (self-assessed)` row, emitted only when > 0; both summary tables build rows from the metric-dict keys, so it appears automatically (Simulation column blank).
+- Reconciliation: `# Assessor Submitted (old) = # Assessor Submitted (new) + # Smile Squad`; student count the reverse.
+- Scale/GR/incident metrics still use the post-swap `submitted_by_assessor` subset (`adf`) — intended, unchanged.
+Backup: `_bak/boh2_dds2_dds3_utils.py.bak_20261022_*`. Verify: rebuild `onlyStudents=["1755988"]` and compare with DASH.
+
 ---
 
 ## 5. Palette / constants (all new, module-level)

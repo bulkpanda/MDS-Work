@@ -18,6 +18,14 @@
 
 > The AST extraction was last run 2026-08-14. The additions below (all in this file, cohort-generic for BOH3/DDS4) are documented by hand; line numbers elsewhere in this doc still refer to the 2026-08-14 snapshot. Full detail: `_handover_docs/HANDOVER_student_report_weakness_comments_and_toc.md`.
 
+**Added 2026-10-15 (rev. 2026-10-16) — DTC clinical-exposure comparison + item-code totals on PDF bars.** Full detail: `_handover_docs/HANDOVER_dtc_clinic_comparison.md`.
+
+- **New section 11 (EOF), all public.** `getClinicStudentExposure(engine, cohort, attended=True, filters=None)` → one row per (clinic, student): attended `patients`, `total_codes` (Σ item-code quantity), `unique_codes` (COUNT DISTINCT code at site level). `summariseClinicExposure` (per-site means), `dtcVsOthersExposure` (DTC vs pooled others, 3 metrics, abs+% diff), `buildClinicComparisonWorkbook(engine, cohort, outPath, *, dtcName='DTC', attended=True, minStudents=1, today=None)` → one 'Clinical Exposure' sheet (DTC-vs-others table + per-site table + 3 bar charts, DTC/MDC bars recoloured) via `_xlClinicBar`/`_xlHighlightPoints`. Output: `BOH3_DDS4/Clinical Exposure <cohort> <today>.xlsx`.
+- **Cohort PDF.** New `getItemCodeTotal(engine, cohort, filters=None)` (grand total of item-code quantity for a filter). `plotItemCodeFrequencies` gained `total=None` → title `Top Item Codes (Total: N)`; `buildFrontPage` and the by-age panels in `buildCohortSummaryPdf` pass it. The earlier (2026-10-15) `addGenericCharts` kwarg/block and `addCohortGenericCharts` were **removed** — the PDF ends at the patient-count table again.
+- **`main.ipynb`:** one call cell after `createPatientStatsPerClinicPerRotation`. Old per-clinic functions (`createPatientStatsPerClinic*`, `clinic_metrics_<cohort>.xlsx`) untouched.
+- **Rotation exclusion.** `getClinicStudentExposure`/`buildClinicComparisonWorkbook` take `excludeRotations=(8,)` (default) — drops those rotation NUMBERS before aggregating; a note lists them on the sheet.
+- **Note.** Per student (not per rotation); attended patients counted directly (no Operator field on final-year forms); `external_clinic` holds readable site names.
+
 **Added 2026-09-16 — weakness analytics, all-comments, PDF cover/contents + page numbers.**
 
 - **Weakness over time & by item code (queries, §5-area).** `getStudentWeaknessTimeline` (per-form category counts + `Item Codes`), `summariseWeaknessByRotation`, `getStudentWeaknessByCodeRotation` (per code×rotation detail), `aggregateWeaknessByCode(detail, rotationNums, descMap, minWeaknessForms)`, `getStudentWeaknessByItemCode` (wrapper), plus `rotationSortKey`, `rotationNumber`, `weaknessRotationGroups`. Weaknesses = the 7 `assessor_data->'multi-select'->'weakness-*'` buckets; item-code figures are **co-occurrence** (feedback is per-form, not per-procedure).

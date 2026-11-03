@@ -11,6 +11,7 @@ from openpyxl import load_workbook
 from openpyxl.formatting.rule import FormulaRule, ColorScaleRule
 from openpyxl.styles import Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.comments import Comment as XlComment   # reportlab-safe alias (import * rule)
 from openpyxl.chart import ScatterChart, BarChart, Reference, Series
 from openpyxl.chart.trendline import Trendline
 from openpyxl.chart.marker import Marker
@@ -2786,6 +2787,62 @@ def highlightRepeatAssessors(ws, df, idCols, repeatCounts, valueCols,
     return n
 
 
+def buildAssessorNoteMap(longDf, idCols=DEFAULT_ID_COLS, pivotCol=ITEM_CODE_COL,
+                         assessorCol="assessor_name", dateCol="date"):
+    """{(idTuple, itemCode): ["Assessor: <name> (<date>)", ...]} from a long weekly frame.
+
+    One line per form, date-ordered, so a repeated attempt lists every assessor the student
+    saw on that code — the score/GR/PR pivots keep only the best attempt (agg="max"), and
+    the note is the only place the other attempt's assessor survives.
+    """
+    need = list(idCols) + [pivotCol, assessorCol]
+    if longDf is None or longDf.empty or any(c not in longDf.columns for c in need):
+        return {}
+    cols = need + ([dateCol] if dateCol in longDf.columns else [])
+    df = longDf[cols].dropna(subset=[assessorCol]).drop_duplicates()
+    if dateCol in df.columns:
+        df = df.sort_values(list(idCols) + [pivotCol, dateCol])
+    notes = {}
+    for _, r in df.iterrows():
+        key = (tuple(r[c] for c in idCols), r[pivotCol])
+        when = r[dateCol] if dateCol in df.columns else None
+        if hasattr(when, "strftime"):
+            when = when.strftime("%Y-%m-%d")
+        line = f"Assessor: {r[assessorCol]}" + (f" ({when})" if when else "")
+        notes.setdefault(key, []).append(line)
+    return notes
+
+
+def addAssessorComments(ws, df, idCols, noteMap, codeCols, firstRow=2, author="DASH",
+                        width=260, height=None):
+    """Attach an Excel hover note (openpyxl Comment) to every student x item-code cell.
+
+    ``df`` is the RELABELLED frame as written to ``ws`` (same row order, header row at
+    firstRow-1); ``idCols`` are its id column names in the same order as the snake_case
+    idCols used to build ``noteMap`` (values are untouched by relabelling, only headers).
+    Cells with no value, or no note, are skipped. Returns the number of notes written.
+    """
+    if not noteMap or df is None or df.empty:
+        return 0
+    colIndex = {col: i + 1 for i, col in enumerate(df.columns)}
+    codeCols = [c for c in codeCols if c in colIndex]
+    n = 0
+    for rOffset, (_, row) in enumerate(df.iterrows()):
+        ids = tuple(row[c] for c in idCols)
+        for col in codeCols:
+            if pd.isna(row[col]):
+                continue
+            lines = noteMap.get((ids, col))
+            if not lines:
+                continue
+            note = XlComment("\n".join(lines), author)
+            note.width = width
+            note.height = height or (20 + 18 * len(lines))
+            ws.cell(row=firstRow + rOffset, column=colIndex[col]).comment = note
+            n += 1
+    return n
+
+
 # Both spellings on purpose: styleWeeklySheet is handed the RELABELLED frame for a new
 # build, but is still callable on a raw snake_case frame. Names absent from the frame are
 # ignored, so listing both costs nothing.
@@ -3139,31 +3196,74 @@ PERIOD_FHY = "FHY"
 PERIOD_SHY = "SHY"
 PERIOD_ALL = "ALL"
 
+# ── Quarters (2026-10-27, additive) ──────────────────────────────────────────
+# Q1 start of year -> day before Easter Sunday (Easter Sunday 2026 = 5 April)
+# Q2 Easter Sunday  -> day before SEMESTER_SPLIT_DATE (mid June)
+# Q3 SEMESTER_SPLIT_DATE -> QUARTER3_END_DATE
+# Q4 day after QUARTER3_END_DATE -> QUARTER4_END_DATE
+# Q2/Q3 hinge on SEMESTER_SPLIT_DATE, so Q1+Q2 == FHY and Q3 starts with SHY.
+# Forms after QUARTER4_END_DATE fall in SHY/ALL but in no quarter.
+PERIOD_Q1, PERIOD_Q2, PERIOD_Q3, PERIOD_Q4 = "Q1", "Q2", "Q3", "Q4"
+EASTER_SUNDAY_DATE = "2026-04-05"
+QUARTER3_END_DATE  = "2026-09-04"
+QUARTER4_END_DATE  = "2026-11-02"
+
+
+def getQuarterBounds(splitDate=None):
+    """{'Q1': (min, max), ...} inclusive 'YYYY-MM-DD' bounds (None = open)."""
+    splitDate = _asDateStr(splitDate or SEMESTER_SPLIT_DATE)
+    dayBefore = lambda d: (pd.Timestamp(d) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    dayAfter  = lambda d: (pd.Timestamp(d) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    return {PERIOD_Q1: (None, dayBefore(EASTER_SUNDAY_DATE)),
+            PERIOD_Q2: (EASTER_SUNDAY_DATE, dayBefore(splitDate)),
+            PERIOD_Q3: (splitDate, QUARTER3_END_DATE),
+            PERIOD_Q4: (dayAfter(QUARTER3_END_DATE), QUARTER4_END_DATE)}
+
 
 def resolvePeriod(period=PERIOD_ALL, minDate=None, maxDate=None, splitDate=None):
     """Turn a period name into an inclusive (minDate, maxDate, label) triple.
 
-    ``period`` accepts 'FHY' / 'SHY' / 'ALL' (case-insensitive, and the aliases
-    'SEM1'/'S1'/'H1' and 'SEM2'/'S2'/'H2'), or None to use minDate/maxDate as given.
+    ``period`` accepts (case-insensitive):
+      'FHY' / 'SHY' / 'ALL'  (aliases 'SEM1'/'S1'/'H1' and 'SEM2'/'S2'/'H2')
+      'Q1' .. 'Q4'           quarters, see getQuarterBounds
+      'Q2-Q3' (or 'Q2:Q3', 'Q2–Q3', 'Q2-3')  contiguous quarter range
+    or None to use minDate/maxDate as given.
     Explicit ``minDate`` / ``maxDate`` always win over the period's own bounds, so
-    you can narrow a half year further (e.g. period='SHY', maxDate='2026-07-31').
+    you can narrow a period further (e.g. period='SHY', maxDate='2026-07-31').
 
     Returns (minDate, maxDate, label) with dates as 'YYYY-MM-DD' strings or None.
     """
     splitDate = _asDateStr(splitDate or SEMESTER_SPLIT_DATE)
     dayBeforeSplit = (pd.Timestamp(splitDate) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-
-    aliases = {"FHY": PERIOD_FHY, "SEM1": PERIOD_FHY, "S1": PERIOD_FHY, "H1": PERIOD_FHY,
-               "SHY": PERIOD_SHY, "SEM2": PERIOD_SHY, "S2": PERIOD_SHY, "H2": PERIOD_SHY,
-               "ALL": PERIOD_ALL, "": PERIOD_ALL}
-    label = PERIOD_ALL if period is None else aliases.get(str(period).strip().upper())
-    if label is None:
-        raise ValueError(f"Unknown period {period!r} — use 'FHY', 'SHY' or 'ALL'.")
+    quarters = getQuarterBounds(splitDate)
 
     bounds = {PERIOD_FHY: (None, dayBeforeSplit),
               PERIOD_SHY: (splitDate, None),
-              PERIOD_ALL: (None, None)}[label]
-    return (_asDateStr(minDate) or bounds[0], _asDateStr(maxDate) or bounds[1], label)
+              PERIOD_ALL: (None, None),
+              **quarters}
+
+    aliases = {"FHY": PERIOD_FHY, "SEM1": PERIOD_FHY, "S1": PERIOD_FHY, "H1": PERIOD_FHY,
+               "SHY": PERIOD_SHY, "SEM2": PERIOD_SHY, "S2": PERIOD_SHY, "H2": PERIOD_SHY,
+               "ALL": PERIOD_ALL, "": PERIOD_ALL,
+               **{q: q for q in quarters}}
+    key = "" if period is None else str(period).strip().upper()
+    label = aliases.get(key)
+
+    if label is None:                                   # quarter range 'Q2-Q3'
+        m = re.fullmatch(r"Q([1-4])\s*[-–:]\s*Q?([1-4])", key)
+        if m:
+            qFrom, qTo = int(m.group(1)), int(m.group(2))
+            if qFrom > qTo:
+                raise ValueError(f"Quarter range {period!r} runs backwards — use 'Q{qTo}-Q{qFrom}'.")
+            label = f"Q{qFrom}" if qFrom == qTo else f"Q{qFrom}-Q{qTo}"
+            bounds[label] = (quarters[f"Q{qFrom}"][0], quarters[f"Q{qTo}"][1])
+
+    if label is None:
+        raise ValueError(f"Unknown period {period!r} — use 'FHY', 'SHY', 'ALL', "
+                         f"'Q1'..'Q4' or a quarter range like 'Q2-Q3'.")
+
+    b = bounds[label]
+    return (_asDateStr(minDate) or b[0], _asDateStr(maxDate) or b[1], label)
 
 
 def periodSuffixPath(path, period=PERIOD_ALL):

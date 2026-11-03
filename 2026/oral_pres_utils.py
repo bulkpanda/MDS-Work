@@ -6,14 +6,22 @@ Called from main.ipynb section "## Oral Presentation" via `from oral_pres_utils 
 
 Public functions (everything else is private / not exported by `import *`):
     fetchOralPresentationJson(bearerToken, outPath, year, cohorts)   pull from DASH (ordering=id) + dedupe + check
-    checkOralExport(jsonPath)                                         integrity check of a pulled JSON
-    loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort)  parse + score + all statistics (dict)
+    listOralItemCodes(jsonPath, cohort)                               item codes (checklist keys) in a pull + form counts
+    defaultOralReportPath(cohort, itemCode, year)                    standard per-item-code report path
+    checkOralExport(jsonPath, checklistKey)                           integrity check of a pulled JSON (one item code)
+    loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort, ignoreStudents)  parse + score + all statistics (dict)
     buildOralPresentationReport(jsonPath, outPath, ...)              full workbook from scratch (current layout)
+    buildOralStudentReports(jsonPath, outDir, checklistKey, ...)     one feedback PDF per student (+ combined review PDF)
+    defaultOralStudentPdfDir(cohort, itemCode, year)                 standard folder for those PDFs
     refreshOralPresentationReport(jsonPath, workbookPath, ...)       rewrite values into an EXISTING workbook,
                                                                       keeping manual edits (layout, widths, sorts,
                                                                       removed columns/sections, charts)
-Scoring: Excellent 4 · Good 3 · Satisfactory 2 · Poor 1 · Missing 0 (an unanswered item counts as Missing).
-Examiner % = total / (4 × n items) × 100; Final % = mean of the examiners' %.
+Scoring is read per item code from the checklist's options (O1 = best), via _setScale():
+    options ending in 'Missing' (BOH3-OHTR: Excellent 4 · Good 3 · Satisfactory 2 · Poor 1 · Missing 0)
+    otherwise n..1 + Missing 0 for unanswered (BOH3-OCT: Exemplary 4 · Proficient 3 · Developing 2 · Unsatisfactory 1).
+Item weights: ORAL_ITEM_WEIGHTS[itemCode] = {MC: weight}; total = Σ weight × level points (unlisted MC / code = 1).
+Examiner % = weighted total / (max points × Σ weights) × 100; Final % = mean of the examiners' %.
+Item-level stats (distributions, item means, α, κ) stay on the unweighted 0–max level points.
 Examiner 1 / Examiner 2 = order of form id (submission order), not a role.
 """
 import os
@@ -34,20 +42,36 @@ from openpyxl import Workbook as _XlWorkbook
 from openpyxl.styles import Font as _XlFont, PatternFill as _XlPatternFill, Alignment as _XlAlignment, \
     Border as _XlBorder, Side as _XlSide
 from openpyxl.utils import get_column_letter as _xlColLetter
-from openpyxl.chart import BarChart as _XlBarChart, Reference as _XlReference
+from openpyxl.chart import BarChart as _XlBarChart, LineChart as _XlLineChart, Reference as _XlReference
 from openpyxl.chart.label import DataLabelList as _XlDataLabelList
+from openpyxl.chart.title import Title as _XlTitle
+from openpyxl.chart.text import RichText as _XlRichText, Text as _XlText
+from openpyxl.chart.shapes import GraphicalProperties as _XlGraphicalProperties
+from openpyxl.chart.legend import LegendEntry as _XlLegendEntry
+from openpyxl.drawing.line import LineProperties as _XlLineProperties
+from openpyxl.drawing.text import Paragraph as _XlDrawParagraph, ParagraphProperties as _XlDrawParaProps, \
+    CharacterProperties as _XlCharProps, RichTextProperties as _XlRichTextProps, RegularTextRun as _XlTextRun
 from openpyxl.formatting.rule import ColorScaleRule as _XlColorScaleRule
 
-__all__ = ["ORAL_LEVEL_POINTS", "fetchOralPresentationJson", "checkOralExport", "loadOralPresentation",
+__all__ = ["ORAL_LEVEL_POINTS", "fetchOralPresentationJson", "listOralItemCodes", "defaultOralReportPath",
+           "checkOralExport", "loadOralPresentation", "ORAL_ITEM_WEIGHTS",
            "buildOralPresentationReport", "refreshOralPresentationReport"]
 
 # ---------------------------------------------------------------- config
 ORAL_LEVEL_POINTS = {"Excellent": 4, "Good": 3, "Satisfactory": 2, "Poor": 1, "Missing": 0}
 _LEVELS = ["Excellent", "Good", "Satisfactory", "Poor", "Missing"]
 _MAX_PTS = 4
+# Per-item-code weights for the TOTAL (multiplier on each MC's level points). Codes not listed = equal weight 1;
+# MCs missing from a code's dict also get 1. Edit here (or pass itemWeights= to load/build/refresh).
+ORAL_ITEM_WEIGHTS = {
+    # BOH3 Oral Presentation Rubric (Canvas): Professional identity /12, Central message /8,
+    # Structure /4, Delivery /4, Quality of presentation /4  -> max 32
+    "BOH3-OCT": {"MC1": 3, "MC2": 2, "MC3": 1, "MC4": 1, "MC5": 1},
+}
+
 _LOW_PCT = 50.0          # all-Satisfactory average
 _HIGH_PCT = 75.0         # Good average
-_DISAGREE_PCT = 20.0     # examiner gap flag (percentage points)
+_DISAGREE_PCT = 10.0     # default examiner gap flag (percentage points); override with gapThreshold=
 _BASE_URL = "https://api.unimelb-dash.com"
 
 # palette (same as the BOH3 viva report)
@@ -97,9 +121,65 @@ def fetchOralPresentationJson(bearerToken, outPath, year=2026, cohorts="BOH3", b
     return records
 
 
-def checkOralExport(jsonPath):
-    """Print and return integrity facts: repeated ids, submitted count, students without exactly 2 forms."""
-    records = json.load(open(jsonPath, encoding="utf-8"))
+def listOralItemCodes(jsonPath, cohort=None):
+    """Item codes (= checklist keys, e.g. 'BOH3-OHTR') in a pulled JSON with form counts.
+
+    Returns {itemCode: {name, forms, submitted, cohorts, subjects}}; also prints one line per code.
+    cohort: optional filter (e.g. 'BOH3').
+    """
+    out = {}
+    for r in json.load(open(jsonPath, encoding="utf-8")):
+        if cohort and r.get("cohort") and r["cohort"] != cohort: continue
+        for code, ck in ((r.get("form") or {}).get("checklists") or {}).items():
+            d = out.setdefault(code, dict(name=ck.get("name"), forms=0, submitted=0, cohorts=set(), subjects=set()))
+            d["forms"] += 1
+            d["submitted"] += bool(r.get("submitted"))
+            d["cohorts"].add(r.get("cohort")); d["subjects"].add(r.get("subject"))
+    for code, d in sorted(out.items()):
+        d["cohorts"], d["subjects"] = sorted(filter(None, d["cohorts"])), sorted(filter(None, d["subjects"]))
+        print(f"{code:<20} {d['name'] or '':<40} forms {d['forms']:>4} · submitted {d['submitted']:>4} · "
+              f"cohorts {d['cohorts']} · subjects {d['subjects']}")
+    return out
+
+
+def defaultOralReportPath(cohort, itemCode, year=2026, baseDir="Oral Presentation"):
+    """Standard report path for one item code: '<baseDir>/<cohort>/<cohort>_<itemCode>_Oral_Presentation_Report_<year>.xlsx'."""
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", str(itemCode)).strip()
+    return os.path.join(baseDir, cohort, f"{cohort}_{safe}_Oral_Presentation_Report_{year}.xlsx")
+
+
+def _hasItemCode(r, checklistKey):
+    return checklistKey is None or checklistKey in ((r.get("form") or {}).get("checklists") or {})
+
+
+def _ignoreMatcher(ignoreStudents, rosterPath="studentEmailList.csv"):
+    """Return f(studentName) -> True if the student is on the ignore list.
+
+    ignoreStudents: names (case-insensitive) and/or student numbers (int or str); None/[] = ignore nobody.
+    Numbers are matched through the roster's student_name -> student_number.
+    """
+    keys = {str(x).strip().lower() for x in (ignoreStudents or []) if str(x).strip()}
+    if not keys: return lambda name: False
+    nameToNo = {}
+    if rosterPath and os.path.exists(rosterPath):
+        for r in csv.DictReader(open(rosterPath, encoding="utf-8")):
+            nameToNo[r["student_name"].strip().lower()] = str(r.get("student_number", "")).split(".")[0].strip()
+    def isIgnored(name):
+        n = (name or "").strip().lower()
+        return n in keys or nameToNo.get(n, "") in keys
+    return isIgnored
+
+
+def checkOralExport(jsonPath, checklistKey=None, ignoreStudents=None, rosterPath="studentEmailList.csv"):
+    """Print and return integrity facts: repeated ids, submitted count, students without exactly 2 forms.
+
+    checklistKey: item code to check (None = every form in the file).
+    ignoreStudents: names / student numbers left out of the check (same list as the report).
+    """
+    isIgnored = _ignoreMatcher(ignoreStudents, rosterPath)
+    records = [r for r in json.load(open(jsonPath, encoding="utf-8"))
+               if _hasItemCode(r, checklistKey) and not isIgnored(r["student"])]
+    if checklistKey: print(f"[{checklistKey}] ", end="")
     ids = _collections.Counter(r["id"] for r in records)
     uniq = {r["id"]: r for r in records}
     submitted = [r for r in uniq.values() if r.get("submitted")]
@@ -150,20 +230,100 @@ def _weightedKappa(a, b, cats=(0, 1, 2, 3, 4)):
     return float(1 - (W * O).sum() / den) if den else None
 
 
-def loadOralPresentation(jsonPath, rosterPath="studentEmailList.csv", checklistKey="BOH3-OHTR", cohort="BOH3"):
+_FILL_TOP_DOWN = [("C6EFCE", "006100"), ("E2EFDA", "375623"), ("FFEB9C", "9C5700"), ("FFC7CE", "9C0006")]
+_CHART_TOP_DOWN = ["548235", "A9D08E", "FFC000", "C00000"]
+
+
+def _rampPick(ramp, i, n):
+    """Colour for rank i of n (0 = best) from a best→worst ramp."""
+    return ramp[0] if n <= 1 else ramp[round(i * (len(ramp) - 1) / (n - 1))]
+
+
+def _setScale(ck, checklistKey):
+    """Set the module scale (ORAL_LEVEL_POINTS, _LEVELS, _MAX_PTS, colours) from this item code's checklist options.
+
+    Options sorted by O-key (O1 = best). If the last option is 'Missing' it scores 0 and the rest count down
+    from n-1; otherwise options score n..1 and an unanswered item is 'Missing' = 0.
+    Returns {checklist label: level label} (identity here; kept so callers can normalise answers).
+    """
+    global ORAL_LEVEL_POINTS, _LEVELS, _MAX_PTS, _LEVEL_FILL, _CHART_COL
+    opts = (((ck.get("extra_config") or {}).get("options") or {}).get("assessor")) or {}
+    if opts:
+        ordered = [str(opts[k]).strip() for k in sorted(opts, key=lambda k: int(re.sub(r"\D", "", k) or 0))]
+        ordered = [o for o in ordered if o]
+    else:                                                               # no option config: BOH3-OHTR default
+        ordered = ["Excellent", "Good", "Satisfactory", "Poor", "Missing"]
+    real = ordered[:-1] if ordered[-1].lower() == "missing" else ordered
+    if not real:
+        raise ValueError(f"Item code '{checklistKey}' has no usable rating options: {ordered}")
+    n = len(real)
+    _LEVELS = real + ["Missing"]
+    ORAL_LEVEL_POINTS = {l: n - i for i, l in enumerate(real)}
+    ORAL_LEVEL_POINTS["Missing"] = 0
+    _MAX_PTS = n
+    _LEVEL_FILL = {n - i: _rampPick(_FILL_TOP_DOWN, i, n) for i in range(n)}
+    _LEVEL_FILL[0] = ("D9D9D9", "000000")
+    _CHART_COL = {l: _rampPick(_CHART_TOP_DOWN, i, n) for i, l in enumerate(real)}
+    _CHART_COL["Missing"] = "7F7F7F"
+    labelMap = {l: l for l in _LEVELS}
+    labelMap.update({l.lower(): l for l in _LEVELS})
+    return labelMap
+
+
+def _scaleText():
+    return " · ".join(f"{l} = {ORAL_LEVEL_POINTS[l]}" for l in _LEVELS)
+
+
+def _fmtNum(x):
+    return f"{x:g}"
+
+
+def _weightText(m):
+    w = m["weights"]
+    if len(set(w.values())) == 1: return "Equal weighting (no weights set for this item code)."
+    return " · ".join(f"{mc} ×{_fmtNum(w[mc])} (/{_fmtNum(_MAX_PTS * w[mc])})" for mc in m["mcs"]) + \
+           " — total = Σ weight × level points. Student Results / Raw Forms item cells show weighted points (colour = level); Item & Examiner Analysis use unweighted level points (/" + _fmtNum(_MAX_PTS) + ")."
+
+
+def _midLevel():
+    """Level whose points = half of max (the 'reference line' level), e.g. Satisfactory / Developing."""
+    return min(_LEVELS[:-1], key=lambda l: abs(ORAL_LEVEL_POINTS[l] - _MAX_PTS / 2))
+
+
+def _bottomLabel():
+    return f"{_LEVELS[-2]}/Missing"
+
+
+def loadOralPresentation(jsonPath, rosterPath="studentEmailList.csv", checklistKey="BOH3-OHTR", cohort="BOH3",
+                         ignoreStudents=None, itemWeights=None, gapThreshold=_DISAGREE_PCT):
     """Parse the DASH JSON, score every submitted form and compute all report statistics.
 
     Returns a dict: forms, excluded, students (sorted by surname), mcs, items, rubric, itemStats, alpha,
     examiners, pairs, cohortMean, formMean, notPresented, rosterCount, dates.
-    Excluded: repeated ids, drafts, dummy/test students, forms without checklist answers.
+    Excluded: repeated ids, ignored students, drafts, dummy/test students, forms without checklist answers.
+    ignoreStudents: names (case-insensitive) and/or student numbers to leave out entirely — their forms are listed
+    as excluded ("Ignored (ignore list)") and they are not reported as roster students without a form.
+    itemWeights: {MC: weight} for the total; None = ORAL_ITEM_WEIGHTS.get(checklistKey) (code not listed = all 1).
+    gapThreshold: examiner gap (percentage points) that is flagged / counted in "Gap ≥" (default 10).
     """
+    isIgnored = _ignoreMatcher(ignoreStudents, rosterPath)
     raw = json.load(open(jsonPath, encoding="utf-8"))
     roster = {r["student_name"].strip().lower(): r for r in csv.DictReader(open(rosterPath, encoding="utf-8"))}
     rosterCohort = {k: v for k, v in roster.items() if v.get("cohort") == cohort}
-    ref = next(r for r in raw if checklistKey in r["form"]["checklists"])
-    items = ref["form"]["checklists"][checklistKey]["fields"]
+    raw = [r for r in raw if _hasItemCode(r, checklistKey)]            # only forms of this item code
+    if not raw:
+        raise ValueError(f"No forms with item code '{checklistKey}' in {jsonPath} — run listOralItemCodes() to see the codes.")
+    ref = raw[0]
+    ck = ref["form"]["checklists"][checklistKey]
+    items = ck["fields"]
     mcs = list(items)
-    rubric = ref["form"]["checklists"][checklistKey]["extra_config"]["rubric"]
+    rubric = (ck.get("extra_config") or {}).get("rubric") or {}
+    labelMap = _setScale(ck, checklistKey)                              # scale from this item code's options
+    wSrc = itemWeights if itemWeights is not None else ORAL_ITEM_WEIGHTS.get(checklistKey, {})
+    unknown = set(wSrc) - set(mcs)
+    if unknown: raise ValueError(f"Weights for '{checklistKey}' name MCs not on the checklist: {sorted(unknown)} (has {mcs})")
+    weights = {mc: float(wSrc.get(mc, 1)) for mc in mcs}               # unlisted MC -> 1
+    maxTotal = _MAX_PTS * sum(weights.values())
 
     excluded, seen, forms = [], set(), []
     for r in raw:
@@ -171,6 +331,7 @@ def loadOralPresentation(jsonPath, rosterPath="studentEmailList.csv", checklistK
         ans = (r["form"]["data"] or {}).get("assessor", {}) or {}
         reason = None
         if r["id"] in seen: reason = "Repeated form id in export"
+        elif isIgnored(r["student"]): reason = "Ignored (ignore list)"
         elif not r.get("submitted"): reason = "Not submitted (draft)"
         elif _isTestName(r["student"]): reason = "Dummy/test student"
         elif not ans.get(checklistKey): reason = "No checklist answers"
@@ -179,14 +340,15 @@ def loadOralPresentation(jsonPath, rosterPath="studentEmailList.csv", checklistK
             excluded.append(dict(id=r["id"], student=r["student"], assessor=r["assessor"], date=r["datetime"][:10], reason=reason))
             continue
         ros = roster.get(r["student"].strip().lower(), {})
-        labels = {mc: ans[checklistKey].get(mc) or "Missing" for mc in mcs}
+        labels = {mc: labelMap.get(str(ans[checklistKey].get(mc) or "").strip(),
+                                   labelMap.get(str(ans[checklistKey].get(mc) or "").strip().lower(), "Missing")) for mc in mcs}
         pts = {mc: ORAL_LEVEL_POINTS[labels[mc]] for mc in mcs}
-        total = sum(pts.values())
+        total = sum(weights[mc] * pts[mc] for mc in mcs)                # weighted total
         stNo = r.get("student_number") or (int(ros["student_number"]) if ros else None)
         forms.append(dict(id=r["id"], date=_dt.date.fromisoformat(r["datetime"][:10]),
                           student=_cleanName(ros.get("student_name", r["student"])), studentNo=stNo,
                           subject=r.get("subject"), assessor=r["assessor"], labels=labels, pts=pts, total=total,
-                          pct=100 * total / (_MAX_PTS * len(mcs)), nPoor=sum(p <= 1 for p in pts.values()),
+                          pct=100 * total / maxTotal, nPoor=sum(p <= 1 for p in pts.values()),
                           comments=(ans.get("comments") or "").strip()))
 
     byStudent = _collections.defaultdict(list)
@@ -200,8 +362,8 @@ def loadOralPresentation(jsonPath, rosterPath="studentEmailList.csv", checklistK
         flags = []
         if not e2: flags.append("Single-marked")
         if meanPct < _LOW_PCT: flags.append(f"Mean < {_LOW_PCT:.0f}%")
-        if any(f["nPoor"] for f in fs): flags.append("Poor/Missing rating")
-        if gap is not None and gap >= _DISAGREE_PCT: flags.append(f"Examiner gap ≥ {_DISAGREE_PCT:.0f} pts")
+        if any(f["nPoor"] for f in fs): flags.append(f"{_bottomLabel()} rating")
+        if gap is not None and gap >= gapThreshold: flags.append(f"Examiner gap ≥ {gapThreshold:g} pts")
         if len(fs) > 2: flags.append(f"{len(fs)} forms")
         students.append(dict(name=name, no=e1["studentNo"], subject=e1["subject"], date=e1["date"], e1=e1, e2=e2,
                              forms=fs, meanPct=meanPct, gap=gap, flags=flags, nPoor=sum(f["nPoor"] for f in fs),
@@ -250,19 +412,25 @@ def loadOralPresentation(jsonPath, rosterPath="studentEmailList.csv", checklistK
         pval = float(_scipyStats.ttest_rel(ap, bp).pvalue) if len(lst) >= 3 else None
         pairs.append(dict(label=f"{A} | {B}", n=len(lst), aMean=float(_np.mean(ap)), bMean=float(_np.mean(bp)),
                           diff=float(_np.mean(ap) - _np.mean(bp)), absGap=float(_np.mean(_np.abs(_np.subtract(ap, bp)))),
+                          absGapPts=float(_np.mean([abs(a["total"] - b["total"]) for a, b in lst])),
+                          itemAbsGapPts=float(_np.mean([sum(weights[mc] * abs(a["pts"][mc] - b["pts"][mc]) for mc in mcs)
+                                                        for a, b in lst])),   # per-MC |diff| summed, no cancelling
+                          itemAbsGapRaw=float(_np.mean([sum(abs(a["pts"][mc] - b["pts"][mc]) for mc in mcs)
+                                                        for a, b in lst])),   # same, unweighted level points
                           p=None if pval is None or _np.isnan(pval) else pval,
                           exact=100 * float(_np.mean(_np.equal(ai, bi))),
                           adj=100 * float(_np.mean([abs(x - y) <= 1 for x, y in zip(ai, bi)])),
                           kappa=_weightedKappa(ai, bi) if len(lst) >= 3 else None,
-                          nGap=sum(abs(x - y) >= _DISAGREE_PCT for x, y in zip(ap, bp))))
+                          nGap=sum(abs(x - y) >= gapThreshold for x, y in zip(ap, bp))))
 
     presented = {s["name"].lower() for s in students}
-    notPresented = sorted([v for k, v in rosterCohort.items() if k not in presented],
+    notPresented = sorted([v for k, v in rosterCohort.items() if k not in presented and not isIgnored(k)],
                           key=lambda v: _surnameKey(v["student_name"]))
     return dict(forms=forms, excluded=excluded, students=students, mcs=mcs, items=items, rubric=rubric,
                 itemStats=itemStats, alpha=alpha, examiners=examiners, pairs=pairs, formMean=formMean,
                 cohortMean=float(_np.mean([s["meanPct"] for s in students])), notPresented=notPresented,
                 rosterCount=len(rosterCohort), dates=sorted({f["date"] for f in forms}),
+                weights=weights, maxTotal=maxTotal, gapThreshold=gapThreshold,
                 checklistKey=checklistKey, checklistName=ref["form"]["checklists"][checklistKey]["name"], cohort=cohort)
 
 
@@ -277,9 +445,9 @@ def _kpis(m):
             "Min / Max": f"{min(means):.1f} / {max(means):.1f}",
             f"Students with mean < {_LOW_PCT:.0f}%": sum(v < _LOW_PCT for v in means),
             "Students with ≥1 Poor/Missing rating": sum(1 for s in st if s["nPoor"]),
-            f"Examiner gap ≥ {_DISAGREE_PCT:.0f} pts": sum(g >= _DISAGREE_PCT for g in gaps),
+            f"Examiner gap ≥ {m['gapThreshold']:g} pts": sum(g >= m['gapThreshold'] for g in gaps),
             "Mean examiner gap (pts)": round(float(_np.mean(gaps)), 1) if gaps else None,
-            "Cronbach's α (6 criteria)": round(m["alpha"], 2),
+            "Cronbach's α (all criteria)": round(m["alpha"], 2),
             "Overall rating mix": " · ".join(
                 f"{l} {100 * sum(1 for f in forms for mc in mcs if f['labels'][mc] == l) / (len(forms) * len(mcs)):.0f}%"
                 for l in _LEVELS)}
@@ -287,12 +455,18 @@ def _kpis(m):
 
 def _descriptionValues(m):
     subj = _collections.Counter(s["subject"] for s in m["students"])
+    ignForms = [e for e in m["excluded"] if e["reason"].startswith("Ignored")]
+    ign = sorted({_cleanName(e["student"]) for e in ignForms}, key=_surnameKey)
+    nIgnForms = len(ignForms)
     return {"Generated": _dt.datetime.now().strftime("%d %b %Y %H:%M"),
             "Cohort / subject(s)": ", ".join(f"{k} ({v})" for k, v in subj.items()),
             "Assessment date(s)": ", ".join(d.strftime("%d %b %Y") for d in m["dates"]),
             "Students assessed": f"{len(m['students'])} of {m['rosterCount']} {m['cohort']} on roster "
-                                 f"({len(m['notPresented'])} with no submitted form — see Data Quality)",
-            "Forms used": f"{len(m['forms'])} submitted forms"}
+                                 f"({len(m['notPresented'])} with no submitted form — see Data Quality"
+                                 + (f"; {len(ign)} ignored: {', '.join(ign)}" if ign else "") + ")",
+            "Flags": f"Mean < {_LOW_PCT:.0f}% · any {_bottomLabel()} rating · examiner gap ≥ {m['gapThreshold']:g} percentage points · single-marked.",
+            "Forms used": f"{len(m['forms'])} submitted forms"
+                          + (f" ({nIgnForms} form(s) of ignored students left out)" if nIgnForms else "")}
 
 
 # ================================================================ cell helpers
@@ -333,11 +507,20 @@ def _restyle(c, v, bg=None, fg=_INK, bold=False):
     c.font = _XlFont(name=f.name or "Calibri", sz=f.sz or 9, b=bold, i=f.i, color=fg)
 
 
-def _levelCell(c, pts):
+def _levelCell(c, pts, weight=1):
+    """Item cell: shows weight × level points, coloured by the (unweighted) level."""
     if pts is None: _restyle(c, None, "F2F2F2")
     else:
         bg, fg = _LEVEL_FILL[pts]
-        _restyle(c, pts, bg, fg, bold=pts <= 1)
+        v = pts * weight
+        _restyle(c, int(v) if float(v).is_integer() else v, bg, fg, bold=pts <= 1)
+
+
+def _mcHeader(m, mc):
+    """Student Results group header; adds '(×w, /max)' when the item code is weighted."""
+    w = m["weights"][mc]
+    base = f"{mc} · {m['items'][mc]}"
+    return base if len(set(m["weights"].values())) == 1 else f"{base} (×{_fmtNum(w)}, /{_fmtNum(_MAX_PTS * w)})"
 
 
 def _pctCell(c, v, boldNormal=False):
@@ -375,14 +558,15 @@ def _byFinal(m):
 
 # ================================================================ full build
 def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.csv", checklistKey="BOH3-OHTR",
-                                cohort="BOH3", year=2026):
+                                cohort="BOH3", year=2026, ignoreStudents=None,
+                                itemWeights=None, gapThreshold=_DISAGREE_PCT):
     """Build the whole workbook from scratch (layout = the reviewed 2026 version).
 
     Sheets: Description · Student Results (sorted by Final %, both examiners' comments at the end, unwrapped)
     · Cohort Summary (+2 charts) · Item Analysis · Examiner Analysis · Comments · Data Quality · Raw Forms.
     Use refreshOralPresentationReport instead when the workbook has manual edits worth keeping.
     """
-    m = loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort)
+    m = loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort, ignoreStudents, itemWeights, gapThreshold)
     mcs, items = m["mcs"], m["items"]
     nItems = len(mcs)
     wb = _XlWorkbook()
@@ -397,14 +581,15 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     lines = [("Generated", d["Generated"]), ("Cohort / subject(s)", d["Cohort / subject(s)"]),
              ("Assessment date(s)", d["Assessment date(s)"]), ("Students assessed", d["Students assessed"]),
              ("Forms used", d["Forms used"]),
-             ("Checklist", f"{nItems} criteria (MC1–MC{nItems}), 4-level rubric; full descriptors on 'Item Analysis'."),
-             ("Scoring", f"Excellent = 4 · Good = 3 · Satisfactory = 2 · Poor = 1 · Missing = 0 (an unanswered item also counts as Missing). Max {4 * nItems} per examiner."),
-             ("Examiner %", f"Examiner total ÷ {4 * nItems} × 100 (all {nItems} criteria always counted)."),
+             ("Checklist", f"{nItems} criteria (MC1–MC{nItems}), {_MAX_PTS}-level rubric; full descriptors on 'Item Analysis'."),
+             ("Scoring", f"{_scaleText()} (an unanswered item also counts as Missing). Max {_fmtNum(m['maxTotal'])} per examiner."),
+             ("Item weights", _weightText(m)),
+             ("Examiner %", f"Weighted examiner total ÷ {_fmtNum(m['maxTotal'])} × 100 (all {nItems} criteria always counted)."),
              ("Final %", "Mean of the two examiners' %. Single-marked students use the one available form."),
-             ("Reference line", f"{_LOW_PCT:.0f}% = all criteria Satisfactory. No cut score set in DASH — flags are for review, not a pass/fail decision."),
-             ("Flags", f"Mean < {_LOW_PCT:.0f}% · any Poor/Missing rating · examiner gap ≥ {_DISAGREE_PCT:.0f} percentage points · single-marked."),
+             ("Reference line", f"{_LOW_PCT:.0f}% = all criteria at {_MAX_PTS / 2:g}/{_MAX_PTS} ({_midLevel()}). No cut score set in DASH — flags are for review, not a pass/fail decision."),
+             ("Flags", f"Mean < {_LOW_PCT:.0f}% · any {_bottomLabel()} rating · examiner gap ≥ {m['gapThreshold']:g} percentage points · single-marked."),
              ("Reliability", "Cronbach's α and item–rest correlations computed on student-level item means (average of examiners)."),
-             ("Agreement", "Exact = same level; Adjacent = within one level. Weighted κ = quadratic over the 5 levels.")]
+             ("Agreement", f"Exact = same level; Adjacent = within one level. Weighted κ = quadratic over the {len(_LEVELS)} levels.")]
     r = 5
     for k, v in lines:
         _cell(ws, r, 2, k, bold=True, align="left", sz=10)
@@ -413,15 +598,15 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     r += 1
     _cell(ws, r, 2, "Colour key", bold=True, align="left", sz=10); _cell(ws, r, 3, "", align="left", sz=10)
     r += 1
-    for pts, lab in [(4, "Excellent (4)"), (3, "Good (3)"), (2, "Satisfactory (2)"), (1, "Poor (1)"), (0, "Missing (0)")]:
+    for pts, lab in [(ORAL_LEVEL_POINTS[l], f"{l} ({ORAL_LEVEL_POINTS[l]})") for l in _LEVELS]:
         c = _cell(ws, r, 2, None)
         _levelCell(c, pts); c.value = lab
         _cell(ws, r, 3, "Item rating cell", align="left")
         r += 1
     _pctCell(_cell(ws, r, 2, None), 0); ws.cell(r, 2).value = f"< {_LOW_PCT:.0f}%"
-    _cell(ws, r, 3, "Percentage below the all-Satisfactory line", align="left"); r += 1
+    _cell(ws, r, 3, f"Percentage below the all-{_midLevel()} line", align="left"); r += 1
     _pctCell(_cell(ws, r, 2, None), 80); ws.cell(r, 2).value = f"≥ {_HIGH_PCT:.0f}%"
-    _cell(ws, r, 3, f"Percentage at/above {_HIGH_PCT:.0f}% (Good average)", align="left"); r += 2
+    _cell(ws, r, 3, f"Percentage at/above {_HIGH_PCT:.0f}%", align="left"); r += 2
     _cell(ws, r, 2, "Sheets", bold=True, align="left", sz=10); r += 1
     for sname, dsc in [("Student Results", "One row per student (sorted by Final %): both examiners' item ratings, totals, final %, flags and comments"),
                        ("Cohort Summary", "Headline numbers, % band distribution and rating mix per criterion (charts)"),
@@ -437,12 +622,12 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     ws.sheet_view.showGridLines = False
     info = ["Student No", "Student", "Date", "Examiner 1", "Examiner 2"]
     c0 = len(info) + 1
-    resCols = [f"E1 Total\n/{4 * nItems}", f"E2 Total\n/{4 * nItems}", "E1 %", "E2 %", "Final %", "Examiner\nGap (pts)", "Poor/Missing\nRatings"]
+    resCols = [f"E1 Total\n/{_fmtNum(m['maxTotal'])}", f"E2 Total\n/{_fmtNum(m['maxTotal'])}", "E1 %", "E2 %", "Final %", "Examiner\nGap (pts)", "Poor/Missing\nRatings"]
     resStart = c0 + 2 * nItems
     flagCol = resStart + len(resCols)
     groups = [("Student Information", 1, len(info), _NAVY)]
     for i, mc in enumerate(mcs):
-        groups.append((f"{mc} · {items[mc]}", c0 + 2 * i, c0 + 2 * i + 1, _BLUE if i % 2 == 0 else _BLUE2))
+        groups.append((_mcHeader(m, mc), c0 + 2 * i, c0 + 2 * i + 1, _BLUE if i % 2 == 0 else _BLUE2))
     groups += [("Result", resStart, flagCol - 1, _GREEN), ("Flags", flagCol, flagCol, _OCHRE),
                ("Comments", flagCol + 1, flagCol + 2, _OCHRE)]
     for text, a, b, bg in groups:
@@ -495,13 +680,16 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
         _cell(ws, 5 + i, 5, lab, sz=10); _cell(ws, 5 + i, 6, None, sz=10)
     ws.column_dimensions["E"].width = 13
     ws.column_dimensions["F"].width = 10
-    ch = _XlBarChart(); ch.type = "col"; ch.title = "Distribution of final %"; ch.style = 10
+    ch = _XlBarChart(); ch.type = "col"
     ch.add_data(_XlReference(ws, min_col=6, min_row=4, max_row=4 + len(_BANDS)), titles_from_data=True)
     ch.set_categories(_XlReference(ws, min_col=5, min_row=5, max_row=4 + len(_BANDS)))
-    ch.legend = None; ch.y_axis.title = "Students"; ch.x_axis.title = "Final %"; ch.height, ch.width = 7, 13
-    ch.series[0].graphicalProperties.solidFill = _BLUE
-    ch.dataLabels = _XlDataLabelList(); ch.dataLabels.showVal = True
-    ch.x_axis.delete = False; ch.y_axis.delete = False
+    ch.legend = None; ch.height, ch.width = 7.5, 14; ch.gapWidth = 40
+    ch.series[0].graphicalProperties = _XlGraphicalProperties(solidFill=_BLUE, ln=_XlLineProperties(solidFill=_BLUE))
+    ch.dataLabels = _XlDataLabelList(showVal=True, showCatName=False, showSerName=False, showLegendKey=False,
+                                     showPercent=False, showLeaderLines=False, dLblPos="outEnd")
+    ch.dataLabels.txPr = _chartFont(8, color=_INK)
+    ch.y_axis.majorUnit = 2; ch.y_axis.numFmt = "0"
+    _styleChart(ch, "Distribution of final % (students per band)")
     ws.add_chart(ch, "H4")
     r0 = 22
     _hdr(ws.cell(r0, 2), "Criterion", bg=_BLUE, sz=10)
@@ -513,12 +701,13 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
         _cell(ws, r0 + 1 + i, 3 + len(_LEVELS), None, numFmt="0.0", bold=True)
     for cc in "DEFGH": ws.column_dimensions[cc].width = 13
     ch = _XlBarChart(); ch.type = "bar"; ch.grouping = "percentStacked"; ch.overlap = 100
-    ch.title = "Rating mix by criterion"
     ch.add_data(_XlReference(ws, min_col=3, max_col=2 + len(_LEVELS), min_row=r0, max_row=r0 + nItems), titles_from_data=True)
     ch.set_categories(_XlReference(ws, min_col=2, min_row=r0 + 1, max_row=r0 + nItems))
-    for sser, l in zip(ch.series, _LEVELS): sser.graphicalProperties.solidFill = _CHART_COL[l]
-    ch.x_axis.scaling.orientation = "maxMin"; ch.height, ch.width = 8, 18
-    ch.x_axis.delete = False; ch.y_axis.delete = False; ch.legend.position = "b"
+    for sser, l in zip(ch.series, _LEVELS):
+        sser.graphicalProperties = _XlGraphicalProperties(solidFill=_CHART_COL[l], ln=_XlLineProperties(solidFill="FFFFFF"))
+    ch.x_axis.scaling.orientation = "maxMin"; ch.height, ch.width = 9, 22; ch.gapWidth = 50
+    ch.y_axis.numFmt = "0%"
+    _styleChart(ch, "Rating mix by criterion (% of ratings)")
     ws.add_chart(ch, f"B{r0 + nItems + 3}")
     _writeCohortSummary(ws, m)
 
@@ -527,7 +716,7 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     _title(ws, "Item Analysis — per criterion",
            f"Cronbach's α ({nItems} criteria, student-level means) = {m['alpha']:.2f}. Item–rest r ≥ 0.30 good discrimination; "
            "α-if-deleted above overall α suggests the item adds little.", width=17)
-    cols = ["Item", "Criterion", "Ratings"] + _LEVELS + ["Mean pts\n(/4)", "SD", "Mean %", "Item–rest r", "α if deleted",
+    cols = ["Item", "Criterion", "Ratings"] + _LEVELS + [f"Mean pts\n(/{_MAX_PTS})", "SD", "Mean %", "Item–rest r", "α if deleted",
                                                         "Exact\nagreement %", "Adjacent\nagreement %"]
     for i, h in enumerate(cols): _hdr(ws.cell(5, 2 + i), h, bg=_BLUE, sz=9)
     ws.row_dimensions[5].height = 30
@@ -543,7 +732,7 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=15)
     r += 1
     _hdr(ws.cell(r, 2), "Item", bg=_BLUE, sz=9); _hdr(ws.cell(r, 3), "Criterion", bg=_BLUE, sz=9)
-    spans = [(4, 6, "Excellent (4)", "O1"), (7, 9, "Good (3)", "O2"), (10, 12, "Satisfactory (2)", "O3"), (13, 15, "Poor (1)", "O4")]
+    spans = [(4 + 3 * i, 6 + 3 * i, f"{l} ({ORAL_LEVEL_POINTS[l]})", f"O{i + 1}") for i, l in enumerate(_LEVELS[:-1])]
     for a, b, t, _o in spans:
         for cc in range(a, b + 1): _hdr(ws.cell(r, cc), None, bg=_BLUE, sz=9)
         _hdr(ws.cell(r, a), t, bg=_BLUE, sz=9)
@@ -568,24 +757,27 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
         for k in range(len(cols)): _cell(ws, 6 + i, 2 + k, None, numFmt=None if k < 2 else "0.0", align="left" if k == 0 else "center")
         ws.cell(6 + i, 2).value = m["examiners"][i]["name"]
     r = 6 + len(m["examiners"]) + 2
-    for cc in range(2, 13): _hdr(ws.cell(r, cc), None, bg=_NAVY, sz=10)
+    for cc in range(2, 16): _hdr(ws.cell(r, cc), None, bg=_NAVY, sz=10)
     _hdr(ws.cell(r, 2), "Examiner pairs — agreement on the same students", bg=_NAVY, sz=10)
-    ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=12)
+    ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=15)
     r += 1
-    cols = ["Pair (A | B)", "Students", "A mean %", "B mean %", "Mean diff\n(A−B)", "Mean |gap|", "Paired t p",
-            "Exact item\nagreement %", "Adjacent\nagreement %", "Weighted κ", "Gap ≥ 20"]
+    cols = ["Pair (A | B)", "Students", "A mean %", "B mean %", "Mean diff\n(A−B)", "Mean |gap|", f"Mean |gap|\n(pts /{_fmtNum(m['maxTotal'])})",
+            f"Mean Σ|MC gap|\n(pts /{_fmtNum(m['maxTotal'])})",
+            f"Mean Σ|MC gap|\nunweighted (/{_MAX_PTS * nItems})", "Paired t p",
+            "Exact item\nagreement %", "Adjacent\nagreement %", "Weighted κ", f"Gap ≥ {m['gapThreshold']:g}"]
     for i, h in enumerate(cols): _hdr(ws.cell(r, 2 + i), h, bg=_BLUE, sz=9)
     ws.row_dimensions[r].height = 30
-    fmts = [None, None, "0.0", "0.0", "0.0", "0.0", "0.000", "0.0", "0.0", "0.00", None]
+    fmts = [None, None, "0.0", "0.0", "0.0", "0.0", "0.00", "0.00", "0.00", "0.000", "0.0", "0.0", "0.00", None]
     for i in range(len(m["pairs"])):
         for k, fm in enumerate(fmts): _cell(ws, r + 1 + i, 2 + k, None, numFmt=fm, align="left" if k == 0 else "center")
         ws.cell(r + 1 + i, 2).value = m["pairs"][i]["label"]
     r += 1 + len(m["pairs"])
     _cell(ws, r, 2, "κ guide: ≥0.60 substantial · 0.40–0.59 moderate · <0.40 fair/poor. Paired t p < 0.05 = systematic "
-                    "difference between the two examiners.", align="left", fg="7F7F7F")
+                    "difference between the two examiners. Mean |gap| (pts) = |total A − total B|; Mean Σ|MC gap| = Σ over criteria of "
+                    "weight × |A − B| (item disagreements can't cancel, so it is ≥ the total gap); unweighted = same with every criterion ×1 (level points).", align="left", fg="7F7F7F")
     r += 3
     for cc in range(2, 13): _hdr(ws.cell(r, cc), None, bg=_NAVY, sz=10)
-    _hdr(ws.cell(r, 2), "Examiner × criterion — mean points (/4)", bg=_NAVY, sz=10)
+    _hdr(ws.cell(r, 2), f"Examiner × criterion — mean points (/{_MAX_PTS})", bg=_NAVY, sz=10)
     ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=12)
     r += 1
     _hdr(ws.cell(r, 2), "Examiner", bg=_BLUE, sz=9)
@@ -603,8 +795,9 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
                                   _XlColorScaleRule(start_type="num", start_value=2, start_color="F8696B", mid_type="num",
                                                     mid_value=3, mid_color="FFEB84", end_type="num", end_value=4, end_color="63BE7B"))
     ws.column_dimensions["B"].width = 36
-    for cc in range(3, 13): ws.column_dimensions[_xlColLetter(cc)].width = 11
+    for cc in range(3, 16): ws.column_dimensions[_xlColLetter(cc)].width = 11
     _writeExaminerAnalysis(ws, m)
+    _addGapCharts(wb, m)                                                    # charts at N4 + data sheet at the end
 
     # ---- Comments
     ws = wb.create_sheet("Comments")
@@ -651,7 +844,7 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     # ---- Raw Forms
     ws = wb.create_sheet("Raw Forms")
     heads = ["Form id", "Date", "Student No", "Student", "Subject", "Examiner"] + [f"{mc} label" for mc in mcs] + \
-            [f"{mc} pts" for mc in mcs] + [f"Total /{4 * nItems}", "Form %", "Poor/Missing ratings"]
+            [f"{mc} pts" for mc in mcs] + [f"Total /{_fmtNum(m['maxTotal'])}", "Form %", "Poor/Missing ratings"]
     for i, h in enumerate(heads): _hdr(ws.cell(1, 1 + i), h, bg=_NAVY, sz=9)
     ws.row_dimensions[1].height = 24
     for r in range(2, 2 + len(m["forms"])):
@@ -663,6 +856,7 @@ def buildOralPresentationReport(jsonPath, outPath, rosterPath="studentEmailList.
     _writeRawForms(ws, m)
 
     os.makedirs(os.path.dirname(os.path.abspath(outPath)), exist_ok=True)
+    wb.move_sheet(_GAP_SHEET, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index(_GAP_SHEET))   # data sheet last
     wb.save(outPath)
     print(f"Built {outPath}: {len(m['students'])} students · {len(m['forms'])} forms · α {m['alpha']:.2f} · "
           f"mean {m['cohortMean']:.1f}% · excluded {len(m['excluded'])}")
@@ -710,6 +904,8 @@ def _writeStudentResults(ws, m):
     dataRows = list(range(3, meanRow))
     nT = next((k for k in hdr if k.startswith("E1 Total")), None)
     nT2 = next((k for k in hdr if k.startswith("E2 Total")), None)
+    for k, lab in ((nT, "E1"), (nT2, "E2")):                            # keep "/max" in step with the weights
+        if k: ws.cell(2, col(k)).value = f"{lab} Total\n/{_fmtNum(m['maxTotal'])}"
     for r, s in zip(dataRows, order):
         e1, e2 = s["e1"], s["e2"]
         for name, v in [("Student No", s["no"]), ("Student", s["name"]), ("Subject", s["subject"]),
@@ -718,15 +914,16 @@ def _writeStudentResults(ws, m):
             if col(name): ws.cell(r, col(name)).value = v
         for i, mc in enumerate(mcs):
             c1 = e1Cols[i]
-            _levelCell(ws.cell(r, c1), e1["pts"][mc])
-            _levelCell(ws.cell(r, c1 + 1), e2["pts"][mc] if e2 else None)
+            w = m["weights"][mc]
+            _levelCell(ws.cell(r, c1), e1["pts"][mc], w)
+            _levelCell(ws.cell(r, c1 + 1), e2["pts"][mc] if e2 else None, w)
         if nT: _restyle(ws.cell(r, col(nT)), e1["total"])
         if nT2: _restyle(ws.cell(r, col(nT2)), e2["total"] if e2 else None)
         if col("E1 %"): _pctCell(ws.cell(r, col("E1 %")), e1["pct"])
         if col("E2 %"): _pctCell(ws.cell(r, col("E2 %")), e2["pct"] if e2 else None)
         if col("Final %"): _pctCell(ws.cell(r, col("Final %")), s["meanPct"], True)
         g = s["gap"]
-        if col("Examiner Gap (pts)"): _restyle(ws.cell(r, col("Examiner Gap (pts)")), g, "FFEB9C" if g is not None and g >= _DISAGREE_PCT else None)
+        if col("Examiner Gap (pts)"): _restyle(ws.cell(r, col("Examiner Gap (pts)")), g, "FFEB9C" if g is not None and g >= m["gapThreshold"] else None)
         if col("Max Item Gap (lvls)"):
             ws.cell(r, col("Max Item Gap (lvls)")).value = max(abs(e1["pts"][mc] - e2["pts"][mc]) for mc in mcs) if e2 else None
         n = s["nPoor"]
@@ -736,8 +933,9 @@ def _writeStudentResults(ws, m):
         if col("Examiner 1 Comments"): ws.cell(r, col("Examiner 1 Comments")).value = e1["comments"] or None
         if col("Examiner 2 Comments"): ws.cell(r, col("Examiner 2 Comments")).value = (e2["comments"] or None) if e2 else None
     for i, mc in enumerate(mcs):
+        if e1Cols[i] and ws.cell(1, e1Cols[i]).value: ws.cell(1, e1Cols[i]).value = _mcHeader(m, mc)
         for k, key in enumerate(("e1", "e2")):
-            v = [s[key]["pts"][mc] for s in m["students"] if s[key]]
+            v = [m["weights"][mc] * s[key]["pts"][mc] for s in m["students"] if s[key]]
             ws.cell(meanRow, e1Cols[i] + k).value = round(float(_np.mean(v)), 2) if v else None
     for name, key in (("E1 %", "e1"), ("E2 %", "e2")):
         v = [s[key]["pct"] for s in m["students"] if s[key]]
@@ -754,6 +952,8 @@ def _writeCohortSummary(ws, m):
     itemBy = {it["mc"]: it for it in m["itemStats"]}
     for r in range(1, ws.max_row + 1):
         k = ws.cell(r, 2).value
+        if isinstance(k, str) and k.startswith("Examiner gap ≥"):          # label follows the threshold
+            k = next(x for x in kp if x.startswith("Examiner gap ≥")); ws.cell(r, 2).value = k
         if k in kp: ws.cell(r, 3).value = kp[k]
         b = ws.cell(r, 5).value
         if b in bandMap:
@@ -779,7 +979,7 @@ def _writeItemAnalysis(ws, m):
         if hdr.get("Ratings"): ws.cell(r, hdr["Ratings"]).value = it["n"]
         for l in _LEVELS:
             if hdr.get(l): _restyle(ws.cell(r, hdr[l]), it["dist"][l], _LEVEL_FILL[ORAL_LEVEL_POINTS[l]][0] if it["dist"][l] else None)
-        for name, key in (("Mean pts\n(/4)", "meanPts"), ("SD", "sd"), ("Exact\nagreement %", "exact"), ("Adjacent\nagreement %", "adj")):
+        for name, key in ((f"Mean pts\n(/{_MAX_PTS})", "meanPts"), ("SD", "sd"), ("Exact\nagreement %", "exact"), ("Adjacent\nagreement %", "adj")):
             if hdr.get(name): ws.cell(r, hdr[name]).value = it[key]
         if hdr.get("Mean %"): _pctCell(ws.cell(r, hdr["Mean %"]), it["pct"])
         if hdr.get("Item–rest r"): _restyle(ws.cell(r, hdr["Item–rest r"]), it["ritc"], _ritcFill(it["ritc"]))
@@ -812,12 +1012,31 @@ def _writeExaminerAnalysis(ws, m):
     while isinstance(ws.cell(r, 2).value, str) and " | " in ws.cell(r, 2).value: rows.append(r); r += 1
     if len(rows) != len(m["pairs"]):
         raise ValueError(f"Examiner Analysis: sheet has {len(rows)} pair rows, data has {len(m['pairs'])} — rebuild the workbook.")
+    pc = {}                                                                 # header text -> column
+    for c in range(2, ws.max_column + 1):
+        v = ws.cell(h2, c).value
+        if isinstance(v, str): pc[v.replace("\n", " ").strip()] = c
+    find = lambda pred: next((c for k, c in pc.items() if pred(k)), None)
+    cAbsPts = find(lambda k: k.startswith("Mean |gap| (pts"))
+    cGap = find(lambda k: k.startswith("Gap ≥"))
+    cItemPts = find(lambda k: k.startswith("Mean Σ|MC gap| (pts"))
+    cItemRaw = find(lambda k: k.startswith("Mean Σ|MC gap| unweighted"))
+    simple = {"Pair (A | B)": "label", "Students": "n", "A mean %": "aMean", "B mean %": "bMean",
+              "Mean diff (A−B)": "diff", "Mean |gap|": "absGap", "Exact item agreement %": "exact",
+              "Adjacent agreement %": "adj"}
     for r, p in zip(rows, m["pairs"]):
-        for k, key in enumerate(["label", "n", "aMean", "bMean", "diff", "absGap"]): ws.cell(r, 2 + k).value = p[key]
-        _restyle(ws.cell(r, 8), p["p"], "FFC7CE" if p["p"] is not None and p["p"] < 0.05 else None)
-        ws.cell(r, 9).value = p["exact"]; ws.cell(r, 10).value = p["adj"]
-        _restyle(ws.cell(r, 11), p["kappa"], _kappaFill(p["kappa"]))
-        ws.cell(r, 12).value = p["nGap"]
+        for h, key in simple.items():
+            if h in pc: ws.cell(r, pc[h]).value = p[key]
+        if cAbsPts: ws.cell(r, cAbsPts).value = p["absGapPts"]
+        if cItemPts: ws.cell(r, cItemPts).value = p["itemAbsGapPts"]
+        if cItemRaw: ws.cell(r, cItemRaw).value = p["itemAbsGapRaw"]
+        if "Paired t p" in pc: _restyle(ws.cell(r, pc["Paired t p"]), p["p"], "FFC7CE" if p["p"] is not None and p["p"] < 0.05 else None)
+        if "Weighted κ" in pc: _restyle(ws.cell(r, pc["Weighted κ"]), p["kappa"], _kappaFill(p["kappa"]))
+        if cGap: ws.cell(r, cGap).value = p["nGap"]
+    if cAbsPts: ws.cell(h2, cAbsPts).value = f"Mean |gap|\n(pts /{_fmtNum(m['maxTotal'])})"
+    if cGap: ws.cell(h2, cGap).value = f"Gap ≥ {m['gapThreshold']:g}"
+    if cItemPts: ws.cell(h2, cItemPts).value = f"Mean Σ|MC gap|\n(pts /{_fmtNum(m['maxTotal'])})"
+    if cItemRaw: ws.cell(h2, cItemRaw).value = f"Mean Σ|MC gap|\nunweighted (/{_MAX_PTS * len(m['mcs'])})"
     # block 3: examiner × criterion
     h3 = _findRow(ws, 2, lambda v: v == "Examiner", h2)
     exBy = {e["name"]: e for e in m["examiners"]}
@@ -844,6 +1063,8 @@ def _writeComments(ws, m):
         ws.cell(r, 1).value = s["no"]; ws.cell(r, 2).value = s["name"]; ws.cell(r, 3).value = f["assessor"]
         _pctCell(ws.cell(r, 4), s["meanPct"]); _pctCell(ws.cell(r, 5), f["pct"])
         ws.cell(r, 6).value = f["comments"] or "—"
+        a = ws.cell(r, 6).alignment
+        ws.cell(r, 6).alignment = _XlAlignment(horizontal=a.horizontal or "left", vertical=a.vertical or "top", wrap_text=False)
     last = 1 + len(rows)
     ws.auto_filter.ref = f"A1:F{last}"
     ss = ws.auto_filter.sortState
@@ -898,8 +1119,9 @@ def _writeRawForms(ws, m):
         vals = [f["id"], _dt.datetime.combine(f["date"], _dt.time()), f["studentNo"], f["student"], f["subject"], f["assessor"]] + \
                [f["labels"][mc] for mc in mcs]
         for i, v in enumerate(vals): ws.cell(r, 1 + i).value = v
-        for i, mc in enumerate(mcs): _levelCell(ws.cell(r, 7 + n + i), f["pts"][mc])
+        for i, mc in enumerate(mcs): _levelCell(ws.cell(r, 7 + n + i), f["pts"][mc], m["weights"][mc])
         ws.cell(r, 7 + 2 * n).value = f["total"]; ws.cell(r, 8 + 2 * n).value = f["pct"]; ws.cell(r, 9 + 2 * n).value = f["nPoor"]
+    ws.cell(1, 7 + 2 * n).value = f"Total /{_fmtNum(m['maxTotal'])}"
     ws.auto_filter.ref = f"A1:{_xlColLetter(9 + 2 * n)}{1 + len(fs)}"
 
 
@@ -908,6 +1130,146 @@ def _writeDescription(ws, m):
     for r in range(1, ws.max_row + 1):
         k = ws.cell(r, 2).value
         if k in vals: ws.cell(r, 3).value = vals[k]
+
+
+# ================================================================ chart styling (explicit, so Excel doesn't fall back to defaults)
+def _chartFont(sz=8, bold=False, color="404040", rot=None):
+    cp = _XlCharProps(sz=int(sz * 100), b=bold, solidFill=color)
+    return _XlRichText(bodyPr=_XlRichTextProps(rot=rot, vert="horz") if rot is not None else _XlRichTextProps(),
+                       p=[_XlDrawParagraph(pPr=_XlDrawParaProps(defRPr=cp), endParaRPr=cp)])
+
+
+def _chartTitle(text, sz=11):
+    cp = _XlCharProps(sz=int(sz * 100), b=True, solidFill=_INK)
+    para = _XlDrawParagraph(pPr=_XlDrawParaProps(defRPr=cp), r=[_XlTextRun(rPr=cp, t=text)])
+    return _XlTitle(tx=_XlText(rich=_XlRichText(p=[para])), overlay=False)
+
+
+def _styleChart(ch, title, xRot=None, legendPos="b"):
+    """Title above the plot (not overlaid), light grey gridlines, small grey axis text, legend below, no outer border."""
+    ch.title = _chartTitle(title)
+    ch.style = None
+    for ax in (ch.x_axis, ch.y_axis):
+        ax.delete = False
+        ax.title = None
+        ax.txPr = _chartFont(8)
+        ax.spPr = _XlGraphicalProperties(ln=_XlLineProperties(solidFill="BFBFBF"))
+    if xRot is not None: ch.x_axis.txPr = _chartFont(8, rot=xRot)
+    ch.y_axis.majorGridlines.spPr = _XlGraphicalProperties(ln=_XlLineProperties(solidFill="E7E7E7"))
+    ch.x_axis.majorGridlines = None
+    if ch.legend is not None:
+        ch.legend.position = legendPos
+        ch.legend.overlay = False
+        ch.legend.txPr = _chartFont(8)
+    ch.graphical_properties = _XlGraphicalProperties(ln=_XlLineProperties(noFill=True))
+    return ch
+
+
+# ================================================================ examiner-gap charts (Examiner Analysis)
+_GAP_SHEET = "Examiner Gap Data"
+_PAIR_COLOURS = ["094183", "E87722", "009E73", "CC79A7", "56B4E9", "D55E00", "F0E442", "7F7F7F"]  # UniMelb navy/orange + Okabe-Ito
+
+
+def _gapRows(m):
+    """One row per double-marked student: pair oriented E1 − E2, where E1 = the examiner who submitted first for
+    most of that pair's students (consistent sign within a pair). Diffs are weighted points."""
+    firstCount = _collections.Counter()
+    for s in m["students"]:
+        if s["e2"]: firstCount[(frozenset((s["e1"]["assessor"], s["e2"]["assessor"])), s["e1"]["assessor"])] += 1
+    rows = []
+    for s in m["students"]:
+        if not s["e2"]: continue
+        a, b = s["e1"], s["e2"]
+        key = frozenset((a["assessor"], b["assessor"]))
+        if (firstCount[(key, b["assessor"])], a["assessor"]) > (firstCount[(key, a["assessor"])], b["assessor"]): a, b = b, a
+        rows.append(dict(no=s["no"], name=s["name"], e1=a["assessor"], e2=b["assessor"], t1=a["total"], t2=b["total"],
+                         dTotal=a["total"] - b["total"],
+                         dMc={mc: m["weights"][mc] * (a["pts"][mc] - b["pts"][mc]) for mc in m["mcs"]}))
+    pairs = sorted({(r["e1"], r["e2"]) for r in rows})
+    rows.sort(key=lambda r: (-r["dTotal"], pairs.index((r["e1"], r["e2"])), _surnameKey(r["name"])))   # largest E1−E2 first
+    return rows, pairs
+
+
+def _writeGapData(wb, m):
+    """(Re)write the chart data sheet. Columns: student block, then one column per (metric, pair) holding the diff
+    only on that pair's rows (so each pair is its own coloured series). Returns layout for the charts."""
+    if _GAP_SHEET in wb.sheetnames: del wb[_GAP_SHEET]
+    ws = wb.create_sheet(_GAP_SHEET)
+    rows, pairs = _gapRows(m)
+    mcs, thrPts = m["mcs"], m["gapThreshold"] / 100 * m["maxTotal"]
+    head = ["Student ID", "Student", "E1", "E2", "E1 Total", "E2 Total", "Total E1−E2"] + [f"{mc} E1−E2" for mc in mcs] + \
+           [f"±{m['gapThreshold']:g}% gap", f"−{m['gapThreshold']:g}% gap"]
+    for i, h in enumerate(head): _hdr(ws.cell(1, 1 + i), h, bg=_NAVY, sz=9)
+    for r, g in enumerate(rows, start=2):
+        vals = [str(g["no"]), g["name"], g["e1"], g["e2"], g["t1"], g["t2"], g["dTotal"]] + [g["dMc"][mc] for mc in mcs] + [thrPts, -thrPts]
+        for i, v in enumerate(vals): _cell(ws, r, 1 + i, v, align="left" if i in (1, 2, 3) else "center")
+    metrics = ["Total"] + mcs
+    c0 = len(head) + 2
+    seriesCols, catCols = {}, {}
+    pairRank = {p: i for i, p in enumerate(pairs)}
+    val = lambda g, met: g["dTotal"] if met == "Total" else g["dMc"][met]
+    for k, met in enumerate(metrics):                                       # one block per metric: IDs + one column per pair
+        cBase = c0 + k * (len(pairs) + 1)
+        catCols[met] = cBase
+        order = sorted(rows, key=lambda g: (-val(g, met), -g["dTotal"], pairRank[(g["e1"], g["e2"])], _surnameKey(g["name"])))
+        bg = _BLUE if k % 2 == 0 else _BLUE2
+        _hdr(ws.cell(1, cBase), f"{met} · Student ID", bg=bg, sz=8)
+        for r, g in enumerate(order, start=2): ws.cell(r, cBase).value = str(g["no"])   # sorted largest E1−E2 first
+        for j, pr in enumerate(pairs):
+            c = cBase + 1 + j
+            seriesCols[(met, pr)] = c
+            _hdr(ws.cell(1, c), f"{pr[0]} − {pr[1]}", bg=bg, sz=8)
+            for r, g in enumerate(order, start=2):
+                if (g["e1"], g["e2"]) == pr: ws.cell(r, c).value = val(g, met)
+    ws.column_dimensions["B"].width = 24; ws.column_dimensions["C"].width = 18; ws.column_dimensions["D"].width = 18
+    ws.freeze_panes = "C2"
+    return dict(ws=ws, n=len(rows), pairs=pairs, seriesCols=seriesCols, catCols=catCols, thrCols=(len(head) - 1, len(head)), thrPts=thrPts)
+
+
+def _gapChart(L, met, title, yTitle, yMax, height, withThreshold=False, majorUnit=None):
+    ws, n = L["ws"], L["n"]
+    ch = _XlBarChart(); ch.type = "col"; ch.grouping = "clustered"; ch.overlap = 100; ch.gapWidth = 35
+    ch.height, ch.width = height, 34
+    for j, p in enumerate(L["pairs"]):
+        c = L["seriesCols"][(met, p)]
+        ch.add_data(_XlReference(ws, min_col=c, min_row=1, max_row=1 + n), titles_from_data=True)
+        sr, colour = ch.series[-1], _PAIR_COLOURS[j % len(_PAIR_COLOURS)]
+        sr.invertIfNegative = False                                         # Excel otherwise draws negatives hollow
+        sr.graphicalProperties = _XlGraphicalProperties(solidFill=colour, ln=_XlLineProperties(solidFill=colour))
+    ch.set_categories(_XlReference(ws, min_col=L["catCols"][met], min_row=2, max_row=1 + n))   # this metric's own order
+    ch.y_axis.scaling.min, ch.y_axis.scaling.max = -yMax, yMax
+    if majorUnit: ch.y_axis.majorUnit = majorUnit
+    ch.y_axis.numFmt = "0"
+    ch.x_axis.tickLblPos = "low"                                            # student IDs below the plot, not at 0
+    _styleChart(ch, f"{title}  ·  {yTitle}", xRot=-5400000)
+    if withThreshold:
+        ln = _XlLineChart()
+        for c in L["thrCols"]:
+            ln.add_data(_XlReference(ws, min_col=c, min_row=1, max_row=1 + n), titles_from_data=True)
+            sr = ln.series[-1]; sr.smooth = False
+            sr.graphicalProperties = _XlGraphicalProperties(ln=_XlLineProperties(solidFill="7F7F7F", prstDash="dash", w=12700))
+            sr.marker.symbol = "none"
+        ch += ln
+        ch.legend.legendEntry = [_XlLegendEntry(idx=len(L["pairs"]) + 1, delete=True)]   # one legend entry for ±gap
+    return ch
+
+
+def _addGapCharts(wb, m, anchorCol="Q"):
+    """Examiner Analysis: total E1−E2 bar chart + one bar chart per MC, bars coloured by examiner pair."""
+    ws = wb["Examiner Analysis"]
+    ws._charts = []                                                         # this sheet only holds the gap charts
+    L = _writeGapData(wb, m)
+    if not L["n"]: return
+    yTot = max([abs(v) for v in [L["thrPts"]] + [ws_v for ws_v in (L["ws"].cell(r, 7).value for r in range(2, 2 + L["n"]))]]) + 1
+    ws.add_chart(_gapChart(L, "Total", f"Examiner difference in weighted total, E1 − E2 (/{_fmtNum(m['maxTotal'])})",
+                                       "points, by student ID", 2 * -(-int(yTot) // 2), 10, True, 2),
+                 f"{anchorCol}4")
+    r = 4 + 21
+    for mc in m["mcs"]:
+        w = m["weights"][mc]
+        ws.add_chart(_gapChart(L, mc, f"{mc} · {m['items'][mc]} (×{_fmtNum(w)}, /{_fmtNum(_MAX_PTS * w)}), E1 − E2",
+                               "weighted points", (_MAX_PTS - 1) * w, 7, majorUnit=w), f"{anchorCol}{r}")
+        r += 15
 
 
 # ================================================================ refresh (keeps manual edits)
@@ -924,14 +1286,16 @@ def _restoreCharts(srcPath, dstPath):
             data = zd.read(item.filename)
             if re.match(r"xl/charts/chart\d+\.xml$", item.filename):
                 key = refs(data.decode("utf-8"))
-                if key in srcCharts: data = srcCharts[key]; restored += 1
+                if key in srcCharts and not any(_GAP_SHEET in k for k in key):   # gap charts are regenerated, not restored
+                    data = srcCharts[key]; restored += 1
             zo.writestr(item, data)
     os.replace(tmp, dstPath)
     return restored
 
 
 def refreshOralPresentationReport(jsonPath, workbookPath, rosterPath="studentEmailList.csv", checklistKey="BOH3-OHTR",
-                                  cohort="BOH3", outPath=None, backupDir="_bak"):
+                                  cohort="BOH3", outPath=None, backupDir="_bak", ignoreStudents=None,
+                                  itemWeights=None, gapThreshold=_DISAGREE_PCT):
     """Re-score a new JSON pull and write the numbers into an EXISTING report workbook.
 
     Keeps everything the user changed by hand: deleted columns / sections / tables, column widths, row heights,
@@ -941,7 +1305,7 @@ def refreshOralPresentationReport(jsonPath, workbookPath, rosterPath="studentEma
     If the examiner or examiner-pair count changes, it stops and asks for a full rebuild.
     The original is copied to `backupDir` first (set backupDir=None to skip). outPath defaults to workbookPath.
     """
-    m = loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort)
+    m = loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort, ignoreStudents, itemWeights, gapThreshold)
     outPath = outPath or workbookPath
     if backupDir and os.path.abspath(outPath) == os.path.abspath(workbookPath):
         os.makedirs(backupDir, exist_ok=True)
@@ -954,6 +1318,9 @@ def refreshOralPresentationReport(jsonPath, workbookPath, rosterPath="studentEma
                "Data Quality": _writeDataQuality, "Raw Forms": _writeRawForms}
     for name, fn in writers.items():
         if name in wb.sheetnames: fn(wb[name], m)
+    if "Examiner Analysis" in wb.sheetnames:                               # rebuild gap charts + data (student list may change)
+        _addGapCharts(wb, m)
+        wb.move_sheet(_GAP_SHEET, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index(_GAP_SHEET))
     src = workbookPath
     if os.path.abspath(outPath) == os.path.abspath(workbookPath):
         src = outPath + ".src.tmp"
@@ -965,3 +1332,265 @@ def refreshOralPresentationReport(jsonPath, workbookPath, rosterPath="studentEma
           f"mean {m['cohortMean']:.1f}% · single-marked {sum(1 for s in m['students'] if not s['e2'])} · "
           f"excluded {len(m['excluded'])} · charts kept {nCharts}")
     return outPath
+
+
+# ================================================================ student PDF reports (one per student)
+# Student-facing feedback PDF for one item code (built for BOH3-OCT). Uses loadOralPresentation() for the
+# scores, so weights, ignore list and scale match the Excel report exactly.
+import io as _io
+from matplotlib.figure import Figure as _MplFigure                 # no pyplot: safe inside the notebook
+from matplotlib.backends.backend_agg import FigureCanvasAgg as _MplCanvas
+from reportlab.lib.pagesizes import A4 as _RlA4
+from reportlab.lib import colors as _rlColors
+from reportlab.lib.units import mm as _rlMm
+from reportlab.lib.styles import ParagraphStyle as _RlStyle
+from reportlab.platypus import SimpleDocTemplate as _RlDoc, Paragraph as _RlPara, Table as _RlTable, \
+    TableStyle as _RlTableStyle, Spacer as _RlSpacer, Image as _RlImage, KeepTogether as _RlKeep, \
+    PageBreak as _RlPageBreak
+from xml.sax.saxutils import escape as _xmlEscape
+
+__all__ += ["defaultOralStudentPdfDir", "buildOralStudentReports"]
+
+_UOM_NAVY, _UOM_ORANGE, _PDF_GREY = "#094183", "#E87722", "#64748B"   # UniMelb navy / orange (colour-blind safe pair)
+_PDF_W = _RlA4[0] - 30 * _rlMm                                        # usable width (15 mm margins)
+_PS_BASE = dict(fontName="Helvetica", fontSize=8.5, leading=11, textColor=_rlColors.HexColor("#1E293B"))
+_PS = {k: _RlStyle(k, **{**_PS_BASE, **kw})
+       for k, kw in {"body": {}, "small": {"fontSize": 7.5, "leading": 9.5}, "cellC": {"alignment": 1},
+                     "note": {"fontSize": 7, "leading": 9, "textColor": _rlColors.HexColor(_PDF_GREY)}}.items()}
+_PS["title"] = _RlStyle("title", fontName="Helvetica-Bold", fontSize=16, leading=20, textColor=_rlColors.HexColor(_UOM_NAVY))
+_PS["h2"] = _RlStyle("h2", fontName="Helvetica-Bold", fontSize=10.5, leading=14, spaceBefore=8, spaceAfter=4,
+                     textColor=_rlColors.HexColor(_UOM_NAVY))
+_PS["tileLab"] = _RlStyle("tileLab", fontName="Helvetica", fontSize=7.5, leading=9, alignment=1, textColor=_rlColors.HexColor(_PDF_GREY))
+_PS["tileVal"] = _RlStyle("tileVal", fontName="Helvetica-Bold", fontSize=15, leading=18, alignment=1, textColor=_rlColors.HexColor(_UOM_NAVY))
+
+
+def defaultOralStudentPdfDir(cohort, itemCode, year=2026, baseDir="Oral Presentation"):
+    """Standard folder for the student PDFs: '<baseDir>/<cohort>/Student Reports <itemCode> <year>'."""
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", str(itemCode)).strip()
+    return os.path.join(baseDir, cohort, f"Student Reports {safe} {year}")
+
+
+def _pdfScale():
+    """Snapshot of the module scale set by loadOralPresentation (levels, points, max, fills)."""
+    return dict(levels=list(_LEVELS), pts=dict(ORAL_LEVEL_POINTS), maxPts=_MAX_PTS, fill=dict(_LEVEL_FILL))
+
+
+def _pdfFileName(s, m):
+    name = re.sub(r"[^A-Za-z0-9]+", "_", s["name"]).strip("_")
+    return f"{s['no'] or 'NA'}_{name}_{m['cohort']}_{m['checklistKey']}_Oral_Presentation.pdf"
+
+
+def _pdfMcLevelText(f, mc, w, sc):
+    """'Proficient' + weighted points line for one examiner × criterion."""
+    if f is None: return "—"
+    lab, p = f["labels"][mc], f["pts"][mc]
+    return f"<b>{_xmlEscape(lab)}</b><br/>{_fmtNum(w * p)} / {_fmtNum(w * sc['maxPts'])}"
+
+
+def _pdfCriterionChart(s, m, sc):
+    """Horizontal bars: student's mean % per criterion (navy) vs cohort mean % (orange). Returns a reportlab Image."""
+    mcs = m["mcs"]
+    labels = [m["items"][mc] for mc in mcs][::-1]
+    mine = [100 * s["itemMean"][mc] / sc["maxPts"] for mc in mcs][::-1]
+    cohortPct = {it["mc"]: it["pct"] for it in m["itemStats"]}
+    coh = [cohortPct[mc] for mc in mcs][::-1]
+    fig = _MplFigure(figsize=(7.2, 0.42 * len(mcs) + 0.9), dpi=200)
+    _MplCanvas(fig)
+    ax = fig.add_subplot(111)
+    y = _np.arange(len(mcs)); h = 0.38
+    b1 = ax.barh(y + h / 2, mine, h, color=_UOM_NAVY, label="Your average")
+    ax.barh(y - h / 2, coh, h, color=_UOM_ORANGE, label="Cohort average")
+    for rect, v in zip(b1, mine):
+        ax.text(v + 1, rect.get_y() + rect.get_height() / 2, f"{v:.0f}%", va="center", fontsize=7, color=_UOM_NAVY)
+    ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=7.5)
+    ax.set_xlim(0, 108); ax.set_xticks(range(0, 101, 25)); ax.tick_params(axis="x", labelsize=7)
+    ax.xaxis.grid(True, color="#E2E8F0", lw=0.6); ax.set_axisbelow(True)
+    for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+    for sp in ("left", "bottom"): ax.spines[sp].set_color("#94A3B8")
+    ax.legend(fontsize=7, frameon=False, loc="lower center", bbox_to_anchor=(0.4, 1.0), ncol=2)
+    fig.tight_layout()
+    buf = _io.BytesIO(); fig.savefig(buf, format="png"); buf.seek(0)
+    wPx, hPx = fig.get_size_inches()
+    return _RlImage(buf, width=_PDF_W, height=_PDF_W * hPx / wPx)
+
+
+def _pdfStudentStory(s, m, sc, showExaminerNames=False, note=None):
+    """Flowables for one student's report (≈ 1–2 A4 pages)."""
+    mcs, w, P = m["mcs"], m["weights"], _PS
+    exs = [s["e1"], s["e2"]]
+    exLabel = [(f["assessor"] if (f and showExaminerNames) else f"Examiner {i + 1}") for i, f in enumerate(exs)]
+    maxT = m["maxTotal"]
+    story = [_RlPara("Oral Presentation Feedback Report", P["title"]),
+             _RlPara(f"{_xmlEscape(m['checklistName'])} ({_xmlEscape(m['checklistKey'])}) · {_xmlEscape(m['cohort'])}", P["note"]),
+             _RlSpacer(1, 5)]
+
+    # -- student details
+    det = [["Student", s["name"], "Student number", str(s["no"] or "—")],
+           ["Subject", s["subject"] or "—", "Date presented", s["date"].strftime("%d %b %Y")]]
+    t = _RlTable(det, colWidths=[0.14 * _PDF_W, 0.40 * _PDF_W, 0.18 * _PDF_W, 0.28 * _PDF_W])
+    t.setStyle(_RlTableStyle([("FONT", (0, 0), (-1, -1), "Helvetica", 8.5), ("FONT", (0, 0), (0, -1), "Helvetica-Bold", 8.5),
+                              ("FONT", (2, 0), (2, -1), "Helvetica-Bold", 8.5),
+                              ("BACKGROUND", (0, 0), (-1, -1), _rlColors.HexColor("#F1F5F9")),
+                              ("TEXTCOLOR", (0, 0), (0, -1), _rlColors.HexColor(_UOM_NAVY)),
+                              ("TEXTCOLOR", (2, 0), (2, -1), _rlColors.HexColor(_UOM_NAVY)),
+                              ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+    story += [t, _RlSpacer(1, 8)]
+
+    # -- score tiles: final, examiner 1, examiner 2, cohort mean
+    finalTotal = _st.mean(f["total"] for f in s["forms"][:2])
+    tiles = [("Final score", f"{s['meanPct']:.1f}%", f"{_fmtNum(round(finalTotal, 1))} / {_fmtNum(maxT)}")]
+    for lab, f in zip(exLabel, exs):
+        tiles.append((lab, f"{f['pct']:.1f}%" if f else "—", f"{_fmtNum(f['total'])} / {_fmtNum(maxT)}" if f else "not marked"))
+    tiles.append(("Cohort average", f"{m['cohortMean']:.1f}%", f"n = {len(m['students'])}"))
+    row = [[_RlPara(_xmlEscape(a), P["tileLab"]), _RlPara(b, P["tileVal"]), _RlPara(c, P["tileLab"])] for a, b, c in tiles]
+    tt = _RlTable([[ _RlTable([[p] for p in cell], colWidths=[_PDF_W / 4 - 8]) for cell in row]], colWidths=[_PDF_W / 4] * 4)
+    tt.setStyle(_RlTableStyle([("BOX", (i, 0), (i, 0), 0.6, _rlColors.HexColor("#CBD5E1")) for i in range(1, 4)] +
+                              [("BACKGROUND", (0, 0), (0, 0), _rlColors.HexColor("#E8EEF7")),
+                               ("BOX", (0, 0), (0, 0), 1.2, _rlColors.HexColor(_UOM_NAVY)),
+                               ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 5),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
+    story += [tt]
+    if not s["e2"]:
+        story.append(_RlPara("Only one examiner's form was submitted; the final score is based on that form.", P["note"]))
+    story.append(_RlSpacer(1, 4))
+
+    # -- criterion table (cells = weighted points, colour = level)
+    story.append(_RlPara("Results by criterion", P["h2"]))
+    hdr = ["Criterion", "Max", exLabel[0], exLabel[1], "Average"]
+    data = [None]
+    cmds = [("BACKGROUND", (0, 0), (-1, 0), _rlColors.HexColor(_UOM_NAVY)), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.4, _rlColors.HexColor("#CBD5E1")),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]
+    whiteHdr = _RlStyle("wh", parent=P["cellC"], textColor=_rlColors.white)
+    data[0] = [_RlPara(f"<b>{_xmlEscape(h)}</b>", _RlStyle("whl", parent=whiteHdr, alignment=0 if i == 0 else 1)) for i, h in enumerate(hdr)]
+    for r, mc in enumerate(mcs, start=1):
+        avgW = _st.mean(w[mc] * f["pts"][mc] for f in s["forms"][:2])
+        data.append([_RlPara(_xmlEscape(m["items"][mc]), P["body"]), _RlPara(_fmtNum(w[mc] * sc["maxPts"]), P["cellC"]),
+                     _RlPara(_pdfMcLevelText(exs[0], mc, w[mc], sc), P["cellC"]),
+                     _RlPara(_pdfMcLevelText(exs[1], mc, w[mc], sc), P["cellC"]),
+                     _RlPara(f"<b>{_fmtNum(round(avgW, 1))}</b>", P["cellC"])])
+        for c, f in ((2, exs[0]), (3, exs[1])):
+            if f:
+                bg, fg = sc["fill"].get(f["pts"][mc], ("FFFFFF", "000000"))
+                cmds.append(("BACKGROUND", (c, r), (c, r), _rlColors.HexColor("#" + bg)))
+    tr = len(mcs) + 1
+    data.append([_RlPara("<b>Total</b>", P["body"]), _RlPara(f"<b>{_fmtNum(maxT)}</b>", P["cellC"])] +
+                [_RlPara(f"<b>{_fmtNum(f['total'])}</b> ({f['pct']:.1f}%)" if f else "—", P["cellC"]) for f in exs] +
+                [_RlPara(f"<b>{_fmtNum(round(finalTotal, 1))}</b> ({s['meanPct']:.1f}%)", P["cellC"])])
+    cmds += [("BACKGROUND", (0, tr), (-1, tr), _rlColors.HexColor("#E8EEF7")),
+             ("LINEABOVE", (0, tr), (-1, tr), 1, _rlColors.HexColor(_UOM_NAVY))]
+    ct = _RlTable(data, colWidths=[0.34 * _PDF_W, 0.08 * _PDF_W, 0.2 * _PDF_W, 0.2 * _PDF_W, 0.18 * _PDF_W], repeatRows=1)
+    ct.setStyle(_RlTableStyle(cmds))
+    story += [ct, _RlPara("Cell colour shows the level awarded; points are weighted (criterion maximum in the Max column).",
+                          P["note"])]
+
+    # -- chart
+    story += [_RlKeep([_RlPara("Your criteria compared with the cohort", P["h2"]), _pdfCriterionChart(s, m, sc)])]
+
+    # -- rubric descriptors for the level(s) awarded
+    rub = m.get("rubric") or {}
+    optKey = {l: f"O{i + 1}" for i, l in enumerate(sc["levels"][:-1])}           # level label -> rubric O-key
+    rows = [[_RlPara("<b>Criterion</b>", whiteHdr), _RlPara("<b>What the awarded level means</b>", _RlStyle("whL", parent=whiteHdr, alignment=0))]]
+    for mc in mcs:
+        byLevel = _collections.OrderedDict()
+        for lab, f in zip(exLabel, exs):
+            if f: byLevel.setdefault(f["labels"][mc], []).append(lab)
+        parts = []
+        for lev, who in byLevel.items():
+            desc = (rub.get(mc) or {}).get(optKey.get(lev, ""), "") if lev != "Missing" else "Not rated."
+            parts.append(f"<b>{_xmlEscape(lev)}</b> <font color='{_PDF_GREY}'>({_xmlEscape(' & '.join(who))})</font> — {_xmlEscape(desc)}")
+        rows.append([_RlPara(_xmlEscape(m["items"][mc]), P["small"]), _RlPara("<br/>".join(parts), P["small"])])
+    if rub:
+        rt = _RlTable(rows, colWidths=[0.22 * _PDF_W, 0.78 * _PDF_W], repeatRows=1)
+        rt.setStyle(_RlTableStyle([("BACKGROUND", (0, 0), (-1, 0), _rlColors.HexColor(_UOM_NAVY)),
+                                   ("GRID", (0, 0), (-1, -1), 0.4, _rlColors.HexColor("#CBD5E1")),
+                                   ("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 3),
+                                   ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+        story += [_RlPara("Rubric descriptors", P["h2"]), rt]
+
+    # -- examiner comments
+    story.append(_RlPara("Examiner comments", P["h2"]))
+    for lab, f in zip(exLabel, exs):
+        txt = (f["comments"] if f else "") or "No comment provided."
+        box = _RlTable([[_RlPara(f"<b>{_xmlEscape(lab)}</b>", P["body"])],
+                        [_RlPara(_xmlEscape(txt).replace("\n", "<br/>"), P["body"])]], colWidths=[_PDF_W])
+        box.setStyle(_RlTableStyle([("LINEBEFORE", (0, 0), (0, -1), 2.5, _rlColors.HexColor(_UOM_ORANGE)),
+                                    ("BACKGROUND", (0, 0), (-1, -1), _rlColors.HexColor("#F8FAFC")),
+                                    ("LEFTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 3),
+                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        story += [_RlKeep([box]), _RlSpacer(1, 5)]
+
+    # -- scoring note
+    scaleTxt = " · ".join(f"{l} = {sc['pts'][l]}" for l in sc["levels"][:-1])
+    wTxt = " · ".join(f"{_xmlEscape(m['items'][mc])} ×{_fmtNum(w[mc])}" for mc in mcs) \
+        if len(set(w.values())) > 1 else "all criteria weighted equally"
+    story.append(_RlPara(f"<b>How this was scored.</b> Each criterion is rated {scaleTxt} points, then multiplied by its weight "
+                         f"({wTxt}); total out of {_fmtNum(maxT)}. Your final score is the average of the two examiners' "
+                         f"percentages. Cohort average = mean final score of the {len(m['students'])} students assessed.", P["note"]))
+    if note: story += [_RlSpacer(1, 4), _RlPara(_xmlEscape(note), P["note"])]
+    return story
+
+
+def _pdfPageDeco(cohort, year):
+    def deco(canv, doc):
+        W, H = _RlA4
+        canv.saveState()
+        canv.setFillColor(_rlColors.HexColor(_UOM_NAVY)); canv.rect(0, H - 14 * _rlMm, W, 14 * _rlMm, fill=1, stroke=0)
+        canv.setFillColor(_rlColors.HexColor(_UOM_ORANGE)); canv.rect(0, H - 15 * _rlMm, W, 1 * _rlMm, fill=1, stroke=0)
+        canv.setFillColor(_rlColors.white); canv.setFont("Helvetica-Bold", 10)
+        canv.drawString(15 * _rlMm, H - 9 * _rlMm, "Melbourne Dental School")
+        canv.setFont("Helvetica", 9); canv.drawRightString(W - 15 * _rlMm, H - 9 * _rlMm, f"{cohort} Oral Presentation {year}")
+        canv.setFillColor(_rlColors.HexColor(_PDF_GREY)); canv.setFont("Helvetica", 7)
+        canv.drawString(15 * _rlMm, 8 * _rlMm, f"Generated {_dt.date.today().strftime('%d %b %Y')} · Confidential — for the named student")
+        canv.drawRightString(W - 15 * _rlMm, 8 * _rlMm, f"Page {doc.page}")
+        canv.restoreState()
+    return deco
+
+
+def _pdfDoc(path, cohort, year):
+    return _RlDoc(path, pagesize=_RlA4, leftMargin=15 * _rlMm, rightMargin=15 * _rlMm,
+                  topMargin=21 * _rlMm, bottomMargin=14 * _rlMm, title=f"{cohort} Oral Presentation Report {year}")
+
+
+def buildOralStudentReports(jsonPath, outDir=None, rosterPath="studentEmailList.csv", checklistKey="BOH3-OCT",
+                            cohort="BOH3", year=2026, ignoreStudents=None, itemWeights=None, students=None,
+                            showExaminerNames=False, combinedPdf=True, note=None):
+    """One feedback PDF per student for an oral-presentation item code (+ optional combined PDF for review).
+
+    Page: student details · score tiles (final / examiner 1 / examiner 2 / cohort average) · criterion table
+    (weighted points, cell colour = level) · student-vs-cohort chart · rubric descriptor of each awarded level ·
+    examiner comments · scoring note. Scores come from loadOralPresentation(), so they match the Excel report.
+    outDir: None -> defaultOralStudentPdfDir(cohort, checklistKey, year).
+    students: optional names / student numbers to build only those (None = everyone assessed).
+    showExaminerNames: False labels examiners 'Examiner 1 / 2' (submission order); True prints their names.
+    combinedPdf: also write '_ALL_<code>.pdf' with every student (one after another) for checking.
+    note: optional line printed at the end of each report (e.g. weighting of the assessment in the subject).
+    Returns a pandas DataFrame: student, studentNo, email, finalPct, file — ready for the mailer cells.
+    """
+    import pandas as _pd
+    m = loadOralPresentation(jsonPath, rosterPath, checklistKey, cohort, ignoreStudents, itemWeights)
+    sc = _pdfScale()
+    outDir = outDir or defaultOralStudentPdfDir(cohort, checklistKey, year)
+    os.makedirs(outDir, exist_ok=True)
+    pick = _ignoreMatcher(students, rosterPath) if students else (lambda n: True)
+    emails = {}
+    if rosterPath and os.path.exists(rosterPath):
+        emails = {r["student_name"].strip().lower(): r.get("student_email", "") for r in csv.DictReader(open(rosterPath, encoding="utf-8"))}
+    deco = _pdfPageDeco(cohort, year)
+    rows, allStory = [], []
+    for s in m["students"]:
+        if not pick(s["name"]): continue
+        story = _pdfStudentStory(s, m, sc, showExaminerNames, note)
+        path = os.path.join(outDir, _pdfFileName(s, m))
+        _pdfDoc(path, cohort, year).build(story, onFirstPage=deco, onLaterPages=deco)
+        if combinedPdf:
+            allStory += (_pdfStudentStory(s, m, sc, showExaminerNames, note) + [_RlPageBreak()])
+        rows.append(dict(student=s["name"], studentNo=s["no"], email=emails.get(s["name"].strip().lower(), ""),
+                         finalPct=round(s["meanPct"], 1), singleMarked=not s["e2"], file=path))
+    if combinedPdf and allStory:
+        combPath = os.path.join(outDir, f"_ALL_{m['cohort']}_{m['checklistKey']}_Oral_Presentation.pdf")
+        _pdfDoc(combPath, cohort, year).build(allStory[:-1], onFirstPage=deco, onLaterPages=deco)
+    out = _pd.DataFrame(rows)
+    print(f"{len(rows)} student PDF(s) → {outDir}" + (f" (+ combined)" if combinedPdf and rows else "") +
+          f" · missing email: {int((out['email'] == '').sum()) if len(out) else 0}")
+    return out

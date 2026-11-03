@@ -16,6 +16,8 @@ The handover doc holds the detail; this file holds the trail.
 
 | Date | Document | Scope | Cohorts | Main code files |
 |---|---|---|---|---|
+| 2026-10-23 | [HANDOVER_weekly_combined_assessor_hover_notes.md](HANDOVER_weekly_combined_assessor_hover_notes.md) | **Weekly combined workbook: assessor hover notes** — every student × item-code cell on the `scores`, `global_ratings`, `practice_readiness`, `scores_flagged` sheets gets an Excel comment `Assessor: <name> (<date>)`, one line per form (repeat attempts list every assessor). New `buildAssessorNoteMap` (from `score_long_df`) + `addAssessorComments` in `general_utils.py`; one call block + Description line in the `exportCombinedNotebook` cell. No signature or layout changes; `risk_report.py` unaffected. Offline-tested only. | DDS2 / BOH2 / BOH1 weekly (cohort-generic) | `general_utils.py`, `main.ipynb` |
+| 2026-10-15 *(rev. 2026-10-16)* | [HANDOVER_dtc_clinic_comparison.md](HANDOVER_dtc_clinic_comparison.md) | **DTC vs placement-site clinical-exposure comparison + PDF item-code totals** — new section 11 in `boh3_dds4_utils.py`: `getClinicStudentExposure` (per clinic×student: attended patients, total item codes =Σqty, unique item codes=COUNT DISTINCT), `summariseClinicExposure`, `dtcVsOthersExposure`, and `buildClinicComparisonWorkbook` → **one-sheet** `BOH3_DDS4/Clinical Exposure <cohort> <today>.xlsx` (DTC-vs-others table + per-site table + 3 bar charts, DTC/MDC highlighted), all **per student**. PDF: `getItemCodeTotal` + `plotItemCodeFrequencies(total=)` show the grand total on the Top-Item-Codes and by-age bars; the extra sections after the patient-count table (the 2026-10-15 `addGenericCharts` block) were removed. One new call cell in `main.ipynb`; old per-clinic funcs untouched. Offline-validated. | DDS4, BOH3 (utils cohort-generic) | `boh3_dds4_utils.py`, `main.ipynb` |
 | 2026-10-08 | [HANDOVER_boh2_item_code_year_summary.md](HANDOVER_boh2_item_code_year_summary.md) | **BOH2 Item-Code Year Summary (new PDF)** + quantity-aware item-code counts. New `buildItemCodeYearSummaryPdf` / `getItemCodeCohortCounts` / `plotItemCodeBars` / `_codeQuantityMap` in `boh2_dds2_dds3_utils.py`; new call cell below `getCohortReports`. Per form type (Clinic & Simulation, separate): requested-codes table (`Item Code · Section · Sub-section · Count · Students`) + Top-N table + bar, PDF `/Info` metadata. Codes come from `getDataDf.item_codes` (assessor side + Smile Squad swap kept), reduced to real 3-digit via `_shortItemCode` and multi-code labels split (fold `114`/`114-US`/`BOH2 S2 114`), then **quantity-weighted** from the new `context_checklists`. **Ingest change:** `rawform_forms_v3` gains `context_checklists JSONB` (= `form_context.checklists` `[{code,quantity}]`) in `general_utils.getInsertSqlRawform_forms_v3` + idempotent `ALTER … ADD COLUMN IF NOT EXISTS`; **re-run `processForms(replaceExisting=True)`** to populate. Quantity was previously dropped at ingest. | BOH2 (util cohort-generic; ingest all non-final) | `boh2_dds2_dds3_utils.py`, `general_utils.py`, `main.ipynb` |
 | 2026-10-01 | [HANDOVER_osce_student_feedback_pdfs.md](HANDOVER_osce_student_feedback_pdfs.md) | **DDS4 OSCE student feedback PDFs (new)**: per-student A4 PDF in the `OSCE/OSCE Feedback Template.xlsx` layout (navy header + logo, green panel) plus a station cutoff. Reads cleaned `OSCE/DDS4/DDS4 OSCE (2).xlsx` (scores + Feedback + B/F info) and the BLR workbook's Standard Setting APPLIED cut. Station label/domain/type/topic/order/Include/**Counts To Outcome** come from the new `OSCE/OSCE Station Metadata.xlsx`. Station FAIL = score < cut; PASS ALL cutoff printed as lowest − 1; **Perio not counted** (N/A outcome + cutoff, left out of counts and the overall outcome, with a note); 2 SDBM = < mean − 2SD; overall FAIL when > 4 stations failed; overall mark withheld; B/F heading only on failed stations. Built for 7 overall-fail students; numbers match the official OSCE Outcome sheet (avg 75.5%, Counted Fails) | DDS4 (metadata cohort-generic) | `osce_utils.py`, `main.ipynb`, `OSCE/OSCE Station Metadata.xlsx` (new) |
 | 2026-10-01 | [HANDOVER_dds3_reportable_score_pivot_es_lvl1_count.md](HANDOVER_dds3_reportable_score_pivot_es_lvl1_count.md) | **DDS3 Clinic flagging: Reportable Item Score Pivot + count-based ES L1 flag** — new "Reportable Item Score Pivot" sheet (Item Code Score Pivot filtered to `DDS3_REPORTABLE_ITEMS`, variant codes folded to base, category-ordered; `itemScorePivotReportableOnly`, `reportableItems`). New opt-in flags `high_es_lvl1_count` / `high_es_lvl2_count` (`maxEsLvl1Count` / `maxEsLvl2Count`, `es_lvl*_count` on flagDf). `dds3_clinic` swaps `high_es_lvl1` (%) for `high_es_lvl1_count` with `maxEsLvl1Count=1` (one L1 tolerated, ≥2 flags, HIGH tier); ES L2 stays >20%. **Bug fix:** `"LA"` removed from `DDS3_REPORTABLE_ITEMS` — its `int()` sort had silently dropped the Reportable Items + Item Scale Distribution sheets from every DDS3 workbook. Other 10 presets byte-identical. `main.ipynb` not edited | DDS3 | `flagging_utils.py` |
@@ -53,6 +55,32 @@ The handover doc holds the detail; this file holds the trail.
 ---
 
 ## Detail by document
+### 2026-10-23 · HANDOVER_weekly_combined_assessor_hover_notes.md
+
+**Scope.** Hover notes (openpyxl `Comment`) on the weekly **combined workbook** pivots so the assessor is visible on the GR/PR/score cells without opening the `assessors` sheet.
+
+- **New utils:** `buildAssessorNoteMap(longDf, idCols)` → `{(ids, code): ["Assessor: name (date)", …]}` from the long weekly frame; `addAssessorComments(ws, df, idCols, noteMap, codeCols)` writes the comments against the relabelled frame (same row addressing as `styleCombinedSheet`). Import `openpyxl.comments.Comment as XlComment`.
+- **`main.ipynb` `exportCombinedNotebook`:** builds the map once from `score_long_df`, applies to `scores`, `global_ratings`, `practice_readiness`, `scores_flagged`; `Description` row for `scores` mentions the notes.
+- **Decisions:** all attempts listed even though pivots keep the best (`agg="max"`); comments rather than a column so `risk_report.py` column lookup is untouched.
+
+**Gotchas.** Blank cells get no note. Many notes → larger `.xlsx`. Keep `firstRow` in step with `styleCombinedSheet`.
+
+**Open.** Not run on live data yet — re-run the combined cell for one stream and check.
+
+### 2026-10-15 *(rev. 2026-10-16)* · HANDOVER_dtc_clinic_comparison.md
+
+**Scope.** Compare average student **clinical exposure** at DTC vs the other placement sites — avg patients, avg total item codes (volume), avg unique item codes (variety), **per student** — plus item-code totals on the cohort-PDF bar charts. (Initial 2026-10-15 build had a 3-sheet workbook + per-student histogram pages; narrowed 2026-10-16 to exposure-only.)
+
+- **New utils (section 11, public):** `getClinicStudentExposure` (one row per clinic×student — attended `patients`, `total_codes`=Σ qty, `unique_codes`=COUNT DISTINCT code at site level, NOT a sum of rotation varieties), `summariseClinicExposure`, `dtcVsOthersExposure`, `buildClinicComparisonWorkbook` (one 'Clinical Exposure' sheet: DTC-vs-others table + per-site table + 3 bar charts, DTC/MDC bars recoloured), helpers `_xlClinicBar`/`_xlHighlightPoints`.
+- **Cohort PDF:** `getItemCodeTotal` (grand total of item-code qty for a filter); `plotItemCodeFrequencies` gained `total=` → title `Top Item Codes (Total: N)`; `buildFrontPage` and the by-age panels pass it (`Age 0-6 (Total: N)`). **Removed** the `addGenericCharts` kwarg/block + `addCohortGenericCharts` (the 2026-10-15 sections after the patient table).
+- **Decisions:** per student (not per rotation); unique codes via SQL DISTINCT; attended patients counted directly (no Operator field on final-year forms); `external_clinic` holds readable site names.
+- **`main.ipynb`:** one call cell after `createPatientStatsPerClinicPerRotation`. Old per-clinic functions untouched.
+
+**Gotchas.** `targetCohorts`/`today` must exist. `(unknown)` bucket = missing `external_clinic`.
+
+**Open.** Not yet run on the live DB — validate per-student numbers.
+
+
 ### 2026-10-08 · HANDOVER_boh2_item_code_year_summary.md
 
 **Scope.** New colleague-facing **BOH2 Item-Code Year Summary PDF** for the EOY whole-student brief, plus the
@@ -913,7 +941,21 @@ reference the same `DEFAULT_INTERVAL` or auto-refresh won't start. Same UTC-vs-l
 
 ---
 
+## Unwritten — work done without a handover doc
+
+**DDS2 OSCE special-consideration student added (2026-10-15)** — new standalone module `osce_spec_cons.py`. Nethmini Nanayakkara (1357773), who sat the special-consideration OSCE (`round_label = "2026 DDS2 Spec Cons OSCE"`, round 6, single circuit, 13 stations, 14 Oct), was scored against the **frozen** cohort standard (BLR cut %, Mean-2SD %, cohort mean read verbatim from the finalized `OSCE/DDS2` workbooks — nothing recomputed). Her 13 `spec-cons-*` checklists map 1:1 onto the cohort checklists (configs verified identical) and are scored via `osce_utils.buildStationSpecs` so figures match the cohort method exactly. Outputs: (1) new **`OSCE/DDS2/DDS2 Spec Cons OSCE.xlsx`** (Read Me, Station Results + /100 summary, 13 detail sheets, Legend); (2) her row appended to **`Student x Station`** in `DDS2 BLR & Validity.xlsx`, below the cohort block + totals, clearly labelled and excluded from cohort N/stats. Result: Mean 73.5%, fails **Local Anaesthetic (55 vs 58)** and **Referral (20 vs 34)**, below Mean-2SD on **Periodontics (72.5 vs 72.6)**. Run: `python osce_spec_cons.py`; backups of both workbooks in `_bak/`. No overall allowable-failure rule existed for the DDS2 run, so overall pass/fail stays a Board decision. A full handover doc has not been written — delete this entry when one is.
+
+---
+
 ## Open items across all sessions
+
+**Weekly combined assessor hover notes (2026-10-23)**
+- Re-run the combined cell for one DDS2 stream on the live workbooks and confirm the hover notes (name + date, two lines on a repeat attempt).
+
+**DTC clinical-exposure comparison + PDF item-code totals (2026-10-15, rev. 2026-10-16)**
+- Not run on live Postgres (VM can't reach localhost DB). Run the `buildClinicComparisonWorkbook` cell for DDS4 + BOH3 and sanity-check per-student numbers (avg patients, total codes, unique codes).
+- Re-run `buildCohortSummaryPdf` to confirm the item-code bars show totals and nothing renders after the patient-count table.
+
 
 **BOH2 Item-Code Year Summary + `context_checklists` ingest (2026-10-08)**
 - Not run on live Postgres/Windows. **Re-run `processForms(replaceExisting=True)` (cell 6)** to add +

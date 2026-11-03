@@ -1,0 +1,277 @@
+# -*- coding: utf-8 -*-
+"""Score the DDS2 special-consideration OSCE student against the FROZEN cohort cuts and
+(1) build a standalone 'DDS2 Spec Cons OSCE.xlsx' with only her results, and
+(2) append her row to the 'Student x Station' outcome sheet of 'DDS2 BLR & Validity.xlsx'.
+
+Nothing in the cohort standard is recomputed: cuts / Mean-2SD / means are read verbatim from the
+finalized workbooks, and her 13 'spec-cons-*' checklists are mapped 1:1 onto the cohort checklists
+(identical item/option configs). Scoring reuses osce_utils so her %=the cohort method exactly."""
+import json, copy, statistics, os
+import osce_utils as ou
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+SRC="temp 2026 osce.json"
+STATION_WB="OSCE/DDS2/DDS2 OSCE.xlsx"
+ANALYSIS_WB="OSCE/DDS2/DDS2 BLR & Validity.xlsx"
+OUT_WB="OSCE/DDS2/DDS2 Spec Cons OSCE.xlsx"
+SPEC_ROUND="2026 DDS2 Spec Cons OSCE"
+
+SPEC2CK={'spec-cons-radiography':'radiography','spec-cons-medical-emergency':'medical-emergency',
+ 'spec-cons-infection-control':'infection-control','spec-cons-referral':'referral',
+ 'spec-cons-conservative-dentistry':'conservative-dentistry','spec-cons-local-anaesthesia':'local-anaesthetic',
+ 'spec-cons-periodontics':'periodontics','spec-cons-communication-with-staff':'communication-with-staff',
+ 'spec-cons-occlusal-assessment':'occlusal-assessment-note-to-markers-student-must-write-no-nil-no-marks-awarded-for-blank-boxes',
+ 'spec-cons-communication-with-a-patient':'communication-with-a-patient','spec-cons-medical-history':'medical-history',
+ 'spec-cons-risk-and-recall':'risk-and-recall','spec-cons-informed-consent':'informed-consent'}
+
+# ---- shared styles (mirror osce_utils) ----
+HEAD=ou.HEAD
+hFont=Font(name="Arial",size=10,bold=True,color="FFFFFF")
+bFont=Font(name="Arial",size=10)
+hFill=PatternFill("solid",fgColor=HEAD)
+thin=Side(style="thin",color="C5D5E8"); box=Border(left=thin,right=thin,top=thin,bottom=thin)
+ctrW=Alignment(horizontal="center",vertical="center",wrap_text=True)
+ctr=Alignment(horizontal="center",vertical="center")
+leftC=Alignment(horizontal="left",vertical="center")
+flatL=Alignment(horizontal="left",vertical="center",wrap_text=False)
+
+def styleHeader(ws,ncol,row=1):
+    for c in range(1,ncol+1):
+        cell=ws.cell(row,c); cell.font=hFont; cell.fill=hFill; cell.alignment=ctrW; cell.border=box
+
+# =====================================================================================
+def load_her_specs():
+    recs=json.load(open(SRC,encoding="utf-8"))
+    her=[r for r in recs if r.get("round_label")==SPEC_ROUND]
+    if not her: raise SystemExit("No spec-cons records found.")
+    name=her[0]["student"]; number=str(her[0]["student_number"]).strip()
+    her2=[]
+    for r in her:
+        r=copy.deepcopy(r); fd=r["form_data"].get("checklists",{}); fc=r["form_config"].get("checklists",{})
+        for sk,ck in SPEC2CK.items():
+            if sk in fd: fd[ck]=fd.pop(sk)
+            if sk in fc: fc[ck]=fc.pop(sk)
+        her2.append(r)
+    specs={s["ck"]:s for s in ou.buildStationSpecs(her2,reverseGr="auto")}
+    return specs,name,number
+
+def load_frozen():
+    awb=openpyxl.load_workbook(ANALYSIS_WB,data_only=True)
+    sx=awb["Student x Station"]; rows=list(sx.iter_rows(values_only=True)); hdr=list(rows[0])
+    i0=hdr.index("Student No")+1
+    iMean=[i for i,h in enumerate(hdr) if h and str(h).startswith("Mean %")][0]
+    stationCols=list(range(i0,iMean)); stationHdrs=[str(hdr[i]) for i in stationCols]
+    abbr2ck={v:k for k,v in ou.CHECKLIST_ABBR.items()}
+    ckOrder=[abbr2ck[h.split(" ",1)[1]] for h in stationHdrs]
+    # station summary aligned
+    swb=openpyxl.load_workbook(STATION_WB,data_only=True)
+    ss=swb["Station Summary"]; sr=list(ss.iter_rows(values_only=True)); sh=list(sr[0]); ci={h:i for i,h in enumerate(sh)}
+    ssdata=[r for r in sr[1:] if r[ci["Checklist"]] is not None]
+    cut={}; cohMean={}; station={}
+    for ck,row in zip(ckOrder,ssdata):
+        cut[ck]=round(float(row[ci["BLR Cut %"]]),1); cohMean[ck]=float(row[ci["Mean %"]]); station[ck]=row[ci["Station"]]
+    # standard setting mean-2sd aligned
+    stds=awb["Standard Setting"]; srows=list(stds.iter_rows(values_only=True)); m2sd={}
+    for i,row in enumerate(srows):
+        if row and row[0]=="Station" and any(str(c)=="Mean-2SD %" for c in row):
+            j=[k for k,c in enumerate(row) if str(c)=="Mean-2SD %"][0]
+            data=[]
+            for r2 in srows[i+1:]:
+                if not r2 or r2[0] in (None,"Station") or str(r2[0]).startswith("Number"): break
+                data.append(r2)
+            for ck,r2 in zip(ckOrder,data): m2sd[ck]=round(float(r2[j]),1)
+            break
+    # cohort per-student matrix (for frozen /100 ctx) - only true student rows
+    import re
+    cohort=[]
+    for row in rows[1:]:
+        if not (row[1] and re.fullmatch(r"\d{6,8}",str(row[1]).strip())): continue
+        sc={ck:float(row[col]) for col,ck in zip(stationCols,ckOrder) if isinstance(row[col],(int,float))}
+        if len(sc)==len(ckOrder): cohort.append(sc)
+    return dict(ckOrder=ckOrder,cut=cut,cohMean=cohMean,station=station,m2sd=m2sd,
+                cohort=cohort,stationHdrs=stationHdrs,hdr=hdr,rows=rows,awb_path=ANALYSIS_WB)
+
+def final_scores(her_pp,fr):
+    cut=fr["cut"]; ck=fr["ckOrder"]; cohort=fr["cohort"]
+    def stnCut50(s,c): return (50+50*(s-c)/(100-c)) if (c and s>=c) else ((50*s/c) if c else 0.0)
+    def rawmean(sc): return statistics.mean([sc[k] for k in sc])
+    def base(sc): return statistics.mean([stnCut50(sc[k],cut[k]) for k in sc])
+    grandMean=statistics.mean([rawmean(s) for s in cohort]); bmean=statistics.mean([base(s) for s in cohort])
+    k=((grandMean-50)/(bmean-50)) if bmean>50 else 1.0
+    raw=statistics.mean([her_pp[c] for c in ck])
+    psc=max(0,min(100,50+(base(her_pp)-50)*k))
+    num=den=0.0
+    for c in ck:
+        if cut[c]: w=100.0/cut[c]; num+=her_pp[c]*w; den+=w
+    psw=max(0,min(100,num/den)) if den else raw
+    return dict(rawMean=round(raw,1),perStationCut=round(psc,1),perStationWeighted=round(psw,1),
+                grandMean=round(grandMean,1),bmean=round(bmean,1))
+
+# ---- detail sheet (mirror osce_utils) ----
+def write_detail(wb,spec,sheet_name):
+    st,ck,cfg,rows,items=spec["st"],spec["ck"],spec["cfg"],spec["rows"],spec["items"]
+    ws=wb.create_sheet(sheet_name[:31])
+    hdr=["Circuit","Student Name","Student No","Assessor"]+[f"MC{i}\n(/{spec['itemMax'][i]})" for i in items]+["Score (%)","GR","Feedback","Borderline/Fail Info"]
+    ws.append(hdr); styleHeader(ws,len(hdr))
+    C={h:i+1 for i,h in enumerate(hdr)}
+    for r in rows:
+        pts=[r["points"][i] for i in items]
+        pct=round(r["score"]*100,2) if r["score"] is not None else None
+        ws.append([r["circuit"],r["student"],r["studentNo"],r["assessor"]]+pts+[pct,r["gr"],r["feedback"],r["blfail"]])
+    ncol=len(hdr); mc0=C["Assessor"]+1; gcol=C["GR"]; icol=C["Borderline/Fail Info"]; fcol=C["Feedback"]
+    ws.row_dimensions[1].height=28
+    nameCols=(C["Student Name"],C["Student No"],C["Assessor"])
+    for ri,r in enumerate(rows,start=2):
+        for c in range(1,ncol+1):
+            cell=ws.cell(ri,c); cell.font=bFont; cell.border=box
+            cell.alignment=flatL if c in (icol,fcol) else (leftC if c in nameCols else ctr)
+        for j,i in enumerate(items):
+            frv=r["frac"].get(i)
+            if frv is not None:
+                cc=ws.cell(ri,mc0+j); cc.fill=PatternFill("solid",fgColor=ou.gradientHex(frv))
+                cc.font=Font(name="Arial",size=10,color="FFFFFF" if frv<=0.001 else "000000")
+        ws.cell(ri,C["Score (%)"]).number_format="0.00"
+        gv=ws.cell(ri,gcol).value
+        if gv in ou.GR_FILL:
+            ws.cell(ri,gcol).fill=PatternFill("solid",fgColor=ou.GR_FILL[gv]); ws.cell(ri,gcol).font=Font(name="Arial",size=10,color=ou.GR_FONTC[gv])
+        if gv==1:
+            ws.cell(ri,icol).fill=PatternFill("solid",fgColor="FFC7CE"); ws.cell(ri,icol).font=Font(name="Arial",size=10,bold=True,color="9C0006")
+        elif gv==2:
+            ws.cell(ri,icol).fill=PatternFill("solid",fgColor="FFEB9C"); ws.cell(ri,icol).font=Font(name="Arial",size=10,color="7F6000")
+    ws.column_dimensions["A"].width=7
+    ws.column_dimensions[get_column_letter(C["Student Name"])].width=22
+    ws.column_dimensions[get_column_letter(C["Student No"])].width=11
+    ws.column_dimensions[get_column_letter(C["Assessor"])].width=20
+    for c in range(mc0,mc0+len(items)): ws.column_dimensions[get_column_letter(c)].width=6
+    ws.column_dimensions[get_column_letter(C["Score (%)"])].width=9
+    ws.column_dimensions[get_column_letter(gcol)].width=5
+    ws.column_dimensions[get_column_letter(fcol)].width=55
+    ws.column_dimensions[get_column_letter(icol)].width=55
+    ws.freeze_panes=f"{get_column_letter(C['Assessor']+1)}2"
+
+GR_LABELS=ou.GR_LABELS
+
+def build_standalone(specs,name,number,fr):
+    ck=fr["ckOrder"]; cut=fr["cut"]; m2=fr["m2sd"]; cohMean=fr["cohMean"]; stn=fr["station"]
+    her_pp={c:ou.pct1(specs[c]["rows"][0]["score"]) for c in ck}
+    fsc=final_scores(her_pp,fr)
+    fails=sum(1 for c in ck if her_pp[c]<cut[c]); below2=sum(1 for c in ck if her_pp[c]<m2[c])
+    meanPct=round(statistics.mean([her_pp[c] for c in ck]),1)
+    wb=openpyxl.Workbook(); wb.remove(wb.active)
+    # ---- Read Me ----
+    rm=wb.create_sheet("Read Me"); rm.sheet_view.showGridLines=False
+    lines=[(f"DDS2 OSCE — Special Consideration sitting",13,True),("",10,False),
+      (f"Student: {name}  ({number})",11,True),
+      (f"Spec-cons OSCE sat {SPEC_ROUND} (round 6, single circuit, 13 stations, 14 Oct 2026).",10,False),
+      ("Scored against the FROZEN cohort standard: BLR cut %, Mean-2SD % and cohort mean % are read",10,False),
+      ("verbatim from the finalized DDS2 OSCE workbooks and are NOT recomputed. Her inclusion does not",10,False),
+      ("change any cohort statistic, cut or other student's result.",10,False),
+      ("Her 13 'spec-cons-*' checklists map 1:1 onto the cohort checklists (identical item/option config);",10,False),
+      ("scoring uses the same dynamic per-item rank method (4-level 4/3/2/0, 3-level 2/1/0, 2-level 1/0;",10,False),
+      ("each item normalised to its own max, equal weight; Score% = mean of item fractions).",10,False),
+      ("Pass/fail per station = Score% < BLR cut % (both at 1 dp), matching the cohort Student x Station.",10,False),
+      ("",10,False),
+      (f"Result: Mean {meanPct}%  |  {fails} station(s) below BLR cut  |  {below2} below Mean-2SD.",11,True),
+      ("No overall allowable-failure rule was set for the DDS2 cohort run, so overall pass/fail is a Board",10,False),
+      ("of Examiners decision; the /100 columns use the frozen cohort scaling constants.",10,False)]
+    for i,(t,sz,b) in enumerate(lines,1):
+        rm.cell(i,1,t).font=Font(name="Arial",size=sz,bold=b,color=HEAD if b else "000000")
+    rm.column_dimensions["A"].width=110
+    # ---- Station Results (outcome) ----
+    rs=wb.create_sheet("Station Results")
+    hd=["Station","Checklist","Levels","Score %","BLR Cut %","Pass/Fail","Margin","GR","Cohort Mean %","Mean-2SD %","< M-2SD?"]
+    rs.append(hd); styleHeader(rs,len(hd))
+    order=sorted(ck,key=lambda c:(stn[c],ou.CHECKLIST_ABBR[c]))
+    for c in order:
+        s=specs[c]; r=s["rows"][0]; pp=her_pp[c]; passed=pp>=cut[c]
+        rs.append([stn[c],s["cfg"]["name"].split(".")[0][:40].replace("Spec Cons ","").replace("spec cons ",""),
+                   s["levels"],pp,cut[c],"PASS" if passed else "FAIL",round(pp-cut[c],1),
+                   r["gr"],cohMean[c],m2[c],"Yes" if pp<m2[c] else ""])
+    GREEN,RED="C6EFCE","FFC7CE"; GREENF,REDF="006100","9C0006"
+    for ri in range(2,rs.max_row+1):
+        for cc in range(1,len(hd)+1):
+            cell=rs.cell(ri,cc); cell.font=bFont; cell.border=box
+            cell.alignment=leftC if cc==2 else ctr
+        pf=rs.cell(ri,6); isP=pf.value=="PASS"
+        pf.fill=PatternFill("solid",fgColor=GREEN if isP else RED); pf.font=Font(name="Arial",size=10,bold=True,color=GREENF if isP else REDF)
+        gv=rs.cell(ri,8).value
+        if gv in ou.GR_FILL:
+            rs.cell(ri,8).fill=PatternFill("solid",fgColor=ou.GR_FILL[gv]); rs.cell(ri,8).font=Font(name="Arial",size=10,color=ou.GR_FONTC[gv])
+    rs.column_dimensions["A"].width=8; rs.column_dimensions["B"].width=26; rs.column_dimensions["C"].width=12
+    for c in range(4,len(hd)+1): rs.column_dimensions[get_column_letter(c)].width=12
+    rs.freeze_panes="A2"
+    # summary block below
+    rp=rs.max_row+2
+    rs.cell(rp,1,"Summary").font=Font(name="Arial",size=11,bold=True,color=HEAD); rp+=1
+    for lab,val in [("Mean % (13 stations)",meanPct),("Stations below BLR cut",fails),
+                    ("Stations below Mean-2SD",below2),
+                    ("Final /100 — Avg % (raw)",fsc["rawMean"]),
+                    ("Final /100 — Per-stn cut",fsc["perStationCut"]),
+                    ("Final /100 — Wtd 100/cut",fsc["perStationWeighted"])]:
+        rs.cell(rp,1,lab).font=bFont; c=rs.cell(rp,4,val); c.font=Font(name="Arial",size=10,bold=True); c.alignment=ctr; rp+=1
+    rs.cell(rp,1,f"/100 scaling constants (frozen cohort): mean={fsc['grandMean']}%, per-stn base mean={fsc['bmean']}.").font=Font(name="Arial",size=9,italic=True,color="555555")
+    # ---- detail sheets (cohort station names) ----
+    for c in order:
+        write_detail(wb,specs[c],ou.stationTitle(stn[c],c))
+    # ---- Checklist Legend ----
+    leg=wb.create_sheet("Checklist Legend"); leg.append(["Station","Sheet","Checklist","Item Level","MC","Description"]); styleHeader(leg,6)
+    for c in order:
+        s=specs[c]
+        for i in s["items"]:
+            leg.append([stn[c],ou.stationTitle(stn[c],c),s["cfg"]["name"].split(".")[0][:40],
+                        f"{s['itemLevel'][i]}-level",f"MC{i}",s["cfg"]["fields"].get(f"MC{i}","").strip()])
+    for ri in range(2,leg.max_row+1):
+        for cc in range(1,7):
+            cell=leg.cell(ri,cc); cell.font=bFont; cell.border=box
+            cell.alignment=Alignment(horizontal="left",vertical="top",wrap_text=True) if cc==6 else ctr
+    for col,w in zip("ABCDEF",[8,12,24,10,7,78]): leg.column_dimensions[col].width=w
+    leg.freeze_panes="A2"
+    os.makedirs(os.path.dirname(OUT_WB),exist_ok=True)
+    wb.save(OUT_WB)
+    return dict(meanPct=meanPct,fails=fails,below2=below2,her_pp=her_pp,fsc=fsc)
+
+def append_to_sxs(specs,name,number,fr,res):
+    ck=fr["ckOrder"]; cut=fr["cut"]; m2=fr["m2sd"]; her_pp=res["her_pp"]
+    wb=openpyxl.load_workbook(ANALYSIS_WB)
+    ws=wb["Student x Station"]; hdr=[c.value for c in ws[1]]
+    i0=hdr.index("Student No")+1
+    iMean=[i for i,h in enumerate(hdr) if h and str(h).startswith("Mean %")][0]
+    stationCols=list(range(i0+1,iMean+1))   # 1-based openpyxl columns
+    # column -> ck via header abbr
+    abbr2ck={v:k for k,v in ou.CHECKLIST_ABBR.items()}
+    colck={col:abbr2ck[str(hdr[col-1]).split(' ',1)[1]] for col in stationCols}
+    last=ws.max_row
+    sep=last+2
+    ws.cell(sep,1,f"SPECIAL CONSIDERATION — added 2026-10-15 — scored vs frozen cohort cuts; NOT in cohort N / stats / totals above").font=Font(name="Arial",size=9,bold=True,italic=True,color=HEAD)
+    rr=sep+1
+    ws.cell(rr,1,name).font=bFont; ws.cell(rr,1).alignment=leftC; ws.cell(rr,1).border=box
+    ws.cell(rr,2,number).font=bFont; ws.cell(rr,2).alignment=leftC; ws.cell(rr,2).border=box
+    STATUS_FILL={1:"FF0000",2:"FFC000",3:"7030A0"}; STATUS_FONT={1:"FFFFFF",2:"000000",3:"FFFFFF"}
+    for col in stationCols:
+        c=colck[col]; pp=her_pp[c]; cell=ws.cell(rr,col,pp); cell.border=box; cell.alignment=ctr; cell.number_format="0.0"; cell.font=bFont
+        bBLR=pp<cut[c]; b2=pp<m2[c]; stt=3 if (bBLR and b2) else (1 if bBLR else (2 if b2 else 0))
+        if stt in STATUS_FILL:
+            cell.fill=PatternFill("solid",fgColor=STATUS_FILL[stt]); cell.font=Font(name="Arial",size=10,bold=(stt!=2),color=STATUS_FONT[stt])
+    mcol=iMean+1  # Mean % column (1-based)
+    mc=ws.cell(rr,mcol,res["meanPct"]); mc.font=bFont; mc.border=box; mc.alignment=ctr; mc.number_format="0.0"
+    fc=ws.cell(rr,mcol+1,res["fails"]); fc.border=box; fc.alignment=ctr; fc.font=Font(name="Arial",size=10,bold=True,color="9C0006" if res["fails"] else "000000")
+    if res["fails"]: fc.fill=PatternFill("solid",fgColor="FFC7CE")
+    bc=ws.cell(rr,mcol+2,res["below2"]); bc.border=box; bc.alignment=ctr; bc.font=Font(name="Arial",size=10,bold=True,color="7030A0" if res["below2"] else "000000")
+    wb.save(ANALYSIS_WB)
+    return rr
+
+def main():
+    specs,name,number=load_her_specs()
+    fr=load_frozen()
+    res=build_standalone(specs,name,number,fr)
+    row=append_to_sxs(specs,name,number,fr,res)
+    print(f"Student: {name} ({number})")
+    print(f"Mean %: {res['meanPct']}  Fails(BLR): {res['fails']}  <M-2SD: {res['below2']}")
+    print(f"Final /100: rawMean={res['fsc']['rawMean']}  perStationCut={res['fsc']['perStationCut']}  perStationWeighted={res['fsc']['perStationWeighted']}")
+    print(f"Standalone workbook: {OUT_WB}")
+    print(f"Appended to Student x Station row {row} of {ANALYSIS_WB}")
+
+if __name__=="__main__":
+    main()

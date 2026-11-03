@@ -1384,11 +1384,36 @@ def getFrontPageSummaryTable(engine, cohort, formsTable="dds4_boh3_forms_v3", fi
     return pd.DataFrame([summary])
 
 
-def plotItemCodeFrequencies(itemCodesDf, ax, uniColor=None):
+def getItemCodeTotal(engine, cohort, formsTable="dds4_boh3_forms_v3", filters=None):
+    """Grand total of item-code quantity (all procedures performed) for a cohort,
+    honouring the same cohort/age filters as getTopItemCodes. Used to annotate the
+    item-code bar charts with an overall total."""
+    whereClause, params = _where(cohort, filters)
+    ageClause = ""
+    if filters:
+        if "age_min" in filters:
+            ageClause += " AND NULLIF(pd->>'patient_age','')::int >= :age_min"
+        if "age_max" in filters:
+            ageClause += " AND NULLIF(pd->>'patient_age','')::int <= :age_max"
+    sql = f"""
+    SELECT COALESCE(SUM(COALESCE(NULLIF(ic->>'quantity','')::int, 1)), 0)::bigint AS total
+    FROM {formsTable} f
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END) pd
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(pd->'item_codes')='array' THEN pd->'item_codes' ELSE '[]'::jsonb END) ic
+    WHERE {whereClause}
+      AND ic ? 'code'
+      {ageClause};
+    """
+    df = readDf(engine, sql, params)
+    return int(df.iloc[0]["total"]) if not df.empty else 0
+
+
+def plotItemCodeFrequencies(itemCodesDf, ax, uniColor=None, total=None):
     if uniColor is None:
         uniColor = variableUtils.uniColor
     ax.bar(itemCodesDf["itemcode"], itemCodesDf["freq"], color=uniColor)
-    ax.set_title("Top Item Codes", fontsize=14, color=uniColor)
+    title = "Top Item Codes" if total is None else f"Top Item Codes (Total: {int(total):,})"
+    ax.set_title(title, fontsize=14, color=uniColor)
     ax.set_xlabel("")
     ax.set_ylabel("Frequency", fontsize=10, color=uniColor)
     ax.set_xticklabels(itemCodesDf["itemcode"], rotation=90, ha="right", fontsize=8, color=uniColor)
@@ -1411,8 +1436,9 @@ def buildFrontPage(engine, cohort, filters, elements, subheadingColor,
     elements.append(summaryTable)
 
     allItemCodesDf = getTopItemCodes(engine, cohort, limit=25, filters=filters)
+    itemCodeTotal = getItemCodeTotal(engine, cohort, filters=filters)
     fig, ax = plt.subplots(figsize=(figSize[0], figSize[1] / 4), dpi=200)
-    plotItemCodeFrequencies(allItemCodesDf, ax, uniColor=uniColor)
+    plotItemCodeFrequencies(allItemCodesDf, ax, uniColor=uniColor, total=itemCodeTotal)
     plt.close(fig)
     img = addPlotImage(fig, 0.9)
     elements.append(Spacer(1, 24))
@@ -1489,8 +1515,9 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     fig, axs = plt.subplots(3, 1, figsize=(figSize[0], figSize[1]), dpi=200)
     for ax, (ageGroupName, ageFilter) in zip(axs, ageGroups):
         itemCodeDf = getTopItemCodes(engine, cohort, limit=20, filters=ageFilter)
+        ageTotal = getItemCodeTotal(engine, cohort, filters=ageFilter)
         plotItemCodeFrequencies(itemCodeDf, ax, uniColor=uniColor)
-        ax.set_title(f"Age {ageGroupName}", fontsize=12, color=uniColor)
+        ax.set_title(f"Age {ageGroupName} (Total: {ageTotal:,})", fontsize=12, color=uniColor)
     plt.suptitle("Top Item Codes by Age Group", fontsize=14, color=uniColor)
     plt.subplots_adjust(hspace=0.5)
     plt.close(fig)
@@ -1583,9 +1610,9 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
     entrustmentDfR13.sort_values('Entrustment Avg', ascending=False, inplace=True)
     entrustmentDfR46 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(4, 6))
     entrustmentDfR46.sort_values('Entrustment Avg', ascending=False, inplace=True)
-    entrustmentDfR57 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(5, 7))
-    entrustmentDfR57.sort_values('Entrustment Avg', ascending=False, inplace=True)
-    entrustmentDfR7 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(7, 7))
+    entrustmentDfR78 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(7, 8))
+    entrustmentDfR78.sort_values('Entrustment Avg', ascending=False, inplace=True)
+    entrustmentDfR8 = getEntrustmentPerStudentBatch(engine, cohort, rotationRange=(8, 8))
     # Load section mapping and merge with item codes to get section-level summaries later if needed
     itemsDf = getItemCodesPerStudentBatch(engine, cohort)
     mappingDf = pd.read_excel(variableUtils.itemSectionMappingFile)
@@ -1616,11 +1643,12 @@ def buildCohortSummaryPdf(*, engine, cohort, outPath, bannerTitle,
         modeArgs = getmodeArgs(superExcelPath)
         with pd.ExcelWriter(superExcelPath, **modeArgs) as writer:
             ageCountsExcelDf.to_excel(writer, sheet_name=f"Age Counts {cohort}", index=False)
+
             entrustmentDf.to_excel(writer, sheet_name=f"Entrustment {cohort}", index=False)
             entrustmentDfR13.to_excel(writer, sheet_name=f"Entrustment R1-3 {cohort}", index=False)
             entrustmentDfR46.to_excel(writer, sheet_name=f"Entrustment R4-6 {cohort}", index=False)
-            entrustmentDfR57.to_excel(writer, sheet_name=f"Entrustment R5-7 {cohort}", index=False)
-            entrustmentDfR7.to_excel(writer, sheet_name=f"Entrustment R7 {cohort}", index=False)
+            entrustmentDfR78.to_excel(writer, sheet_name=f"Entrustment R7-8 {cohort}", index=False)
+            entrustmentDfR8.to_excel(writer, sheet_name=f"Entrustment R8 {cohort}", index=False)
 
             incidentsExcelDf.to_excel(writer, sheet_name=f"Incidents {cohort}", index=False)
             concernsDf.to_excel(writer, sheet_name=f"Concerns {cohort}", index=False)
@@ -1764,11 +1792,59 @@ def setWeaknessCodeTopN(n):
     WEAKNESS_CODE_TOPN = int(n)
     return WEAKNESS_CODE_TOPN
 
-# Shared category palette (hex, no '#') — used for BOTH the matplotlib PDF charts and
-# the native Excel stacked bars, so the two deliverables read the same. Order matches
-# WEAKNESS_KEY_LABELS.values().
-WEAKNESS_PALETTE = ["66C2A5", "FC8D62", "8DA0CB", "E78AC3",
-                    "A6D854", "FFD92F", "E5C494"]
+# Standard weakness colour sets (hex, no '#'), keyed by WEAKNESS_KEY_LABELS label so a
+# category keeps its colour in EVERY chart (pie, PDF time series, Excel stacked bars)
+# even when other categories are absent. Switch sets with setWeaknessColorSet("okabeIto").
+WEAKNESS_COLOR_SETS = {
+    # "set2" — seaborn Set2, the original time-series palette (default)
+    "set2": {
+        "Time Management": "66C2A5",
+        "Communication": "FC8D62",
+        "Technical Skills": "8DA0CB",
+        "Person-Centred Care": "E78AC3",
+        "Professional Behaviour": "A6D854",
+        "Risk Management": "FFD92F",
+        "Knowledge & Clinical Reasoning": "E5C494",
+        "Other": "B3B3B3",
+    },
+    # "okabeIto" — Okabe–Ito colour-blind-safe palette
+    "okabeIto": {
+        "Time Management": "E69F00",
+        "Communication": "56B4E9",
+        "Technical Skills": "0072B2",
+        "Person-Centred Care": "009E73",
+        "Professional Behaviour": "CC79A7",
+        "Risk Management": "D55E00",
+        "Knowledge & Clinical Reasoning": "F0E442",
+        "Other": "9E9E9E",
+    },
+}
+WEAKNESS_COLOR_SET = "set2"   # active set name
+
+
+def setWeaknessColorSet(name):
+    """Select the active weakness colour set ("set2" or "okabeIto"). Use this from
+    main.ipynb rather than reassigning WEAKNESS_COLOR_SET (a `from … import *` copy
+    would not reach this module). Returns the active set name."""
+    global WEAKNESS_COLOR_SET
+    if name not in WEAKNESS_COLOR_SETS:
+        raise ValueError(f"Unknown weakness colour set {name!r}; "
+                         f"choose from {list(WEAKNESS_COLOR_SETS)}")
+    WEAKNESS_COLOR_SET = name
+    return WEAKNESS_COLOR_SET
+
+
+def getWeaknessColor(label, withHash=True):
+    """Colour for one weakness category label in the active set (grey if unknown)."""
+    hexCode = WEAKNESS_COLOR_SETS[WEAKNESS_COLOR_SET].get(label, "B3B3B3")
+    return "#" + hexCode if withHash else hexCode
+
+
+def getWeaknessPalette(labels=None, withHash=False):
+    """Colours for `labels` (default: WEAKNESS_KEY_LABELS order) in the active set."""
+    if labels is None:
+        labels = list(WEAKNESS_KEY_LABELS.values())
+    return [getWeaknessColor(l, withHash=withHash) for l in labels]
 
 
 def _weaknessLenExpr(key, src="assessor_data->'multi-select'"):
@@ -2404,21 +2480,32 @@ def getAllStudentComments(engine, cohort, studentNumber, formsTable="dds4_boh3_f
 # 6. Student PDF report builder
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _isLightColor(hexColor):
+    """True if a '#RRGGBB' colour is light enough to need dark text on it."""
+    h = hexColor.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return 0.299 * r + 0.587 * g + 0.114 * b > 0.6
+
+
 def weaknessPiePlot(weaknessCounts, totalWeaknesses, uniColor):
+    """Weakness pie — colours come from the active weakness colour set (same as the time
+    series), slices start at 12 o'clock and run largest → smallest clockwise."""
     fig, ax = plt.subplots(figsize=(variableUtils.figSize[0]*0.55, variableUtils.figSize[1]*0.32), dpi=200)
-    palette = sns.color_palette("Set2", n_colors=weaknessCounts.shape[0])
+    weaknessCounts = weaknessCounts.sort_values("Count", ascending=False, kind="stable")
+    palette = [getWeaknessColor(l) for l in weaknessCounts["Weakness Type"]]
     wedges, texts, autotexts = ax.pie(
         weaknessCounts["Count"],
         labels=None,
         colors=palette,
         autopct=lambda pct: autopct(pct, totalWeaknesses),
         pctdistance=0.75,
-        startangle=140,
+        startangle=90,          # start at top vertical
+        counterclock=False,     # largest first, then clockwise
         wedgeprops=dict(linewidth=0.8, edgecolor="white"),
     )
-    for at in autotexts:
+    for at, col in zip(autotexts, palette):
         at.set_fontsize(5)
-        at.set_color("white")
+        at.set_color(uniColor if _isLightColor(col) else "white")
         at.set_fontweight("bold")
 
     ax.legend(
@@ -2499,13 +2586,13 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
 
     # Weakness counts
     weaknessCounts = pd.DataFrame([
-        ("Time management", toInt(a.get("weakness_timeliness_n"))),
+        ("Time Management", toInt(a.get("weakness_timeliness_n"))),
         ("Communication", toInt(a.get("weakness_communication_n"))),
-        ("Technical skills", toInt(a.get("weakness_technical_n"))),
-        ("Person-centred care", toInt(a.get("weakness_pcc_n"))),
-        ("Professional behaviour", toInt(a.get("weakness_professional_n"))),
-        ("Risk management", toInt(a.get("weakness_risk_n"))),
-        ("Knowledge & reasoning", toInt(a.get("weakness_reasoning_n"))),
+        ("Technical Skills", toInt(a.get("weakness_technical_n"))),
+        ("Person-Centred Care", toInt(a.get("weakness_pcc_n"))),
+        ("Professional Behaviour", toInt(a.get("weakness_professional_n"))),
+        ("Risk Management", toInt(a.get("weakness_risk_n"))),
+        ("Knowledge & Clinical Reasoning", toInt(a.get("weakness_reasoning_n"))),
         # ("Other weaknesses noted", toInt(a.get("weakness_other_n"))),
     ], columns=["Weakness Type", "Count"])
     weaknessCounts = weaknessCounts[weaknessCounts["Count"] > 0]
@@ -2792,13 +2879,14 @@ def plotWeaknessOverTime(timelineDf, byRotationDf, uniColor=None, figWidth=None)
       top    — per rotation, with mean entrustment overlaid (secondary axis)
       bottom — per FORM that recorded a weakness (empty forms dropped), on a numeric
                date axis, with the item codes for that form printed above the bar
-    Categories are stacked in the shared WEAKNESS_PALETTE so the colours match Excel.
+    Categories use the active weakness colour set (getWeaknessPalette) so colours match
+    the pie chart and Excel.
     figWidth (inches) overrides the default width — pass the page width when embedding
     in a wide report. Returns a matplotlib Figure (or None if there is nothing to plot)."""
     if uniColor is None:
         uniColor = variableUtils.uniColor
     labels = list(WEAKNESS_KEY_LABELS.values())
-    colors = ["#" + c for c in WEAKNESS_PALETTE]
+    colors = getWeaknessPalette(labels, withHash=True)
 
     hasRot = byRotationDf is not None and not byRotationDf.empty \
         and byRotationDf[labels].to_numpy().sum() > 0
@@ -2897,7 +2985,7 @@ def plotWeaknessByItemCodeGroups(groupTables, uniColor=None, topN=None):
     if topN is None:
         topN = WEAKNESS_CODE_TOPN
     labels = list(WEAKNESS_KEY_LABELS.values())
-    colors = ["#" + c for c in WEAKNESS_PALETTE]
+    colors = getWeaknessPalette(labels, withHash=True)
 
     panels = []
     for label, df in groupTables:
@@ -6360,7 +6448,7 @@ def _collectWeaknessData(data, engine, cohort, studentNumber, formsTable):
 def _xlStackedWeaknessChart(ws, df, headerRow, catName, title, xTitle, yTitle,
                             maxRows=None):
     """A native stacked-column chart: one series per weakness category (coloured from
-    WEAKNESS_PALETTE), categories from `catName`. Reads columns by NAME so it survives
+    active weakness colour set), categories from `catName`. Reads columns by NAME so it survives
     column reordering. Returns the chart (already styled) or None."""
     labels = [l for l in WEAKNESS_KEY_LABELS.values() if l in df.columns]
     if not labels or catName not in df.columns:
@@ -6372,7 +6460,7 @@ def _xlStackedWeaknessChart(ws, df, headerRow, catName, title, xTitle, yTitle,
     chart.type = "col"
     chart.grouping = "stacked"
     chart.overlap = 100
-    for lab, colorHex in zip(labels, WEAKNESS_PALETTE):
+    for lab, colorHex in zip(labels, getWeaknessPalette(labels)):
         idx = df.columns.get_loc(lab) + 1
         chart.add_data(Reference(ws, min_col=idx, min_row=headerRow, max_row=headerRow + nRows),
                        titles_from_data=True)
@@ -6840,3 +6928,201 @@ def buildCohortStudentExcelReports(engine, cohort, outputDir, kind="both",
             log.append({"student_number": studentNumber, "student_name": studentName,
                         "file": None, "kind": kind, "status": f"error: {ex}"})
     return pd.DataFrame(log)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 11. Placement-site clinical-exposure comparison (DTC vs other sites)
+# ---------------------------------------------------------------------------
+# Compares the average student CLINICAL EXPOSURE at each external placement site:
+#   • average patients seen per student
+#   • average TOTAL item codes per student (volume of procedures)
+#   • average UNIQUE item codes per student (variety of procedures)
+# Per student at each site (aggregated across the student's whole time there).
+# Final-year (DDS4/BOH3) forms have no Operator field, so attended patients are
+# counted directly (the Config.xlsx Operator-as-patient note is N/A here).
+# Public so main.ipynb can call under `from boh3_dds4_utils import *`.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def getClinicStudentExposure(engine, cohort, formsTable="dds4_boh3_forms_v3",
+                             attended=True, filters=None, excludeRotations=(8,)):
+    """One row per (clinic, student): attended patients, total item codes
+    (sum of quantity) and unique item codes (distinct codes) across the
+    student's whole time at that site. Returns:
+    external_clinic, student_name, patients, total_codes, unique_codes."""
+    whereClause, params = _where(cohort, filters)
+    params["attended"] = attended
+    # Drop incomplete/unwanted rotations by rotation NUMBER (robust to label
+    # variants/trailing spaces, e.g. "Rotation 8"); forms with no rotation are kept.
+    rotExcl = ""
+    if excludeRotations:
+        params["excludeRot"] = [int(x) for x in excludeRotations]
+        rotExcl = ("AND COALESCE(NULLIF(regexp_replace(f.rotation,'[^0-9]','','g'),'')::int, -1) "
+                   "<> ALL(:excludeRot)")
+    sql = f"""
+    WITH pat AS (
+      SELECT COALESCE(NULLIF(f.external_clinic,''), '(unknown)') AS clinic,
+             f.student_name, p.elem AS patient
+      FROM {formsTable} f
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(f.patient_data)='array' THEN f.patient_data ELSE '[]'::jsonb END
+      ) p(elem)
+      WHERE {whereClause}
+        AND f.student_name IS NOT NULL
+        {rotExcl}
+        AND (p.elem->>'patient_attended')::boolean = :attended
+    ),
+    codes AS (
+      SELECT pat.clinic, pat.student_name,
+             ic->>'code' AS code,
+             COALESCE(NULLIF(ic->>'quantity','')::int, 1) AS qty
+      FROM pat
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(pat.patient->'item_codes')='array'
+             THEN pat.patient->'item_codes' ELSE '[]'::jsonb END
+      ) ic
+      WHERE ic ? 'code' AND NULLIF(ic->>'code','') IS NOT NULL
+    ),
+    codeAgg AS (
+      SELECT clinic, student_name, SUM(qty)::int AS total_codes,
+             COUNT(DISTINCT code)::int AS unique_codes
+      FROM codes GROUP BY clinic, student_name
+    ),
+    patAgg AS (
+      SELECT clinic, student_name, COUNT(*)::int AS patients
+      FROM pat GROUP BY clinic, student_name
+    )
+    SELECT pa.clinic AS external_clinic, pa.student_name, pa.patients,
+           COALESCE(ca.total_codes, 0)  AS total_codes,
+           COALESCE(ca.unique_codes, 0) AS unique_codes
+    FROM patAgg pa
+    LEFT JOIN codeAgg ca USING (clinic, student_name)
+    ORDER BY pa.clinic, pa.student_name;
+    """
+    return readDf(engine, sql, params)
+
+
+def summariseClinicExposure(exposureDf, minStudents=1):
+    """Per-site averages across students: Avg Patients/Student,
+    Avg Total Codes/Student, Avg Unique Codes/Student. Sorted by patients desc."""
+    cols = ["Site", "Students", "Avg Patients/Student",
+            "Avg Total Codes/Student", "Avg Unique Codes/Student"]
+    if exposureDf is None or exposureDf.empty:
+        return pd.DataFrame(columns=cols)
+    g = exposureDf.groupby("external_clinic")
+    out = pd.DataFrame({
+        "Site": g.size().index,
+        "Students": g["student_name"].nunique().values,
+        "Avg Patients/Student": g["patients"].mean().round(1).values,
+        "Avg Total Codes/Student": g["total_codes"].mean().round(1).values,
+        "Avg Unique Codes/Student": g["unique_codes"].mean().round(1).values,
+    })
+    if minStudents and minStudents > 1:
+        out = out[out["Students"] >= minStudents]
+    return out.sort_values("Avg Patients/Student", ascending=False).reset_index(drop=True)
+
+
+def dtcVsOthersExposure(exposureDf, dtcName="DTC"):
+    """DTC vs the pooled average of all other sites, per student, on the three
+    exposure metrics. Returns a DF: Metric, DTC, Other sites, Difference, % vs others."""
+    cols = ["Metric", dtcName, "Other sites (avg)", "Difference", "% vs others"]
+    if exposureDf is None or exposureDf.empty or dtcName not in set(exposureDf["external_clinic"]):
+        return pd.DataFrame(columns=cols)
+    dtc = exposureDf[exposureDf["external_clinic"] == dtcName]
+    rest = exposureDf[exposureDf["external_clinic"] != dtcName]
+    rows = []
+    for label, col in (("Avg patients / student", "patients"),
+                       ("Avg total item codes / student", "total_codes"),
+                       ("Avg unique item codes / student", "unique_codes")):
+        d = dtc[col].mean()
+        o = rest[col].mean() if not rest.empty else float("nan")
+        diff = d - o
+        pct = (diff / o * 100) if o else float("nan")
+        rows.append({"Metric": label, dtcName: round(d, 1),
+                     "Other sites (avg)": round(o, 1) if pd.notna(o) else None,
+                     "Difference": round(diff, 1) if pd.notna(diff) else None,
+                     "% vs others": round(pct, 1) if pd.notna(pct) else None})
+    return pd.DataFrame(rows)
+
+
+def _xlHighlightPoints(series, highlightIdx, color=XL_ACCENT):
+    """Recolour specific category bars in a single-series chart (e.g. DTC/MDC)."""
+    from openpyxl.chart.series import DataPoint
+    for i in highlightIdx:
+        dp = DataPoint(idx=int(i))
+        dp.graphicalProperties = GraphicalProperties(solidFill=color)
+        series.data_points.append(dp)
+
+
+def _xlClinicBar(ws, df, valueCol, catCol, title, yTitle, anchor, startRow,
+                 highlightNames=(), baseColor=XL_BLUE, highColor=XL_ACCENT):
+    """Single-series column chart over sites, DTC/MDC bars recoloured."""
+    if df is None or df.empty or valueCol not in df.columns:
+        return
+    cols = list(df.columns); n = len(df)
+    chart = BarChart(); chart.type = "col"
+    vIdx = cols.index(valueCol) + 1; cIdx = cols.index(catCol) + 1
+    chart.add_data(Reference(ws, min_col=vIdx, min_row=startRow, max_row=startRow + n),
+                   titles_from_data=True)
+    chart.set_categories(Reference(ws, min_col=cIdx, min_row=startRow + 1, max_row=startRow + n))
+    chart.series[0].graphicalProperties.solidFill = baseColor
+    hi = [i for i, nm in enumerate(df[catCol].tolist()) if nm in set(highlightNames)]
+    if hi:
+        _xlHighlightPoints(chart.series[0], hi, highColor)
+    chart.legend = None
+    if n <= 22:
+        chart.dLbls = _xlDataLabels()
+    w, h = _xlChartSize(n, perCategory=0.9, minWidth=22, maxWidth=60, height=12)
+    _xlStyleChart(chart, title, xTitle="Placement site", yTitle=yTitle,
+                  width=w, height=h, xTickRotation=-45 if n > 8 else None)
+    ws.add_chart(chart, anchor)
+
+
+def buildClinicComparisonWorkbook(engine, cohort, outPath, *, dtcName="DTC",
+                                  attended=True, minStudents=1, excludeRotations=(8,), today=None):
+    """One-sheet clinical-exposure comparison across placement sites:
+    DTC-vs-other-sites summary + per-site table + three bar charts
+    (avg patients, avg total item codes, avg unique item codes per student;
+    DTC/MDC bars highlighted). Returns the output path."""
+    exposureDf = getClinicStudentExposure(engine, cohort, attended=attended,
+                                          excludeRotations=excludeRotations)
+    siteDf = summariseClinicExposure(exposureDf, minStudents=minStudents)
+    cmpDf = dtcVsOthersExposure(exposureDf, dtcName=dtcName)
+
+    wb = Workbook(); ws = wb.active; ws.title = "Clinical Exposure"
+    ws.sheet_view.showGridLines = False
+    r = _xlTitle(ws, 1, f"{cohort} — clinical exposure by placement site", size=16, span=10)
+    r = _xlNote(ws, r, "Average student clinical exposure at each external placement site: patients seen, "
+                       "total item codes (volume of procedures) and unique item codes (variety), averaged "
+                       "per student. Use this to compare DTC with the other sites.", span=12)
+    if excludeRotations:
+        _rx = ", ".join(f"Rotation {int(x)}" for x in excludeRotations)
+        r = _xlNote(ws, r, f"Excludes: {_rx} (incomplete).", span=12)
+    r += 1
+    # DTC vs other sites (headline)
+    cmpStart = r
+    r = _xlWriteDf(ws, cmpDf, startRow=cmpStart, title="DTC vs other sites (per student)",
+                   tableName=f"tblDtcExp_{cohort}",
+                   numFmts={dtcName: "0.0", "Other sites (avg)": "0.0",
+                            "Difference": "0.0", "% vs others": "0.0"})
+    # Per-site table
+    siteStart = r
+    r = _xlWriteDf(ws, siteDf, startRow=siteStart, title="All sites (per student)",
+                   tableName=f"tblSitesExp_{cohort}",
+                   numFmts={c: "0.0" for c in siteDf.columns if c not in ("Site", "Students")})
+    # Three bar charts, DTC/MDC highlighted
+    chartCol = get_column_letter(len(siteDf.columns) + 2) if not siteDf.empty else "H"
+    _xlClinicBar(ws, siteDf, "Avg Patients/Student", "Site",
+                 "Avg patients per student", "Patients",
+                 f"{chartCol}{siteStart}", siteStart + 1, highlightNames=(dtcName, "MDC"))
+    _xlClinicBar(ws, siteDf, "Avg Total Codes/Student", "Site",
+                 "Avg total item codes per student", "Total item codes",
+                 f"{chartCol}{siteStart + 24}", siteStart + 1, highlightNames=(dtcName, "MDC"))
+    _xlClinicBar(ws, siteDf, "Avg Unique Codes/Student", "Site",
+                 "Avg unique item codes per student", "Unique item codes",
+                 f"{chartCol}{siteStart + 48}", siteStart + 1, highlightNames=(dtcName, "MDC"))
+    _xlFreezeAndFilter(ws, f"A{siteStart + 1}"); _xlPrintSetup(ws)
+
+    Path(outPath).parent.mkdir(parents=True, exist_ok=True)
+    wb.save(outPath)
+    print(f"[clinic-exposure] {cohort}: wrote {outPath} ({0 if siteDf is None else len(siteDf)} sites)")
+    return outPath

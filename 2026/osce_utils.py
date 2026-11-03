@@ -622,6 +622,87 @@ FINAL_SCORE_HEADERS = {
 }
 
 
+def difficultyWeightedScaling(weights="invcut", label="Difficulty-wtd /100"):
+    """Build a final-score scaling: a WEIGHTED AVERAGE of station %s where each station's weight
+    reflects its DIFFICULTY. Returns ("label", func) for finalScoreMethods.
+
+      weights = "invcut"  (default): w_i = 1 / cut_i  -> lower cut = harder station = higher weight.
+              = "invmean"          : w_i = 1 / stationMean_i
+              = "inv_sd"           : w_i = 1 / stationSD_i
+              = callable(cut, mean, sd, ck) -> w   (any formula; return a constant for flat weights)
+              = dict {ck or sheet-title: w}        (HARD per-station weights; stations not listed -> 1/cut)
+
+      mark = clip( sum(score_i * w_i) / sum(w_i) ).  Note a constant factor in w cancels, so "invcut"
+      is numerically identical to the built-in perStationWeighted (w = 100/cut); this is its
+      configurable twin. Stays on the raw 0-100 scale (no 50 pass-anchor).
+    """
+    def _w(cut, mean, sd, ck, titles):
+        if callable(weights):
+            return weights(cut, mean, sd, ck)
+        if isinstance(weights, dict):
+            if ck in weights: return weights[ck]
+            t = titles.get(ck)
+            if t in weights: return weights[t]
+            return (1.0 / cut) if cut else 0.0
+        if weights in (None, "invcut"): return (1.0 / cut) if cut else 0.0
+        if weights == "invmean":        return (1.0 / mean) if mean else 0.0
+        if weights == "inv_sd":         return (1.0 / sd) if sd else 0.0
+        raise ValueError(f"unknown weights spec {weights!r}")
+    def f(students, ctx):
+        titles = ctx.get("stnTitleByCk", {})
+        out = {}
+        for st, d in students.items():
+            cks = d.get("cks") or [None] * len(d["stn"])
+            num = den = 0.0
+            for (s, c, m, sd), ck in zip(d["stn"], cks):
+                w = _w(c, m, sd, ck, titles)
+                if w:
+                    num += s * w; den += w
+            out[st] = _clip100(num / den) if den else d["raw"]
+        return out
+    return (label, f)
+
+# register the default (w = 1/cut) so it is selectable by name in finalScoreMethods
+FINAL_SCORE_SCALINGS["difficultyWeighted"] = difficultyWeightedScaling()[1]
+FINAL_SCORE_HEADERS["difficultyWeighted"] = "Difficulty-wtd /100"
+
+# weight = stationMean / stationCut : up-weights stations where the cohort scored well ABOVE the cut
+# (lenient / "easy" stations, big headroom); down-weights hard/discriminating stations (mean ~ cut).
+FINAL_SCORE_SCALINGS["meanCutWeighted"] = difficultyWeightedScaling(
+    weights=lambda cut, mean, sd, ck: (mean / cut) if cut else 0.0, label="Wtd mean/cut")[1]
+FINAL_SCORE_HEADERS["meanCutWeighted"] = "Wtd mean/cut"
+
+
+def perStationZScaled(mean=50.0, sd=10.0, restandardize=True, label=None):
+    """Standardised per-station z aggregate -> ("label", func) for finalScoreMethods.
+    Each station score is converted to a z against THAT station's cohort mean/SD, the z's are
+    averaged, then rescaled to a readable scale:
+        z_i   = (x_i - stationMean_i) / stationSD_i
+        zbar  = mean(z_i over the student's stations)
+        mark  = clip( mean + sd * zbar )                       if restandardize=False
+              = clip( mean + sd * (zbar - mu_zbar)/sigma_zbar ) if restandardize=True (default)
+    restandardize=True gives an output with EXACTLY the requested mean/sd (e.g. 50 +/- 10), i.e. a
+    true standardised scale; False just shifts/scales the raw mean-z (spread then < sd, like perStationZ).
+    NORM-REFERENCED: a mark states standing relative to THIS cohort (good for within-cohort ranking,
+    not for an absolute standard or year-on-year comparison)."""
+    def f(students, ctx):
+        zbar = {}
+        for st, d in students.items():
+            zs = [(x - m) / s for (x, c, m, s) in d["stn"] if s and s > 0]
+            zbar[st] = (sum(zs) / len(zs)) if zs else 0.0
+        if restandardize:
+            vals = list(zbar.values())
+            mu = (sum(vals) / len(vals)) if vals else 0.0
+            sig = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+            return {st: _clip100(mean + sd * ((z - mu) / sig if sig else 0.0)) for st, z in zbar.items()}
+        return {st: _clip100(mean + sd * z) for st, z in zbar.items()}
+    return (label or f"Std {mean:.0f}/{sd:.0f}", f)
+
+# default standardised aggregate on a 50 +/- 10 scale
+FINAL_SCORE_SCALINGS["perStationZ50"] = perStationZScaled()[1]
+FINAL_SCORE_HEADERS["perStationZ50"] = "Std 50/10"
+
+
 def resolveFinalScoreMethods(methods):
     """Normalise finalScoreMethods into [(header, func)]. Items may be a registry NAME
     (FINAL_SCORE_SCALINGS) or a (header, func(students, ctx)->{st:mark}) tuple. None/[] -> rawMean only."""
@@ -827,10 +908,92 @@ def buildHarshnessFigure(spec, harsh, stMeanPct, imgDir):
 
 
 # ───────────────────────── workbook assembly ─────────────────────────
+# ── OSCE examiner comments sheet (added 2026-10-28) ─────────────────────────────────────────
+# Free-text fields about the OSCE/station itself (not the per-student feedback). DDS2 forms use
+# "comments-on-the-osce"; DDS4 forms have no such box and use "internal-comments" instead.
+OSCE_COMMENT_KEYS = OrderedDict([
+    ("comments-on-the-osce", "OSCE Comments"),
+    ("internal-comments", "Internal Comments"),
+])
+
+
+def collectOsceComments(records, commentKeys=None):
+    """One row per (form, comment field) with non-blank text, sorted by station -> assessor.
+    `records` = loadOsceRecords output (submitted, cohort-filtered, ignore list applied).
+    `commentKeys` = {textKey: label}; defaults to OSCE_COMMENT_KEYS."""
+    keys = OSCE_COMMENT_KEYS if commentKeys is None else commentKeys
+    rows = []
+    for r in records:
+        fd = r.get("form_data") or {}
+        texts = fd.get("texts") or {}
+        cks = list((fd.get("checklists") or {}).keys())
+        for key, label in keys.items():
+            txt = str(texts.get(key) or "").strip()
+            if not txt:
+                continue
+            st = r.get("station")
+            rows.append({
+                "station": st,
+                "sheet": ", ".join(stationTitle(st, ck) for ck in cks) if cks else f"S{st}",
+                "checklist": ", ".join(cks),
+                "circuit": r.get("circuit") or "",
+                "assessor": r.get("assessor") or "",
+                "student": r.get("student") or "",
+                "studentNo": str(r.get("student_number") or "").strip(),
+                "field": label,
+                "comment": txt,
+            })
+    def stKey(x):
+        try:
+            return (0, int(x["station"]))
+        except (TypeError, ValueError):
+            return (1, str(x["station"]))
+    rows.sort(key=lambda x: (stKey(x), x["checklist"], x["assessor"].lower(), x["field"], x["comment"]))
+    return rows
+
+
+def writeOsceCommentsSheet(wb, rows, cohortLabel="", sheetName="OSCE Comments"):
+    """Add a styled comments sheet to workbook `wb`. If `rows` is empty, print a notice and add
+    nothing. Returns the worksheet or None."""
+    tag = (cohortLabel or "this cohort").strip()
+    if not rows:
+        print(f"No such comments present for {tag}.")
+        return None
+    ws = wb.create_sheet(sheetName)
+    ws.sheet_view.showGridLines = False
+    side = Side(style="thin", color="BFBFBF"); box = Border(left=side, right=side, top=side, bottom=side)
+    hFont = Font(name="Arial", size=10, bold=True, color="FFFFFF"); hFill = PatternFill("solid", fgColor=HEAD)
+    bFont = Font(name="Arial", size=10)
+    ws.cell(1, 1, f"{tag} OSCE — examiner comments: {len(rows)} comment(s) across "
+                  f"{len({r['assessor'] for r in rows})} assessor(s)").font = Font(name="Arial", size=12, bold=True, color=HEAD)
+    heads = ["Station", "Sheet", "Checklist", "Circuit", "Assessor", "Student", "Student No", "Field", "Comment"]
+    keys = ["station", "sheet", "checklist", "circuit", "assessor", "student", "studentNo", "field", "comment"]
+    widths = [9, 16, 26, 9, 22, 24, 12, 18, 90]
+    for c, h in enumerate(heads, 1):
+        cc = ws.cell(3, c, h); cc.font = hFont; cc.fill = hFill; cc.border = box
+        cc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    rr = 4
+    for r in rows:
+        for c, k in enumerate(keys, 1):
+            v = r[k]
+            if k == "studentNo" and str(v).isdigit():
+                v = int(v)
+            cc = ws.cell(rr, c, v); cc.font = bFont; cc.border = box
+            cc.alignment = Alignment(horizontal=("center" if k in ("station", "circuit", "studentNo") else "left"),
+                                     vertical="top", wrap_text=(k in ("comment", "checklist", "sheet")))
+        rr += 1
+    for c, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.freeze_panes = "A4"; ws.auto_filter.ref = f"A3:{get_column_letter(len(heads))}{rr-1}"
+    print(f"{tag}: wrote {len(rows)} OSCE comment(s) to sheet '{sheetName}'.")
+    return ws
+
+
 def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel="", borderlineGr=2,
                       ignoreStudentNumbers=None, rosterPath="studentEmailList.csv", cohort=None,
                       reverseGr="auto", excludeChecklists=None, grScoreBands=None, scoreConfig=None,
-                      stationOverrides=None, allowedStationFailures=None, finalScoreMethods=None):
+                      stationOverrides=None, allowedStationFailures=None, finalScoreMethods=None,
+                      commentKeys=None):
     """
     Build TWO workbooks from an OSCE JSON dump:
       stationPath  : station workbook (Read Me, Station Summary, per-station detail, MC Item Stats, Checklist Legend)
@@ -842,6 +1005,8 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
     `reverseGr` (True/False/"auto") controls Global-Rating direction: "auto" (default) detects it
     from the scale labels — DDS2 stores 1=Excellent..5=Fail (reversed), DDS4 stores 1=Fail..5=Excellent
     (not reversed). Pass True/False to force it.
+    `commentKeys` ({textKey: label}, default OSCE_COMMENT_KEYS) picks the examiner free-text
+    fields written to the station workbook's "OSCE Comments" sheet; none found -> a notice is printed.
     Returns a summary dict.
     """
     effectiveCohort = cohort if cohort is not None else (cohortLabel or None)
@@ -1166,6 +1331,10 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
     asr.column_dimensions["A"].width = 24; asr.column_dimensions["B"].width = 11
     asr.column_dimensions["C"].width = 15; asr.column_dimensions["D"].width = 90
     asr.freeze_panes = "A4"; asr.auto_filter.ref = f"A3:D{rr-1}"
+
+    # ---- OSCE Comments (examiner free text about the OSCE/station) ----
+    osceComments = collectOsceComments(records, commentKeys)
+    writeOsceCommentsSheet(wb, osceComments, cohortLabel)
 
     os.makedirs(os.path.dirname(stationPath) or ".", exist_ok=True)
     wb.save(stationPath)
@@ -1566,17 +1735,18 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
                 vs = [pct1(r["score"]) for r in s["rows"] if r["score"] is not None]
                 stnMean[s["ck"]] = (sum(vs) / len(vs)) if vs else 0.0
                 stnSD[s["ck"]] = (statistics.stdev(vs) if len(vs) > 1 else 0.0)
-        studentsData = {}                                      # st -> {"raw", "stn":[(score,cut,mean,sd)]}
+        studentsData = {}                                      # st -> {"raw", "stn":[(score,cut,mean,sd)], "cks":[ck]}
         for st, byck in srow.items():
-            stn = [(pct1(byck[ck]["score"]), blr[ck]["cutPct"], stnMean[ck], stnSD[ck])
-                   for ck in totalCks if ck in byck and byck[ck]["score"] is not None]
-            studentsData[st] = {"raw": outcome[st]["avg"], "stn": stn}
+            cksOrdered = [ck for ck in totalCks if ck in byck and byck[ck]["score"] is not None]
+            stn = [(pct1(byck[ck]["score"]), blr[ck]["cutPct"], stnMean[ck], stnSD[ck]) for ck in cksOrdered]
+            studentsData[st] = {"raw": outcome[st]["avg"], "stn": stn, "cks": cksOrdered}
         rawAvgs = [outcome[st]["avg"] for st in outcome]
         cutVals = [blr[ck]["cutPct"] for ck in totalCks]
         ctx = {"meanCut": (sum(cutVals) / len(cutVals)) if cutVals else 0.0,
                "grandMean": (sum(rawAvgs) / len(rawAvgs)) if rawAvgs else 0.0,
                "rawSD": (statistics.stdev(rawAvgs) if len(rawAvgs) > 1 else 0.0),
-               "nStn": len(cutVals)}
+               "nStn": len(cutVals),
+               "stnTitleByCk": {s["ck"]: stationTitle(s["st"], s["ck"]) for s in specs}}
         colVals = {hd: fn(studentsData, ctx) for hd, fn in scMethods}   # {header: {st: mark}}
         for st in outcome:
             outcome[st]["finals"] = [(hd, round(colVals[hd].get(st, 0.0), 1)) for hd, _ in scMethods]
@@ -1664,6 +1834,7 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
                          "fail": sum(1 for st in outcome if outcome[st]["result"] == "FAIL"),
                          "n": len(outcome)} if allowedStationFailures is not None else None),
         "recordsUsed": len(records),
+        "osceComments": len(osceComments),
         "stationWorkbook": stationPath, "analysisWorkbook": analysisPath, "imgDir": imgDir,
         "ignored": sorted(IGNORE_STUDENT_NUMBERS if ignoreStudentNumbers is None else ignoreStudentNumbers),
     }
@@ -1792,31 +1963,49 @@ FB_FAIL = "#C00000"
 FB_LOGO_MEDIA = "xl/media/image1.png"   # UniMelb logo inside the template workbook
 
 
-def readStationSheet(ws):
-    """One station sheet -> list of {name, studentNo, score, gr, feedback, bfInfo} (rows with a Score only)."""
+def readStationSheet(ws, feedbackCol="Feedback", bfCol="Borderline/Fail Info"):
+    """One station sheet -> list of {name, studentNo, score, gr, feedback, bfInfo} (rows with a Score only).
+    feedbackCol : column read as the examiner comment (e.g. "Proofread comments"); must exist on the sheet
+    bfCol       : column read as Borderline/Fail Info (None = not read)
+    Rows whose Score (%) or Student No is not numeric (e.g. notes like 'Pass = 43.9' written below the
+    table) are skipped and listed in a printed warning, so they never count as data."""
     hdr = [(str(c.value).strip() if c.value is not None else "") for c in ws[1]]
     col = {h: i for i, h in enumerate(hdr)}
     need = ["Student Name", "Student No", "Score (%)"]
     if any(h not in col for h in need):
         raise ValueError(f"Sheet '{ws.title}' is missing one of {need}")
-    out = []
-    for r in ws.iter_rows(min_row=2, values_only=True):
+    if feedbackCol and feedbackCol != "Feedback" and feedbackCol not in col:
+        raise ValueError(f"Sheet '{ws.title}' has no '{feedbackCol}' column")
+    def toNum(v):                                            # numeric value or None (text notes -> None)
+        try:
+            return float(str(v).strip().rstrip("%")) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    out, skippedRows = [], []
+    for rowIdx, r in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         sc = r[col["Score (%)"]]
         if sc is None or str(sc).strip() == "":
             continue
-        sn = r[col["Student No"]]
+        scNum, snNum = toNum(sc), toNum(r[col["Student No"]])
+        if scNum is None or snNum is None:                    # note / footer row, not a student
+            skippedRows.append(rowIdx)
+            continue
         out.append({
             "name": str(r[col["Student Name"]] or "").strip(),
-            "studentNo": str(int(float(sn))) if sn not in (None, "") else "",
-            "score": float(sc),
+            "studentNo": str(int(snNum)),
+            "score": scNum,
             "gr": r[col["GR"]] if "GR" in col else None,
-            "feedback": str(r[col["Feedback"]] or "").strip() if "Feedback" in col else "",
-            "bfInfo": str(r[col["Borderline/Fail Info"]] or "").strip() if "Borderline/Fail Info" in col else "",
+            "feedback": str(r[col[feedbackCol]] or "").strip() if feedbackCol in col else "",
+            "bfInfo": str(r[col[bfCol]] or "").strip() if bfCol and bfCol in col else "",
         })
+    if skippedRows:
+        print(f"[{ws.title}] ignored {len(skippedRows)} non-data row(s) (non-numeric Score/Student No): rows {skippedRows}")
     return out
 
 
-def loadFeedbackStations(stationPath, stationMeta=None, excludeSheets=None):
+def loadFeedbackStations(stationPath, stationMeta=None, excludeSheets=None, feedbackCol="Feedback",
+                         bfCol="Borderline/Fail Info"):
     """
     Read the cleaned station workbook. Returns (stations, skipped):
       stations : OrderedDict sheetTitle -> {"meta": {...}, "rows": [...]}, in stationMeta order
@@ -1833,7 +2022,7 @@ def loadFeedbackStations(stationPath, stationMeta=None, excludeSheets=None):
                 continue
             if title not in present:
                 raise KeyError(f"Station sheet '{title}' (Station {m.get('label')}) not found in {stationPath}")
-            stations[title] = {"meta": m, "rows": readStationSheet(present[title])}
+            stations[title] = {"meta": m, "rows": readStationSheet(present[title], feedbackCol=feedbackCol, bfCol=bfCol)}
         skipped = []
         for t, ws in present.items():
             if t in stations:
@@ -1844,6 +2033,64 @@ def loadFeedbackStations(stationPath, stationMeta=None, excludeSheets=None):
     finally:
         wb.close()
     return stations, skipped
+
+
+def loadAnalysisScores(analysisPath):
+    """BLR workbook 'Student x Station' -> {sheetTitle: {studentNo: score %}} (station columns only)."""
+    wb = openpyxl.load_workbook(analysisPath, data_only=True, read_only=True)
+    try:
+        rows = list(wb["Student x Station"].iter_rows(values_only=True))
+    finally:
+        wb.close()
+    hdr = [str(v).strip() if v is not None else "" for v in rows[0]]
+    snCol = hdr.index("Student No")
+    stCols = {i: h for i, h in enumerate(hdr) if re.match(r"^S[\d+]+ ", h)}
+    out = {h: {} for h in stCols.values()}
+    for r in rows[1:]:
+        if not r or r[snCol] in (None, ""):
+            continue
+        sn = str(int(float(r[snCol])))
+        for i, h in stCols.items():
+            if isinstance(r[i], (int, float)):
+                out[h][sn] = float(r[i])
+    return out
+
+
+def loadOutcomeMarks(analysisPath, markColumn="Per-stn cut /100", sheetName="OSCE Outcome"):
+    """BLR workbook 'OSCE Outcome' -> {studentNo: mark} from `markColumn` (e.g. "Per-stn cut /100", "Avg % (raw)")."""
+    wb = openpyxl.load_workbook(analysisPath, data_only=True, read_only=True)
+    try:
+        rows = list(wb[sheetName].iter_rows(values_only=True))
+    finally:
+        wb.close()
+    hi = next(i for i, r in enumerate(rows) if r and r[0] == "Student Name")
+    hdr = [str(v).strip() if v is not None else "" for v in rows[hi]]
+    if markColumn not in hdr:
+        raise ValueError(f"'{markColumn}' not in {sheetName} columns {[h for h in hdr if h]}")
+    sc, mc = hdr.index("Student No"), hdr.index(markColumn)
+    return {str(int(float(r[sc]))): float(r[mc]) for r in rows[hi + 1:]
+            if r and r[sc] not in (None, "") and isinstance(r[mc], (int, float))}
+
+
+def applyAnalysisScores(stations, analysisScores):
+    """Replace each station row's score with the analysis-workbook score (same student number).
+    Returns {"changed": n, "missing": [(sheet, studentNo, name)]}; rows with no analysis score are dropped."""
+    changed, missing = 0, []
+    for title, st in stations.items():
+        col = analysisScores.get(title)
+        if col is None:
+            raise KeyError(f"Station '{title}' not in the analysis workbook 'Student x Station'")
+        keep = []
+        for r in st["rows"]:
+            v = col.get(r["studentNo"])
+            if v is None:
+                missing.append((title, r["studentNo"], r["name"]))
+                continue
+            changed += abs(v - r["score"]) > 1e-9
+            r["score"] = v
+            keep.append(r)
+        st["rows"] = keep
+    return {"changed": changed, "missing": missing}
 
 
 def loadAppliedCuts(analysisPath):
@@ -1965,9 +2212,10 @@ def commentHtml(text):
 
 def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohortLabel="DDS4",
                             hideOverall=False, logoBytes=None, showCutoff=True, maxScore=100, stationGapCm=0.9,
-                            bfHeading="failOnly", bfText="always"):
+                            bfHeading="failOnly", bfText="always", showSdbm=True):
     """
     One student's feedback PDF (A4). OVERALL EXAM OUTCOME = student["overallOutcome"].
+    showSdbm=False hides every 2 SDBM item (summary count, per-station YES/NO, footnote).
     hideOverall=True withholds the student's overall MARK (outcome + station counts stay).
     bfHeading : "Borderline/Fail information:" heading — "always" | "failOnly" (only on FAILED stations) | "never"
     bfText    : the Borderline/Fail Info text itself — "always" | "failOnly" | "never"
@@ -1979,6 +2227,7 @@ def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohort
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
     from reportlab.lib.utils import ImageReader
+    from reportlab.pdfbase.pdfmetrics import stringWidth as _rlStringWidth
     from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, NextPageTemplate, Paragraph as RlPara, Table as RlTable,
                                     TableStyle as RlTableStyle, Spacer as RlSpacer, KeepTogether)
 
@@ -2046,12 +2295,12 @@ def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohort
     if hideOverall:                                   # outcome shown, overall mark withheld
         sumRows.append([outcomeCell, None, None])
     else:
-        sumRows.append([outcomeCell, ("MARK:", f"{fmtNum(student['avg'])}%", False), None])
+        sumRows.append([outcomeCell, ("MARK:", f"{fmtNum(student.get('mark', student['avg']))}%", False), None])
     ncLabels = [f"Station {stations[t]['meta'].get('label', '')} ({stations[t]['meta'].get('domain', '')})"
                 for t in stations if not stStats[t].get("counted", True) and t in student["results"]]
     sumRows.append([("NUMBER OF<br/>STATIONS PASSED:", student["nPass"], False),
                     ("NUMBER OF<br/>STATIONS FAILED:", student["nFail"], student["nFail"] > 0),
-                    ("NUMBER OF<br/>STATIONS 2 SDBM:", student["nSdbm"], student["nSdbm"] > 0)])
+                    ("NUMBER OF<br/>STATIONS 2 SDBM:", student["nSdbm"], student["nSdbm"] > 0) if showSdbm else None])
     flow += [fieldGrid(sumRows, gridW), RlSpacer(1, 3)]
     if ncLabels:
         flow += [RlPara("<b>Note:</b> " + _xmlEscape(", ".join(ncLabels)) +
@@ -2060,8 +2309,8 @@ def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohort
                         + ("its" if len(ncLabels) == 1 else "their") + " outcome and cutoff are shown as N/A.",
                         S["note"]), RlSpacer(1, 3)]
     flow += [
-             RlPara(f"maximum station score = {maxScore} &nbsp;&nbsp;·&nbsp;&nbsp; 2 SDBM = more than two standard "
-                    f"deviations below the cohort average for that station", S["max"]),
+             RlPara(f"maximum station score = {maxScore}" + (" &nbsp;&nbsp;·&nbsp;&nbsp; 2 SDBM = more than two standard "
+                    "deviations below the cohort average for that station" if showSdbm else ""), S["max"]),
              RlSpacer(1, 0.25 * cm)]
 
     # ── one block per station ──
@@ -2070,8 +2319,14 @@ def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohort
         if res is None:
             continue
         m, ss = st["meta"], stStats[title]
+        # TOPIC moves to its own line when domain + type + topic would not fit on one line
+        # (otherwise the topic text wraps under DOMAIN mid-phrase)
+        oneLineW = (_rlStringWidth("DOMAIN:  STATION TYPE:  TOPIC: ", "Helvetica-Bold", 8.5)
+                    + _rlStringWidth(f"{m.get('domain', '')}{m.get('type', '')}{m.get('topic', '')}", "Helvetica", 8.5)
+                    + 6 * _rlStringWidth(" ", "Helvetica", 8.5) * 3)
+        topicSep = "<br/>" if oneLineW > 0.82 * innerW - 6 else " &nbsp;&nbsp;&nbsp; "
         metaTxt = (f"<b>DOMAIN:</b> {_xmlEscape(m.get('domain', ''))} &nbsp;&nbsp;&nbsp; "
-                   f"<b>STATION TYPE:</b> {_xmlEscape(m.get('type', ''))} &nbsp;&nbsp;&nbsp; "
+                   f"<b>STATION TYPE:</b> {_xmlEscape(m.get('type', ''))}{topicSep}"
                    f"<b>TOPIC:</b> {_xmlEscape(m.get('topic', ''))}")
         head = RlTable([[RlPara(f"STATION {_xmlEscape(m.get('label', ''))}", S["stn"]), RlPara(metaTxt, S["stnMeta"])]],
                        colWidths=[0.18 * innerW, 0.82 * innerW])
@@ -2081,9 +2336,10 @@ def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohort
         cutTxt = (fmtNum(ss["displayCutPct"]) if ss.get("counted", True) else "N/A") if showCutoff else None
         row1 = [("OUTCOME:", res["outcome"], fail), ("SCORE:", fmtNum(res["score"]), fail),
                 ("STATION CUTOFF:", cutTxt, False) if showCutoff else None]
-        row2 = [("2 SDBM:", "YES" if res["sdbm"] else "NO", res["sdbm"]),
-                ("COHORT AVERAGE:", fmtNum(ss["mean"]), False),
-                ("COHORT RANGE:", f"{fmtNum(ss['min'])} - {fmtNum(ss['max'])}", False)]
+        cohortCells = [("COHORT AVERAGE:", fmtNum(ss["mean"]), False),
+                       ("COHORT RANGE:", f"{fmtNum(ss['min'])} - {fmtNum(ss['max'])}", False)]
+        row2 = ([("2 SDBM:", "YES" if res["sdbm"] else "NO", res["sdbm"])] + cohortCells if showSdbm
+                else cohortCells + [None])
         grid = fieldGrid([row1, row2], gridW)
 
         parts = []
@@ -2146,11 +2402,348 @@ def buildStudentFeedbackPdf(outPath, student, stations, stStats, examAvg, cohort
     return outPath
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STUDENT OSCE FEEDBACK PDF — V2 LAYOUT (2026-11-02)
+#   page 1  : navy header, KPI tiles, rule note, "Results at a glance" table
+#   page 2+ : one card per station (outcome strip, DOMAIN / STATION TYPE / TOPIC,
+#             figures row, CBD-style score bar, old-style EXAMINER COMMENTS box)
+#   colours : PASS = UniMelb blue, FAIL = CBD "N" grade burnt orange, cohort avg = CBD orange
+# ══════════════════════════════════════════════════════════════════════════════
+FB2_NAVY = "#000F46"        # header, headings, comments bar
+FB2_PASS = "#094183"        # PASS badge / strip / marker
+FB2_FAIL = "#A84300"        # FAIL (CBD report N-grade colour)
+FB2_AVG = "#E07B00"         # cohort average line (CBD report orange)
+FB2_NA = "#8A93A3"          # N/A (station not counted)
+FB2_LIGHT = "#E8EEF7"       # tiles / figure rows
+FB2_BELOW_CUT = "#F2DED0"   # bar zone below the station cutoff
+FB2_PAGE_COLORS = {         # pageColor presets for the V2 PDF background (or pass any "#RRGGBB")
+    "white": "#FFFFFF",
+    "paper": "#F7F4EC",     # warm paper (default)
+    "mist": "#F1F4F9",      # cool mist
+    "sage": "#F0F4E6",      # soft sage (old template green, faint)
+    "bluegrey": "#E9EDF3",  # blue-grey
+}
+
+
+def buildStudentFeedbackPdfV2(outPath, student, stations, stStats, examAvg=None, cohortLabel="DDS4",
+                              hideOverall=False, logoBytes=None, showCutoff=True, maxScore=100,
+                              bfHeading="failOnly", bfText="always", showSdbm=True, examLabel="OSCE",
+                              ruleText=None, stationGapCm=0.35, pageColor="paper"):
+    """
+    One student's feedback PDF in the V2 layout (same inputs as buildStudentFeedbackPdf).
+      hideOverall : withhold the OVERALL MARK tile (outcome + counts stay)
+      showSdbm    : False hides every 2 SDBM item (tile, table column, card figure, note)
+      showCutoff  : False hides cutoff column / figure / bar marker
+      bfHeading / bfText : "always" | "failOnly" | "never" (Borderline/Fail Info, as V1)
+      examLabel   : sub-heading under the student name (e.g. "2026 OSCE")
+      ruleText    : sentence explaining the overall outcome rule (None = generic)
+      pageColor   : page background — preset in FB2_PAGE_COLORS ("white", "paper", "mist", "sage",
+                    "bluegrey") or a hex string "#RRGGBB"
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors as rlColors
+    from reportlab.lib.units import cm
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfbase.pdfmetrics import stringWidth as rlStringWidth
+    from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph as RlPara, Table as RlTable,
+                                    TableStyle as RlTableStyle, Spacer as RlSpacer, KeepTogether, Flowable,
+                                    PageBreak as RlPageBreak)
+
+    hx = rlColors.HexColor
+    navy, passC, failC, avgC, naC = hx(FB2_NAVY), hx(FB2_PASS), hx(FB2_FAIL), hx(FB2_AVG), hx(FB2_NA)
+    light, grey, line, white = hx(FB2_LIGHT), hx("#5B6475"), hx("#C9D2E3"), rlColors.white
+    outCol = lambda o: {"PASS": passC, "FAIL": failC}.get(o, naC)
+    W, H = A4
+    M, HDR = 1.5 * cm, 2.7 * cm
+    CW = W - 2 * M
+
+    def ps(name, **kw):
+        base = dict(fontName="Helvetica", fontSize=9, leading=11, textColor=rlColors.black)
+        base.update(kw)
+        return ParagraphStyle(name, **base)
+    S = {
+        "lab": ps("lab", fontName="Helvetica-Bold", fontSize=6.8, leading=8.5, textColor=grey),
+        "val": ps("val", fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=navy),
+        "valF": ps("valF", fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=failC),
+        "meta": ps("meta", fontSize=9, leading=11.5, textColor=navy),
+        "kpi": ps("kpi", fontName="Helvetica-Bold", fontSize=20, leading=23, textColor=navy),
+        "kpiF": ps("kpiF", fontName="Helvetica-Bold", fontSize=20, leading=23, textColor=failC),
+        "stNo": ps("stNo", fontName="Helvetica-Bold", fontSize=13, leading=16, textColor=navy),
+        "cmt": ps("cmt", fontSize=9, leading=12.5, textColor=hx("#1F2430")),
+        "bar": ps("bar", fontName="Helvetica-Bold", fontSize=8.5, leading=10, alignment=TA_CENTER, textColor=white),
+        "note": ps("note", fontSize=8, leading=10.5, textColor=grey),
+        "sec": ps("sec", fontName="Helvetica-Bold", fontSize=11, leading=13, textColor=navy),
+        "th": ps("th", fontName="Helvetica-Bold", fontSize=8.5, leading=10, textColor=white),
+        "thC": ps("thC", fontName="Helvetica-Bold", fontSize=8.5, leading=10, textColor=white, alignment=TA_CENTER),
+    }
+
+    class OutcomeBadge(Flowable):
+        """Rounded PASS / FAIL / N/A pill."""
+        def __init__(self, text, w=2.0 * cm, h=0.65 * cm, size=9):
+            super().__init__()
+            self.text, self.w, self.h, self.size = text, w, h, size
+        def wrap(self, *a):
+            return self.w, self.h
+        def draw(self):
+            c = self.canv
+            c.setFillColor(outCol(self.text))
+            c.roundRect(0, 0, self.w, self.h, self.h / 2, stroke=0, fill=1)
+            c.setFillColor(white)
+            c.setFont("Helvetica-Bold", self.size)
+            c.drawCentredString(self.w / 2, self.h / 2 - self.size * 0.35, self.text)
+
+    class ScoreBar(Flowable):
+        """CBD-style 0-100 bar: below-cut zone, cutoff (dashed navy), cohort avg (orange), student diamond.
+        Labels sit above their marker; an overlapping label moves up one level."""
+        def __init__(self, w, score, avg, cut, outcome, h=1.55 * cm):
+            super().__init__()
+            self.w, self.h, self.score, self.avg, self.cut, self.outcome = w, h, score, avg, cut, outcome
+        def wrap(self, *a):
+            return self.w, self.h
+        def draw(self):
+            c = self.canv
+            x0, x1 = 1.6 * cm, self.w - 0.3 * cm
+            X = lambda v: x0 + (x1 - x0) * max(0.0, min(100.0, v * 100.0 / maxScore)) / 100.0
+            by, bh = 0.42 * cm, 0.36 * cm
+            c.setFont("Helvetica-Bold", 9)
+            c.setFillColor(navy)
+            c.drawString(0, by + bh / 2 - 3, "Score %")
+            c.setFillColor(hx("#F2F6FC"))
+            c.rect(x0, by, x1 - x0, bh, stroke=0, fill=1)
+            if self.cut is not None:
+                c.setFillColor(hx(FB2_BELOW_CUT))
+                c.rect(x0, by, X(self.cut) - x0, bh, stroke=0, fill=1)
+            c.setStrokeColor(navy)
+            c.setLineWidth(0.6)
+            c.rect(x0, by, x1 - x0, bh, stroke=1, fill=0)
+            c.setFont("Helvetica", 6.5)
+            c.setFillColor(grey)
+            c.setStrokeColor(grey)
+            c.setLineWidth(0.4)
+            for t in range(0, 101, 10):
+                c.line(x0 + (x1 - x0) * t / 100, by, x0 + (x1 - x0) * t / 100, by - 2.5)
+                c.drawCentredString(x0 + (x1 - x0) * t / 100, by - 9, str(round(t * maxScore / 100)))
+            marks = []
+            if self.cut is not None:
+                c.setStrokeColor(navy)
+                c.setLineWidth(1.3)
+                c.setDash(2.2, 1.6)
+                c.line(X(self.cut), by - 1, X(self.cut), by + bh + 1)
+                c.setDash()
+                marks.append((X(self.cut), f"Cutoff {fmtNum(self.cut)}", navy))
+            c.setStrokeColor(avgC)
+            c.setLineWidth(1.8)
+            c.line(X(self.avg), by - 1, X(self.avg), by + bh + 1)
+            marks.append((X(self.avg), f"Cohort avg {fmtNum(self.avg)}", avgC))
+            sx, sy, d, col = X(self.score), by + bh / 2, 4.2, outCol(self.outcome)
+            p = c.beginPath()
+            p.moveTo(sx, sy + d); p.lineTo(sx + d, sy); p.lineTo(sx, sy - d); p.lineTo(sx - d, sy); p.close()
+            c.setFillColor(col)
+            c.setStrokeColor(white)
+            c.setLineWidth(0.8)
+            c.drawPath(p, stroke=1, fill=1)
+            marks.append((sx, f"You {fmtNum(self.score)}", col))
+            fs, gap, ly0, step, last = 7.5, 5, by + bh + 3, 9, []
+            c.setFont("Helvetica-Bold", fs)
+            for x, t, tc in sorted(marks, key=lambda m: m[0]):
+                w = rlStringWidth(t, "Helvetica-Bold", fs)
+                left = min(max(x - w / 2, x0 - 4), x1 + 4 - w)
+                lvl = next((i for i, r in enumerate(last) if left >= r + gap), len(last))
+                if lvl == len(last):
+                    last.append(0)
+                last[lvl] = left + w
+                c.setFillColor(tc)
+                c.drawString(left, ly0 + lvl * step, t)
+
+    def showFor(mode, fail):
+        return mode == "always" or (mode == "failOnly" and fail)
+
+    order = [t for t in stations if t in student["results"]]
+    flow = []
+
+    # ── page 1: KPI tiles ──
+    overall = student.get("overallOutcome") or "—"
+    tiles = [("OVERALL OUTCOME", OutcomeBadge(overall, w=2.8 * cm, h=0.85 * cm, size=10.5))]
+    if not hideOverall:
+        tiles.append(("OVERALL MARK", RlPara(f"{fmtNum(student.get('mark', student['avg']))}%", S["kpi"])))
+    tiles += [("STATIONS PASSED", RlPara(str(student["nPass"]), S["kpi"])),
+              ("STATIONS FAILED", RlPara(str(student["nFail"]), S["kpiF"] if student["nFail"] else S["kpi"]))]
+    if showSdbm:
+        tiles.append(("STATIONS 2 SDBM", RlPara(str(student["nSdbm"]), S["kpiF"] if student["nSdbm"] else S["kpi"])))
+    kpi = RlTable([[RlPara(l, S["lab"]) for l, _ in tiles], [v for _, v in tiles]],
+                  colWidths=[CW / len(tiles)] * len(tiles), rowHeights=[0.55 * cm, 1.05 * cm])
+    kpi.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, -1), light), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, 0), 8),
+                               ("LINEAFTER", (0, 0), (-2, -1), 1, white), ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
+                               ("LINEABOVE", (0, 0), (-1, 0), 2.5, navy)]))
+    notes = f"All station scores are out of {maxScore}."
+    if showCutoff:
+        notes += " <b>Station cutoff</b> is the standard-set pass mark for that station."
+    notes += " " + (ruleText or "The overall outcome is based on the number of stations failed.")
+    if showSdbm:
+        notes += " <b>2 SDBM</b> = more than two standard deviations below the cohort average for that station."
+    nc = [f"Station {stations[t]['meta'].get('label', '')} ({stations[t]['meta'].get('domain', '')})"
+          for t in order if not stStats[t].get("counted", True)]
+    if nc:
+        notes += (" " + _xmlEscape(", ".join(nc)) + (" is" if len(nc) == 1 else " are") +
+                  " not counted towards the number of stations passed/failed; outcome and cutoff are shown as N/A.")
+    flow += [kpi, RlSpacer(1, 7), RlPara(notes, S["note"]), RlSpacer(1, 18),
+             RlPara("RESULTS AT A GLANCE", S["sec"]), RlSpacer(1, 6)]
+
+    # ── page 1: overview table ──
+    cols = [("Station", 1.5 * cm, "th"), ("Domain", None, "th"), ("Station Type", 3.6 * cm, "th"),
+            ("Score", 1.3 * cm, "thC")]
+    if showCutoff:
+        cols.append(("Cutoff", 1.4 * cm, "thC"))
+    cols += [("Cohort avg", 2.2 * cm, "thC"), ("Outcome", 2.0 * cm, "thC")]
+    if showSdbm:
+        cols.append(("2 SDBM", 1.8 * cm, "thC"))
+    rows = [[RlPara(h, S[sty]) for h, _, sty in cols]]
+    tsx = [("BACKGROUND", (0, 0), (-1, 0), navy), ("FONT", (0, 1), (-1, -1), "Helvetica", 9.5),
+           ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (3, 1), (-1, -1), "CENTER"),
+           ("LINEBELOW", (0, 1), (-1, -1), 0.5, line), ("LEFTPADDING", (0, 0), (-1, -1), 7),
+           ("FONT", (0, 1), (0, -1), "Helvetica-Bold", 9.5), ("TEXTCOLOR", (0, 1), (0, -1), navy),
+           ("TEXTCOLOR", (2, 1), (2, -1), grey), ("FONT", (2, 1), (2, -1), "Helvetica", 8.5),
+           ("BOX", (0, 0), (-1, -1), 0.6, navy)]
+    for i, t in enumerate(order, 1):
+        m, ss, res = stations[t]["meta"], stStats[t], student["results"][t]
+        cutTxt = fmtNum(ss["displayCutPct"]) if ss.get("counted", True) and ss.get("displayCutPct") is not None else "N/A"
+        r = [m.get("label", ""), m.get("domain", ""), m.get("type", ""), fmtNum(res["score"])]
+        if showCutoff:
+            r.append(cutTxt)
+        r += [fmtNum(ss["mean"]), OutcomeBadge(res["outcome"], w=1.6 * cm, h=0.5 * cm, size=7.5)]
+        if showSdbm:
+            r.append("YES" if res["sdbm"] else "–")
+        rows.append(r)
+        if i % 2 == 0:
+            tsx.append(("BACKGROUND", (0, i), (-1, i), hx("#F3F6FB")))
+        if res["outcome"] == "FAIL":
+            tsx += [("TEXTCOLOR", (3, i), (3, i), failC), ("FONT", (3, i), (3, i), "Helvetica-Bold", 9.5)]
+        if showSdbm and res["sdbm"]:
+            tsx += [("TEXTCOLOR", (-1, i), (-1, i), failC), ("FONT", (-1, i), (-1, i), "Helvetica-Bold", 9.5)]
+    cw = [w for _, w, _ in cols]
+    cw[1] = CW - sum(w for w in cw if w)
+    rowH = 0.78 * cm if len(order) <= 16 else 0.6 * cm
+    ov = RlTable(rows, colWidths=cw, rowHeights=[0.75 * cm] + [rowH] * len(order), repeatRows=1)
+    ov.setStyle(RlTableStyle(tsx))
+    flow += [ov, RlPageBreak(), RlPara("STATION FEEDBACK", S["sec"]), RlSpacer(1, 8)]
+
+    # ── page 2+: one card per station ──
+    inner = CW - 0.8 * cm - 5
+    for t in order:
+        m, ss, res = stations[t]["meta"], stStats[t], student["results"][t]
+        fail = res["outcome"] == "FAIL"
+        counted = ss.get("counted", True)
+        cut = ss.get("displayCutPct") if (showCutoff and counted) else None
+        top = RlTable([[RlPara(f"STATION {_xmlEscape(m.get('label', ''))}", S["stNo"]), OutcomeBadge(res["outcome"])]],
+                      colWidths=[inner - 2.0 * cm, 2.0 * cm])
+        top.setStyle(RlTableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                                   ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                                   ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0)]))
+        topic = m.get("topic", "")
+        topic = topic[:1].upper() + topic[1:]
+        meta = RlTable([[RlPara("DOMAIN", S["lab"]), RlPara("STATION TYPE", S["lab"]), RlPara("TOPIC", S["lab"])],
+                        [RlPara(_xmlEscape(m.get("domain", "")), S["meta"]), RlPara(_xmlEscape(m.get("type", "")), S["meta"]),
+                         RlPara(_xmlEscape(topic), S["meta"])]],
+                       colWidths=[inner * 0.28, inner * 0.24, inner * 0.48])
+        meta.setStyle(RlTableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                    ("RIGHTPADDING", (0, 0), (-1, -1), 8), ("TOPPADDING", (0, 0), (-1, -1), 0),
+                                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1)]))
+        cells = [("SCORE", fmtNum(res["score"]), fail)]
+        if showCutoff:
+            cells.append(("STATION CUTOFF", fmtNum(ss["displayCutPct"]) if counted and ss.get("displayCutPct") is not None else "N/A", False))
+        cells += [("COHORT AVERAGE", fmtNum(ss["mean"]), False),
+                  ("COHORT RANGE", f"{fmtNum(ss['min'])} – {fmtNum(ss['max'])}", False)]
+        if showSdbm:
+            cells.append(("2 SDBM", "YES" if res["sdbm"] else "NO", res["sdbm"]))
+        fig = RlTable([[RlPara(l, S["lab"]) for l, _, _ in cells],
+                       [RlPara(v, S["valF"] if bad else S["val"]) for _, v, bad in cells]],
+                      colWidths=[(inner - 16) / len(cells)] * len(cells))
+        fig.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, -1), light), ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                                   ("TOPPADDING", (0, 0), (-1, 0), 6), ("BOTTOMPADDING", (0, 1), (-1, 1), 6),
+                                   ("TOPPADDING", (0, 1), (-1, 1), 1), ("BOTTOMPADDING", (0, 0), (-1, 0), 1),
+                                   ("LINEAFTER", (0, 0), (-2, -1), 1, white)]))
+        bar = ScoreBar(inner, res["score"], ss["mean"], cut, res["outcome"])
+        parts = [commentHtml(res["feedback"])] if res.get("feedback") else []
+        if res.get("bfInfo") and showFor(bfText, fail):
+            parts.append(("<b>Borderline/Fail information:</b><br/>" if showFor(bfHeading, fail) else "")
+                         + commentHtml(res["bfInfo"]))
+        cmt = RlTable([[RlPara("EXAMINER COMMENTS:", S["bar"])],
+                       [RlPara("<br/><br/>".join(parts) if parts else "<i>No comments recorded.</i>", S["cmt"])]],
+                      colWidths=[inner])
+        cmt.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, 0), navy), ("BACKGROUND", (0, 1), (-1, 1), white),
+                                   ("BOX", (0, 0), (-1, -1), 0.6, navy),
+                                   ("TOPPADDING", (0, 0), (-1, 0), 2), ("BOTTOMPADDING", (0, 0), (-1, 0), 2),
+                                   ("TOPPADDING", (0, 1), (-1, 1), 5), ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
+                                   ("LEFTPADDING", (0, 1), (-1, 1), 6), ("RIGHTPADDING", (0, 1), (-1, 1), 6)]))
+        body = [top, RlSpacer(1, 4), meta, RlSpacer(1, 6), fig, RlSpacer(1, 4), bar, RlSpacer(1, 4), cmt]
+        card = RlTable([["", body]], colWidths=[5, CW - 5])
+        card.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (0, 0), outCol(res["outcome"])),
+                                    ("BACKGROUND", (1, 0), (1, 0), white), ("BOX", (0, 0), (-1, -1), 0.6, line),
+                                    ("LEFTPADDING", (1, 0), (1, 0), 0.4 * cm), ("RIGHTPADDING", (1, 0), (1, 0), 0.4 * cm),
+                                    ("TOPPADDING", (1, 0), (1, 0), 10), ("BOTTOMPADDING", (1, 0), (1, 0), 12),
+                                    ("LEFTPADDING", (0, 0), (0, 0), 0), ("RIGHTPADDING", (0, 0), (0, 0), 0)]))
+        flow += [KeepTogether([card]), RlSpacer(1, stationGapCm * cm)]
+
+    title1 = f"{cohortLabel} OSCE Feedback"
+    logo = ImageReader(_io.BytesIO(logoBytes)) if logoBytes else None
+    who = f"{student['name']}  ·  {student.get('studentNo', '')}" if student.get("studentNo") else student["name"]
+
+    pageBg = hx(FB2_PAGE_COLORS.get(str(pageColor).lower(), pageColor)) if pageColor else None
+
+    def decorate(canv, doc):
+        canv.saveState()
+        if pageBg is not None:
+            canv.setFillColor(pageBg)
+            canv.rect(0, 0, W, H, stroke=0, fill=1)
+        if doc.page == 1:
+            canv.setFillColor(navy)
+            canv.rect(0, H - HDR, W, HDR, stroke=0, fill=1)
+            canv.setFillColor(white)
+            canv.setFont("Helvetica-Bold", 20)
+            canv.drawString(M, H - 1.25 * cm, title1)
+            canv.setFont("Helvetica", 12)
+            canv.drawString(M, H - 1.95 * cm, who)
+            canv.setFont("Helvetica", 8)
+            canv.setFillColor(hx("#B8C0D8"))
+            canv.drawString(M, H - 2.4 * cm, examLabel)
+            if logo:
+                canv.drawImage(logo, W - M - 2.1 * cm, H - HDR + 0.3 * cm, width=2.1 * cm, height=2.1 * cm, mask="auto")
+        else:
+            canv.setFillColor(navy)
+            canv.rect(0, H - 0.35 * cm, W, 0.35 * cm, stroke=0, fill=1)
+            canv.setFont("Helvetica", 7.5)
+            canv.setFillColor(grey)
+            canv.drawString(M, H - 0.95 * cm, f"{title1}  ·  {student['name']}")
+        canv.setFont("Helvetica", 7)
+        canv.setFillColor(grey)
+        canv.drawRightString(W - M, 0.8 * cm, f"{student['name']} · {student.get('studentNo', '')} · page {doc.page}")
+        canv.restoreState()
+
+    os.makedirs(os.path.dirname(outPath) or ".", exist_ok=True)
+    doc = BaseDocTemplate(outPath, pagesize=A4, leftMargin=M, rightMargin=M, topMargin=M, bottomMargin=1.4 * cm,
+                          title=f"{title1} - {student['name']}", author="Melbourne Dental School")
+    f1 = Frame(M, 1.4 * cm, CW, H - HDR - 0.6 * cm - 1.4 * cm, id="f1",
+               leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+    f2 = Frame(M, 1.4 * cm, CW, H - 2.8 * cm, id="f2", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
+    doc.addPageTemplates([PageTemplate(id="first", frames=[f1], onPage=decorate, autoNextPageTemplate="rest"),
+                          PageTemplate(id="rest", frames=[f2], onPage=decorate)])
+    doc.build(flow)
+    return outPath
+
+
 def buildOsceFeedbackReports(stationPath, analysisPath, outDir, studentNumbers=None, cohortLabel="DDS4",
                              hideOverallFor=None, templatePath="OSCE/OSCE Feedback Template.xlsx",
                              stationMeta=None, excludeSheets=None, showCutoff=True, overallOutcomes=None,
                              metaPath=STATION_META_PATH, year=None, passAllCutOffset=1.0, maxStationFails=4,
-                             bfHeading="failOnly", bfText="always", stationGapCm=0.9, notCountedSheets=None):
+                             bfHeading="failOnly", bfText="always", stationGapCm=0.9, notCountedSheets=None,
+                             feedbackCol="Feedback", bfCol="Borderline/Fail Info", scoresFrom="station",
+                             showSdbm=True, requireAvgAboveCut=False, markColumn=None,
+                             excludeStudentNumbers=None, markPath=None, pdfVersion=1, examLabel=None,
+                             pageColor="paper"):
     """
     Build one feedback PDF per student.
       studentNumbers : iterable of student numbers to build (None = everyone on the sheets)
@@ -2162,6 +2755,20 @@ def buildOsceFeedbackReports(stationPath, analysisPath, outDir, studentNumbers=N
       notCountedSheets : extra station sheet names whose pass/fail is not counted (on top of the metadata
                        workbook's 'Counts To Outcome' = N) -> N/A outcome + cutoff, excluded from counts
       overallOutcomes: optional {studentNo: "PASS"/"FAIL"} that overrides the computed outcome
+      requireAvgAboveCut : also FAIL when the student's average station score < average applied cut of the
+                       counted stations (the official 'OSCE Outcome' rule); default False = station count only
+      feedbackCol / bfCol : comment columns on the station sheets (e.g. feedbackCol="Proofread comments")
+      scoresFrom     : "station" = Score (%) on the station sheets; "analysis" = 'Student x Station' of
+                       analysisPath (joined by Student No) — cohort stats then use those scores too
+      showSdbm       : False hides all 2 SDBM info on the PDFs
+      excludeStudentNumbers : student numbers dropped everywhere (no PDF, not in cohort avg/range/SD)
+      markColumn     : None = MARK is the plain average station score; else a column of the analysis workbook's
+                       'OSCE Outcome' sheet, e.g. "Per-stn cut /100" (official scaled /100 mark)
+      pdfVersion     : 1 = original layout (buildStudentFeedbackPdf); 2 = V2 layout (buildStudentFeedbackPdfV2)
+      pageColor      : V2 page background — "white" | "paper" | "mist" | "sage" | "bluegrey" | "#RRGGBB"
+      examLabel      : V2 sub-heading under the name (default "<year> OSCE" or "OSCE")
+      markPath       : workbook holding the 'OSCE Outcome' mark table (default = analysisPath), e.g. a
+                       separately approved overall-score table
       passAllCutOffset : PASS ALL stations print cutoff = lowest cohort score - this (default 1)
       metaPath / year : station metadata workbook (rows for cohortLabel [+ year]); used when stationMeta is None
       stationMeta / excludeSheets : explicit overrides; fallback DDS4_FEEDBACK_STATION_META / FEEDBACK_EXCLUDE_SHEETS
@@ -2175,13 +2782,28 @@ def buildOsceFeedbackReports(stationPath, analysisPath, outDir, studentNumbers=N
         excludeSheets = set(excludeSheets or []) | metaExcl
         metaSource = metaPath
     elif stationMeta is None:
+        if metaPath and str(cohortLabel).upper() != "DDS4":       # DDS4 dict fallback is wrong for other cohorts
+            raise FileNotFoundError(f"Station metadata workbook not found: {metaPath}")
         metaSource = "DDS4_FEEDBACK_STATION_META (fallback)"
-    stations, skipped = loadFeedbackStations(stationPath, stationMeta, excludeSheets)
+    stations, skipped = loadFeedbackStations(stationPath, stationMeta, excludeSheets, feedbackCol=feedbackCol, bfCol=bfCol)
+    dropSet = {str(int(float(x))) for x in (excludeStudentNumbers or [])}
+    for st in stations.values():
+        st["rows"] = [r for r in st["rows"] if r["studentNo"] not in dropSet]
+    scoreSwap = None
+    if scoresFrom == "analysis":
+        scoreSwap = applyAnalysisScores(stations, loadAnalysisScores(analysisPath))
+    elif scoresFrom != "station":
+        raise ValueError("scoresFrom must be 'station' or 'analysis'")
     cuts = loadAppliedCuts(analysisPath)
     stStats, students, examAvg = computeFeedbackStats(stations, cuts, passAllCutOffset=passAllCutOffset,
                                                       notCountedSheets=notCountedSheets)
     logoBytes = loadTemplateLogo(templatePath)
+    marks = loadOutcomeMarks(markPath or analysisPath, markColumn) if markColumn else None
 
+    cntCuts = [stStats[t]["cutPct"] for t in stStats if stStats[t]["counted"] and stStats[t]["cutPct"] is not None]
+    avgCut = statistics.mean(cntCuts) if cntCuts else None          # for requireAvgAboveCut
+    ruleText = (f"The overall outcome is FAIL when more than {maxStationFails} stations are failed"
+                + (" or the average score is below the average cutoff." if requireAvgAboveCut else "."))
     want = [str(int(float(x))) for x in studentNumbers] if studentNumbers is not None else sorted(students, key=lambda k: students[k]["name"].lower())
     if hideOverallFor is True:
         hideSet = set(want)
@@ -2197,15 +2819,29 @@ def buildOsceFeedbackReports(stationPath, analysisPath, outDir, studentNumbers=N
         if not s["complete"]:
             incomplete[sn] = [stations[t]["meta"]["label"] for t in stations if t not in s["results"]]
         autoOutcome = "FAIL" if s["nFail"] > maxStationFails else "PASS"
+        if requireAvgAboveCut and avgCut is not None and round(s["avg"], 1) < round(avgCut, 1):
+            autoOutcome = "FAIL"
         stu = dict(s, studentNo=sn, overallOutcome=(overallOutcomes or {}).get(sn, autoOutcome))
+        if marks is not None:
+            if sn not in marks:
+                raise KeyError(f"Student {sn} has no '{markColumn}' in the OSCE Outcome sheet")
+            stu["mark"] = marks[sn]
         safe = re.sub(r"[^A-Za-z0-9]+", "_", s["name"]).strip("_")
         path = os.path.join(outDir, f"{safe}_{sn}.pdf")
-        buildStudentFeedbackPdf(path, stu, stations, stStats, examAvg, cohortLabel=cohortLabel,
-                                hideOverall=sn in hideSet, logoBytes=logoBytes, showCutoff=showCutoff,
-                                bfHeading=bfHeading, bfText=bfText, stationGapCm=stationGapCm)
+        if pdfVersion == 2:
+            buildStudentFeedbackPdfV2(path, stu, stations, stStats, examAvg, cohortLabel=cohortLabel,
+                                      hideOverall=sn in hideSet, logoBytes=logoBytes, showCutoff=showCutoff,
+                                      bfHeading=bfHeading, bfText=bfText, showSdbm=showSdbm,
+                                      examLabel=examLabel or (f"{year} OSCE" if year else "OSCE"), ruleText=ruleText,
+                                      pageColor=pageColor)
+        else:
+            buildStudentFeedbackPdf(path, stu, stations, stStats, examAvg, cohortLabel=cohortLabel,
+                                    hideOverall=sn in hideSet, logoBytes=logoBytes, showCutoff=showCutoff,
+                                    bfHeading=bfHeading, bfText=bfText, stationGapCm=stationGapCm, showSdbm=showSdbm)
         files.append(path)
-        summary.append({"name": s["name"], "studentNo": sn, "avg": round(s["avg"], 1), "passed": s["nPass"],
+        summary.append({"name": s["name"], "studentNo": sn, "avg": round(s["avg"], 1),
+                        "mark": round(stu.get("mark", s["avg"]), 1), "passed": s["nPass"],
                         "failed": s["nFail"], "sdbm": s["nSdbm"], "overallOutcome": stu["overallOutcome"],
                         "markHidden": sn in hideSet, "file": path})
     return {"metaSource": metaSource, "files": files, "missing": missing, "incomplete": incomplete, "skippedSheets": skipped,
-            "examAvg": examAvg, "stationStats": stStats, "summary": summary}
+            "examAvg": examAvg, "avgCut": avgCut, "scoreSwap": scoreSwap, "stationStats": stStats, "summary": summary}

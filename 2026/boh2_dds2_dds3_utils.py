@@ -256,6 +256,15 @@ def applySmileSquadSwap(df, cohort):
     df = df.copy()
     idx = df.index[mask]
 
+    # Keep a record of the real DASH submission flags BEFORE the swap so form
+    # counts (# Student / # Assessor Submitted) can be reported as the student
+    # and educators actually see them in DASH.
+    for col in ("submitted_by_student", "submitted_by_assessor"):
+        if col in df.columns and f"{col}_raw" not in df.columns:
+            df[f"{col}_raw"] = df[col]
+    if "is_smile_squad" not in df.columns:
+        df["is_smile_squad"] = mask
+
     for colA, colB in (("student_data", "assessor_data"),
                        ("submitted_by_student", "submitted_by_assessor")):
         if colA in df.columns and colB in df.columns:
@@ -2162,7 +2171,8 @@ def _labelledCountsText(series, labelMap):
     )
 
 
-def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
+def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False,
+                           smileSquadAsAssessor=False):
     """
     Compute summary metrics from a student DataFrame (optionally pre-filtered
     by form type).
@@ -2180,8 +2190,20 @@ def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
         return OrderedDict()
  
     nForms = len(df)
-    nAssessorSubmitted = int(df["submitted_by_assessor"].sum())
-    nStudentSubmitted = int(df["submitted_by_student"].sum())
+    # Count submissions from the PRE-Smile-Squad-swap flags when available
+    # (applySmileSquadSwap keeps them as *_raw) so the numbers match DASH.
+    sbaCol = "submitted_by_assessor_raw" if "submitted_by_assessor_raw" in df.columns else "submitted_by_assessor"
+    sbsCol = "submitted_by_student_raw" if "submitted_by_student_raw" in df.columns else "submitted_by_student"
+    nAssessorSubmitted = int(df[sbaCol].sum())
+    nStudentSubmitted = int(df[sbsCol].sum())
+    nSmileSquad = int(df["is_smile_squad"].sum()) if "is_smile_squad" in df.columns else 0
+    # smileSquadAsAssessor (V2 report): Smile Squad forms need no assessor, so a
+    # student-submitted SS form also counts as assessor-submitted. A gap between
+    # the two counts then shows only forms that are genuinely unsubmitted.
+    if smileSquadAsAssessor and "is_smile_squad" in df.columns:
+        ssMask = df["is_smile_squad"].fillna(False).astype(bool)
+        ssExtra = ssMask & df[sbsCol].fillna(False).astype(bool) & ~df[sbaCol].fillna(False).astype(bool)
+        nAssessorSubmitted += int(ssExtra.sum())
  
     # assessor-filtered subset for remaining metrics
     adf = df[df["submitted_by_assessor"]].copy()
@@ -2191,6 +2213,7 @@ def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
             ("# Forms", nForms),
             ("# Assessor Submitted", nAssessorSubmitted),
             ("# Student Submitted", nStudentSubmitted),
+            *([("# Smile Squad (self-assessed)", nSmileSquad)] if nSmileSquad else []),
             # ("Entrustment Counts", "N/A"),
             ("Avg Global Rating", "N/A"),
             ("Critical Incidents", "0"),
@@ -2209,6 +2232,7 @@ def _computeSummaryMetrics(df, patientInfo=False, isSimulation=False):
         ("# Forms", nForms),
         ("# Assessor Submitted", nAssessorSubmitted),
         ("# Student Submitted", nStudentSubmitted),
+        *([("# Smile Squad (self-assessed)", nSmileSquad)] if nSmileSquad else []),
         # ("Entrustment Counts", esCountsText),
         ("Avg Global Rating", f"{avgGR:.2f}/5" if not np.isnan(avgGR) else "N/A"),
         ("Critical Incidents", str(ciCount)),
@@ -3033,7 +3057,8 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
                               normalizeItemCodes=True,
                               useSchedule=True, scheduleYear=2026,
                               scheduleMaxDate=None, rosterOrder=True,
-                              dateRangeInBanner=True):
+                              dateRangeInBanner=True, peCdSplit=None,
+                              task7Scoring=True, peScoring=True):
     """
     Scrollable PDF with every student's score scatter + rubric time series,
     optionally filtered to Simulation or Clinic.
@@ -3083,9 +3108,21 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
                          in this run gets a table. 1.25 leaves a ~237pt gutter for
                          a ~151pt content-fitted table; it was 1.45 while the
                          table still stretched to fill whatever it was given.
+
+    Added 2026-10-28 (DDS1):
+    ``peCdSplit``        None (default) -> on for PE_CD_SPLIT_COHORTS (DDS1) Simulation.
+                         When on, each student gets the V2 student-report PE | CD
+                         side-by-side figure (makePeCdTimeSeriesFigure, white
+                         background) instead of the generic scatter + 5 rubrics.
+                         False restores the generic charts.
+    ``task7Scoring``     CD Task 7 points = completed-section % (as V2 report).
+    ``peScoring``        PE points = weighted session % (as V2 report).
     """
     if combined is None:
         combined = COMBINE_TIMESERIES_PANELS
+    isSimType = bool(formType) and str(formType).strip().lower().startswith("sim")
+    if peCdSplit is None:
+        peCdSplit = cohort in PE_CD_SPLIT_COHORTS and isSimType
     if scoreMap is None:
         scoreMap = SCORE_MAP
     if uniColor is None:
@@ -3267,7 +3304,15 @@ def buildCohortTimeSeriesPdf(*, engine, cohort, outPath, bannerTitle,
         ]
 
         chartFlowables = []
-        if combined:
+        if peCdSplit:
+            # ── DDS1: PE | CD side by side, same figure as the V2 student report ──
+            peCdFig = makePeCdTimeSeriesFigure(
+                studentDataDf, task7Scoring=task7Scoring, peScoring=peScoring,
+                faceColor="white",
+            )
+            if peCdFig is not None:
+                chartFlowables.append(_v2FullFigImage(peCdFig, 0.98))
+        elif combined:
             # ── One combined figure: scatter on top, then the 5 rubric panels,
             # all sharing one x-axis (alignment guaranteed by construction). The
             # scatter gets a taller share (5:1) and the whole figure is larger. ──
@@ -4175,7 +4220,7 @@ def _v2PeCdColumn(axScatter, axRubrics, sub, panelTitle, rubricSpecs):
 
 
 def _addTimeSeriesPageV2PeCd(elements, df, typeLabel, subheadingStyle, cohort=None,
-                             tsSplit=False, splitDate=None, task7Scoring=True):
+                             tsSplit=False, splitDate=None, task7Scoring=True, peScoring=True):
     """DDS1 static time-series: PE and CD side by side (one column each) on ONE
     whole-year page. No FHY/SHY split by default (tsSplit=False; the report
     builder's tsSplit is deliberately NOT passed through). Each column
@@ -4201,6 +4246,8 @@ def _addTimeSeriesPageV2PeCd(elements, df, typeLabel, subheadingStyle, cohort=No
             colDf = streams.get(key)
             if key == "CD" and task7Scoring and colDf is not None and not colDf.empty:
                 colDf = _v2ApplyTask7Scores(colDf)   # Task 7 points = completed-section %
+            if key == "PE" and peScoring and colDf is not None and not colDf.empty:
+                colDf = _v2ApplyPeScores(colDf)      # PE points = weighted session % (lenient/strict)
             _v2PeCdColumn(axS, axR, colDf, title, rubricSpecs)
             if c:
                 axS.set_ylabel("")
@@ -4208,6 +4255,40 @@ def _addTimeSeriesPageV2PeCd(elements, df, typeLabel, subheadingStyle, cohort=No
 
         elements.append(Spacer(1, 18))
         elements.append(KeepTogether([heading, Spacer(1, 12), img]))
+
+
+def makePeCdTimeSeriesFigure(df, task7Scoring=True, peScoring=True, faceColor="white",
+                             figSize=(14, 14)):
+    """DDS1 PE | CD side-by-side time-series figure (2026-10-28, additive).
+
+    Same drawing as the V2 student report (_addTimeSeriesPageV2PeCd): one column per
+    stream (PE, CD), item scatter + rolling avg(3) on top, Entrustment and Global
+    Rating below, each column on its OWN dates. Used by buildCohortTimeSeriesPdf.
+      task7Scoring : CD Task 7 points = completed-section % (_v2ApplyTask7Scores)
+      peScoring    : PE points = weighted session %, lenient to PE-04 / strict from PE-05
+      faceColor    : figure + axes background (V2 report uses V2_PAGE grey)
+    Returns the matplotlib figure, or None for an empty frame."""
+    if df is None or df.empty:
+        return None
+    rubricSpecs = [("Entrustment", "blue", 4.5), ("Global Rating", "green", 5.5)]
+    streams = _v2PeCdSplit(df)
+    fig = plt.figure(figsize=figSize, dpi=200, facecolor=faceColor)
+    gs = fig.add_gridspec(3, 2, height_ratios=[3, 1.1, 1.1], hspace=0.35, wspace=0.14,
+                          left=0.055, right=0.99, top=0.965, bottom=0.075)
+    for c, (key, title) in enumerate(PE_CD_PANELS):
+        axS = fig.add_subplot(gs[0, c])
+        axR = [fig.add_subplot(gs[1, c]), fig.add_subplot(gs[2, c])]
+        colDf = streams.get(key)
+        if key == "CD" and task7Scoring and colDf is not None and not colDf.empty:
+            colDf = _v2ApplyTask7Scores(colDf)
+        if key == "PE" and peScoring and colDf is not None and not colDf.empty:
+            colDf = _v2ApplyPeScores(colDf)
+        _v2PeCdColumn(axS, axR, colDf, title, rubricSpecs)
+        for ax in [axS] + axR:          # _v2PeCdColumn paints V2_PAGE; override
+            ax.set_facecolor(faceColor)
+        if c:
+            axS.set_ylabel("")
+    return fig
 
 
 # ── DDS1 Cons Dent Task 7 section charts (2026-09-24, additive) ──
@@ -4227,7 +4308,25 @@ TASK7_SECTION_COLORS = {            # stacked-bar fills (C) — blue/orange fami
 TASK7_INCOMPLETE_FILL = "#d9d9d9"
 TASK7_HEAT_COLORS = [V2_CLINIC_COLOR, "#f2dcc6", "#dbe6f3", V2_SIM_COLOR]   # low -> high (A)
 TASK7_ENTRUST_COLOR = "blue"        # same as the V2 rubric Entrustment line
-_T7_ABBR = {"Isolation": "Iso", "Preparation": "Prep", "Matrix": "Matrix", "Restoration": "Resto"}
+_T7_ABBR = {"Isolation": "Iso", "Preparation": "Prep", "CaOH cement": "CaOH", "Liner or base": "Liner",
+            "Matrix": "Matrix", "Restoration": "Resto"}
+TASK7_SECTION_COLORS.setdefault("CaOH cement", "#b8d4ee")     # pale blue  (2026-10-27)
+TASK7_SECTION_COLORS.setdefault("Liner or base", "#f7d3b0")   # pale orange
+
+
+def _t7Sections(scoresLong):
+    """Rows to draw: the 4 core sections always, CaOH cement / Liner or base only when the
+    student has one attempted — in canonical TASK7_SECTIONS order."""
+    import dds1_pe_utils as _pe
+    have = set(scoresLong["section"]) if scoresLong is not None and not scoresLong.empty else set()
+    return [s for s in _pe.TASK7_SECTIONS if s in _pe.TASK7_CORE_SECTIONS or s in have]
+
+
+def _t7Attempted(scoresLong):
+    """Drop sections whose criteria were ALL Not Reviewed (shown as '–', not Incomplete)."""
+    if scoresLong is None or scoresLong.empty or "attempted" not in scoresLong.columns:
+        return scoresLong
+    return scoresLong[scoresLong["attempted"].astype(bool)]
 _T7_ROW_HEIGHTS = {"heatmap": 3.9, "bars": 5.0, "entrust": 1.9}   # inches per panel
 
 
@@ -4235,7 +4334,8 @@ def _t7Forms(scoresLong):
     """One row per scored Task 7 checklist instance, in date order, with an x label."""
     f = scoresLong.drop_duplicates("formKey")[["formKey", "date", "datetime", "task"]].copy()
     f = f.sort_values(["datetime", "task"]).reset_index(drop=True)
-    f["label"] = [f"{pd.Timestamp(d).strftime('%d %b')}\nT{t}" for d, t in zip(f["date"], f["task"])]
+    f["label"] = [f"{pd.Timestamp(d).strftime('%d %b')}\n{'T' if str(t)[:1].isdigit() else ''}{t}"
+                  for d, t in zip(f["date"], f["task"])]
     return f
 
 
@@ -4265,7 +4365,7 @@ def _t7DrawHeatmap(ax, scoresLong, forms, colors=None, showLabels=True):
     from matplotlib.patches import Patch
     import dds1_pe_utils as _pe
     cmap = LinearSegmentedColormap.from_list("t7heat", colors or TASK7_HEAT_COLORS)
-    secs = list(_pe.TASK7_SECTIONS)
+    secs = _t7Sections(scoresLong)
     fs = _t7FontSize(len(forms))
     ax.set_facecolor(V2_PAGE)
     for xi, fr in forms.iterrows():
@@ -4296,7 +4396,7 @@ def _t7DrawHeatmap(ax, scoresLong, forms, colors=None, showLabels=True):
     _t7SetX(ax, forms, fs, showLabels)
     handles = [Patch(fc=cmap(v), ec="none", label=l) for v, l in ((0.1, "Low"), (0.5, "Mid"), (0.95, "High"))]
     handles += [Patch(fc=TASK7_INCOMPLETE_FILL, ec="#8a8a8a", hatch="///", label="Incomplete"),
-                Patch(fc="white", ec=V2_LINE, label="– not in task")]
+                Patch(fc="white", ec=V2_LINE, label="– not in task / not attempted")]
     ax.legend(handles=handles, ncol=5, fontsize=7.5, loc="lower left", bbox_to_anchor=(0, 1.0),
               frameon=False)
 
@@ -4306,9 +4406,9 @@ def _t7DrawBars(ax, scoresLong, forms, sectionColors=None, showLabels=True):
     from matplotlib.patches import Patch
     import dds1_pe_utils as _pe
     colors = dict(TASK7_SECTION_COLORS, **(sectionColors or {}))
-    secs = list(_pe.TASK7_SECTIONS)
+    secs = _t7Sections(scoresLong)
     fs = _t7FontSize(len(forms)) - 0.5
-    h = 25.0
+    h = 100.0 / len(secs)
     ax.set_facecolor(V2_PAGE)
     for x, fr in forms.iterrows():
         sub = scoresLong[scoresLong["formKey"] == fr["formKey"]].set_index("section")
@@ -4330,8 +4430,8 @@ def _t7DrawBars(ax, scoresLong, forms, sectionColors=None, showLabels=True):
                 ax.text(x, y0 + h / 2, f"{_T7_ABBR[sec]}\n{_t7Fmt(r['score'])}/{int(r['maxScore'])}",
                         ha="center", va="center", fontsize=fs, fontweight="bold",
                         color=("white" if dark else V2_INK))
-    ax.set_ylim(0, 4 * h + 1)
-    ax.set_yticks([h * (i + 0.5) for i in range(4)])
+    ax.set_ylim(0, len(secs) * h + 1)
+    ax.set_yticks([h * (i + 0.5) for i in range(len(secs))])
     ax.set_yticklabels([f"{s} (/{_pe.TASK7_SECTION_MAX[s]})" for s in secs], fontsize=9, color=V2_INK)
     ax.tick_params(axis="y", length=0)
     for sp in ("top", "right"):
@@ -4372,16 +4472,18 @@ def plotTask7SectionPanel(scoresLong, chartStyle="heatmap", entrustment=None, ti
     x-axis (date + task under the bottom panel only, so columns line up exactly).
     chartStyle: "heatmap" | "bars" | "both". entrustment: {formKey: level} (optional;
     None -> no Entrustment panel). Returns a Figure or None."""
+    scoresLong = _t7Attempted(scoresLong)
     if scoresLong is None or scoresLong.empty:
         return None
     style = str(chartStyle).strip().lower()
     if style not in TASK7_CHART_STYLES:
         raise ValueError(f"chartStyle must be one of {TASK7_CHART_STYLES}, got {chartStyle!r}")
     forms = _t7Forms(scoresLong)
+    rowScale = len(_t7Sections(scoresLong)) / 4.0
     rows = (["heatmap"] if style in ("heatmap", "both") else []) + (["bars"] if style in ("bars", "both") else [])
     if entrustment is not None:
         rows.append("entrust")
-    heights = [_T7_ROW_HEIGHTS[r] for r in rows]
+    heights = [_T7_ROW_HEIGHTS[r] * (rowScale if r != "entrust" else 1) for r in rows]
     topIn, botIn, gapIn = (0.55 + (0.3 if title else 0)), 0.75, 0.55
     H = sum(heights) + topIn + botIn + gapIn * (len(rows) - 1)
     fig = plt.figure(figsize=(figWidth, H), dpi=200, facecolor=V2_PAGE)
@@ -4446,20 +4548,215 @@ def _addTask7SectionPageV2(elements, df, subheadingStyle, chartStyle="heatmap"):
     style = str(chartStyle).strip().lower()
     if style not in TASK7_CHART_STYLES:
         raise ValueError(f"task7Chart must be one of {TASK7_CHART_STYLES} or None, got {chartStyle!r}")
-    long_ = _v2Task7Long(df)
-    if long_.empty:
+    long_ = _t7Attempted(_v2Task7Long(df))
+    if long_ is None or long_.empty:
         return
     nInc = int((~long_["complete"].astype(bool)).sum())
     nDone = int(long_["complete"].astype(bool).sum())
     note = _V2ParagraphStyle("t7note", fontName="Helvetica", fontSize=9.5, leading=12.5,
                              textColor=V2_MUTED)
     fig = plotTask7SectionPanel(long_, style, entrustment=_v2Task7Entrustment(df))
-    parts = [Paragraph("Cons Dent Task 7 — Section Scores Over Time", subheadingStyle), Spacer(1, 8),
-             Paragraph(f"Each Task 7 form is scored per section (Isolation /2, Preparation /10, "
+    parts = [Paragraph("Cons Dent Tasks 7 & 8 — Section Scores Over Time", subheadingStyle), Spacer(1, 8),
+             Paragraph(f"Each Task 7 / Task 8, mock (MA) and practice (P / AP) form is scored per section (Isolation /2, Preparation /10, "
+                       f"Calcium hydroxide cement /2 and Liner or base /2 where the form has them, "
                        f"Matrix /2, Restoration /10) using that section’s band table. A section is "
-                       f"<b>Incomplete</b> until every criterion in it has been assessed. "
+                       f"<b>Incomplete</b> until every criterion in it has been assessed; a section "
+                       f"with nothing reviewed shows “–”. "
                        f"Entrustment for the same forms is shown underneath. "
                        f"So far: {nDone} section(s) scored, {nInc} incomplete.", note),
+             Spacer(1, 8)]
+    if fig is not None:
+        parts.append(_v2FullFigImage(fig, 0.98))
+    elements.append(Spacer(1, 12))
+    elements.append(KeepTogether(parts))
+
+
+# ── DDS1 Periodontics section scores page (2026-10-27, additive) ──
+# One column per PE form, rows = PE sections (dds1_pe_utils.PE_SECTIONS). Cell =
+# weighted marks earned / section weight (Weighting sheet) + %, so the sections add
+# up to the session total plotted on the PE time-series panel. Chosen per call via
+# `peSectionChart=` on the V2 builders: "heatmap" (default) | "bars" | "both" | None.
+# Entrustment for the same forms sits underneath on the SAME x columns.
+PE_SECTION_CHART_STYLES = ("heatmap", "bars", "both")
+PE_SECTION_COLORS = {"Ergonomics": "#7fb3e0", "Instrument Handling": V2_SIM_COLOR,
+                     "Quality of Scaling": "#f0b27a", "Damage": V2_CLINIC_COLOR}
+_PE_ROW_HEIGHTS = {"heatmap": 3.9, "bars": 5.0, "entrust": 1.9}
+
+
+def _peFmt(v):
+    return f"{v:.1f}".rstrip("0").rstrip(".")
+
+
+def _v2PeSectionLong(df):
+    """Long frame (one row per PE form x section) for a one-student Sim frame:
+    formKey, code, datetime, label, section, marks, weight, pct, formPct, entrustment.
+    OB/SO role forms are skipped (same gate as calcScore)."""
+    cols = ["formKey", "code", "datetime", "label", "section", "marks", "weight", "pct",
+            "formPct", "entrustment"]
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    import dds1_pe_utils as _pe
+    weights = _pe.loadPeWeights()
+    idCol = next((c for c in ("form_code", "form_id", "id", "assessmentid") if c in df.columns), None)
+    rows = []
+    for idx, row in df.iterrows():
+        if row.get("role") in ("OB", "SO") or not _v2IsPeRow(row):
+            continue
+        codes = set()
+        ic = row.get("item_codes")
+        if isinstance(ic, (list, tuple, np.ndarray)):
+            codes |= {str(c).strip() for c in ic}
+        sc = row.get("scores")
+        if isinstance(sc, dict):
+            codes |= {str(c).strip() for c in sc}
+        dt = pd.Timestamp(row["datetimeutc"])
+        for code in sorted(c for c in codes if c.upper().startswith("PE-")):
+            pct, secs = _pe.peSectionScores(row.get("assessor_data"), row.get("assessor_config"),
+                                            code, weights=weights)
+            if pct is None:
+                continue
+            key = f"{row[idCol] if idCol else idx}|{code}"
+            for sec, (m, w) in secs.items():
+                rows.append(dict(formKey=key, code=code, datetime=dt,
+                                 label=f"{dt.strftime('%d %b')}\n{code}", section=sec,
+                                 marks=m, weight=w, pct=100.0 * m / w if w else None,
+                                 formPct=pct, entrustment=row.get("entrustment")))
+    out = pd.DataFrame(rows, columns=cols)
+    return out.sort_values(["datetime", "code"]).reset_index(drop=True) if not out.empty else out
+
+
+def _peForms(long_):
+    return long_.drop_duplicates("formKey")[["formKey", "label", "datetime", "formPct"]].reset_index(drop=True)
+
+
+def _peDrawHeatmap(ax, long_, forms, showLabels=True):
+    """Rows = PE sections, columns = forms; cell = marks/weight + %, colour = section %."""
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.patches import Patch
+    import dds1_pe_utils as _pe
+    cmap = LinearSegmentedColormap.from_list("peheat", TASK7_HEAT_COLORS)
+    secs = list(_pe.PE_SECTIONS)
+    fs = _t7FontSize(len(forms))
+    ax.set_facecolor(V2_PAGE)
+    for xi, fr in forms.iterrows():
+        sub = long_[long_["formKey"] == fr["formKey"]].set_index("section")
+        for yi, sec in enumerate(secs):
+            box = dict(xy=(xi - 0.45, yi - 0.42), width=0.9, height=0.84)
+            if sec not in sub.index:
+                ax.add_patch(Rectangle(**box, fc="white", ec=V2_LINE, lw=0.6))
+                ax.text(xi, yi, "–", ha="center", va="center", color="#9aa0ad", fontsize=fs)
+                continue
+            r = sub.loc[sec]
+            pct = float(r["pct"])
+            ax.add_patch(Rectangle(**box, fc=cmap(pct / 100.0), ec="white", lw=0.8))
+            txt = "white" if (pct <= 30 or pct >= 80) else V2_INK
+            ax.text(xi, yi, f"{_peFmt(r['marks'])}/{_peFmt(r['weight'])}\n{pct:.0f}%", ha="center",
+                    va="center", fontsize=fs - 0.5, fontweight="bold", color=txt)
+    ax.set_ylim(len(secs) - 0.5, -0.5)
+    ax.set_yticks(range(len(secs)))
+    ax.set_yticklabels(secs, fontsize=9, color=V2_INK)
+    ax.tick_params(axis="y", length=0)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    _t7SetX(ax, forms, fs, showLabels)
+    handles = [Patch(fc=cmap(v), ec="none", label=l) for v, l in ((0.1, "Low"), (0.5, "Mid"), (0.95, "High"))]
+    handles += [Patch(fc="white", ec=V2_LINE, label="– not assessed this session")]
+    ax.legend(handles=handles, ncol=4, fontsize=7.5, loc="lower left", bbox_to_anchor=(0, 1.0),
+              frameon=False)
+
+
+def _peDrawBars(ax, long_, forms, showLabels=True):
+    """One stacked bar per form: block height = section weight share, filled = marks earned;
+    session total % on top."""
+    from matplotlib.patches import Patch
+    import dds1_pe_utils as _pe
+    secs = list(_pe.PE_SECTIONS)
+    fs = _t7FontSize(len(forms)) - 0.5
+    ax.set_facecolor(V2_PAGE)
+    for x, fr in forms.iterrows():
+        sub = long_[long_["formKey"] == fr["formKey"]].set_index("section")
+        tot = float(sub["weight"].sum()) or 1.0
+        y0 = 0.0
+        for sec in secs:
+            if sec not in sub.index:
+                continue
+            r = sub.loc[sec]
+            h, e = 100 * r["weight"] / tot, 100 * r["marks"] / tot
+            ax.add_patch(Rectangle((x - 0.36, y0), 0.72, h, fc="white", ec="#a7adba", lw=0.6))
+            ax.add_patch(Rectangle((x - 0.36, y0), 0.72, e, fc=PE_SECTION_COLORS[sec], ec="none"))
+            if h >= 7:
+                ax.text(x, y0 + h / 2, f"{_peFmt(r['marks'])}/{_peFmt(r['weight'])}", ha="center",
+                        va="center", fontsize=fs - 1, color=V2_INK)
+            y0 += h
+        ax.text(x, 103, f"{fr['formPct']:.1f}%", ha="center", fontsize=fs, fontweight="bold", color=V2_INK)
+    ax.set_ylim(0, 112)
+    ax.set_yticks(range(0, 101, 20))
+    ax.set_ylabel("Share of session total (%)", fontsize=9, color=V2_INK)
+    ax.grid(axis="y", ls="--", alpha=0.4)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    _t7SetX(ax, forms, fs, showLabels)
+    handles = [Patch(fc=c, label=k) for k, c in PE_SECTION_COLORS.items()]
+    handles += [Patch(fc="white", ec="#a7adba", label="Marks lost")]
+    ax.legend(handles=handles, ncol=5, fontsize=7.5, loc="lower left", bbox_to_anchor=(0, 1.0),
+              frameon=False)
+
+
+def plotPeSectionPanel(long_, chartStyle="heatmap", entrustment=True, title=None, figWidth=14):
+    """PE section figure: heatmap and/or bars + Entrustment, all on ONE per-form x-axis.
+    long_ from _v2PeSectionLong. Returns a Figure or None."""
+    if long_ is None or long_.empty:
+        return None
+    style = str(chartStyle).strip().lower()
+    if style not in PE_SECTION_CHART_STYLES:
+        raise ValueError(f"chartStyle must be one of {PE_SECTION_CHART_STYLES}, got {chartStyle!r}")
+    forms = _peForms(long_)
+    rows = (["heatmap"] if style in ("heatmap", "both") else []) + (["bars"] if style in ("bars", "both") else [])
+    if entrustment:
+        rows.append("entrust")
+    heights = [_PE_ROW_HEIGHTS[r] for r in rows]
+    topIn, botIn, gapIn = (0.55 + (0.3 if title else 0)), 0.75, 0.55
+    H = sum(heights) + topIn + botIn + gapIn * (len(rows) - 1)
+    fig = plt.figure(figsize=(figWidth, H), dpi=200, facecolor=V2_PAGE)
+    gs = fig.add_gridspec(len(rows), 1, height_ratios=heights,
+                          hspace=gapIn / (sum(heights) / len(rows)),
+                          left=0.14, right=0.99, top=1 - topIn / H, bottom=botIn / H)
+    ent = long_.drop_duplicates("formKey").set_index("formKey")["entrustment"].to_dict()
+    for i, r in enumerate(rows):
+        ax = fig.add_subplot(gs[i, 0])
+        last = i == len(rows) - 1
+        if r == "heatmap":
+            _peDrawHeatmap(ax, long_, forms, showLabels=last)
+        elif r == "bars":
+            _peDrawBars(ax, long_, forms, showLabels=last)
+        else:
+            _t7DrawEntrust(ax, forms, ent, showLabels=last)
+    if title:
+        fig.suptitle(title, x=0.01, ha="left", fontsize=11, color=V2_INK)
+    return fig
+
+
+def _addPeSectionPageV2(elements, df, subheadingStyle, chartStyle="heatmap"):
+    """Append the 'Periodontics — Section Scores Over Time' page. No-op when chartStyle
+    is None or the student has no scored PE form."""
+    if not chartStyle:
+        return
+    style = str(chartStyle).strip().lower()
+    if style not in PE_SECTION_CHART_STYLES:
+        raise ValueError(f"peSectionChart must be one of {PE_SECTION_CHART_STYLES} or None, got {chartStyle!r}")
+    long_ = _v2PeSectionLong(df)
+    if long_.empty:
+        return
+    note = _V2ParagraphStyle("penote", fontName="Helvetica", fontSize=9.5, leading=12.5,
+                             textColor=V2_MUTED)
+    fig = plotPeSectionPanel(long_, style, entrustment=True)
+    parts = [Paragraph("Periodontics — Section Scores Over Time", subheadingStyle), Spacer(1, 8),
+             Paragraph("Each Periodontics session is scored per section (Ergonomics, Instrument "
+                       "Handling, Quality of Scaling, Damage). Each cell shows the weighted marks "
+                       "earned out of that section’s weighting for the session, so the sections add "
+                       "up to the session score on the time-series page; “–” means the section was "
+                       "not assessed that session. Entrustment for the same sessions is shown "
+                       "underneath.", note),
              Spacer(1, 8)]
     if fig is not None:
         parts.append(_v2FullFigImage(fig, 0.98))
@@ -4487,12 +4784,44 @@ def _v2ApplyTask7Scores(df):
         sc = dict(sc)
         key = row[idCol] if idCol else idx
         for code in list(sc.keys()):
-            if str(code).strip() in _pe.TASK7_LAYOUT:
+            if str(code).strip() in _pe.TASK7_LAYOUT or _pe.isCdSectionCode(code):
                 p = pctByKey.get(f"{key}|{code}")
                 if p is None or pd.isna(p):
                     sc.pop(code)
                 else:
                     sc[code] = dict(sc[code] or {}, score=float(p) / 100.0)
+        newScores.append(sc)
+    out["scores"] = newScores
+    return out
+
+
+def _v2ApplyPeScores(df):
+    """Copy of *df* whose 'scores' use the DDS1 PE weighted form % for PE-xx codes
+    (dds1_pe_utils.peFormPercent, 2026-10-27): Weighting-sheet item weights
+    (DDS1/DDS1 Perio DASH Forms.xlsx), lenient levels to PE-04 and strict levels
+    from PE-05. A PE code with no weighted answered item is dropped from the scatter.
+    Rows calcScore left empty (OB/SO roles) stay empty."""
+    if df is None or df.empty or "scores" not in df.columns:
+        return df
+    import dds1_pe_utils as _pe
+    weights = _pe.loadPeWeights()
+    out = df.copy()
+    newScores = []
+    for _, row in out.iterrows():
+        sc = row["scores"]
+        if not isinstance(sc, dict) or not sc:
+            newScores.append(sc)
+            continue
+        sc = dict(sc)
+        for code in list(sc.keys()):
+            if not str(code).strip().upper().startswith("PE-"):
+                continue
+            p = _pe.peFormPercent(row.get("assessor_data"), row.get("assessor_config"),
+                                  str(code).strip(), weights=weights)
+            if p is None or pd.isna(p):
+                sc.pop(code)
+            else:
+                sc[code] = dict(sc[code] or {}, score=round(float(p) / 100.0, 4))
         newScores.append(sc)
     out["scores"] = newScores
     return out
@@ -4979,7 +5308,8 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
                          uniColor=None, cohort=None, classAvgItemCounts=None, combined=None,
                          sectionStreams=("Clinic",), studentName=None, studentNumber=None,
                          interactiveTimeSeries=None, tsSplit=False, tsSplitDate=None,
-                         attachSink=None, task7Chart="heatmap", task7Scoring=None):
+                         attachSink=None, task7Chart="heatmap", task7Scoring=None,
+                         peScoring=True, peSectionChart="heatmap"):
     """Redesigned single-student report (see mockup). Builds reportlab flowables
     using ONLY the new V2 helpers; the original buildStudentReport is untouched.
 
@@ -5001,6 +5331,11 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
                               sum of COMPLETED section scores / their max sum x 100 (a form with no
                               completed section is not plotted); when task7Chart is None, generic
                               calcScore. True/False forces it.
+      peScoring             : DDS1 only — True (default): PE points on the PE time-series panel =
+                              weighted session % (Weighting sheet; lenient levels to PE-04, strict
+                              from PE-05 — dds1_pe_utils.peFormPercent). False -> generic calcScore.
+      peSectionChart        : DDS1 only — Periodontics section scores page: "heatmap" (default),
+                              "bars", "both", or None to omit (2026-10-27).
       attachSink            : mutable list the interactive path appends embed payloads to;
                               None -> the interactive path degrades to the static split page."""
     if scoreMap is None:
@@ -5055,8 +5390,10 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
 
     simDf = studentDataDf[studentDataDf["type"] == "Simulation"]
     clinicDf = studentDataDf[studentDataDf["type"] == "Clinic"]
-    simMetrics = _computeSummaryMetrics(simDf, patientInfo=patientInfo, isSimulation=True)
-    clinicMetrics = _computeSummaryMetrics(clinicDf, patientInfo=patientInfo)
+    simMetrics = _computeSummaryMetrics(simDf, patientInfo=patientInfo, isSimulation=True,
+                                        smileSquadAsAssessor=True)
+    clinicMetrics = _computeSummaryMetrics(clinicDf, patientInfo=patientInfo,
+                                           smileSquadAsAssessor=True)
     # Patient age distribution + patient outcomes: count Operator-role forms only.
     if patientInfo and clinicMetrics:
         _opClinic = _v2OperatorClinicDf(clinicDf)
@@ -5168,17 +5505,26 @@ def buildStudentReportV2(studentDataDf, patientInfo=False, scoreMap=None, subhea
                 lambda e=typeDf, t=typeLabel: (
                     _addTimeSeriesPageV2PeCd(
                         elements, e, t, subheadingStyle=subheadingStyle, cohort=cohort,
-                        task7Scoring=task7Scoring)
+                        task7Scoring=task7Scoring, peScoring=peScoring)
                     if cohort in PE_CD_SPLIT_COHORTS and t == "Simulation"
                     else _addTimeSeriesPageV2Split(
                         elements, e, t, subheadingStyle=subheadingStyle, combined=combined,
                         cohort=cohort, tsSplit=tsSplit, splitDate=tsSplitDate)))
 
+    # DDS1: Periodontics section scores page (heatmap / bars / both / None)
+    if cohort in PE_CD_SPLIT_COHORTS and peSectionChart and not simAdf.empty:
+        _v2AddSection(
+            elements,
+            _V2TocMark(_v2TocText("Periodontics — Section Scores",
+                                  "each section’s weighted marks per session")),
+            lambda: _addPeSectionPageV2(elements, simAdf, subheadingStyle=subheadingStyle,
+                                        chartStyle=peSectionChart))
+
     # DDS1: Cons Dent Task 7 section scores page (heatmap / bars / both / None)
     if cohort in PE_CD_SPLIT_COHORTS and task7Chart and not simAdf.empty:
         _v2AddSection(
             elements,
-            _V2TocMark(_v2TocText("Cons Dent Task 7 — Section Scores",
+            _V2TocMark(_v2TocText("Cons Dent Tasks 7 & 8 — Section Scores",
                                   "each section’s score per form, incl. incomplete sections")),
             lambda: _addTask7SectionPageV2(elements, simAdf, subheadingStyle=subheadingStyle,
                                            chartStyle=task7Chart))
@@ -5205,7 +5551,7 @@ def buildEntireCohortStudentReportsV2(engine, cohort, formsTable="rawform_forms_
                                       sectionStreams=("Clinic",), outSubfolder="Individual Student Reports V2",
                                       onlyStudents=None, interactiveTimeSeries=None,
                                       tsSplit=False, tsSplitDate=None, task7Chart="heatmap",
-                                      task7Scoring=None):
+                                      task7Scoring=None, peScoring=True, peSectionChart="heatmap"):
     """V2 equivalent of buildEntireCohortStudentReports — same data/gating, new
     layout. Saves to a separate folder so the original reports are not overwritten.
 
@@ -5269,7 +5615,8 @@ def buildEntireCohortStudentReportsV2(engine, cohort, formsTable="rawform_forms_
             studentName=studentName, studentNumber=studentNumber,
             interactiveTimeSeries=interactiveTimeSeries, tsSplit=tsSplit,
             tsSplitDate=tsSplitDate, attachSink=attachSink,
-            task7Chart=task7Chart, task7Scoring=task7Scoring,
+            task7Chart=task7Chart, task7Scoring=task7Scoring, peScoring=peScoring,
+            peSectionChart=peSectionChart,
         )
         _v2First, _v2Later = _v2MakePageDecorators("Till Date performance report",
                                                    f"{studentName} ({studentNumber})")

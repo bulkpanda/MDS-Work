@@ -1,0 +1,1581 @@
+"""
+dds1_pe_utils.py — DDS1 Periodontics (PE) session progress report for coordinators.
+
+Source : the DASH CAF export (e.g. "temp 2026 caf.json"), forms whose
+         form_context.clinic_type == "PE" and checklist code PE-01 … PE-06.
+Output : one Excel workbook (buildDds1PeProgressReport) with
+         Read Me · Overview · Progress Grid · Flags · Student Tracker (dropdown + charts) ·
+         Item Pivot · Criterion x Session · Self vs Assessor · Adjustments.
+
+Scoring reproduces the per-session marking sheets (DDS1/DDS1_PE0x.xlsx):
+  * item level = rank among the criterion's VALID options (options minus row_config
+    disabled_options), best = denominator, worst = 1  → e.g. Seating /3, Lighting /2,
+    debridement /5, Damage /3 (No / Minor / Major damage).
+  * an out-of-rubric selection is mapped to the nearest valid level AT OR BELOW it
+    (worse); if nothing valid is below, the lowest valid level. Logged on "Adjustments".
+  * session % : Equal (mean of item %) and Proportional (PE_SESSIONS[...]['propWeights']).
+
+Usage (main.ipynb):
+    from dds1_pe_utils import *
+    buildDds1PeProgressReport("temp 2026 caf.json", "DDS1/DDS1 PE Progress Report.xlsm")
+"""
+import json
+import math
+import re
+from collections import Counter, defaultdict
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.chart.axis import ChartLines
+from openpyxl.chart.layout import Layout as _XlLayout, ManualLayout as _XlManualLayout
+from openpyxl.chart.text import RichText as _XlRichText
+from openpyxl.chart.title import Title as _XlTitle
+from openpyxl.chart.text import Text as _XlText
+from openpyxl.drawing.text import (Paragraph as _XlParagraph, ParagraphProperties as _XlParagraphProperties,
+                                   CharacterProperties as _XlCharacterProperties, RegularTextRun as _XlRun)
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.drawing.line import LineProperties
+from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
+from openpyxl.styles import Alignment, Border, PatternFill, Side
+from openpyxl.styles import Font as _XlFont            # aliased: collides with reportlab Font
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
+
+__all__ = [
+    "PE_SESSIONS", "PE_ITEMS", "PE_FLAG_CONFIG", "PE_MARKED_MIN_FRACTION",
+    "loadPeForms", "scorePeForms", "buildPeTables", "validatePeScoring",
+    "buildDds1PeProgressReport",
+    # Task 7 (Cons Dent) section scoring — 2026-09-24
+    "TASK7_BANDS", "TASK7_LAYOUT", "TASK7_SECTIONS", "TASK7_SECTION_MAX",
+    "scoreTask7Section", "scoreTask7Checklist", "scoreTask7Forms", "task7FormPercent",
+    "validateTask7Scoring",
+]
+
+# ────────────────────────────────────────────────────────────────────────────
+# 1. Registries
+# ────────────────────────────────────────────────────────────────────────────
+# Canonical checklist items (same criterion NAME recurs across sessions with different MC numbers).
+# itemId: (shortLabel, section, [normalised field-name aliases])
+PE_ITEMS = {
+    "seating":     ("Seating + head position", "Ergonomics", ["seating + head position"]),
+    "posture":     ("Posture", "Ergonomics", ["posture"]),
+    "lighting":    ("Lighting & visibility", "Ergonomics", ["lighting and visibility"]),
+    "infection":   ("Infection control", "Ergonomics", ["infection control"]),
+    "instrUse":    ("Instrument use", "Instrument Handling", ["appropriate instrument use"]),
+    "angulation":  ("Instrument angulation", "Instrument Handling", ["instrument angulation"]),
+    "fingerRests": ("Finger rests", "Instrument Handling", ["finger rests"]),
+    "cheek":       ("Cheek retraction", "Instrument Handling", ["cheek retraction"]),
+    "debIncisor":  ("Debridement – incisor", "Quality of Scaling", ["appropriate debridement - incisor"]),
+    "debCanine":   ("Debridement – canine", "Quality of Scaling", ["appropriate debridement - canine"]),
+    "debPremolar": ("Debridement – premolar", "Quality of Scaling", ["appropriate debridement - premolar"]),
+    "debMolar":    ("Debridement – molar", "Quality of Scaling", ["appropriate debridement - molar"]),
+    "dmgTissue":   ("Damage – tissue", "Damage", ["damage - tissue"]),
+    "dmgTooth":    ("Damage – tooth", "Damage", ["damage - tooth"]),
+}
+PE_SECTIONS = ["Ergonomics", "Instrument Handling", "Quality of Scaling", "Damage"]
+
+_W14 = {"seating": 6.25, "posture": 6.25, "lighting": 6.25, "infection": 6.25,
+        "instrUse": 12.5, "angulation": 12.5, "fingerRests": 12.5, "cheek": 2.5,
+        "debIncisor": 6.25, "debCanine": 6.25, "debPremolar": 6.25, "debMolar": 6.25,
+        "dmgTissue": 5, "dmgTooth": 5}
+
+# Scored items + proportional weights per session — copied from DDS1_PE0x.xlsx "Criterion Summary".
+# PE-01 excluded Cheek retraction; PE-02 excluded scaling/damage (still in the form, not marked).
+# PE-06 had no marking sheet yet → ASSUMED same scheme as PE-04/05 (change here if it differs).
+PE_SESSIONS = {
+    # PE-01 sheet (DDS1 Perio.xlsx) scored the disabled middle option (O2 on the /2 items) as the
+    # TOP level, i.e. mapped UP; every later sheet maps DOWN. adjustRule keeps S1 = published marks.
+    "PE-01": dict(short="S1", weightage=4, adjustRule="up", propWeights={
+        "seating": 12.5, "posture": 12.5, "lighting": 12.5, "infection": 25,
+        "instrUse": 12.5, "angulation": 12.5, "fingerRests": 12.5}),
+    "PE-02": dict(short="S2", weightage=8, propWeights={
+        "seating": 10, "posture": 10, "lighting": 10, "infection": 20,
+        "instrUse": 20, "angulation": 10, "fingerRests": 10, "cheek": 10}),
+    "PE-03": dict(short="S3", weightage=10, propWeights={
+        "debIncisor": 20, "debPremolar": 20, "debMolar": 40, "dmgTissue": 10, "dmgTooth": 10}),
+    "PE-04": dict(short="S4", weightage=8, propWeights=dict(_W14)),
+    "PE-05": dict(short="S5", weightage=8, propWeights=dict(_W14)),
+    "PE-06": dict(short="S6", weightage=None, propWeights=dict(_W14), assumedScheme=True),
+}
+
+# Items whose BOTTOM level is a patient-safety event (flagged RED on any occurrence):
+# Infection control "No mask or gloves / contaminated instrument", Instrument use "Dangerous".
+PE_SAFETY_ITEMS = {"infection", "instrUse"}
+# Damage items: bottom level = "Major damage". Common on benchtop sessions (≈12–17% in S4), so
+# RED only when it recurs across sessions (PE_FLAG_CONFIG['damageRedSessions']), AMBER once.
+PE_DAMAGE_ITEMS = {"dmgTissue", "dmgTooth"}
+
+# A session counts as "marked" once this share of the roster has an assessor-submitted form;
+# before that, missing forms are NOT flagged (e.g. PE-06 on the day of the test).
+PE_MARKED_MIN_FRACTION = 0.5
+
+PE_FLAG_CONFIG = dict(
+    lowPercentile=0.15,      # bottom share of the cohort within a session counts as "low"
+    minLowSessions=2,        # RED when low in >= this many marked sessions
+    declineZ=-0.75,          # AMBER when latest z minus mean of earlier z <= this (min 3 sessions)
+    latestGrMax=2,           # AMBER when latest Global Rating <= this (1 Starting, 2 Emerging)
+    latestPrMax=1,           # AMBER when latest Readiness <= this (1 = lacks knowledge/skills)
+    safetyMinCount=1,        # RED when bottom level on a PE_SAFETY_ITEMS criterion >= this many times
+    damageRedSessions=2,     # RED when "Major damage" in >= this many sessions; AMBER when in one
+    missRed=2,               # RED when >= this many marked sessions have no scored form
+    selfGapPts=15.0,         # AMBER when mean (self % - assessor %) >= +this (over-estimates)
+    minSelfSessions=2,       # ... over at least this many sessions
+)
+
+_MELB = "Australia/Melbourne"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2. Loading
+# ────────────────────────────────────────────────────────────────────────────
+def _norm(text):
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+_ALIAS_TO_ITEM = {a: k for k, (_, _, al) in PE_ITEMS.items() for a in al}
+
+
+def _localDate(value):
+    """DASH stores UTC timestamps ('…T14:00:00Z') and plain dates; return Melbourne-local date."""
+    if not value:
+        return None
+    s = str(value)
+    if len(s) == 10:
+        return pd.Timestamp(s).date()
+    ts = pd.Timestamp(s)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    return ts.tz_convert(_MELB).date()
+
+
+def _excludedStudents(excludeStudents):
+    if excludeStudents is not None:
+        return {str(s) for s in excludeStudents}
+    try:
+        from general_utils import EXCLUDED_STUDENT_NUMBERS   # single source of truth
+        return {str(s) for s in EXCLUDED_STUDENT_NUMBERS}
+    except Exception:
+        return {"40029860"}
+
+
+def _isTestAccount(student):
+    """DASH test login (Config.xlsx: test.student@student.unimelb.edu.au, No 1234567)."""
+    email = (student.get("email") or "").lower()
+    return email.startswith("test.") or str(student.get("student_number")) == "1234567"
+
+
+def loadPeForms(jsonPath, cohort="DDS1", excludeStudents=None, sessions=None):
+    """
+    Read the CAF JSON export and return (roster, forms).
+      roster : DataFrame studentNumber, lastName, firstName, email — every student of the cohort
+               in the export (so students with NO PE form still appear as missing).
+      forms  : list of dicts, one per (form × PE checklist code), with the raw form under "form".
+    """
+    sessions = sessions or PE_SESSIONS
+    excl = _excludedStudents(excludeStudents)
+    with open(jsonPath, encoding="utf-8") as fh:
+        rows = json.load(fh)
+    roster, forms = {}, []
+    for r in rows:
+        if r.get("cohort") != cohort:
+            continue
+        st = r.get("student") or {}
+        sn = str(st.get("student_number", "")).strip()
+        if not sn or sn in excl or _isTestAccount(st):
+            continue
+        roster[sn] = dict(studentNumber=sn, lastName=(st.get("last_name") or "").strip(),
+                          firstName=(st.get("first_name") or "").strip(), email=st.get("email"))
+        for f in r.get("forms") or []:
+            fc = f.get("form_context") or {}
+            # route by CHECKLIST CODE, never clinic_type: some PE forms are saved with
+            # clinic_type "CD" (student picked the wrong clinic) — e.g. 4 PE-02 forms in 2026.
+            for c in fc.get("checklists") or []:
+                code = c.get("code")
+                if code not in sessions:
+                    continue
+                forms.append(dict(
+                    studentNumber=sn, code=code, formId=f.get("id"),
+                    date=_localDate(fc.get("datetime") or r.get("datetime")),
+                    assessor=(f.get("assessor_name") or "").strip(),
+                    subStudent=bool(f.get("submitted_by_student")),
+                    subAssessor=bool(f.get("submitted_by_assessor")),
+                    createdAt=f.get("created_at"), updatedAt=f.get("updated_at"), form=f))
+    rosterDf = pd.DataFrame(list(roster.values())).sort_values(
+        ["lastName", "firstName"], key=lambda s: s.str.lower()).reset_index(drop=True)
+    return rosterDf, forms
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 3. Scoring
+# ────────────────────────────────────────────────────────────────────────────
+def _oNum(key):
+    m = re.match(r"O(\d+)$", str(key))
+    return int(m.group(1)) if m else None
+
+
+def _checklistMeta(form, code, side):
+    """Field names, valid option keys (best→worst) and labels for one checklist/side."""
+    cfg = (form.get(f"{side}_config") or {}).get("checklists") or {}
+    sel = (cfg.get("selected") or {}).get(code)
+    if not sel:   # the student side sometimes only carries the assessor config
+        sel = (((form.get("assessor_config") or {}).get("checklists") or {}).get("selected") or {}).get(code)
+    if not sel:
+        return None
+    extra = sel.get("extra_config") or {}
+    options = (extra.get("options") or {}).get(side) or (extra.get("options") or {}).get("assessor") or {}
+    rubric = (extra.get("rubric") or {}).get(side) or {}
+    rowCfg = extra.get("row_config") or {}
+    meta = {}
+    for mc, name in (sel.get("fields") or {}).items():
+        disabled = set(((rowCfg.get(mc) or {}).get("disabled_options") or {}).get(side) or
+                       ((rowCfg.get(mc) or {}).get("disabled_options") or {}).get("assessor") or [])
+        valid = sorted([k for k in options if k not in disabled and _oNum(k)], key=_oNum)
+        labels = {k: ((rubric.get(mc) or {}).get(k) or options.get(k) or k) for k in options}
+        meta[mc] = dict(name=name, itemId=_ALIAS_TO_ITEM.get(_norm(name)), valid=valid, labels=labels)
+    return meta
+
+
+def _scoreOption(key, valid, rule="down"):
+    """
+    (level, denom, adjustedKey) — rank among valid keys (best→worst order O1, O2 …).
+    Out-of-rubric key: rule "down" → nearest valid at/below (worse), else the lowest valid;
+                       rule "up"   → nearest valid at/above (better), else the highest valid.
+    """
+    if not valid or _oNum(key) is None:
+        return None, len(valid) or None, None
+    n = len(valid)
+    if key in valid:
+        return n - valid.index(key), n, key
+    if rule == "up":
+        above = [k for k in valid if _oNum(k) <= _oNum(key)]
+        adj = above[-1] if above else valid[0]
+    else:
+        below = [k for k in valid if _oNum(k) >= _oNum(key)]
+        adj = below[0] if below else valid[-1]
+    return n - valid.index(adj), n, adj
+
+
+def _scale(data, key):
+    v = ((data.get("scales") or {}).get(key) or {}).get("key")
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def scorePeForms(forms, sessions=None):
+    """
+    Return (formsDf, itemsDf, adjustDf, dupDf).
+      formsDf : one row per student × session (the chosen form) with status, GR/PR/Prof, comments,
+                Equal % and Proportional % (assessor), and student self Equal %.
+      itemsDf : long, one row per student × session × item × side ('assessor'/'student').
+      adjustDf: out-of-rubric selections and the level they were mapped to.
+      dupDf   : extra forms for the same student × session that were NOT used.
+    """
+    sessions = sessions or PE_SESSIONS
+    # choose one form per student × session: assessor-submitted first, then latest update
+    byKey = defaultdict(list)
+    for f in forms:
+        byKey[(f["studentNumber"], f["code"])].append(f)
+    chosen, dups = [], []
+    for key, fs in byKey.items():
+        # tie-break on created_at (latest attempt), NOT updated_at: a later edit to an older
+        # duplicate must not displace the newer attempt — matches the published PE-02 sheet.
+        fs = sorted(fs, key=lambda x: (x["subAssessor"], x["subStudent"], x["createdAt"] or ""), reverse=True)
+        chosen.append(fs[0])
+        dups += [dict(studentNumber=x["studentNumber"], code=x["code"], formId=x["formId"],
+                      keptFormId=fs[0]["formId"], subAssessor=x["subAssessor"]) for x in fs[1:]]
+
+    formRows, itemRows, adjRows = [], [], []
+    for f in chosen:
+        code, form = f["code"], f["form"]
+        weights = sessions[code]["propWeights"]
+        status = ("Scored" if f["subAssessor"] else
+                  "Assessor pending" if f["subStudent"] else "Form opened, not submitted")
+        ad, sd = form.get("assessor_data") or {}, form.get("student_data") or {}
+        row = dict(studentNumber=f["studentNumber"], code=code, formId=f["formId"], date=f["date"],
+                   assessor=f["assessor"], status=status, subStudent=f["subStudent"],
+                   subAssessor=f["subAssessor"],
+                   gr=_scale(ad, "scale-global-rating") if f["subAssessor"] else None,
+                   pr=_scale(ad, "scale-practice-readiness") if f["subAssessor"] else None,
+                   prof=_scale(ad, "scale-professionalism") if f["subAssessor"] else None,
+                   assessorComment=((ad.get("texts") or {}).get("reflection") or "").strip(),
+                   studentComment=((sd.get("texts") or {}).get("reflection") or "").strip())
+        for side, data, submitted in (("assessor", ad, f["subAssessor"]), ("student", sd, f["subStudent"])):
+            answers = ((data.get("checklists") or {}).get(code)) or {}
+            meta = _checklistMeta(form, code, side) or {}
+            pcts, wsum, wtot = [], 0.0, 0.0
+            if submitted and answers:
+                for mc, ans in answers.items():
+                    m = meta.get(mc)
+                    if not m or m["itemId"] not in weights:
+                        continue             # item not scored in this session (see PE_SESSIONS)
+                    level, denom, adj = _scoreOption((ans or {}).get("key"), m["valid"],
+                                                     sessions[code].get("adjustRule", "down"))
+                    if level is None:
+                        continue
+                    pct = 100.0 * level / denom
+                    pcts.append(pct)
+                    wsum += pct * weights[m["itemId"]]
+                    wtot += weights[m["itemId"]]
+                    itemRows.append(dict(studentNumber=f["studentNumber"], code=code, side=side,
+                                         itemId=m["itemId"], mc=mc, level=level, denom=denom, pct=pct,
+                                         optionKey=ans.get("key"), label=m["labels"].get(adj, adj)))
+                    if adj != ans.get("key"):
+                        adjRows.append(dict(studentNumber=f["studentNumber"], code=code, side=side,
+                                            mc=mc, itemId=m["itemId"], criterion=m["name"],
+                                            original=f"{ans.get('key')} · {ans.get('value')}",
+                                            mappedTo=f"{adj} · {m['labels'].get(adj, adj)} ({level}/{denom})"))
+            pre = "" if side == "assessor" else "self"
+            row[f"{pre}{'eq' if not pre else 'Eq'}"] = float(np.mean(pcts)) if pcts else None
+            row[f"{pre}{'prop' if not pre else 'Prop'}"] = (wsum / wtot) if wtot else None
+        formRows.append(row)
+    formsDf = pd.DataFrame(formRows)
+    itemsDf = pd.DataFrame(itemRows)
+    adjustDf = pd.DataFrame(adjRows)
+    return formsDf, itemsDf, adjustDf, pd.DataFrame(dups)
+
+
+def validatePeScoring(formsDf, expected=None):
+    """Compare session class means to the published marking sheets (Equal, Prop)."""
+    expected = expected or {"PE-01": (None, 74.88), "PE-02": (77.53, 77.98), "PE-03": (58.75, 55.04),
+                            "PE-04": (79.88, 80.65), "PE-05": (82.18, 83.20)}
+    s = formsDf[formsDf["status"] == "Scored"].groupby("code")[["eq", "prop"]].mean().round(2)
+    out = []
+    for code, (eq, prop) in expected.items():
+        if code in s.index:
+            out.append(dict(code=code, eqCalc=s.loc[code, "eq"], eqSheet=eq,
+                            propCalc=s.loc[code, "prop"], propSheet=prop))
+    return pd.DataFrame(out)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4. Derived tables
+# ────────────────────────────────────────────────────────────────────────────
+def _slope(y):
+    y = [v for v in y if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if len(y) < 3:
+        return None
+    x = np.arange(len(y))
+    return float(np.polyfit(x, y, 1)[0])
+
+
+def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
+    """Session summary, per-student progress (with z-scores + flags) and self-vs-assessor gaps."""
+    sessions = sessions or PE_SESSIONS
+    cfg = dict(PE_FLAG_CONFIG, **(flagConfig or {}))
+    codes = list(sessions)
+    nRoster = len(roster)
+
+    # ---- session summary -------------------------------------------------------
+    sessRows = []
+    for code in codes:
+        d = formsDf[formsDf["code"] == code]
+        sc = d[d["status"] == "Scored"]
+        date = d["date"].mode().iloc[0] if len(d) and d["date"].notna().any() else None
+        sessRows.append(dict(
+            code=code, short=sessions[code]["short"], date=date, weightage=sessions[code]["weightage"],
+            title=None, nRoster=nRoster, nForms=len(d), nScored=len(sc),
+            nPending=int((d["status"] == "Assessor pending").sum()),
+            nOpened=int((d["status"] == "Form opened, not submitted").sum()),
+            marked=len(sc) >= PE_MARKED_MIN_FRACTION * nRoster,
+            meanEq=sc["eq"].mean(), medianEq=sc["eq"].median(), sdEq=sc["eq"].std(),
+            meanProp=sc["prop"].mean(), grMean=sc["gr"].mean(), prMean=sc["pr"].mean(),
+            gr=Counter(sc["gr"].dropna().astype(int)), pr=Counter(sc["pr"].dropna().astype(int)),
+            selfEq=d.loc[d["subStudent"], "selfEq"].mean()))
+    sessDf = pd.DataFrame(sessRows)
+
+    # ---- z within session (sessions differ in difficulty & items) ---------------
+    fd = formsDf.copy()
+    fd["z"] = None
+    fd["pctile"] = None
+    for code in codes:
+        m = (fd["code"] == code) & (fd["status"] == "Scored") & fd["eq"].notna()
+        v = fd.loc[m, "eq"]
+        if len(v) > 1 and v.std() > 0:
+            fd.loc[m, "z"] = (v - v.mean()) / v.std()
+            fd.loc[m, "pctile"] = v.rank(pct=True, method="max")
+
+    markedCodes = [c for c, mk in zip(sessDf["code"], sessDf["marked"]) if mk]
+    lowCut = {c: fd.loc[(fd["code"] == c) & (fd["status"] == "Scored"), "eq"].quantile(cfg["lowPercentile"])
+              for c in markedCodes}
+
+    items = itemsDf[itemsDf["side"] == "assessor"] if len(itemsDf) else itemsDf
+    progRows = []
+    for _, s in roster.iterrows():
+        sn = s["studentNumber"]
+        mine = fd[fd["studentNumber"] == sn].set_index("code")
+        row = dict(studentNumber=sn, lastName=s["lastName"], firstName=s["firstName"])
+        zs, eqs = [], []
+        missing, lows, pendings = [], [], []
+        for code in codes:
+            st = mine.loc[code, "status"] if code in mine.index else "No form"
+            row[f"status_{code}"] = st
+            for k in ("eq", "prop", "gr", "pr", "z", "selfEq", "assessor", "assessorComment",
+                      "studentComment", "date"):
+                row[f"{k}_{code}"] = (mine.loc[code, k] if code in mine.index and st == "Scored"
+                                      or (code in mine.index and k in ("selfEq", "studentComment", "date"))
+                                      else None)
+            if st == "Scored":
+                eqs.append(row[f"eq_{code}"])
+                if row[f"z_{code}"] is not None:
+                    zs.append(float(row[f"z_{code}"]))
+                if code in lowCut and row[f"eq_{code}"] <= lowCut[code]:
+                    lows.append(sessions[code]["short"])
+            elif code in markedCodes:
+                missing.append(sessions[code]["short"])
+                if st == "Assessor pending":
+                    pendings.append(sessions[code]["short"])
+        scoredCodes = [c for c in codes if row[f"status_{c}"] == "Scored"]
+        row["nScored"] = len(scoredCodes)
+        row["meanEq"] = float(np.mean(eqs)) if eqs else None
+        row["latestCode"] = scoredCodes[-1] if scoredCodes else None
+        row["latestEq"] = row[f"eq_{scoredCodes[-1]}"] if scoredCodes else None
+        row["latestGr"] = row[f"gr_{scoredCodes[-1]}"] if scoredCodes else None
+        row["latestPr"] = row[f"pr_{scoredCodes[-1]}"] if scoredCodes else None
+        row["meanZ"] = float(np.mean(zs)) if zs else None
+        row["zSlope"] = _slope(zs)
+        row["zChange"] = (zs[-1] - float(np.mean(zs[:-1]))) if len(zs) >= 3 else None
+
+        # safety events (bottom level on a safety item)
+        mineItems = items[(items["studentNumber"] == sn)] if len(items) else items
+        safety, dmgSess = [], []
+        if len(mineItems):
+            ev = mineItems[mineItems["itemId"].isin(PE_SAFETY_ITEMS) & (mineItems["level"] == 1)]
+            safety = [f"{sessions[r.code]['short']} {PE_ITEMS[r.itemId][0]}" for r in ev.itertuples()]
+            dm = mineItems[mineItems["itemId"].isin(PE_DAMAGE_ITEMS) & (mineItems["level"] == 1)]
+            for c in codes:
+                what = [PE_ITEMS[i][0].split("– ")[-1] for i in dm.loc[dm["code"] == c, "itemId"]]
+                if what:
+                    dmgSess.append(f"{sessions[c]['short']} ({' & '.join(what)})")
+        # self vs assessor
+        gaps = [row[f"selfEq_{c}"] - row[f"eq_{c}"] for c in scoredCodes
+                if row[f"selfEq_{c}"] is not None and not pd.isna(row[f"selfEq_{c}"])]
+        row["selfGap"] = float(np.mean(gaps)) if gaps else None
+        row["nSelf"] = len(gaps)
+
+        red, amber = [], []
+        if row["nScored"] == 0 and not any(c in mine.index for c in codes):
+            red.append("No PE forms recorded")
+        if len(lows) >= cfg["minLowSessions"]:
+            red.append(f"Bottom {int(cfg['lowPercentile']*100)}% in {len(lows)} sessions ({', '.join(lows)})")
+        elif lows and row["latestCode"] and lows[0] == sessions[row["latestCode"]]["short"]:
+            amber.append(f"Bottom {int(cfg['lowPercentile']*100)}% in latest session ({lows[0]})")
+        if len(safety) >= cfg["safetyMinCount"]:
+            red.append("Safety-level rating: " + "; ".join(safety))
+        if len(dmgSess) >= cfg["damageRedSessions"]:
+            red.append(f"Major damage in {len(dmgSess)} sessions: " + ", ".join(dmgSess))
+        elif dmgSess and row["latestCode"] and dmgSess[0].startswith(sessions[row["latestCode"]]["short"] + " "):
+            amber.append("Major damage in latest session " + dmgSess[0])
+        if len(missing) >= cfg["missRed"] and row["nScored"] > 0:
+            red.append(f"No scored form for {len(missing)} marked sessions ({', '.join(missing)})")
+        elif missing and row["nScored"] > 0:
+            amber.append(f"No scored form for {', '.join(missing)}"
+                         + (" (assessor not submitted)" if pendings else ""))
+        if row["zChange"] is not None and row["zChange"] <= cfg["declineZ"]:
+            amber.append(f"Declining vs own earlier sessions (latest z {zs[-1]:+.2f}, change {row['zChange']:+.2f})")
+        if row["latestGr"] is not None and row["latestGr"] <= cfg["latestGrMax"]:
+            amber.append(f"Latest Global Rating {int(row['latestGr'])} ({sessions[row['latestCode']]['short']})")
+        if row["latestPr"] is not None and row["latestPr"] <= cfg["latestPrMax"]:
+            amber.append(f"Latest Readiness Level {int(row['latestPr'])} ({sessions[row['latestCode']]['short']})")
+        if row["selfGap"] is not None and row["nSelf"] >= cfg["minSelfSessions"] and row["selfGap"] >= cfg["selfGapPts"]:
+            amber.append(f"Self-assessment above assessor by {row['selfGap']:.0f} pts on average")
+        row["flag"] = "RED" if red else "AMBER" if amber else ""
+        row["reasons"] = red + amber
+        row["safety"] = safety
+        row["damageSessions"] = dmgSess
+        row["lowSessions"] = lows
+        row["missingSessions"] = missing
+        progRows.append(row)
+    progDf = pd.DataFrame(progRows)
+    return sessDf, progDf, fd
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 5. Workbook styling helpers
+# ────────────────────────────────────────────────────────────────────────────
+NAVY, TEAL, GREY = "1F3864", "2E75B6", "F2F2F2"
+_FILL = lambda c: PatternFill("solid", start_color=c, end_color=c)
+_RED, _AMBER, _GREEN, _LIGHT = _FILL("F8CBAD"), _FILL("FFE699"), _FILL("C6EFCE"), _FILL("DDEBF7")
+_THIN = Side(style="thin", color="BFBFBF")
+_BOX = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_SECTION_COLORS = {"Ergonomics": ["1F4E79", "2E75B6", "6FA8DC", "9DC3E6"],
+                   "Instrument Handling": ["375623", "548235", "70AD47", "A9D08E"],
+                   "Quality of Scaling": ["C55A11", "ED7D31", "F4B183", "BF9000"],
+                   "Damage": ["C00000", "FF6F6F"]}
+_DASHES = ["solid", "dash", "sysDot", "lgDash"]
+
+
+def _title(ws, text, sub=None, width=12):
+    ws["A1"] = text
+    ws["A1"].font = _XlFont(bold=True, size=14, color=NAVY)
+    if sub:
+        ws["A2"] = sub
+        ws["A2"].font = _XlFont(italic=True, size=9, color="595959")
+
+
+def _header(ws, row, col, values, fill=NAVY):
+    for i, v in enumerate(values):
+        c = ws.cell(row=row, column=col + i, value=v)
+        c.font = _XlFont(bold=True, color="FFFFFF", size=10)
+        c.fill = _FILL(fill)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = _BOX
+
+
+def _put(ws, row, col, value, fmt=None, fill=None, bold=False, wrap=False, align=None):
+    if isinstance(value, float) and math.isnan(value):
+        value = None
+    c = ws.cell(row=row, column=col, value=value)
+    c.border = _BOX
+    if fmt:
+        c.number_format = fmt
+    if fill:
+        c.fill = fill
+    if bold:
+        c.font = _XlFont(bold=True)
+    c.alignment = Alignment(wrap_text=wrap, vertical="top", horizontal=align)
+    return c
+
+
+def _widths(ws, widths):
+    for col, w in widths.items():
+        ws.column_dimensions[col if isinstance(col, str) else get_column_letter(col)].width = w
+
+
+def _sessLabel(s):
+    d = s["date"]
+    return f"{s['short']} · {d.strftime('%d %b')}" if d else s["short"]
+
+
+def _levelFill(level, denom):
+    if level is None or denom is None:
+        return None
+    return _RED if level == 1 else _GREEN if level == denom else _AMBER
+
+
+def _lineChart(title, yTitle, yMax=100):
+    ch = LineChart()
+    ch.title = title
+    ch.y_axis.title = yTitle
+    ch.y_axis.scaling.min = 0
+    ch.y_axis.scaling.max = yMax
+    ch.y_axis.majorGridlines = ChartLines()
+    ch.y_axis.delete = False
+    ch.x_axis.delete = False
+    ch.height, ch.width = 10, 16          # taller/wider so x ticks + legend both fit
+    # Fixed vertical bands (fractions of chart height) so Excel cannot auto-place and collide:
+    #   0.00–0.10 title · gap · 0.15–0.28 legend · gap · 0.36–0.81 plot (inner) · 0.81–1.00 x ticks
+    ch.legend.position = "t"
+    ch.legend.overlay = False
+    ch.legend.layout = _XlLayout(manualLayout=_XlManualLayout(
+        xMode="edge", yMode="edge", x=0.04, y=0.15, w=0.92, h=0.13))
+    ch.layout = _XlLayout(manualLayout=_XlManualLayout(   # NB: ch.plot_area.layout is discarded by openpyxl on save
+        layoutTarget="inner", xMode="edge", yMode="edge", x=0.09, y=0.36, w=0.87, h=0.45))
+    ch.display_blanks = "gap"
+    ch.visible_cells_only = False
+    return ch
+
+
+def _smallTitle(chart, text, sizeHundredths=1000, color=NAVY):
+    """Chart title as rich text with an explicit (small) font size — plain chart.title uses ~14pt."""
+    cp = _XlCharacterProperties(sz=sizeHundredths, b=True, solidFill=color)
+    para = _XlParagraph(pPr=_XlParagraphProperties(defRPr=cp), r=[_XlRun(rPr=cp, t=text)])
+    chart.title = _XlTitle(tx=_XlText(rich=_XlRichText(p=[para])), overlay=False)
+
+
+def _styleSeries(series, color, dash="solid", width=22000):
+    series.graphicalProperties.line.solidFill = color
+    series.graphicalProperties.line.width = width
+    series.graphicalProperties.line.prstDash = dash
+    series.marker.symbol = "circle"
+    series.marker.size = 6
+    series.marker.graphicalProperties = GraphicalProperties(solidFill=color)
+    series.marker.graphicalProperties.line.solidFill = color
+    series.smooth = False
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 6. Workbook
+# ────────────────────────────────────────────────────────────────────────────
+def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
+                              outPath="DDS1/DDS1 PE Progress Report.xlsm",
+                              cohort="DDS1", subject="DENT90141", excludeStudents=None,
+                              flagConfig=None, sessions=None, verbose=True, macroEnabled=True):
+    """
+    Build the coordinator workbook. Returns dict of the DataFrames used (for notebook inspection).
+
+    jsonPath        : CAF export (list of assessments with nested forms).
+    outPath         : destination. With macroEnabled (default) the file is written as .xlsm (extension
+                      forced) so clicking a name in the Student Tracker side list loads that student;
+                      macroEnabled=False writes a plain .xlsx (dropdown only).
+    excludeStudents : list of student numbers to drop (default general_utils.EXCLUDED_STUDENT_NUMBERS).
+    flagConfig      : overrides for PE_FLAG_CONFIG, e.g. {"lowPercentile": 0.10}.
+    sessions        : override PE_SESSIONS (scored items / proportional weights per checklist code).
+    """
+    sessions = sessions or PE_SESSIONS
+    roster, forms = loadPeForms(jsonPath, cohort=cohort, excludeStudents=excludeStudents, sessions=sessions)
+    formsDf, itemsDf, adjustDf, dupDf = scorePeForms(forms, sessions)
+    sessDf, progDf, fd = buildPeTables(roster, formsDf, itemsDf, sessions, flagConfig)
+    cfg = dict(PE_FLAG_CONFIG, **(flagConfig or {}))
+    codes = list(sessions)
+    titles = {}
+    for f in forms:   # session names from the form config
+        if f["code"] not in titles:
+            sel = (((f["form"].get("assessor_config") or {}).get("checklists") or {}).get("selected") or {}).get(f["code"])
+            titles[f["code"]] = (sel or {}).get("name", f["code"])
+    sessDf["title"] = sessDf["code"].map(titles)
+    sessInfo = {r["code"]: r for r in sessDf.to_dict("records")}
+    labels = [_sessLabel(sessInfo[c]) for c in codes]
+    asOf = max([f["date"] for f in forms if f["date"]] or [None])
+    stamp = f"{cohort} · {subject} · data to {asOf:%d %b %Y}" if asOf else f"{cohort} · {subject}"
+
+    wb = Workbook()
+    wsRead = wb.active
+    wsRead.title = "Read Me"
+    wsOv = wb.create_sheet("Overview")
+    wsGrid = wb.create_sheet("Progress Grid")
+    wsFlag = wb.create_sheet("Flags")
+    wsTr = wb.create_sheet("Student Tracker")
+    wsSc = wb.create_sheet("Student Charts")
+    wsPiv = wb.create_sheet("Item Pivot")
+    wsCx = wb.create_sheet("Criterion x Session")
+    wsSelf = wb.create_sheet("Self vs Assessor")
+    wsAdj = wb.create_sheet("Adjustments")
+    wsData = wb.create_sheet("TrackerData")
+    wsList = wb.create_sheet("Lists")
+    wsGd = wb.create_sheet("GridData")
+
+    # ---------------- Overview -------------------------------------------------
+    _title(wsOv, "DDS1 Periodontics — cohort progress by session", stamp)
+    hdr = ["Session", "Code", "Title", "Date", "Weightage", "Roster", "Scored", "Assessor pending",
+           "Opened only", "No form", "Mean %\n(Equal)", "Median %", "SD", "Mean %\n(Prop)",
+           "Mean self %", "Mean GR\n(1–5)", "Mean PR\n(1–4)", "GR 1/2/3/4/5", "PR 1/2/3/4", "Status"]
+    _header(wsOv, 4, 1, hdr)
+    for i, c in enumerate(codes):
+        s = sessInfo[c]
+        r = 5 + i
+        vals = [s["short"], c, s["title"], s["date"], f"{s['weightage']:g}%" if isinstance(s["weightage"], (int, float)) and not pd.isna(s["weightage"]) else "TBC",
+                s["nRoster"], s["nScored"], s["nPending"], s["nOpened"], s["nRoster"] - s["nForms"],
+                s["meanEq"], s["medianEq"], s["sdEq"], s["meanProp"], s["selfEq"], s["grMean"], s["prMean"],
+                " / ".join(str(s["gr"].get(k, 0)) for k in range(1, 6)),
+                " / ".join(str(s["pr"].get(k, 0)) for k in range(1, 5)),
+                ("Marked" if s["marked"] else "Awaiting marking")
+                + (" (scheme assumed = S5)" if sessions[c].get("assumedScheme") else "")]
+        fmts = [None, None, None, "dd mmm yyyy", None, "0", "0", "0", "0", "0", "0.0", "0.0", "0.0", "0.0",
+                "0.0", "0.00", "0.00", None, None, None]
+        for j, (v, fm) in enumerate(zip(vals, fmts)):
+            _put(wsOv, r, 1 + j, v, fm, fill=None if s["marked"] else _AMBER if j == 19 else None)
+    _widths(wsOv, {"A": 8, "B": 8, "C": 44, "D": 12, "E": 10, "R": 16, "S": 13, "T": 30})
+    for col in range(6, 18):
+        wsOv.column_dimensions[get_column_letter(col)].width = 10
+    wsOv.row_dimensions[4].height = 42
+    n = len(codes)
+    # chart data (label row) in hidden helper area
+    wsOv.cell(row=5 + n + 2, column=1, value="Chart data").font = _XlFont(italic=True, color="808080")
+    base = 5 + n + 3
+    _header(wsOv, base, 1, ["Session", "Mean % (Equal)", "Mean % (Prop)", "Mean self %"], fill=TEAL)
+    for i, c in enumerate(codes):
+        s = sessInfo[c]
+        _put(wsOv, base + 1 + i, 1, labels[i])
+        _put(wsOv, base + 1 + i, 2, s["meanEq"] if s["marked"] else None, "0.0")
+        _put(wsOv, base + 1 + i, 3, s["meanProp"] if s["marked"] else None, "0.0")
+        _put(wsOv, base + 1 + i, 4, s["selfEq"], "0.0")
+    ch = _lineChart("Cohort mean by session", "%")
+    ch.add_data(Reference(wsOv, min_col=2, max_col=4, min_row=base, max_row=base + n), titles_from_data=True)
+    ch.set_categories(Reference(wsOv, min_col=1, min_row=base + 1, max_row=base + n))
+    for sr, col in zip(ch.series, [NAVY, "70AD47", "ED7D31"]):
+        _styleSeries(sr, col)
+    ch.width = 18
+    wsOv.add_chart(ch, f"F{base}")
+    wsOv.cell(row=base + n + 2, column=1,
+              value="Note: sessions differ in content (S1 has 7 items, S3 is the practice test on scaling/damage "
+                    "only) so raw % is not directly comparable across sessions — use the within-session "
+                    "rank (Progress Grid z) for individual trends.").font = _XlFont(italic=True, size=9)
+
+    # ---------------- Progress Grid -------------------------------------------
+    _title(wsGrid, "Progress grid — session % (Equal weighting) per student",
+           f"{stamp} · colours are relative within each session column · blank = no scored form")
+    fixed = ["#", "Last Name", "First Name", "Student No"]
+    grHdr = [f"GR {sessions[c]['short']}" for c in codes]
+    prHdr = [f"PR {sessions[c]['short']}" for c in codes]
+    tail = ["Sessions scored", "Mean %", "Latest %", "Mean z", "Trend\n(z slope)", "Change vs\nearlier (z)",
+            "Self − assessor\n(pts)", "Flag", "Reasons"]
+    hdrs = fixed + labels + grHdr + prHdr + tail
+    _header(wsGrid, 4, 1, hdrs)
+    wsGrid.row_dimensions[4].height = 42
+    c0 = len(fixed) + 1
+    for i, r in enumerate(progDf.to_dict("records")):
+        row = 5 + i
+        for j, v in enumerate([i + 1, r["lastName"], r["firstName"], r["studentNumber"]]):
+            _put(wsGrid, row, 1 + j, v)
+        for k, c in enumerate(codes):
+            st = r[f"status_{c}"]
+            cell = _put(wsGrid, row, c0 + k, r[f"eq_{c}"], "0.0", align="center")
+            if st != "Scored" and sessInfo[c]["marked"]:
+                cell.value = "missing" if st == "No form" else "pending"
+                cell.font = _XlFont(italic=True, color="C00000", size=9)
+            _put(wsGrid, row, c0 + n + k, r[f"gr_{c}"], "0", align="center")
+            _put(wsGrid, row, c0 + 2 * n + k, r[f"pr_{c}"], "0", align="center")
+        t0 = c0 + 3 * n
+        vals = [r["nScored"], r["meanEq"], r["latestEq"], r["meanZ"], r["zSlope"], r["zChange"], r["selfGap"],
+                r["flag"], "; ".join(r["reasons"])]
+        fmts = ["0", "0.0", "0.0", "+0.00;-0.00", "+0.00;-0.00", "+0.00;-0.00", "+0;-0", None, None]
+        for j, (v, fm) in enumerate(zip(vals, fmts)):
+            cell = _put(wsGrid, row, t0 + j, v, fm)      # no wrap: full reasons live on "Flags"
+        fc = wsGrid.cell(row=row, column=t0 + 7)
+        fc.fill = _RED if r["flag"] == "RED" else _AMBER if r["flag"] == "AMBER" else PatternFill()
+        fc.font = _XlFont(bold=True)
+    last = 4 + len(progDf)
+    for k in range(n):   # per-session relative colour scale
+        col = get_column_letter(c0 + k)
+        wsGrid.conditional_formatting.add(f"{col}5:{col}{last}", ColorScaleRule(
+            start_type="percentile", start_value=5, start_color="F8696B",
+            mid_type="percentile", mid_value=50, mid_color="FFEB84",
+            end_type="percentile", end_value=95, end_color="63BE7B"))
+    for k in range(2 * n):   # GR / PR low values
+        col = get_column_letter(c0 + n + k)
+        wsGrid.conditional_formatting.add(f"{col}5:{col}{last}", FormulaRule(
+            formula=[f'AND(ISNUMBER({col}5),{col}5<=1)'], fill=_RED))
+        if k < n:
+            wsGrid.conditional_formatting.add(f"{col}5:{col}{last}", FormulaRule(
+                formula=[f'AND(ISNUMBER({col}5),{col}5=2)'], fill=_AMBER))
+    _widths(wsGrid, {"A": 5, "B": 16, "C": 16, "D": 11})
+    for k in range(n):
+        wsGrid.column_dimensions[get_column_letter(c0 + k)].width = 10
+    for k in range(2 * n):
+        wsGrid.column_dimensions[get_column_letter(c0 + n + k)].width = 5.5
+    for j, w in enumerate([8, 8, 8, 8, 8, 9, 10, 8, 70]):
+        wsGrid.column_dimensions[get_column_letter(c0 + 3 * n + j)].width = w
+    wsGrid.freeze_panes = wsGrid.cell(row=5, column=c0)
+    wsGrid.auto_filter.ref = f"A4:{get_column_letter(len(hdrs))}{last}"
+
+    # ---------------- Flags -----------------------------------------------------
+    _title(wsFlag, "Students to review",
+           f"{stamp} · RED = act now, AMBER = watch · thresholds on Read Me (PE_FLAG_CONFIG)")
+    fh = ["Flag", "Last Name", "First Name", "Student No", "Sessions scored", "Mean z", "Latest %",
+          "Latest GR", "Latest PR", "Reasons", "Latest assessor comment"]
+    _header(wsFlag, 4, 1, fh)
+    fl = progDf[progDf["flag"] != ""].copy()
+    fl["ord"] = fl["flag"].map({"RED": 0, "AMBER": 1})
+    fl = fl.sort_values(["ord", "meanZ"], na_position="first")
+    for i, r in enumerate(fl.to_dict("records")):
+        row = 5 + i
+        lc = r["latestCode"] if isinstance(r["latestCode"], str) else None   # NaN-safe (pandas ≥ 3)
+        vals = [r["flag"], r["lastName"], r["firstName"], r["studentNumber"], r["nScored"], r["meanZ"],
+                r["latestEq"], r["latestGr"], r["latestPr"], "\n".join("• " + x for x in r["reasons"]),
+                r[f"assessorComment_{lc}"] if lc else None]
+        fmts = [None, None, None, None, "0", "+0.00;-0.00", "0.0", "0", "0", None, None]
+        for j, (v, fm) in enumerate(zip(vals, fmts)):
+            _put(wsFlag, row, 1 + j, v, fm, wrap=j in (9, 10))
+        wsFlag.cell(row=row, column=1).fill = _RED if r["flag"] == "RED" else _AMBER
+        wsFlag.cell(row=row, column=1).font = _XlFont(bold=True)
+    _widths(wsFlag, {"A": 8, "B": 16, "C": 16, "D": 11, "E": 9, "F": 8, "G": 9, "H": 8, "I": 8, "J": 70, "K": 60})
+    wsFlag.freeze_panes = "B5"
+    wsFlag.auto_filter.ref = f"A4:K{4 + max(len(fl), 1)}"
+    cnt = Counter(fl["flag"])
+    wsFlag["D2"] = f"RED {cnt.get('RED', 0)} · AMBER {cnt.get('AMBER', 0)} · of {len(progDf)} students"
+    wsFlag["D2"].font = _XlFont(bold=True, color="C00000")
+
+    # ---------------- Item Pivot (long, one row per student × item) ------------
+    _title(wsPiv, "Checklist item by session — every student (filterable)",
+           "Value = item % (level ÷ levels available × 100). Red = bottom level, green = top level. "
+           "Raw level in the right-hand block. Blank = item not assessed / no scored form.")
+    ph = ["Key", "Last Name", "First Name", "Student No", "Section", "Checklist item"] + labels + \
+         [f"Level {sessions[c]['short']}" for c in codes] + ["Items at bottom level"]
+    _header(wsPiv, 4, 1, ph)
+    ai = itemsDf[itemsDf["side"] == "assessor"] if len(itemsDf) else itemsDf
+    aiIdx = {(r.studentNumber, r.code, r.itemId): (r.pct, r.level, r.denom, r.label) for r in ai.itertuples()}
+    row = 5
+    for r in progDf.to_dict("records"):
+        sn = r["studentNumber"]
+        for itemId, (lab, sec, _) in PE_ITEMS.items():
+            _put(wsPiv, row, 1, f"{sn}|{itemId}")
+            for j, v in enumerate([r["lastName"], r["firstName"], sn, sec, lab]):
+                _put(wsPiv, row, 2 + j, v)
+            bottoms = 0
+            for k, c in enumerate(codes):
+                hit = aiIdx.get((sn, c, itemId))
+                if hit:
+                    pct, lvl, den, olab = hit
+                    _put(wsPiv, row, 7 + k, pct, "0", fill=_levelFill(lvl, den), align="center")
+                    cell = _put(wsPiv, row, 7 + n + k, f"{lvl}/{den}", align="center")
+                    bottoms += lvl == 1
+                else:
+                    _put(wsPiv, row, 7 + k, None)
+                    _put(wsPiv, row, 7 + n + k, None)
+            _put(wsPiv, row, 7 + 2 * n, bottoms or None, "0")
+            row += 1
+    wsPiv.column_dimensions["A"].hidden = True
+    _widths(wsPiv, {"B": 16, "C": 16, "D": 11, "E": 18, "F": 24})
+    for k in range(2 * n + 1):
+        wsPiv.column_dimensions[get_column_letter(7 + k)].width = 9
+    wsPiv.freeze_panes = "G5"
+    wsPiv.auto_filter.ref = f"A4:{get_column_letter(7 + 2 * n)}{row - 1}"
+    pivLast = row - 1
+
+    # ---------------- TrackerData (hidden, one row per student) ----------------
+    tdFields = ["eq", "prop", "gr", "pr", "status", "assessor", "assessorComment", "studentComment", "selfEq"]
+    tdHdr = ["Student No", "Display"] + [f"{f}_{c}" for c in codes for f in tdFields]
+    for j, h in enumerate(tdHdr):
+        wsData.cell(row=1, column=1 + j, value=h)
+    for i, r in enumerate(progDf.to_dict("records")):
+        wsData.cell(row=2 + i, column=1, value=r["studentNumber"])
+        wsData.cell(row=2 + i, column=2, value=f"{r['lastName']}, {r['firstName']} ({r['studentNumber']})")
+        j = 3
+        for c in codes:
+            for fdn in tdFields:
+                v = r.get(f"{fdn}_{c}") if fdn != "status" else r[f"status_{c}"]
+                if isinstance(v, float) and math.isnan(v):
+                    v = None
+                wsData.cell(row=2 + i, column=j, value=v)
+                j += 1
+    tdLast = 1 + len(progDf)
+    tdCol = {h: get_column_letter(1 + j) for j, h in enumerate(tdHdr)}
+    wsData.sheet_state = "hidden"
+
+    # Lists (dropdown source)
+    for i, r in enumerate(progDf.to_dict("records")):
+        wsList.cell(row=1 + i, column=1, value=f"{r['lastName']}, {r['firstName']} ({r['studentNumber']})")
+    wsList.sheet_state = "hidden"
+
+    # ---------------- Student Tracker ------------------------------------------
+    # Layout: side list of students in A:B (frozen, click a name → macro sets the pick cell),
+    # C = spacer, tracker tables start at column D (offset X). Dropdown on the pick cell still works
+    # when macros are disabled.
+    ws = wsTr
+    X = 3
+    cn = lambda c: c + X                       # tracker column number
+    cl = lambda c: get_column_letter(c + X)    # tracker column letter
+    pick = f"{cl(2)}3"
+    sn = f"${cl(7)}$3"
+    _title(ws, "Student tracker — click a name on the left",
+           "Click a student in the list (macro-enabled file) or use the dropdown in the yellow cell. "
+           "Everything updates.")
+    ws[f"{cl(1)}3"] = "Student:"
+    ws[f"{cl(1)}3"].font = _XlFont(bold=True)
+    ws.merge_cells(f"{pick}:{cl(5)}3")
+    ws[pick] = wsList["A1"].value
+    ws[pick].fill = _FILL("FFF2CC")
+    ws[pick].font = _XlFont(bold=True, size=12)
+    dv = DataValidation(type="list", formula1=f"=Lists!$A$1:$A${len(progDf)}", allow_blank=False)
+    ws.add_data_validation(dv)
+    dv.add(pick)
+    ws[f"{cl(6)}3"] = "Student No:"
+    ws[sn.replace("$", "")] = f'=IFERROR(INDEX(TrackerData!$A$2:$A${tdLast},MATCH(${cl(2)}$3,TrackerData!$B$2:$B${tdLast},0)),"")'
+    ws[sn.replace("$", "")].font = _XlFont(bold=True)
+    ws[f"{cl(9)}3"] = "Flag:"
+    flagCell = f"{cl(10)}3"
+    gFlag, gRes = get_column_letter(c0 + 3 * n + 7), get_column_letter(c0 + 3 * n + 8)
+    ws[flagCell] = f"=IFERROR(INDEX('Progress Grid'!${gFlag}$5:${gFlag}${last},MATCH({sn},'Progress Grid'!$D$5:$D${last},0)),\"\")"
+    ws[flagCell].font = _XlFont(bold=True)
+    ws[f"{cl(11)}3"] = f"=IFERROR(INDEX('Progress Grid'!${gRes}$5:${gRes}${last},MATCH({sn},'Progress Grid'!$D$5:$D${last},0)),\"\")"
+    ws[f"{cl(11)}3"].alignment = Alignment(wrap_text=True, vertical="top")
+    ws.merge_cells(f"{cl(11)}3:{cl(17)}3")
+    ws.row_dimensions[3].height = 45
+    ws.conditional_formatting.add(flagCell, FormulaRule(formula=[f'${cl(10)}$3="RED"'], fill=_RED))
+    ws.conditional_formatting.add(flagCell, FormulaRule(formula=[f'${cl(10)}$3="AMBER"'], fill=_AMBER))
+
+    # side list (A:B)
+    listRow0 = 6
+    ws["A4"] = "Students — click a name"
+    ws["A4"].font = _XlFont(bold=True, color=NAVY)
+    _header(ws, 5, 1, ["Student", "Flag"])
+    for i, r in enumerate(progDf.to_dict("records")):
+        rr = listRow0 + i
+        c = _put(ws, rr, 1, f"{r['lastName']}, {r['firstName']} ({r['studentNumber']})")
+        c.font = _XlFont(color="1F3864", underline="single")
+        fc = _put(ws, rr, 2, r["flag"] or None, align="center")
+        if r["flag"]:
+            fc.fill = _RED if r["flag"] == "RED" else _AMBER
+    listLast = listRow0 + len(progDf) - 1
+    ws.conditional_formatting.add(f"A{listRow0}:A{listLast}", FormulaRule(
+        formula=[f"$A{listRow0}=${cl(2)}$3"], fill=_FILL("FFD966"), font=_XlFont(bold=True)))
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 7
+    ws.column_dimensions["C"].width = 2
+    pickListRef = f"'Student Tracker'!$A${listRow0}:$A${listLast}"
+    pickCellRef = f"'Student Tracker'!${cl(2)}$3"
+
+    # block 1: session summary
+    r0 = 5
+    _header(ws, r0, cn(1), ["", "Session"] + labels)
+    summ = [("Status", "status", None), ("Session % (Equal)", "eq", "0.0"), ("Session % (Prop)", "prop", "0.0"),
+            ("Cohort mean % (Equal)", None, "0.0"), ("Self-assessed %", "selfEq", "0.0"),
+            ("Global Rating (1–5)", "gr", "0"), ("Readiness (1–4)", "pr", "0"), ("Assessor", "assessor", None)]
+    for i, (lab, fdn, fm) in enumerate(summ):
+        rr = r0 + 1 + i
+        _put(ws, rr, cn(2), lab, bold=True)
+        for k, c in enumerate(codes):
+            if fdn is None:
+                v = sessInfo[c]["meanEq"] if sessInfo[c]["marked"] else None
+                _put(ws, rr, cn(3 + k), v, fm, align="center")
+                continue
+            col = tdCol[f"{fdn}_{c}"]
+            f = (f'=IFERROR(IF(INDEX(TrackerData!${col}$2:${col}${tdLast},MATCH({sn},TrackerData!$A$2:$A${tdLast},0))="",NA(),'
+                 f'INDEX(TrackerData!${col}$2:${col}${tdLast},MATCH({sn},TrackerData!$A$2:$A${tdLast},0))),NA())')
+            c_ = _put(ws, rr, cn(3 + k), f, fm, align="center")
+            if fdn == "assessor":       # long names: shrink, never wrap (row height is shared with the side list)
+                c_.alignment = Alignment(horizontal="center", vertical="top", shrink_to_fit=True)
+    sumLast = r0 + len(summ)
+    ws.conditional_formatting.add(f"{cl(3)}{r0+1}:{cl(2+n)}{sumLast}",
+                                  FormulaRule(formula=[f"ISNA({cl(3)}{r0+1})"], font=_XlFont(color="BFBFBF")))
+
+    # block 2: item % pivot (MC × session)
+    r1 = sumLast + 2
+    ws.cell(row=r1, column=cn(1), value="Checklist items — % of available levels (red = bottom level, green = top)").font = \
+        _XlFont(bold=True, color=NAVY)
+    _header(ws, r1 + 1, cn(1), ["Item key", "Checklist item"] + labels + ["Section"])
+    itemRow0 = r1 + 2
+    for i, (itemId, (lab, sec, _)) in enumerate(PE_ITEMS.items()):
+        rr = itemRow0 + i
+        _put(ws, rr, cn(1), itemId)
+        _put(ws, rr, cn(2), lab, bold=True)
+        _put(ws, rr, cn(3 + n), sec)
+        for k in range(n):
+            col = get_column_letter(7 + k)
+            f = (f'=IFERROR(IF(INDEX(\'Item Pivot\'!${col}$5:${col}${pivLast},MATCH({sn}&"|"&${cl(1)}{rr},\'Item Pivot\'!$A$5:$A${pivLast},0))="",NA(),'
+                 f'INDEX(\'Item Pivot\'!${col}$5:${col}${pivLast},MATCH({sn}&"|"&${cl(1)}{rr},\'Item Pivot\'!$A$5:$A${pivLast},0))),NA())')
+            _put(ws, rr, cn(3 + k), f, "0", align="center")
+    itemLast = itemRow0 + len(PE_ITEMS) - 1
+    # block 3: raw levels (same layout) → drives red/green
+    r2 = itemLast + 2
+    ws.cell(row=r2, column=cn(1), value="Raw level awarded (level / levels available)").font = _XlFont(bold=True, color=NAVY)
+    _header(ws, r2 + 1, cn(1), ["Item key", "Checklist item"] + labels)
+    rawRow0 = r2 + 2
+    for i, (itemId, (lab, sec, _)) in enumerate(PE_ITEMS.items()):
+        rr = rawRow0 + i
+        _put(ws, rr, cn(1), itemId)
+        _put(ws, rr, cn(2), lab)
+        for k in range(n):
+            col = get_column_letter(7 + n + k)
+            f = (f'=IFERROR(INDEX(\'Item Pivot\'!${col}$5:${col}${pivLast},MATCH({sn}&"|"&${cl(1)}{rr},\'Item Pivot\'!$A$5:$A${pivLast},0))&"","")')
+            _put(ws, rr, cn(3 + k), f, align="center")
+    rawLast = rawRow0 + len(PE_ITEMS) - 1
+    for blk0 in (itemRow0, rawRow0):
+        rng = f"{cl(3)}{blk0}:{cl(2+n)}{blk0 + len(PE_ITEMS) - 1}"
+        off = rawRow0 - blk0      # formulas reference the raw block
+        tl = f"{cl(3)}{blk0 + off}"
+        ws.conditional_formatting.add(rng, FormulaRule(formula=[f'LEFT({tl},2)="1/"'], fill=_RED))
+        ws.conditional_formatting.add(rng, FormulaRule(
+            formula=[f'AND(LEN({tl})>2,LEFT({tl},FIND("/",{tl}&"/")-1)=MID({tl},FIND("/",{tl}&"/")+1,5))'], fill=_GREEN))
+        ws.conditional_formatting.add(rng, FormulaRule(formula=[f'LEN({tl})>2'], fill=_AMBER))
+    ws.conditional_formatting.add(f"{cl(3)}{itemRow0}:{cl(2+n)}{itemLast}",
+                                  FormulaRule(formula=[f"ISNA({cl(3)}{itemRow0})"], font=_XlFont(color="D9D9D9")))
+
+    # block 4: comments
+    r3 = rawLast + 6          # extra gap: comments sit clear of the tables above
+    ws.cell(row=r3, column=cn(1), value="Comments").font = _XlFont(bold=True, color=NAVY)
+    _header(ws, r3 + 1, cn(1), ["", "Session", "Assessor comment", "", "", "", "Student reflection", "", "", ""])
+    ws.merge_cells(start_row=r3 + 1, start_column=cn(3), end_row=r3 + 1, end_column=cn(6))
+    ws.merge_cells(start_row=r3 + 1, start_column=cn(7), end_row=r3 + 1, end_column=cn(10))
+    CROWS = 4     # each comment spans 4 normal-height rows (merged) — tall rows would stretch the side list
+    for k, c in enumerate(codes):
+        rr = r3 + 2 + k * CROWS
+        ws.merge_cells(start_row=rr, start_column=cn(2), end_row=rr + CROWS - 1, end_column=cn(2))
+        _put(ws, rr, cn(2), labels[k], bold=True)
+        for fdn, c1, c2 in (("assessorComment", 3, 6), ("studentComment", 7, 10)):
+            col = tdCol[f"{fdn}_{c}"]
+            ws.merge_cells(start_row=rr, start_column=cn(c1), end_row=rr + CROWS - 1, end_column=cn(c2))
+            _put(ws, rr, cn(c1), f'=IFERROR(INDEX(TrackerData!${col}$2:${col}${tdLast},MATCH({sn},TrackerData!$A$2:$A${tdLast},0))&"","")',
+                 wrap=True)
+            for rrr in range(rr, rr + CROWS):     # border the whole merged block
+                for ccc in range(cn(c1), cn(c2) + 1):
+                    ws.cell(row=rrr, column=ccc).border = _BOX
+        for rrr in range(rr, rr + CROWS):
+            ws.cell(row=rrr, column=cn(2)).border = _BOX
+    ws.column_dimensions[cl(1)].hidden = True
+    ws.column_dimensions[cl(2)].width = 24
+    for k in range(n + 1):
+        ws.column_dimensions[cl(3 + k)].width = 12
+
+    # charts: one per section (item lines) + session % vs cohort
+    anchorCol = cl(n + 5)
+    secRows = defaultdict(list)
+    for i, (itemId, (lab, sec, _)) in enumerate(PE_ITEMS.items()):
+        secRows[sec].append(itemRow0 + i)
+    cats = Reference(ws, min_col=cn(3), max_col=cn(2 + n), min_row=itemRow0 - 1)
+    chartRow = r0
+    ch = _lineChart("Session % — student vs cohort mean", "%")
+    ch.add_data(Reference(ws, min_col=cn(2), max_col=cn(2 + n), min_row=r0 + 2), from_rows=True, titles_from_data=True)
+    ch.add_data(Reference(ws, min_col=cn(2), max_col=cn(2 + n), min_row=r0 + 4), from_rows=True, titles_from_data=True)
+    ch.set_categories(cats)
+    _styleSeries(ch.series[0], NAVY, width=28000)
+    _styleSeries(ch.series[1], "A6A6A6", dash="dash")
+    ws.add_chart(ch, f"{anchorCol}{chartRow}")
+    for si, sec in enumerate(PE_SECTIONS):
+        ch = _lineChart(f"{sec} — item % by session", "%")
+        for j, rr in enumerate(secRows[sec]):
+            ch.add_data(Reference(ws, min_col=cn(2), max_col=cn(2 + n), min_row=rr), from_rows=True, titles_from_data=True)
+            _styleSeries(ch.series[-1], _SECTION_COLORS[sec][j % 4], _DASHES[j % 4])
+        ch.set_categories(cats)
+        ch.y_axis.scaling.max = 105
+        col = anchorCol if si % 2 == 0 else cl(n + 5 + 11)
+        rowA = chartRow + 22 + (si // 2) * 22
+        ws.add_chart(ch, f"{col}{rowA}")
+    for rr in range(4, max(listLast, r3 + 2 + n * CROWS) + 1):   # fixed heights: side list stays evenly spaced
+        ws.row_dimensions[rr].height = 15
+    ws.freeze_panes = "C4"          # side list + pick row stay visible
+
+    # ---------------- Student Charts (one small chart per student) --------------
+    # Data lives on hidden GridData: row 1 categories, row 2 cohort mean, row 3+ one student each
+    # (same A–Z order as every other sheet). Charts fill left→right, then down.
+    PER_ROW, COL_PITCH, ROW_PITCH = 4, 8, 16
+    shortLabels = [sessions[c]["short"] for c in codes]
+    wsGd.cell(row=1, column=1, value="Series")
+    for k, lab in enumerate(shortLabels):
+        wsGd.cell(row=1, column=2 + k, value=lab)
+    wsGd.cell(row=2, column=1, value="Cohort mean")
+    for k, c in enumerate(codes):
+        wsGd.cell(row=2, column=2 + k, value=round(sessInfo[c]["meanEq"], 1) if sessInfo[c]["marked"] else None)
+    flagLine = {"RED": "C00000", "AMBER": "BF8F00", "": NAVY}
+    _title(wsSc, "All students — session % (Equal) vs cohort mean",
+           f"{stamp} · A–Z, left→right then down · line colour = flag (red RED, amber AMBER, navy none) · "
+           "grey dashed = cohort mean · gaps = no scored form")
+    for i, r in enumerate(progDf.to_dict("records")):
+        gr = 3 + i
+        wsGd.cell(row=gr, column=1, value="Student")
+        for k, c in enumerate(codes):
+            v = r[f"eq_{c}"]
+            wsGd.cell(row=gr, column=2 + k, value=None if v is None or (isinstance(v, float) and math.isnan(v)) else round(v, 1))
+        ch = _lineChart("", "%")
+        ch.height, ch.width = 7.2, 12.5
+        ch.y_axis.title = None
+        ch.add_data(Reference(wsGd, min_col=1, max_col=1 + n, min_row=gr), from_rows=True, titles_from_data=True)
+        ch.add_data(Reference(wsGd, min_col=1, max_col=1 + n, min_row=2), from_rows=True, titles_from_data=True)
+        ch.set_categories(Reference(wsGd, min_col=2, max_col=1 + n, min_row=1))
+        _styleSeries(ch.series[0], flagLine.get(r["flag"], NAVY), width=28000)
+        _styleSeries(ch.series[1], "A6A6A6", dash="dash", width=15000)
+        ch.series[1].marker.size = 4
+        tag = f"  ·  {r['flag']}" if r["flag"] else ""
+        _smallTitle(ch, f"{r['lastName']}, {r['firstName']} ({r['studentNumber']}){tag}", 1000,
+                    flagLine.get(r["flag"], NAVY))
+        rowA = 4 + (i // PER_ROW) * ROW_PITCH
+        colA = get_column_letter(1 + (i % PER_ROW) * COL_PITCH)
+        wsSc.add_chart(ch, f"{colA}{rowA}")
+    wsGd.sheet_state = "hidden"
+
+    # ---------------- Criterion x Session --------------------------------------
+    _title(wsCx, "Criterion × session — cohort", f"{stamp} · mean item % and share of students at the bottom level")
+    _header(wsCx, 4, 1, ["Section", "Checklist item"] + [f"Mean % {x}" for x in labels] +
+            [f"% bottom {sessions[c]['short']}" for c in codes] + [f"n {sessions[c]['short']}" for c in codes])
+    wsCx.row_dimensions[4].height = 36
+    for i, (itemId, (lab, sec, _)) in enumerate(PE_ITEMS.items()):
+        rr = 5 + i
+        _put(wsCx, rr, 1, sec)
+        _put(wsCx, rr, 2, lab, bold=True)
+        for k, c in enumerate(codes):
+            d = ai[(ai["code"] == c) & (ai["itemId"] == itemId)] if len(ai) else ai
+            _put(wsCx, rr, 3 + k, d["pct"].mean() if len(d) else None, "0.0", align="center")
+            _put(wsCx, rr, 3 + n + k, (d["level"] == 1).mean() * 100 if len(d) else None, "0", align="center")
+            _put(wsCx, rr, 3 + 2 * n + k, len(d) or None, "0", align="center")
+    cl = 4 + len(PE_ITEMS)
+    wsCx.conditional_formatting.add(f"C5:{get_column_letter(2+n)}{cl}", ColorScaleRule(
+        start_type="num", start_value=40, start_color="F8696B", mid_type="num", mid_value=70,
+        mid_color="FFEB84", end_type="num", end_value=100, end_color="63BE7B"))
+    wsCx.conditional_formatting.add(f"{get_column_letter(3+n)}5:{get_column_letter(2+2*n)}{cl}", ColorScaleRule(
+        start_type="num", start_value=0, start_color="FFFFFF", end_type="num", end_value=50, end_color="F8696B"))
+    _widths(wsCx, {"A": 18, "B": 24})
+    for k in range(3 * n):
+        wsCx.column_dimensions[get_column_letter(3 + k)].width = 10
+    # chart: section means per session
+    cr = cl + 3
+    _header(wsCx, cr, 1, ["", "Section"] + labels, fill=TEAL)
+    for i, sec in enumerate(PE_SECTIONS):
+        _put(wsCx, cr + 1 + i, 2, sec)
+        for k, c in enumerate(codes):
+            ids = [x for x, v in PE_ITEMS.items() if v[1] == sec]
+            d = ai[(ai["code"] == c) & ai["itemId"].isin(ids)] if len(ai) else ai
+            _put(wsCx, cr + 1 + i, 3 + k, d["pct"].mean() if len(d) else None, "0.0")
+    ch = _lineChart("Cohort mean by section", "%")
+    for i, sec in enumerate(PE_SECTIONS):
+        ch.add_data(Reference(wsCx, min_col=2, max_col=2 + n, min_row=cr + 1 + i), from_rows=True, titles_from_data=True)
+        _styleSeries(ch.series[-1], _SECTION_COLORS[sec][0])
+    ch.set_categories(Reference(wsCx, min_col=3, max_col=2 + n, min_row=cr))
+    ch.width = 18
+    wsCx.add_chart(ch, f"B{cr + 7}")
+
+    # ---------------- Self vs Assessor -----------------------------------------
+    _title(wsSelf, "Self-assessment vs assessor",
+           "Gap = student self % − assessor % (same checklist, same session). + = rates self higher.")
+    sh = ["Last Name", "First Name", "Student No"] + [f"Gap {x}" for x in labels] + ["Mean gap", "Sessions", "Pattern"]
+    _header(wsSelf, 4, 1, sh)
+    for i, r in enumerate(progDf.to_dict("records")):
+        rr = 5 + i
+        for j, v in enumerate([r["lastName"], r["firstName"], r["studentNumber"]]):
+            _put(wsSelf, rr, 1 + j, v)
+        for k, c in enumerate(codes):
+            s_, a_ = r[f"selfEq_{c}"], r[f"eq_{c}"]
+            gap = (s_ - a_) if (s_ is not None and a_ is not None and not pd.isna(s_) and not pd.isna(a_)) else None
+            _put(wsSelf, rr, 4 + k, gap, "+0;-0;0", align="center")
+        g = r["selfGap"]
+        pat = ("" if g is None or r["nSelf"] < cfg["minSelfSessions"] else
+               "Over-estimates" if g >= cfg["selfGapPts"] else
+               "Under-estimates" if g <= -cfg["selfGapPts"] else "Calibrated")
+        _put(wsSelf, rr, 4 + n, g, "+0.0;-0.0")
+        _put(wsSelf, rr, 5 + n, r["nSelf"], "0")
+        _put(wsSelf, rr, 6 + n, pat, fill=_AMBER if pat == "Over-estimates" else _LIGHT if pat == "Under-estimates" else None)
+    sl = 4 + len(progDf)
+    wsSelf.conditional_formatting.add(f"D5:{get_column_letter(4+n)}{sl}", ColorScaleRule(
+        start_type="num", start_value=-30, start_color="5B9BD5", mid_type="num", mid_value=0,
+        mid_color="FFFFFF", end_type="num", end_value=30, end_color="ED7D31"))
+    _widths(wsSelf, {"A": 16, "B": 16, "C": 11, get_column_letter(6 + n): 16})
+    for k in range(n + 2):
+        wsSelf.column_dimensions[get_column_letter(4 + k)].width = 10
+    wsSelf.freeze_panes = "D5"
+    wsSelf.auto_filter.ref = f"A4:{get_column_letter(6+n)}{sl}"
+    # item-level cohort gap
+    si0 = 4
+    ic = 8 + n
+    wsSelf.cell(row=si0 - 1, column=ic, value="Cohort mean gap by item (pts)").font = _XlFont(bold=True, color=NAVY)
+    _header(wsSelf, si0, ic, ["Checklist item", "Mean gap", "Pairs"])
+    if len(itemsDf):
+        piv = itemsDf.pivot_table(index=["studentNumber", "code", "itemId"], columns="side", values="pct").dropna()
+        piv["gap"] = piv["student"] - piv["assessor"]
+        byItem = piv.groupby(level="itemId")["gap"].agg(["mean", "count"])
+        for i, (itemId, (lab, _, _)) in enumerate(PE_ITEMS.items()):
+            _put(wsSelf, si0 + 1 + i, ic, lab)
+            if itemId in byItem.index:
+                _put(wsSelf, si0 + 1 + i, ic + 1, byItem.loc[itemId, "mean"], "+0.0;-0.0")
+                _put(wsSelf, si0 + 1 + i, ic + 2, int(byItem.loc[itemId, "count"]), "0")
+    wsSelf.column_dimensions[get_column_letter(ic)].width = 24
+
+    # ---------------- Adjustments ----------------------------------------------
+    _title(wsAdj, "Out-of-rubric selections and how they were scored",
+           "Rule (as in DDS1_PE0x marking sheets): mapped to the nearest valid level at or below the selection "
+           "(if none below, the lowest valid level). S1 only: mapped UP, as in the published S1 sheet.")
+    ah = ["Session", "Side", "Last Name", "First Name", "Student No", "MC", "Criterion", "Selected", "Scored as"]
+    _header(wsAdj, 4, 1, ah)
+    names = progDf.set_index("studentNumber")[["lastName", "firstName"]].to_dict("index")
+    if len(adjustDf):
+        adj = adjustDf.sort_values(["code", "side", "studentNumber"])
+        for i, r in enumerate(adj.to_dict("records")):
+            nm = names.get(r["studentNumber"], {})
+            for j, v in enumerate([sessions[r["code"]]["short"], r["side"], nm.get("lastName"), nm.get("firstName"),
+                                   r["studentNumber"], r["mc"], r["criterion"], r["original"], r["mappedTo"]]):
+                _put(wsAdj, 5 + i, 1 + j, v)
+    # duplicate forms (same student × session) — which one was used
+    dc = 11
+    wsAdj.cell(row=3, column=dc, value="Duplicate forms — not used (the assessor-submitted, latest-created form is kept)"
+               ).font = _XlFont(bold=True, color=NAVY)
+    _header(wsAdj, 4, dc, ["Session", "Last Name", "First Name", "Student No", "Ignored form", "Kept form",
+                           "Ignored was assessor-submitted"])
+    if len(dupDf):
+        for i, r in enumerate(dupDf.sort_values(["code", "studentNumber"]).to_dict("records")):
+            nm = names.get(r["studentNumber"], {})
+            for j, v in enumerate([sessions[r["code"]]["short"], nm.get("lastName"), nm.get("firstName"),
+                                   r["studentNumber"], r["formId"], r["keptFormId"],
+                                   "Yes" if r["subAssessor"] else "No"]):
+                _put(wsAdj, 5 + i, dc + j, v, fill=_AMBER if (j == 6 and r["subAssessor"]) else None)
+    _widths(wsAdj, {"A": 8, "B": 9, "C": 16, "D": 16, "E": 11, "F": 6, "G": 34, "H": 30, "I": 40,
+                    "K": 8, "L": 16, "M": 16, "N": 11, "O": 11, "P": 11, "Q": 14})
+    wsAdj.freeze_panes = "A5"
+
+    # ---------------- Read Me --------------------------------------------------
+    ws = wsRead
+    _title(ws, "DDS1 Periodontics (PE) — coordinator progress report", stamp)
+    lines = [
+        ("What this is", "Progress of every DDS1 student across the six PE sessions (PE-01 … PE-06), "
+                         "from the DASH CAF export. Built by dds1_pe_utils.buildDds1PeProgressReport."),
+        ("Sheets", "Overview — per-session completion and cohort means.  Progress Grid — one row per student, "
+                   "session %, GR/PR per session, trend and flag.  Flags — students to review with reasons.  "
+                   "Student Tracker — click a name in the left-hand list (enable macros) or use the yellow dropdown: item × session table, raw levels, charts, comments.  Student Charts — every student's session % vs cohort mean, A–Z left→right then down.  "
+                   "Item Pivot — every student × checklist item × session (filterable).  Criterion x Session — "
+                   "which skills the cohort is improving on.  Self vs Assessor — calibration.  Adjustments — "
+                   "out-of-rubric selections."),
+        ("Item scoring", "Level = rank among the criterion's valid options (best = number of levels, worst = 1). "
+                         "e.g. Seating /3, Lighting /2, debridement /5, Damage /3 (No/Minor/Major). "
+                         "Item % = level ÷ levels × 100."),
+        ("Session %", "Equal = mean of item %. Proportional = weighted per the marking sheets (PE_SESSIONS). "
+                      "S1 excludes Cheek retraction; S2 scores ergonomics + instrument handling only; "
+                      "S3 is scaling + damage only."),
+        ("Only scored forms", "A session counts for a student only when the assessor has submitted the form. "
+                              "'pending' = student submitted, assessor has not; 'missing' = no form."),
+        ("Trend", "Sessions differ in content and difficulty (S3 practice test mean ≈59%), so trends use the "
+                  "within-session z-score (student % vs that session's cohort). Trend = slope of z across "
+                  "scored sessions; Change = latest z − mean of earlier z."),
+        ("RED flags", f"Bottom {int(cfg['lowPercentile']*100)}% in ≥{cfg['minLowSessions']} marked sessions · "
+                      f"bottom level on Infection control or Instrument use ('Dangerous') · "
+                      f"Major damage in ≥{cfg['damageRedSessions']} sessions · "
+                      f"no scored form for ≥{cfg['missRed']} marked sessions · no PE forms at all."),
+        ("AMBER flags", f"Bottom {int(cfg['lowPercentile']*100)}% in the latest session only · "
+                        f"Major damage once, in the latest session · "
+                        f"change in z ≤ {cfg['declineZ']} · "
+                        f"latest GR ≤ {cfg['latestGrMax']} · latest Readiness ≤ {cfg['latestPrMax']} · "
+                        f"self-assessment ≥ {cfg['selfGapPts']:.0f} pts above assessor · one missed marked session."),
+        ("Marked session", f"A session is 'marked' once ≥{int(PE_MARKED_MIN_FRACTION*100)}% of the roster has a "
+                           "scored form. Missing forms are not flagged before then."),
+        ("Assumption", "PE-06 (Preclinical test) had no marking sheet — scored with the S4/S5 items and weights. "
+                       "Change PE_SESSIONS['PE-06'] if the test uses a different scheme."),
+        ("Data", f"Roster {len(progDf)} students · {len(formsDf)} student×session forms · "
+                 f"{len(dupDf)} duplicate forms ignored (assessor-submitted/latest kept) · "
+                 f"{len(adjustDf)} out-of-rubric selections."),
+    ]
+    for i, (k, v) in enumerate(lines):
+        ws.cell(row=4 + i, column=1, value=k).font = _XlFont(bold=True, color=NAVY)
+        ws.cell(row=4 + i, column=1).alignment = Alignment(vertical="top")
+        c = ws.cell(row=4 + i, column=2, value=v)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[4 + i].height = max(18, 15 * math.ceil(len(v) / 110))
+    _widths(ws, {"A": 18, "B": 120})
+
+    wb.active = 1
+    # names used by the VBA handler (and harmless without it)
+    from openpyxl.workbook.defined_name import DefinedName
+    for nm, ref in (("StudentPickList", pickListRef), ("StudentPick", pickCellRef)):
+        dn = DefinedName(nm, attr_text=ref)
+        try:
+            wb.defined_names[nm] = dn            # openpyxl >= 3.1
+        except TypeError:
+            wb.defined_names.append(dn)          # openpyxl < 3.1
+    import io, os
+    if macroEnabled:
+        wb.code_name = "ThisWorkbook"                     # must match the VBA document modules
+        wsRead.sheet_properties.codeName = "Sheet1"
+        outPath = os.path.splitext(outPath)[0] + ".xlsm"
+        buf = io.BytesIO()
+        wb.save(buf)
+        with open(outPath, "wb") as fh:
+            fh.write(_addVbaProject(buf.getvalue()))
+    else:
+        outPath = os.path.splitext(outPath)[0] + ".xlsx"
+        wb.save(outPath)
+    if verbose:
+        print(f"Saved {outPath}")
+        print(f"  roster {len(progDf)} · flags RED {cnt.get('RED', 0)} · AMBER {cnt.get('AMBER', 0)}")
+        print(validatePeScoring(formsDf).to_string(index=False))
+    return dict(roster=roster, formsDf=formsDf, itemsDf=itemsDf, adjustDf=adjustDf, dupDf=dupDf,
+                sessDf=sessDf, progDf=progDf)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 7. Macro packaging (.xlsm) — click-a-name on the Student Tracker
+# ────────────────────────────────────────────────────────────────────────────
+# vbaProject.bin with ONE event handler in ThisWorkbook (source below). Built 2026-09-24 from an
+# Excel-authored blank project (ThisWorkbook / Sheet1 / Module1): module source replaced, MODULEOFFSET
+# zeroed and _VBA_PROJECT version set to 0xFFFF so Excel recompiles from source on open.
+# Rebuild recipe: _handover_docs/HANDOVER_dds1_pe_progress_report.md §13.
+#
+#   Private Sub Workbook_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
+#       If Sh.Name <> "Student Tracker" / single cell / inside named range StudentPickList
+#       → Sh.Range("StudentPick").Value = Target.Value   (events off while writing)
+_VBA_PROJECT_B64 = (
+    "0M8R4KGxGuEAAAAAAAAAAAAAAAAAAAAAPgADAP7/CQAGAAAAAAAAAAAAAAABAAAAAQAAAAAAAAAAEAAAAgAAAAEAAAD+////AAAA"
+    "AAAAAAD/////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "///////////////////////////////////////////////////////////////////////////////////9////BQAAAP7///8E"
+    "AAAABgAAAAgAAAAHAAAACQAAAP7////+////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "/////////////////////////////////////////////////////////////////1IAbwBvAHQAIABFAG4AdAByAHkAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWAAUA//////////8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAwAAAIAIAAAAAAAAUABSAE8ASgBFAEMAVAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAABAAAgECAAAACAAAAP////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0gEA"
+    "AAAAAABWAEIAQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAABAP//"
+    "////////AwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE0AbwBkAHUAbABlADEAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAIBBAAAAAYAAAD/////AAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAACYAAAAAAAAAAQAAAAIAAAADAAAABAAAAAUAAAAGAAAABwAAAP7////+////CgAA"
+    "AAsAAAD+////DQAAAA4AAAAPAAAAEAAAABEAAAASAAAAEwAAABQAAAD+////FgAAABcAAAAYAAAAGQAAABoAAAAbAAAAHAAAAB0A"
+    "AAAeAAAA/v////7///8hAAAA/v//////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "////////////////////////////////////////////////////////////////////////////////////////////////////"
+    "//////////////////////////////9JRD0iezlFMzk0QzBCLTY5N0UtNEFFRS05RkE2LTQ0NkY1MUZCMzBEQ30iDQpEb2N1bWVu"
+    "dD1UaGlzV29ya2Jvb2svJkgwMDAwMDAwMA0KRG9jdW1lbnQ9U2hlZXQxLyZIMDAwMDAwMDANCk1vZHVsZT1Nb2R1bGUxDQpOYW1l"
+    "PSJWQkFQcm9qZWN0Ig0KSGVscENvbnRleHRJRD0iMCINClZlcnNpb25Db21wYXRpYmxlMzI9IjM5MzIyMjAwMCINCkNNRz0iNDE0"
+    "MzVBNUE1RTVBNUU1QTVFNUE1RSINCkRQQj0iQkNCRUE3QTI1OTFDNUExQzVBMUMiDQpHQz0iMzczNTJDMkJEQ0RENTZERTU2REVB"
+    "OSINCg0KW0hvc3QgRXh0ZW5kZXIgSW5mb10NCiZIMDAwMDAwMDE9ezM4MzJENjQwLUNGOTAtMTFDRi04RTQzLTAwQTBDOTExMDA1"
+    "QX07VkJFOyZIMDAwMDAwMDANCg0KW1dvcmtzcGFjZV0NClRoaXNXb3JrYm9vaz0wLCAwLCAwLCAwLCBDDQpTaGVldDE9MCwgMCwg"
+    "MCwgMCwgQw0KTW9kdWxlMT0yNiwgMjYsIDEzNDksIDUyMiwgWg0KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAEisABBdHRyaWJ1dABlIFZCX05hbQBlID0gIk1vZAB1bGUxIg0KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+    "pLAAQXR0cmlidXQAZSBWQl9OYW0AZSA9ICJTaGVAZXQxIg0KCuhCBGFzAnQwezAwMMAyMDgyMC0AIAQIRkMFEgMANDZ9DXxHIGxv"
+    "YmFsAcRTcARhYwGSRmFsc2UBDCVDcmVhdGFiAmwVH1ByZWRlYyRsYQAGSWQAI1RyAnUNIkV4cG9zZQEUHFRlbXBsYXTAZURlcml2"
+    "AiSSQoB1c3RvbWl6BEQBgyMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABDLKAAQAEAAAAAwAwqkoGkAICSAkAIBQGSAIDAFQAAOQE"
+    "BAACCgAcVkJBUHJvIGplY3QFABoAAKpAAgoGAgo9AgoHAnIVAQAIBhIJAhJXAr5QZREADAIiPAIKFgECOXN0ZG9sZT4BAhlzAHQA"
+    "ZABvAABsAGUADQBoBQARXgADKlxHezAAMDAyMDQzMC0bAAgEBEMFCQMANDZ9ACMyLjAjMCNDADpcV2luZG93AHNcU3lzdGVtCDMy"
+    "XANlMi50bABiI09MRSBBdQB0b21hdGlvboODUYNFT2ZmaWOERYhPAGaAAGkAY4JFCp6ACJSERTJERjgARDA0Qy01QkYAQS0xUwBo"
+    "AGUAZQB0ADEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4AAgEFAAAA////////"
+    "//8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJAAAAqAAAAAAAAABkAGkAcgAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAACAP///////////////wAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAwAAAAQAgAAAAAAAFQAaABpAHMAVwBvAHIAawBiAG8AbwBrAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAaAAIB/////wcAAAD/////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFQAAAGwC"
+    "AAAAAAAAXwBWAEIAQQBfAFAAUgBPAEoARQBDAFQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABoAAgD/"
+    "//////////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfAAAABwAAAAAAAAAwMUItQkhERTWARUFBgEM0"
+    "DYAFMohFgJhncmFtACBGaWxlc1xDIG9tbW9uBAZNaQBjcm9zb2Z0IABTaGFyZWRcTwBGRklDRTE2XABNU08uRExMIwOHEINNIDE2"
+    "LjAgBE9igcEgTGlicihhcnmDYA+C1AMAIhOCA/MIGYJiVGgAaXNXb3JrYm9gb2tHABiBCICraQWAtFfAWXIAawBiVcABb8ABGs4L"
+    "MtoLHFVCHUhCATHGeh5GAixRwiEcuCJCAytCARkBQllTaGVldDFHVcIbU0AXZUAAdMAQGk1IBzJOB+MbmpvLGweBQAFNb2R1bGUA"
+    "HMYOAQMAL2QAdYKYgRyNCAgyEAhjHUGyIUgdAhBCAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAFosgBBdHRyaWJ1dABlIFZCX05hbQBlID0gIlRoaQBzV29ya2JvbxBrIg0KCoxCYXMBAowwezAwMDIwUDgxOS0AEDADCEMj"
+    "BRIDADQ2fQ18R2wQb2JhbAHQU3BhgmMBkkZhbHNlDCUAQ3JlYXRhYmwBFR9QcmVkZWNsEmEABklkACNUcnWBDSJFeHBvc2UUHABU"
+    "ZW1wbGF0ZWBEZXJpdgISkkJ1wHN0b21pegREgyOAT3B0aW9uIAAvAGxpY2l0DQoNAAonIEREUzEgAFBFIHJlcG9yEHQ6IGOADWsg"
+    "YQAgc3R1ZGVudAQgbgGsaW4gdGgAZSBzaWRlIGyQaXN0IAAjIlOEEIBUcmFja2VyAJcAJyB0byBsb2ESZIAWYXQGIShzZQR0cwIg"
+    "eWVsbG8odyBwATFjgAU7IBBhbGwgApdzIGGAbmQgY2hhcoAVAYCOIGZvcm11bIBhcykuDQpQgHVBgHkgU3ViIIXuXwBTaGVldFNl"
+    "bARlY4E1Q2hhbmcAZShCeVZhbCAAU2ggQXMgT2ISasAGLCDDBFRhcihnZXTBBVJBCikNFAogAABPwENycm8AciBHb1RvIGRMb27A"
+    "ScEFSWYAES4JQpU8Ps86IFRoZTlBUml0wSSGDMMYLkNgb3VudEzBAgEPMYEUC0ludGVyc0AoWiiDDSxBHMImKMUbUAUASkzAWyIp"
+    "KSBJAHMgTm90aGluAmfUE0xlbihDU5R0coQTLgA9dWUADjg9IDBUDEILEh0iKU+ED0APzxSRE0FwQZVhkYFiLkVuQXRFdgATPnMH"
+    "qEEJGhsBqogZDQptgWM6nheDW0WgR4IRAAAAAAAAAAAAAAAAAAAAAAAAAADMYf//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAUABSAE8ASgBFAEMAVAB3AG0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAABQAAgD///////////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAg"
+    "AAAAVgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAP///////////////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA////////////////AAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD///////////////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAABUaGlzV29ya2Jvb2sAVABoAGkAcwBXAG8AcgBrAGIAbwBvAGsAAABTaGVldDEAUwBoAGUAZQB0"
+    "ADEAAABNb2R1bGUxAE0AbwBkAHUAbABlADEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAA=="
+)
+
+
+def _addVbaProject(xlsxBytes):
+    """Turn an openpyxl .xlsx (bytes) into .xlsm bytes carrying _VBA_PROJECT_B64."""
+    import base64, io, zipfile
+    zin = zipfile.ZipFile(io.BytesIO(xlsxBytes))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                t = data.decode("utf-8").replace(
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                    "application/vnd.ms-excel.sheet.macroEnabled.main+xml")
+                if 'Extension="bin"' not in t:
+                    t = t.replace("<Default ", '<Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Default ', 1)
+                data = t.encode("utf-8")
+            elif item.filename == "xl/_rels/workbook.xml.rels":
+                t = data.decode("utf-8")
+                if "vbaProject" not in t:
+                    t = t.replace("</Relationships>",
+                                  '<Relationship Id="rIdVbaProject1" '
+                                  'Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" '
+                                  'Target="vbaProject.bin"/></Relationships>')
+                data = t.encode("utf-8")
+            zout.writestr(item, data)
+        zout.writestr("xl/vbaProject.bin", base64.b64decode("".join(_VBA_PROJECT_B64)))
+    return buf.getvalue()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Task 7 (Cons Dent, posterior approximal restorations) — SECTION scoring
+# (added 2026-09-24). Reproduces DDS1/DDS1_Task7_section_scores.xlsx exactly
+# (3,752 / 3,752 section scores; see validateTask7Scoring).
+#
+# Rule, per section, using that section's OWN band table:
+#   * Option keys: O1 Satisfactory(col1) O2/O3 Needs improvement(col2/3)
+#     O4 Unsatisfactory(col4) O5 Critical error(col5) O6 Not Reviewed.
+#   * Incomplete (None) until EVERY criterion in the section is assessed (no O6/blank).
+#   * No errors -> full marks. Else the MOST-SEVERE error sets the band and the
+#     score starts at that band's upper limit (it is NOT itself deducted);
+#     every OTHER error deducts 0.25 (col2/3) or 0.5 (col4/5); floored at the
+#     band's lower limit.
+#   * Matrix: Sectional has no col2/col4, Tofflemire no col2 — a stray pick in a
+#     disabled column snaps to the nearest enabled column, ties -> MORE severe.
+# ════════════════════════════════════════════════════════════════════════════
+
+# bandKey -> {column: (upperLimit, lowerLimit)}
+TASK7_BANDS = {
+    "isolation":        {1: (2, 2),   2: (2, 1.5),     3: (1.5, 1),    4: (1, 0.5),   5: (0.5, 0)},
+    "prepAdhesive":     {1: (10, 10), 2: (9.75, 9),    3: (8.75, 6.75), 4: (6.5, 4),  5: (4.5, 0)},
+    "prepAmalgam":      {1: (10, 10), 2: (9.75, 8),    3: (7.75, 6),   4: (5.75, 4),  5: (4.5, 0)},
+    "matrixSectional":  {1: (2, 2),                     3: (1.5, 1),                   5: (0.5, 0)},
+    "matrixTofflemire": {1: (2, 2),                     3: (1.5, 1),    4: (1, 0.5),   5: (0.5, 0)},
+    "restComposite":    {1: (10, 10), 2: (9.75, 8.75), 3: (8.5, 6),    4: (6.5, 4),   5: (4.5, 0)},
+    "restAmalgam":      {1: (10, 10), 2: (9.75, 8.75), 3: (8.5, 6),    4: (6.5, 4),   5: (4.5, 0)},
+}
+TASK7_SECTIONS = ("Isolation", "Preparation", "Matrix", "Restoration")
+TASK7_SECTION_MAX = {"Isolation": 2, "Preparation": 10, "Matrix": 2, "Restoration": 10}
+
+
+def _t7Mcs(a, b):
+    return [f"MC{i}" for i in range(a, b + 1)]
+
+
+_T7_ADHESIVE = [("Isolation", "isolation", _t7Mcs(1, 4)), ("Preparation", "prepAdhesive", _t7Mcs(5, 13)),
+                ("Matrix", "matrixSectional", _t7Mcs(14, 18)), ("Restoration", "restComposite", _t7Mcs(19, 27))]
+_T7_AMALGAM = [("Isolation", "isolation", _t7Mcs(1, 4)), ("Preparation", "prepAmalgam", _t7Mcs(5, 17)),
+               ("Matrix", "matrixTofflemire", _t7Mcs(18, 22)), ("Restoration", "restAmalgam", _t7Mcs(23, 29))]
+# checklist code -> [(section, bandKey, [MC keys])]  (from the form headers: 7.1/7.4 adhesive +
+# sectional + composite; 7.2/7.5 amalgam + Tofflemire + amalgam; 7.3 isolation + amalgam only)
+TASK7_LAYOUT = {
+    "Task 7.1": _T7_ADHESIVE, "Task 7.4": _T7_ADHESIVE,
+    "Task 7.2": _T7_AMALGAM,  "Task 7.5": _T7_AMALGAM,
+    "Task 7.3": [("Isolation", "isolation", _t7Mcs(1, 4)), ("Restoration", "restAmalgam", _t7Mcs(5, 11))],
+}
+
+
+def _t7OptionKey(item):
+    """'O1'..'O6' from a v3 checklist cell ({'key': 'O2', 'value': ...}) or a bare key string."""
+    if isinstance(item, dict):
+        item = item.get("key")
+    item = str(item or "").strip().upper()
+    return item if re.fullmatch(r"O[1-6]", item) else None
+
+
+def _t7Snap(col, band):
+    """Snap a disabled column to the nearest enabled one; ties -> the more severe column."""
+    if col in band:
+        return col
+    return sorted(band, key=lambda k: (abs(k - col), -k))[0]
+
+
+def scoreTask7Section(items, bandKey):
+    """Score ONE section. items: list of checklist cells (one per criterion, in order).
+    Returns the section score (float) or None when the section is Incomplete."""
+    band = TASK7_BANDS[bandKey]
+    cols = []
+    for it in items:
+        k = _t7OptionKey(it)
+        if k is None or k == "O6":
+            return None
+        cols.append(_t7Snap(int(k[1:]), band))
+    errs = [c for c in cols if c > 1]
+    if not errs:
+        return float(band[1][0])
+    worst = max(errs)
+    upper, lower = band[worst]
+    rest = list(errs)
+    rest.remove(worst)
+    score = upper - sum(0.25 if c in (2, 3) else 0.5 for c in rest)
+    return float(max(score, lower))
+
+
+def scoreTask7Checklist(code, checklist):
+    """Score every section of one Task 7 checklist ({'MC1': {'key': 'O1', ...}, ...}).
+    Returns [{section, score, maxScore, pct, complete, nReviewed, nCriteria}, ...]
+    in TASK7_LAYOUT order, or [] when *code* is not a Task 7 code."""
+    layout = TASK7_LAYOUT.get(str(code).strip())
+    if not layout or not isinstance(checklist, dict):
+        return []
+    out = []
+    for section, bandKey, mcs in layout:
+        items = [checklist.get(m) for m in mcs]
+        score = scoreTask7Section(items, bandKey)
+        mx = TASK7_SECTION_MAX[section]
+        out.append({
+            "section": section, "score": score, "maxScore": mx,
+            "pct": None if score is None else 100.0 * score / mx,
+            "complete": score is not None,
+            "nReviewed": sum(1 for i in items if _t7OptionKey(i) not in (None, "O6")),
+            "nCriteria": len(mcs),
+        })
+    return out
+
+
+def _t7Checklists(row, checklistsCol="checklists"):
+    """Task 7 checklists of a form row: v3 `checklists` column (dict / JSON string);
+    falls back to assessor_data['checklists'] then to top-level assessor_data keys."""
+    val = row.get(checklistsCol) if hasattr(row, "get") else None
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except ValueError:
+            val = None
+    if not isinstance(val, dict) or not val:
+        ad = row.get("assessor_data") if hasattr(row, "get") else None
+        if isinstance(ad, str):
+            try:
+                ad = json.loads(ad)
+            except ValueError:
+                ad = None
+        if isinstance(ad, dict):
+            val = ad.get("checklists") if isinstance(ad.get("checklists"), dict) and ad.get("checklists") else ad
+    if not isinstance(val, dict):
+        return {}
+    return {k: v for k, v in val.items() if str(k).strip() in TASK7_LAYOUT and isinstance(v, dict)}
+
+
+def scoreTask7Forms(df, dateCol="datetimeutc", checklistsCol="checklists", formIdCol=None,
+                    tz="Australia/Melbourne"):
+    """Long table of Task 7 section scores from a form DataFrame (e.g. getDataDf output,
+    already filtered to one student / submitted forms as needed).
+
+    One row per (form x Task 7 code x section): formKey, date (YYYY-MM-DD, Melbourne),
+    datetime, task ('7.1'...), code, section, score, maxScore, pct, complete,
+    nReviewed, nCriteria. Empty DataFrame when no Task 7 forms."""
+    cols = ["formKey", "date", "datetime", "task", "code", "section", "score", "maxScore",
+            "pct", "complete", "nReviewed", "nCriteria"]
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=cols)
+    if formIdCol is None:
+        formIdCol = next((c for c in ("form_code", "form_id", "id", "assessmentid") if c in df.columns), None)
+    rows = []
+    for idx, row in df.iterrows():
+        cls = _t7Checklists(row, checklistsCol)
+        if not cls:
+            continue
+        dt = pd.Timestamp(row[dateCol])
+        if dt.tzinfo is None:
+            dt = dt.tz_localize("UTC")
+        dt = dt.tz_convert(tz)
+        key = row[formIdCol] if formIdCol else idx
+        for code, cl in cls.items():
+            for s in scoreTask7Checklist(code, cl):
+                rows.append({"formKey": f"{key}|{code}", "date": dt.strftime("%Y-%m-%d"), "datetime": dt,
+                             "task": str(code).replace("Task", "").strip(), "code": code, **s})
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame(rows)[cols]
+    return out.sort_values(["datetime", "task", "formKey"]).reset_index(drop=True)
+
+
+def task7FormPercent(scoresLong):
+    """Per-form summary: completed sections' total / their combined max (%), or None when
+    no section is complete. Index = formKey."""
+    if scoresLong is None or scoresLong.empty:
+        return pd.Series(dtype=float)
+    done = scoresLong[scoresLong["complete"]]
+    g = done.groupby("formKey").agg(s=("score", "sum"), m=("maxScore", "sum"))
+    pct = 100.0 * g["s"] / g["m"]
+    return pct.reindex(scoresLong["formKey"].unique())
+
+
+def validateTask7Scoring(jsonPath="temp 2026 caf.json",
+                         workbookPath="DDS1/DDS1_Task7_section_scores.xlsx"):
+    """Re-score every Task 7 form in the DASH JSON export and compare with the section
+    workbook (task sheets, by form_id). Returns (nMatch, nMismatch, mismatchList)."""
+    from openpyxl import load_workbook
+    with open(jsonPath, encoding="utf-8") as fh:
+        records = json.load(fh)
+    mine = {}
+    for rec in records:
+        for f in rec.get("forms") or []:
+            cls = ((f.get("assessor_data") or {}).get("checklists") or {})
+            for code, cl in cls.items():
+                for s in scoreTask7Checklist(code, cl):
+                    mine[(f.get("id"), code, s["section"])] = s["score"]
+    wb = load_workbook(workbookPath, read_only=True)
+    ok, bad = 0, []
+    for code, layout in TASK7_LAYOUT.items():
+        name = "Task_" + code.split()[1]
+        if name not in wb.sheetnames:
+            continue
+        rows = list(wb[name].iter_rows(values_only=True))
+        head = list(rows[0])
+        fi = head.index("form_id")
+        for r in rows[1:]:
+            for section, _, _ in layout:
+                col = f"{section} /{TASK7_SECTION_MAX[section]}"
+                if col not in head:
+                    continue
+                v = r[head.index(col)]
+                want = None if v in (None, "Incomplete") else float(v)
+                got = mine.get((r[fi], code, section), "missing")
+                if got == want:
+                    ok += 1
+                else:
+                    bad.append(((r[fi], code, section), want, got))
+    return ok, len(bad), bad

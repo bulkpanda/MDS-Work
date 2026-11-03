@@ -142,7 +142,8 @@ def filterCohortDfByPeriod(cohortDf, period=PERIOD_ALL, minDate=None, maxDate=No
 
     ``period`` takes the same values as the weekly-sim chain — 'FHY' (before
     SEMESTER_SPLIT_DATE), 'SHY' (on/after it), 'ALL' (no filter, the default and
-    the original behaviour) plus the SEM1/S1/H1 aliases. Explicit minDate/maxDate
+    the original behaviour) plus the SEM1/S1/H1 aliases, quarters 'Q1'..'Q4' and
+    contiguous quarter ranges like 'Q2-Q3' (bounds: general_utils.getQuarterBounds). Explicit minDate/maxDate
     win over the period's own bounds. Both bounds are INCLUSIVE.
 
     The comparison is done on the **Melbourne-local** date, not the raw UTC one:
@@ -1663,7 +1664,7 @@ def _build_legend_sheet(writer, flagDf, compDf, cohortDf, thresholds,
         _lr(r, "Period", _period,
             f"Forms restricted to {thresholds.get('period_min') or 'start of year'} .. "
             f"{thresholds.get('period_max') or 'end of year'} "
-            f"(Melbourne local date; semester split {SEMESTER_SPLIT_DATE})"); r += 1
+            f"(Melbourne local date, inclusive; semester split {SEMESTER_SPLIT_DATE})"); r += 1
     _ignored = thresholds.get("ignored_dates")
     if _ignored:
         _lr(r, "Dates excluded", f"{len(_ignored)} date(s)",
@@ -3232,6 +3233,7 @@ PRESETS = {
         minChecklists = 25,
         minClasses    = 14,
         countLowPercentile = 0.2,
+        countHighlightMode="zeros",
         highTierFlags = ["low_item_code_count", "low_es", "low_gr", "low_score",
                           "low_checklist_count", "low_class_count",
                           "clinical_incident", "high_es_lvl1"],
@@ -3258,11 +3260,11 @@ PRESETS = {
         esThreshold = 2,
         grThreshold = 2.5,
         scoreThreshold = 0.7,
-        minForms    = 50,
+        minForms    = 54,
         maxEsLvl1Pct = 20.0,
         sdMultiplier = 1.5,
-        minChecklists = 50,
-        minClasses    = 40,
+        minChecklists = 54,
+        minClasses    = 54,
         countLowPercentile = 0.1,
         countHighlightMode = "zeros",
         highTierFlags = ["low_item_code_count", "low_gr", "low_score",

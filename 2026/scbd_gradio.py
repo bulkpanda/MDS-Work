@@ -14,17 +14,36 @@ import tempfile
 import numpy as np
 from datetime import datetime
 from urllib.parse import urlencode
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
+from pathlib import Path
+import re
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from pyngrok import ngrok
 
-# ── Load .env (optional — token field is still editable if not set) ──────────
-load_dotenv()
-ENV_TOKEN = os.getenv("DASH_TOKEN", "")
-LOGIN_USER = os.getenv("SCBD_USERNAME")
-LOGIN_PASS = os.getenv("SCBD_PASSWORD")
+# ── Load .env directly by absolute path ──────────────────────────────────────
+# Read values straight from the FILE (not os.environ) so a stale Windows/shell
+# env var cannot shadow it, and so it works under gradio's <string> reload.
+try:
+    ENV_PATH = Path(__file__).resolve().parent / ".env"
+except NameError:                       # gradio watch mode execs the file as <string>
+    ENV_PATH = Path.cwd() / ".env"
+ENV_FILE = dotenv_values(ENV_PATH)      # file contents, authoritative
+load_dotenv(ENV_PATH, override=True)    # also refresh os.environ for any other reader
 
+def envVal(key):                        # file wins; os.environ only as fallback; strip stray quotes
+    v = ENV_FILE.get(key) or os.environ.get(key, "")
+    return v.strip().strip("'\"") if v else ""
+
+LOGIN_USER = envVal("SCBD_USERNAME") or None
+LOGIN_PASS = envVal("SCBD_PASSWORD") or None
+dash_email = envVal("DASH_EMAIL")
+dash_password = envVal("DASH_PASSWORD")
 # ── Constants ────────────────────────────────────────────────────────────────
 API_BASE    = "https://api.unimelb-dash.com"
 EXCLUDE     = set(['kunal patel', 'suhrid gupta', 'test student'])
+EXCLUDE_SUBSTRINGS = ('test', 'dummy')   # tuple (trailing comma!) — drop names containing these
 ALL_COHORTS = ["DDS3", "DDS2"]
 COLUMNS     = ["Date", "Student", "Assessor", "Cohort", "Subject", "GR", "Submitted", "Comments"]
 MAX_ROWS    = 500
@@ -48,7 +67,7 @@ INTERVAL_MAP = {
     "Every 5 min":  (300, True)
 }
 
-DEFAULT_INTERVAL = "Every 15 sec"
+DEFAULT_INTERVAL = "Every 1 min"
 _def_secs, _def_active = INTERVAL_MAP[DEFAULT_INTERVAL] 
 
 # (sort_key, descending)
@@ -70,6 +89,19 @@ def set_interval(choice):
     secs, active = INTERVAL_MAP.get(choice, INTERVAL_MAP[DEFAULT_INTERVAL])
     return gr.Timer(value=secs, active=active)
 
+def get_token():
+    r = requests.post(f"{API_BASE}/accounts/login", json={
+        "email": dash_email,      # your login email
+        "password": dash_password,  # your login password,
+    })
+    # print("URL:    ", r.url)    
+    # print("Status: ", r.status_code)
+    # print("CT:     ", r.headers.get("content-type"))
+    # print("Body:   ", repr(r.text[:500]))
+    if r.status_code != 200:
+        print(f"email: {dash_email}, pass: {dash_password}")
+        raise ValueError(f"Login failed (HTTP {r.status_code}): {r.text[:200]}")
+    return r.json()["result"]["user"]["token"]
 
 # ── API layer ────────────────────────────────────────────────────────────────
 def fetch_all(token: str, cohorts: list, year: str) -> list:
@@ -78,7 +110,7 @@ def fetch_all(token: str, cohorts: list, year: str) -> list:
     Mirrors the JavaScript fetchAll() in scbd_dashboard.html.
     """
     cohort_str = ",".join(cohorts)
-    params = urlencode({"page_size": "max", "page": 1,
+    params = urlencode({"page_size": 500, "page": 1,
                         "cohort": cohort_str, "year": year,
                         "ordering": "id"})
     url     = f"{API_BASE}/assessment/scbd/get?{params}"
@@ -97,6 +129,7 @@ def fetch_all(token: str, cohorts: list, year: str) -> list:
         else:
             records.extend(d.get("results", []))
             url = d.get("next")
+    print(f'Size of records: {len(records)}')
     return records
 
 
@@ -109,13 +142,16 @@ def parse_records(raw: list) -> list:
     rows = []
     for r in raw:
         student = (r.get("student") or "").strip()
-        if not student or student.lower() in EXCLUDE:
+        nameLc = student.lower()
+        if not student or nameLc in EXCLUDE or any(sub in nameLc for sub in EXCLUDE_SUBSTRINGS):
             continue
 
         ad = {}
         frm = r.get("form")
         if isinstance(frm, dict):
             ad = (frm.get("data") or {}).get("assessor") or {}
+        clKey  = findChecklistKey(ad)
+        clMeta = ((frm.get("checklists") if isinstance(frm, dict) else {}) or {}).get(clKey) or {}
         gr_raw = ad.get("scale-global-rating") or {}
         gr = None
         if isinstance(gr_raw, dict):
@@ -123,6 +159,34 @@ def parse_records(raw: list) -> list:
                 gr = int(gr_raw["scale"])
             except (KeyError, TypeError, ValueError):
                 pass
+
+        # submitted-but-incomplete: check GR plus EVERY checklist on the form is fully answered.
+        # Expected MCs per checklist come from its template (enabled rubric items, else all fields);
+        # a checklist missing from data.assessor, or with blank/absent MC answers, is incomplete.
+        subFlag    = bool(r.get("submitted"))
+        checklists = (frm.get("checklists") if isinstance(frm, dict) else {}) or {}
+        miss = []
+        if gr is None:
+            miss.append("GR")
+        expectedCks = [k for k, v in checklists.items()
+                       if isinstance(v, dict) and any(str(mk).startswith("MC") for mk in (v.get("fields") or {}))]
+        for ck_ in expectedCks:
+            tmpl = checklists[ck_] or {}
+            rub  = (tmpl.get("extra_config") or {}).get("rubric") or {}
+            enabled = [k for k, ov in rub.items()
+                       if re.fullmatch(r"MC\d+", str(k)) and isinstance(ov, dict)
+                       and any(str(ov.get(o) or "").strip() for o in ov if re.fullmatch(r"O\d+", str(o)))]
+            expected = enabled or [k for k in (tmpl.get("fields") or {}) if str(k).startswith("MC")]
+            answers = ad.get(ck_) or {}
+            if not answers:
+                miss.append(f"{ck_}: not filled"); continue
+            blanks = [mc for mc in expected if str(answers.get(mc, "")).strip() == ""]
+            if blanks:
+                miss.append(f"{ck_}: {len(blanks)} MC blank")
+        if not expectedCks and not any(
+                isinstance(v, dict) and any(str(mk).startswith("MC") for mk in v) for v in ad.values()):
+            miss.append("no checklist")
+        incomplete = subFlag and bool(miss)
 
         dt_str = r.get("datetime") or ""
         try:
@@ -143,6 +207,11 @@ def parse_records(raw: list) -> list:
             "GR":        str(gr) if gr is not None else "—",
             "Submitted": "Yes" if r.get("submitted") else "No",
             "Comments":  r.get("form", {}).get("data", {}).get("assessor", {}).get("comments", "—").strip() or "—",
+            "_ad":       ad,
+            "_clkey":    clKey,
+            "_meta":     clMeta,
+            "_incomplete": incomplete,
+            "_missing":    "; ".join(miss) if incomplete else "",
         })
 
     return rows
@@ -293,6 +362,11 @@ def make_table_html(rows: list) -> str:
 
     for i, r in enumerate(display):
         bg   = "#ffffff" if i % 2 == 0 else "#f8fafc"
+        warn = ""
+        if r.get("_incomplete"):
+            bg   = "#fee2e2"
+            warn = (f' <span title="Submitted but missing: {r.get("_missing","")}" '
+                    f'style="color:#dc2626;font-weight:800;">&#9888;</span>')
         # subj = r["Subject"] or "—"
         # subj_cell = (
         #     f'<span title="{subj}" style="display:inline-block;max-width:180px;'
@@ -306,7 +380,7 @@ def make_table_html(rows: list) -> str:
             f'<td style="{TD}">{cohort_badge(r["Cohort"])}</td>'
             # f'<td style="{TD}">{subj_cell}</td>'
             f'<td style="{TD}">{gr_badge(r["GR"])}</td>'
-            f'<td style="{TD}">{sub_cell(r["Submitted"])}</td>'
+            f'<td style="{TD}">{sub_cell(r["Submitted"])}{warn}</td>'
             f'<td style="{TD}">{comments_cell(r["Comments"])}</td>'
             f'</tr>'
         )
@@ -347,7 +421,7 @@ def do_load(cohorts, submitted_only, unsubmitted_only, search, sort_opt=DEFAULT_
             date_from="", date_to=""):
     """Fetch from API → parse → cache in State → return filtered view."""
     _empty = ([], make_table_html([]), build_stats_html([]), "", "")
-
+    ENV_TOKEN = get_token()
     if not ENV_TOKEN:
         return *_empty, "❌ No API token found in .env file."
     if not cohorts:
@@ -394,6 +468,839 @@ def do_export(rows, submitted_only, unsubmitted_only, search, sort_opt=DEFAULT_S
     return tmp.name
 
 
+# ── Detailed formatted export (MC values, colour-coded) ──────────────────────
+# Response label → quality rank 0..4 (None = blank/N-A). Handles every scale
+# family seen in SCBD data: 5-level (Done well…Not done), 4-level words
+# (Excellent/Satisfactory/Borderline/Unsatisfactory), numeric-tagged "X (n)", Yes/No.
+_WORD_RANK = {
+    "done well": 4, "done": 3, "mostly done": 2, "sometimes done": 1, "not done": 0,
+    "excellent": 4, "very good": 4, "good": 3, "satisfactory": 3, "pass": 3,
+    "borderline": 1, "unsatisfactory": 0, "poor": 0, "fail": 0,
+    "yes": 4, "no": 0, "n/a": None, "na": None, "": None,
+}
+_RANK_FILL = {4: "BBFFD9", 3: "D1FAE5", 2: "FEF9C3", 1: "FED7AA", 0: "FECACA"}   # green→red
+_GR_FILL   = {5: "BBFFD9", 4: "D1FAE5", 3: "FEF9C3", 2: "FED7AA", 1: "FECACA"}
+
+def mcRank(label):                      # normalise any response label to 0..4 or None
+    if label is None:
+        return None
+    s = str(label).strip()
+    if not s:
+        return None
+    m = re.search(r"\((\d)\)", s)        # e.g. "Excellent (4)"
+    if m:
+        return min(4, max(0, int(m.group(1))))
+    return _WORD_RANK.get(s.lower())
+
+def mcFill(label):                      # fill hex for an MC response cell
+    return _RANK_FILL.get(mcRank(label), "F1F5F9")
+
+# Score schemes by level count (worst→best); denominator = max of the scheme.
+_SCHEME = {2: [0, 1], 3: [0, 1, 2], 4: [0, 2, 3, 4], 5: [0, 1, 2, 3, 4]}
+def schemeFor(L):
+    if L in _SCHEME: return _SCHEME[L]
+    if L <= 1:       return [0]
+    return list(range(L))                       # linear fallback for unusual counts
+
+# ── CBD (Case Based Discussion) scoring config ───────────────────────
+# DDS3-CBD scores by column location: Done Well 3 / Done 2 / Partially Done 1 /
+# Not Done 0 (Yes->Done=2, No->Not Done=0). Per-item max = best enabled option.
+# Section = raw total; normalised = raw/available; Overall = sum(norm% x weight).
+_CBD_SCORES  = {"done well": 3, "done": 2, "partially done": 1, "not done": 0, "yes": 2, "no": 0}
+_CBD_WEIGHTS = {"DOMAIN 1": 0.15, "DOMAIN 2": 0.10, "DOMAIN 3": 0.25,
+                "DOMAIN 4": 0.20, "DOMAIN 5": 0.25, "DOMAIN 6": 0.05}   # sum 1.00 -> Overall max 100%
+_CBD_CFG = {"scores": _CBD_SCORES, "weights": _CBD_WEIGHTS}
+
+# Master switch: set False to disable the CBD config and fall back to the generic
+# level-count scheme (old behaviour) for the DDS3-CBD checklist too.
+CBD_CONFIG_ENABLED = True
+
+def cbdConfig(meta):                     # CBD checklist? (unique "Partially Done" option label)
+    if not CBD_CONFIG_ENABLED:
+        return None
+    ec   = meta.get("extra_config") or {}
+    opts = (ec.get("options") or {}).get("assessor") or {}
+    return _CBD_CFG if any(str(v).strip().lower() == "partially done" for v in opts.values()) else None
+
+def _domShort(t):                        # "DOMAIN 1: ..." -> "DOMAIN 1"
+    m = re.match(r"\s*(domain\s*\d+)", str(t), re.I)
+    return m.group(1).upper() if m else _shortLabel(t)
+
+def _totHeading(kind, label, den):       # column-2 heading for a totals column
+    if kind == "cbd_raw":
+        d = den if isinstance(den, (int, float)) else 0
+        return f"{_domShort(label)} (/{d:g})"
+    if kind == "cbd_pct":
+        return f"{_domShort(label)} (%)"
+    if kind == "cbd_overall":
+        return "Overall (%)"
+    return f"{_shortLabel(label)} (%)"
+
+def _cbdPlan(mc_sorted, meta, cfg):      # per-domain raw + normalised cols, then weighted Overall
+    from collections import OrderedDict
+    hd     = (meta.get("extra_config") or {}).get("headers") or {}
+    starts = {k: (v[0].get("title") if isinstance(v, list) and v else "") for k, v in hd.items()}
+    blk = OrderedDict(); cur = None
+    for mc in mc_sorted:
+        t = starts.get(mc, "")
+        if t and t.strip(): cur = t.strip()
+        blk.setdefault(cur or "Checklist", []).append(mc)
+    def wOf(title):
+        m = re.match(r"\s*domain\s*(\d+)", str(title), re.I)
+        return cfg["weights"].get(f"DOMAIN {m.group(1)}", 0.0) if m else 0.0
+    cols = []; doms = []
+    for title, ms in blk.items():
+        cols.append(("cbd_raw", ms, title))
+        cols.append(("cbd_pct", ms, title))
+        doms.append((wOf(title), ms))
+    cols.append(("cbd_overall", doms, "Overall"))
+    return "cbd", cols
+
+def mcEnabled(mc, meta):                         # O-codes offered for this MC (non-empty rubric)
+    rub = ((meta.get("extra_config") or {}).get("rubric") or {}).get(mc) or {}
+    return sorted((k for k in rub if re.fullmatch(r"O\d+", str(k)) and str(rub.get(k) or "").strip()),
+                  key=lambda x: int(x[1:]))
+
+def mcDenom(mc, meta):                            # heading denominator = max score for this MC
+    cfg = cbdConfig(meta)
+    if cfg:
+        ec = meta.get("extra_config") or {}
+        optmap = (ec.get("options") or {}).get("assessor") or {}
+        scs = [cfg["scores"].get(str(optmap.get(o) or "").strip().lower()) for o in mcEnabled(mc, meta)]
+        scs = [x for x in scs if x is not None]
+        return max(scs) if scs else ""
+    L = len(mcEnabled(mc, meta)); sch = schemeFor(L) if L else []
+    return max(sch) if sch else ""
+
+def mcScore(label, mc, meta):                     # -> (numeric score | "" | raw, colorRank 0..4 | None)
+    s = str(label or "").strip()
+    _cbd = cbdConfig(meta)
+    if _cbd:
+        if not s:
+            return "", None
+        _ec = meta.get("extra_config") or {}
+        _optmap = (_ec.get("options") or {}).get("assessor") or {}
+        _key = str(_optmap.get(s) or s).strip().lower()     # response stored as label (or O-code)
+        _val = _cbd["scores"].get(_key)
+        if _val is None:
+            return s, None
+        _den = mcDenom(mc, meta); _den = _den if isinstance(_den, (int, float)) and _den else None
+        return _val, (round(4 * _val / _den) if _den else None)
+    ec     = meta.get("extra_config") or {}
+    optmap = (ec.get("options") or {}).get("assessor") or (ec.get("options") or {}).get("student") or {}
+    enabled = mcEnabled(mc, meta)
+    labelToO = {str(v).strip().lower(): k for k, v in optmap.items()}
+    oc = labelToO.get(s.lower()) if s else None
+    if oc and oc not in enabled:                  # response outside rubric-enabled set: include it
+        enabled = sorted(set(enabled) | {oc}, key=lambda x: int(x[1:]))
+    L = len(enabled); scheme = schemeFor(L) if L else []
+    den = max(scheme) if scheme else None
+    if not s:
+        return "", None
+    if oc and oc in enabled:
+        rank = enabled.index(oc); bw = list(reversed(scheme))   # best→worst
+        if rank < len(bw):
+            sc = bw[rank]
+            return sc, (round(4 * sc / den) if den else None)
+    m = re.search(r"\((\d)\)", s)                 # explicit "(n)" in the label
+    if m:
+        sc = int(m.group(1))
+        return sc, (round(4 * sc / den) if den else None)
+    return s, None                                # anomalous label: keep raw
+
+def findChecklistKey(ad):               # the assessor-data key holding MC items
+    for k, v in (ad or {}).items():
+        if isinstance(v, dict) and any(str(mk).startswith("MC") for mk in v):
+            return k
+    return None
+
+def _mcNum(k):                          # numeric part of "MC12" for ordering
+    m = re.sub(r"\D", "", str(k))
+    return int(m) if m else 0
+
+# openpyxl style shorthands
+_thinSide  = Side(style="thin",   color="E2E8F0")
+_thickSide = Side(style="medium", color="94A3B8")
+def xlFill(hex_c):  return PatternFill(fill_type="solid", fgColor=hex_c)
+def xlFont(bold=False, color="1E293B", size=9): return Font(bold=bold, color=color, name="Calibri", size=size)
+def xlAlign(h="left", v="center", wrap=False):  return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+def xlBorder(l=False, r=False):
+    return Border(left=(_thickSide if l else _thinSide), right=(_thickSide if r else _thinSide),
+                  top=_thinSide, bottom=_thinSide)
+
+_ID_COLS = [("Date","Date"),("Student","Student"),("Assessor","Assessor"),
+            ("Cohort","Cohort"),("Subject","Subject"),("Submitted","Submitted")]
+
+def headerTitles(v):                    # all header titles on one MC, e.g. ["Oral Medicine – Case 1", "Question 1. ..."]
+    return [str(t.get("title") or "").strip() for t in (v if isinstance(v, list) else []) if str(t.get("title") or "").strip()]
+
+def shortTop(t):                         # compact top-level heading for narrow columns
+    s = re.sub(r"\s*\(/?\s*\d+(?:\.\d+)?\s*\)\s*$", "", str(t)).strip()
+    m = re.search(r"case scenario\s*(\d+)", s, re.I)
+    pre = "OM" if "oral medicine" in s.lower() else ("OS" if "oral surgery" in s.lower() else "")
+    if pre:
+        return f"{pre} Case {m.group(1)}" if m else f"{pre} Case"
+    return s
+
+def _sectionLabels(meta, mc_sorted):    # per-MC section title from checklist headers (all levels joined by " | ")
+    hdrs   = (meta.get("extra_config") or {}).get("headers") or {}
+    starts = {k: " | ".join(headerTitles(v)) for k, v in hdrs.items()}   # e.g. "Oral Medicine – Case Scenario 1 | Question 1. ..."
+    out, cur = [], "Checklist"
+    for mc in mc_sorted:
+        if mc in starts:
+            cur = (starts[mc] or "").strip() or cur
+        out.append(cur)
+    return out
+
+def buildCombinedSheet(wb, rows):       # overview of every record (MC columns can't align across types)
+    ws = wb.create_sheet("All Records")
+    cols = ["Date","Student","Assessor","Cohort","Subject","Checklist","GR",
+            "Submitted","Incomplete","Critical concerns","General comments"]
+    for i, h in enumerate(cols, 1):
+        c = ws.cell(row=1, column=i, value=h)
+        c.fill = xlFill("010D44"); c.font = xlFont(True, "FFFFFF", 10)
+        c.alignment = xlAlign("center", wrap=True); c.border = xlBorder()
+    for ri, r in enumerate(rows, start=2):
+        ad = r.get("_ad") or {}
+        bg = "FFFFFF" if ri % 2 else "F8FAFC"
+        vals = [r.get("Date",""), r.get("Student",""), r.get("Assessor",""), r.get("Cohort",""),
+                r.get("Subject",""), r.get("_clkey") or "—", r.get("GR","—"), r.get("Submitted",""),
+                (r.get("_missing","") if r.get("_incomplete") else ""),
+                (ad.get("critical_concerns") or "").strip() or "—",
+                (ad.get("comments") or "").strip() or "—"]
+        for i, v in enumerate(vals, 1):
+            c = ws.cell(row=ri, column=i, value=v)
+            c.font = xlFont(size=9); c.alignment = xlAlign(wrap=False); c.border = xlBorder()
+            f = bg
+            if cols[i-1] == "GR":
+                try: f = _GR_FILL.get(int(v), bg)
+                except (ValueError, TypeError): pass
+            elif cols[i-1] == "Submitted":
+                f = ("FED7AA" if r.get("_incomplete") else "BBFFD9") if v == "Yes" else "FECACA"
+            elif cols[i-1] == "Incomplete":
+                f = "FECACA" if r.get("_incomplete") else bg
+            c.fill = xlFill(f)
+    for i, w in enumerate([11,20,18,9,12,16,6,10,16,14,40], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+
+def richestMeta(grp):                    # some records store the template blanked; pick one with real options+rubric
+    best = grp[0].get("_meta") or {}
+    for r in grp:
+        m  = r.get("_meta") or {}
+        ec = m.get("extra_config") or {}
+        opts = (ec.get("options") or {}).get("assessor") or (ec.get("options") or {}).get("student") or {}
+        if (ec.get("rubric")) and any(str(v).strip() for v in opts.values()):
+            return m
+    return best
+
+# ── Score totals + borderline-regression helpers ─────────────────────────────
+def _fmtDen(d):
+    return f"{d:g}"
+
+def _shortLabel(t):
+    s = re.sub(r"\s*\(/?\s*\d+(?:\.\d+)?\s*\)\s*$", "", str(t)).strip()    # drop a trailing "(/8)"
+    m = re.search(r"case scenario\s*(\d+)", s, re.I)
+    if m:
+        pre = "OM" if "oral medicine" in s.lower() else ("OS" if "oral surgery" in s.lower() else "Case")
+        return f"{pre} Case {m.group(1)}"
+    return (s[:26] + "…") if len(s) > 27 else s
+
+def sectionPlan(mc_sorted, meta):
+    """(mode, cols) — cols: list of (kind, mcs, label).
+       kind 'om' = Σ(raw)/2 (0.5/MC); 'norm' = Σ(score/den); 'mixed' = (om_mcs, os_mcs)."""
+    cfg = cbdConfig(meta)
+    if cfg:
+        return _cbdPlan(mc_sorted, meta, cfg)
+    hd = (meta.get("extra_config") or {}).get("headers") or {}
+    starts = {k: (v[0].get("title") if isinstance(v, list) and v else "") for k, v in hd.items()}
+    top = None; top_of = {}; has_oral = False
+    for mc in mc_sorted:
+        t = starts.get(mc, "")
+        if t and t.strip().lower().startswith("oral "):
+            top = t.strip(); has_oral = True
+        top_of[mc] = top
+    cols = []
+    if has_oral:                                        # Oral Medicine / Oral Surgery exam
+        om_tops = []
+        for mc in mc_sorted:
+            t = top_of[mc]
+            if t and "oral medicine" in t.lower() and t not in om_tops:
+                om_tops.append(t)
+        for t in om_tops:                               # per case-scenario OM total
+            cols.append(("om", [mc for mc in mc_sorted if top_of[mc] == t], t))
+        om  = [mc for mc in mc_sorted if top_of[mc] and "oral medicine" in top_of[mc].lower()]
+        os_ = [mc for mc in mc_sorted if top_of[mc] and "oral surgery"  in top_of[mc].lower()]
+        if om:  cols.append(("om",   om,  "OM Total"))
+        if os_: cols.append(("norm", os_, "OS Total"))
+        cols.append(("mixed", (om, os_), "Overall"))
+        return "omos", cols
+    from collections import OrderedDict               # generic: per header block, normalised
+    blk = OrderedDict(); cur = None
+    for mc in mc_sorted:
+        t = starts.get(mc, "")
+        if t and t.strip(): cur = t.strip()
+        blk.setdefault(cur or "Checklist", []).append(mc)
+    if len(blk) > 1:
+        for name, ms in blk.items():
+            cols.append(("norm", ms, name))
+    cols.append(("norm", mc_sorted, "Overall"))
+    return "generic", cols
+
+def colDen(kind, mcs, meta):
+    if kind == "cbd_raw":
+        return float(sum((mcDenom(mc, meta) or 0) for mc in mcs))
+    if kind == "cbd_pct":
+        return 100.0
+    if kind == "cbd_overall":
+        return round(100.0 * sum(w for w, _ in mcs), 1)
+    if kind == "om":
+        return sum((mcDenom(mc, meta) or 0) for mc in mcs) / 2.0
+    if kind == "norm":
+        return float(sum(1 for mc in mcs if (mcDenom(mc, meta) or 0)))
+    om, os_ = mcs
+    return sum((mcDenom(mc, meta) or 0) for mc in om) / 2.0 + float(sum(1 for mc in os_ if (mcDenom(mc, meta) or 0)))
+
+def colVal(kind, mcs, sub, meta):
+    """Percentage for a total column. 'om' = 100·Σraw/Σmax; 'norm' = mean(score/den)·100;
+       'mixed' (OM-OS overall grade) = 50% OM% + 50% OS% (single side if the other is absent)."""
+    def sc(mc):
+        v, _ = mcScore(sub.get(mc, ""), mc, meta)
+        return v if isinstance(v, (int, float)) else None
+    if kind == "cbd_raw":
+        tot = 0.0; got = False
+        for mc in mcs:
+            v = sc(mc)
+            if v is not None: tot += v; got = True
+        return round(tot, 1) if got else None
+    if kind == "cbd_pct":
+        num = 0.0; den = 0.0; got = False
+        for mc in mcs:
+            v = sc(mc); d = mcDenom(mc, meta) or 0
+            if v is not None and d: num += v; den += d; got = True
+        return round(100.0 * num / den, 1) if (got and den) else None
+    if kind == "cbd_overall":
+        tot = 0.0; got = False
+        for w, ms in mcs:
+            p = colVal("cbd_pct", ms, sub, meta)
+            if p is not None: tot += w * p; got = True
+        return round(tot, 1) if got else None
+    if kind == "om":
+        num = 0.0; den = 0.0; got = False
+        for mc in mcs:
+            v = sc(mc); d = mcDenom(mc, meta) or 0
+            if v is not None and d:
+                num += v; den += d; got = True
+        return round(100.0 * num / den, 1) if (got and den) else None
+    if kind == "norm":
+        tot = 0.0; k = 0
+        for mc in mcs:
+            v = sc(mc); d = mcDenom(mc, meta) or 0
+            if v is not None and d:
+                tot += v / d; k += 1
+        return round(100.0 * tot / k, 1) if k else None
+    om, os_ = mcs
+    a = colVal("om", om, sub, meta); b = colVal("norm", os_, sub, meta)
+    if a is None and b is None:
+        return None
+    if a is not None and b is not None:
+        return round(0.5 * a + 0.5 * b, 1)
+    return round(a if a is not None else b, 1)
+
+def linregStats(xs, ys, borderline=2):
+    n = len(xs); mx = sum(xs)/n; my = sum(ys)/n
+    sxx = sum((x-mx)**2 for x in xs); syy = sum((y-my)**2 for y in ys)
+    sxy = sum((x-mx)*(y-my) for x, y in zip(xs, ys))
+    b = sxy/sxx if sxx else 0.0; a = my - b*mx
+    ss_res = sum((y-(a+b*x))**2 for x, y in zip(xs, ys))
+    r2 = 1 - ss_res/syy if syy else 0.0
+    r  = (sxy/((sxx*syy)**0.5)) if sxx and syy else 0.0
+    sem = (ss_res/(n-2))**0.5 if n > 2 else 0.0
+    cut = a + b*borderline
+    return {"n": n, "slope": b, "intercept": a, "r2": r2, "pearson": r, "sem": sem,
+            "cut": cut, "pass": 100.0*sum(1 for y in ys if y >= cut)/n,
+            "mean": my, "sd": (syy/(n-1))**0.5 if n > 1 else 0.0}
+
+def buildChecklistSheet(wb, ck, grp):   # identity + MC grid + score totals + GR + comments
+    meta = richestMeta(grp)
+    mcset = set()
+    for r in grp:
+        mcset.update(k for k in (r.get("_ad") or {}).get(ck, {}) if str(k).startswith("MC"))
+    mc_sorted = sorted(mcset, key=_mcNum)
+    secs = _sectionLabels(meta, mc_sorted)
+    mode, totalCols = sectionPlan(mc_sorted, meta)
+    _ovk, _ovm, _ovl = totalCols[-1]
+    def _ovSort(r):
+        v = colVal(_ovk, _ovm, (r.get("_ad") or {}).get(ck, {}), meta)
+        return v if isinstance(v, (int, float)) else -1
+    grp = sorted(grp, key=_ovSort, reverse=True)   # score sheet sorted by Overall desc
+    ws = wb.create_sheet((ck or "Other")[:31])
+    ws.row_dimensions[1].height = 26; ws.row_dimensions[2].height = 16
+
+    for i, (lbl, _) in enumerate(_ID_COLS):
+        c = ws.cell(row=2, column=1+i, value=lbl)
+        c.fill = xlFill("C7D2FE"); c.font = xlFont(True, size=9); c.alignment = xlAlign("center", wrap=True); c.border = xlBorder(l=(i==0))
+    for c in range(1, 1+len(_ID_COLS)):
+        cc = ws.cell(row=1, column=c); cc.fill = xlFill("010D44"); cc.font = xlFont(True,"FFFFFF",10)
+        cc.alignment = xlAlign("center"); cc.border = xlBorder(l=(c==1), r=(c==len(_ID_COLS)))
+    ws.cell(row=1, column=1).value = "Student Info"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(_ID_COLS))
+
+    mc_first = len(_ID_COLS) + 1
+    col = mc_first; blocks = []; prev = None; bstart = col
+    for j, mc in enumerate(mc_sorted):
+        sec = secs[j]
+        if sec != prev:
+            if prev is not None: blocks.append((prev, bstart, col-1))
+            prev = sec; bstart = col
+        hc = ws.cell(row=2, column=col, value=f"{mc} (/{mcDenom(mc, meta)})")
+        hc.fill = xlFill("E2E8F0"); hc.font = xlFont(True, size=8); hc.alignment = xlAlign("center", wrap=True); hc.border = xlBorder()
+        col += 1
+    if prev is not None: blocks.append((prev, bstart, col-1))
+    for sec, s, e in blocks:
+        for c in range(s, e+1):
+            cc = ws.cell(row=1, column=c); cc.fill = xlFill("4F5FB2"); cc.font = xlFont(True,"FFFFFF",9)
+            cc.alignment = xlAlign("center", wrap=True); cc.border = xlBorder(l=(c==s), r=(c==e))
+        ws.cell(row=1, column=s).value = sec
+        if e > s: ws.merge_cells(start_row=1, start_column=s, end_row=1, end_column=e)
+
+    # Scores block (section totals + overall)
+    score_first = col
+    for kind, mcs, label in totalCols:
+        den = colDen(kind, mcs, meta)
+        c2 = ws.cell(row=2, column=col, value=_totHeading(kind, label, den))
+        c2.fill = xlFill("FDE68A"); c2.font = xlFont(True, size=8); c2.alignment = xlAlign("center", wrap=True); c2.border = xlBorder()
+        col += 1
+    for c in range(score_first, col):
+        cc = ws.cell(row=1, column=c); cc.fill = xlFill("B45309"); cc.font = xlFont(True,"FFFFFF",9)
+        cc.alignment = xlAlign("center"); cc.border = xlBorder(l=(c==score_first), r=(c==col-1))
+    ws.cell(row=1, column=score_first).value = "Scores"
+    if col-1 > score_first: ws.merge_cells(start_row=1, start_column=score_first, end_row=1, end_column=col-1)
+
+    gr_col = col
+    ws.cell(row=1, column=gr_col, value="Summary"); ws.cell(row=1, column=gr_col).fill = xlFill("1E293B")
+    ws.cell(row=1, column=gr_col).font = xlFont(True,"FFFFFF",10); ws.cell(row=1, column=gr_col).alignment = xlAlign("center"); ws.cell(row=1, column=gr_col).border = xlBorder(l=True)
+    gc = ws.cell(row=2, column=gr_col, value="GR"); gc.fill = xlFill("F1F5F9"); gc.font = xlFont(True, size=9); gc.alignment = xlAlign("center"); gc.border = xlBorder(l=True)
+    col += 1
+    cmt_start = col
+    for lbl in ["General","Critical concerns","Critical comments"]:
+        c2 = ws.cell(row=2, column=col, value=lbl); c2.fill = xlFill("F3F4F6"); c2.font = xlFont(True, size=9); c2.alignment = xlAlign("center", wrap=True); c2.border = xlBorder()
+        c1 = ws.cell(row=1, column=col); c1.fill = xlFill("374151"); c1.font = xlFont(True,"FFFFFF",10); c1.alignment = xlAlign("center"); c1.border = xlBorder(l=(col==cmt_start), r=(lbl=="Critical comments"))
+        col += 1
+    ws.cell(row=1, column=cmt_start).value = "Comments"
+    ws.merge_cells(start_row=1, start_column=cmt_start, end_row=1, end_column=col-1)
+
+    for ri, r in enumerate(grp, start=3):
+        bg = "FFFFFF" if ri % 2 else "F8FAFC"
+        idbg = "FFE4E6" if r.get("_incomplete") else bg
+        for i, (lbl, key) in enumerate(_ID_COLS):
+            cc = ws.cell(row=ri, column=1+i, value=r.get(key, "")); cc.font = xlFont(size=9); cc.alignment = xlAlign(); cc.border = xlBorder(l=(i==0)); cc.fill = xlFill(idbg)
+        sub = (r.get("_ad") or {}).get(ck, {})
+        for j, mc in enumerate(mc_sorted):
+            scv, cr = mcScore(sub.get(mc, ""), mc, meta)
+            cc = ws.cell(row=ri, column=mc_first+j, value=scv)
+            cc.font = xlFont(size=8); cc.alignment = xlAlign("center"); cc.border = xlBorder()
+            cc.fill = xlFill(_RANK_FILL.get(cr, "F1F5F9") if cr is not None else "F1F5F9")
+        for k, (kind, mcs, label) in enumerate(totalCols):
+            v = colVal(kind, mcs, sub, meta); den = colDen(kind, mcs, meta)
+            cc = ws.cell(row=ri, column=score_first+k, value=v)
+            cc.font = xlFont(True, size=9); cc.alignment = xlAlign("center"); cc.border = xlBorder()
+            cr2 = round(4*v/(den if kind in ("cbd_raw","cbd_overall") else 100)) if (isinstance(v,(int,float)) and den) else None
+            cc.fill = xlFill(_RANK_FILL.get(cr2, "F1F5F9") if cr2 is not None else "F1F5F9")
+        cc = ws.cell(row=ri, column=gr_col, value=r.get("GR","—")); cc.font = xlFont(size=9); cc.alignment = xlAlign("center"); cc.border = xlBorder(l=True)
+        try: cc.fill = xlFill(_GR_FILL.get(int(r.get("GR")), bg))
+        except (ValueError, TypeError): cc.fill = xlFill(bg)
+        ad = r.get("_ad") or {}
+        cvals = [(ad.get("comments") or "").strip() or "—",
+                 (ad.get("critical_concerns") or "").strip() or "—",
+                 (ad.get("critical_concerns_comments") or "").strip() or "—"]
+        for k, v in enumerate(cvals):
+            cc = ws.cell(row=ri, column=cmt_start+k, value=v); cc.font = xlFont(size=9); cc.alignment = xlAlign(wrap=False); cc.border = xlBorder(r=(k==2)); cc.fill = xlFill(bg)
+
+    for i, (lbl, _) in enumerate(_ID_COLS):
+        ws.column_dimensions[get_column_letter(1+i)].width = 18 if lbl in ("Student","Assessor") else 10
+    for j in range(len(mc_sorted)):
+        ws.column_dimensions[get_column_letter(mc_first+j)].width = 9
+    for k in range(len(totalCols)):
+        ws.column_dimensions[get_column_letter(score_first+k)].width = 12
+    ws.column_dimensions[get_column_letter(gr_col)].width = 6
+    for k in range(3):
+        ws.column_dimensions[get_column_letter(cmt_start+k)].width = 32
+    ws.freeze_panes = ws.cell(row=3, column=len(_ID_COLS)+1)
+
+def _normName(s):
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+STUDENT_CSV = ENV_PATH.parent / "studentEmailList.csv"
+
+def _loadRoster(path):
+    import csv
+    roster = {}
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                ch = (r.get("cohort") or "").strip().upper()
+                nm = (r.get("student_name") or "").strip()
+                if ch and nm:
+                    roster.setdefault(ch, {})[_normName(nm)] = nm
+    except FileNotFoundError:
+        return None
+    return roster
+
+def buildRosterSheet(wb, rows):   # SCBD students present/missing/off-roster/duplicate vs studentEmailList.csv
+    from collections import Counter, defaultdict
+    ws = wb.create_sheet("Roster Check")
+    ws.cell(row=1, column=1, value="Roster Check — SCBD students vs studentEmailList.csv").font = xlFont(True, "1E293B", 12)
+    roster = _loadRoster(STUDENT_CSV)
+    if roster is None:
+        ws.cell(row=3, column=1, value=f"studentEmailList.csv not found next to the app ({STUDENT_CSV}).").font = xlFont(size=10, color="DC2626")
+        return
+    seen = defaultdict(set); disp = {}
+    forms = defaultdict(Counter)                 # cohort -> forms per student (all checklists)
+    perCk = defaultdict(Counter)                 # cohort -> (student, checklist) count
+    for r in rows:
+        ch = (r.get("Cohort") or "").strip().upper()
+        nm = (r.get("Student") or "").strip()
+        if not nm:
+            continue
+        n = _normName(nm); seen[ch].add(n); disp[n] = nm
+        forms[ch][n] += 1; perCk[ch][(n, r.get("_clkey") or "?")] += 1
+    r0 = 3
+    for ch in sorted(seen):
+        rost = roster.get(ch, {})
+        seenset = seen[ch]
+        present = [n for n in rost if n in seenset]
+        missing = sorted(rost[n] for n in rost if n not in seenset)
+        extra   = sorted(disp[n] for n in seenset if n not in rost)
+        # a true duplicate = same student sat the SAME checklist more than once
+        dups    = sorted((disp[n], ck, c) for (n, ck), c in perCk[ch].items() if c > 1)
+        hc = ws.cell(row=r0, column=1, value=ch); hc.font = xlFont(True, "FFFFFF", 11)
+        for c in range(1, 4):
+            ws.cell(row=r0, column=c).fill = xlFill("010D44")
+        ws.merge_cells(start_row=r0, start_column=1, end_row=r0, end_column=3)
+        stats = [("Enrolled (roster)", len(rost)), ("Present", len(present)),
+                 ("Missing", len(missing)), ("Off-roster", len(extra)),
+                 ("Duplicates", len(dups)), ("Total forms", sum(forms[ch].values()))]
+        for i, (k, v) in enumerate(stats):
+            a = ws.cell(row=r0+1+i, column=1, value=k); a.font = xlFont(True, size=9); a.border = xlBorder()
+            b = ws.cell(row=r0+1+i, column=2, value=v); b.font = xlFont(size=9); b.border = xlBorder()
+            if k == "Missing" and v:   b.fill = xlFill("FECACA")
+            if k == "Off-roster" and v: b.fill = xlFill("FED7AA")
+            if k == "Duplicates" and v: b.fill = xlFill("FEF9C3")
+        def writeList(col, title, items, fillhex):
+            t = ws.cell(row=r0, column=col, value=f"{title} ({len(items)})"); t.font = xlFont(True, size=9); t.fill = xlFill(fillhex)
+            for i, it in enumerate(items):
+                ws.cell(row=r0+1+i, column=col, value=it).font = xlFont(size=9)
+        writeList(4, "Missing",    missing, "FECACA")
+        writeList(5, "Off-roster", extra,   "FED7AA")
+        writeList(6, "Duplicates", [f"{nm} — {ck} (x{c})" for nm, ck, c in dups], "FEF9C3")
+        r0 += max(len(stats), len(missing), len(extra), len(dups)) + 3
+    for col, w in {"A": 18, "B": 10, "D": 26, "E": 26, "F": 26}.items():
+        ws.column_dimensions[col].width = w
+
+def _irtLite(item, ability):
+    """2PL via observed-ability logistic (numpy IRLS): returns (a=discrimination, b=difficulty in ability SD)."""
+    m = ~np.isnan(item) & ~np.isnan(ability)
+    y = item[m]; a = ability[m]
+    if len(y) < 8 or len(np.unique(y)) < 2:
+        return (np.nan, np.nan)
+    Xd = np.column_stack([np.ones_like(a), a]); b = np.zeros(2)
+    for _ in range(50):
+        p = 1.0 / (1.0 + np.exp(-(Xd @ b)))
+        W = np.clip(p * (1 - p), 1e-6, None)
+        z = Xd @ b + (y - p) / W
+        try:
+            b = np.linalg.solve((Xd * W[:, None]).T @ Xd, (Xd * W[:, None]).T @ z)
+        except np.linalg.LinAlgError:
+            return (np.nan, np.nan)
+    slope = float(np.clip(b[1], -5.0, 5.0))          # clamp quasi-separation blow-ups
+    if abs(slope) < 0.20:
+        return (round(slope, 3), np.nan)                # ICC too flat -> difficulty unreliable
+    diff = -b[0] / b[1]
+    if not np.isfinite(diff) or abs(diff) > 6:
+        diff = np.nan                                   # difficulty off the usable ability range
+    return (slope, float(diff) if diff == diff else np.nan)
+
+def _rfImportance(Xg, target):
+    """Per-item importance for a section. Real RandomForest if scikit-learn is installed,
+    else a |corrected item-total r| fallback. Returns (importances[], method_label)."""
+    n, k = Xg.shape
+    Xi = np.where(np.isnan(Xg), np.nanmean(np.where(np.isnan(Xg), np.nan, Xg), axis=0), Xg)
+    Xi = np.nan_to_num(Xi, nan=0.0)
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        rf = RandomForestRegressor(n_estimators=300, random_state=0, n_jobs=-1)
+        rf.fit(Xi, np.nan_to_num(target, nan=float(np.nanmean(target))))
+        imp = np.asarray(rf.feature_importances_, float)
+        lbl = "RandomForest importance"
+    except Exception:
+        imp = np.zeros(k)
+        for j in range(k):
+            rest = np.nansum(np.delete(Xg, j, axis=1), axis=1)
+            col = Xg[:, j]; v = ~np.isnan(col)
+            imp[j] = abs(np.corrcoef(col[v], rest[v])[0, 1]) if (v.sum() > 2 and np.nanstd(col[v]) > 0) else 0.0
+        lbl = "Importance = |item-total r|  (install scikit-learn for RandomForest)"
+    s = imp.sum()
+    return (imp / s if s else imp), lbl
+
+def buildItemAnalysis(wb, ck, grp):
+    """One item-analysis sheet per section group (OM & OS split when present, else whole checklist)."""
+    meta = richestMeta(grp)
+    mcs = sorted({k for r in grp for k in (r.get("_ad") or {}).get(ck, {}) if str(k).startswith("MC")}, key=_mcNum)
+    if not mcs:
+        return
+    # group each MC: OM / OS (if Oral headers) else "All"
+    hd = (meta.get("extra_config") or {}).get("headers") or {}
+    starts = {k: (v[0].get("title") if isinstance(v, list) and v else "") for k, v in hd.items()}
+    top = None; gof = {}; hasOral = False
+    for mc in mcs:
+        t = starts.get(mc, "")
+        if t and t.strip().lower().startswith("oral "):
+            top = t.strip(); hasOral = True
+        gof[mc] = top
+    def groupLabel(mc):
+        t = (gof[mc] or "")
+        if hasOral and "oral medicine" in t.lower(): return "OM"
+        if hasOral and "oral surgery"  in t.lower(): return "OS"
+        return "All"
+    # normalised score matrix (0..1 per item)
+    def nrm(r, mc):
+        v, _ = mcScore((r.get("_ad") or {}).get(ck, {}).get(mc, ""), mc, meta)
+        d = mcDenom(mc, meta) or 0
+        return (v / d) if (isinstance(v, (int, float)) and d) else np.nan
+    X = np.array([[nrm(r, mc) for mc in mcs] for r in grp], float)
+    groups = {}
+    for j, mc in enumerate(mcs):
+        groups.setdefault(groupLabel(mc), []).append(j)
+
+    for glabel, idx in groups.items():
+        name = (f"IA {ck} {glabel}")[:31]
+        base = name; z = 1
+        while name in wb.sheetnames:
+            z += 1; name = (base[:28] + str(z))
+        ws = wb.create_sheet(name)
+        def secTitle(mc):                # finer section title; multi-level -> "OM Case 1 | Question 1. ..."
+            ts = headerTitles(hd.get(mc))
+            return f"{shortTop(ts[0])} | {ts[-1]}" if len(ts) > 1 else (ts[0] if ts else "")
+        sec = {jj: secTitle(mcs[jj]) for jj in idx}
+        # section total (for importance + hi/lo groups), per student over this group's items
+        Xg = X[:, idx]
+        tot = np.nansum(Xg, axis=1)
+        imp, impLbl = _rfImportance(Xg, tot)
+        # hi/lo 27% split on total
+        order = np.argsort(np.nan_to_num(tot, nan=-1))
+        cut = max(1, int(round(0.27 * len(order))))
+        lowIdx = set(order[:cut].tolist()); hiIdx = set(order[-cut:].tolist())
+        # title + notes
+        ws.cell(row=1, column=1, value=f"Item Analysis — {ck} — {glabel}").font = xlFont(True, "1E293B", 12)
+        ws.cell(row=2, column=1, value=f"n={X.shape[0]} students · {len(idx)} items · {impLbl} · 2PL = observed-ability logistic · small samples: interpret with care").font = xlFont(size=8, color="64748B")
+        cols = ["Item", "Section", "N", "Difficulty p", "SD", "Item-total r",
+                "D (hi-lo 27%)", "IRT a (disc.)", "IRT b (diff.)", "Importance", "Rank", "Flag", "Note"]
+        for c, h in enumerate(cols, 1):
+            cc = ws.cell(row=3, column=c, value=h); cc.fill = xlFill("010D44"); cc.font = xlFont(True, "FFFFFF", 9)
+            cc.alignment = xlAlign("center", wrap=True); cc.border = xlBorder()
+        ranks = (-imp).argsort().argsort() + 1
+        rws = []
+        for local, j in enumerate(idx):
+            col = X[:, j]; valid = ~np.isnan(col); n = int(valid.sum())
+            p = float(np.nanmean(col)) if n else np.nan
+            sd = float(np.nanstd(col)) if n else np.nan
+            rest = np.nansum(np.delete(X[:, idx], local, axis=1), axis=1)
+            r_it = float(np.corrcoef(col[valid], rest[valid])[0, 1]) if (n > 2 and np.nanstd(col[valid]) > 0 and np.nanstd(rest[valid]) > 0) else np.nan
+            hi = [i for i in range(len(grp)) if i in hiIdx and not np.isnan(col[i])]
+            lo = [i for i in range(len(grp)) if i in lowIdx and not np.isnan(col[i])]
+            D = (np.mean(col[hi]) - np.mean(col[lo])) if (hi and lo) else np.nan
+            ab = (rest - np.nanmean(rest)) / (np.nanstd(rest) or 1)
+            item = np.where(col >= 0.5, 1.0, 0.0) if glabel == "OS" else col
+            a, b = _irtLite(item, ab)
+            novar = (n > 0 and np.nanstd(col[valid]) == 0)
+            if novar:          flag, note = "No variance", f"all {round(p,2)}"
+            elif not (r_it == r_it) or r_it < 0.10: flag, note = "Poor", "low/neg discrimination"
+            elif p > 0.95:     flag, note = "Too easy", "near-ceiling"
+            elif p < 0.10:     flag, note = "Too hard", "near-floor"
+            elif r_it >= 0.20 and 0.20 <= p <= 0.90: flag, note = "Good", ""
+            else:              flag, note = "Review", "borderline p/r"
+            vals = [mcs[j], sec[j][:40], n, None if p!=p else round(p,3), None if sd!=sd else round(sd,3),
+                    None if r_it!=r_it else round(r_it,3), None if D!=D else round(float(D),3),
+                    None if a!=a else round(a,3), None if b!=b else round(b,3),
+                    round(float(imp[local]),3), int(ranks[local]), flag, note]
+            rws.append(vals)
+        rws.sort(key=lambda v: (v[0][:2], _mcNum(v[0])))
+        fillByFlag = {"Good":"D1FAE5","Review":"FEF9C3","Poor":"FECACA","Too easy":"FED7AA","Too hard":"FED7AA","No variance":"E2E8F0"}
+        for ri, vals in enumerate(rws, start=4):
+            for c, v in enumerate(vals, 1):
+                cc = ws.cell(row=ri, column=c, value=v); cc.font = xlFont(size=9)
+                cc.alignment = xlAlign("center" if c not in (2,13) else "left"); cc.border = xlBorder()
+            ws.cell(row=ri, column=12).fill = xlFill(fillByFlag.get(vals[11], "FFFFFF"))
+        for c, w in enumerate([9,26,5,11,7,11,12,11,11,11,6,11,22], 1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+        from openpyxl.chart import ScatterChart, BarChart, Reference, Series
+        _last = 3 + len(rws)
+        _sc = ScatterChart(); _sc.title = f"{glabel}: difficulty vs discrimination"
+        _sc.x_axis.title = "Difficulty p"; _sc.y_axis.title = "Item-total r"
+        _sc.x_axis.delete = False; _sc.y_axis.delete = False; _sc.height = 8; _sc.width = 13
+        _xr = Reference(ws, min_col=4, min_row=4, max_row=_last); _yr = Reference(ws, min_col=6, min_row=4, max_row=_last)
+        _ser = Series(_yr, _xr, title="items"); _ser.marker.symbol = "circle"; _ser.marker.size = 5
+        _ser.graphicalProperties.line.noFill = True; _sc.series.append(_ser)
+        ws.add_chart(_sc, get_column_letter(15) + "3")
+        _bc = BarChart(); _bc.title = f"{glabel}: discrimination (item-total r)"; _bc.height = 8; _bc.width = 16; _bc.legend = None
+        _cats = Reference(ws, min_col=1, min_row=4, max_row=_last); _vals = Reference(ws, min_col=6, min_row=3, max_row=_last)
+        _bc.add_data(_vals, titles_from_data=True); _bc.set_categories(_cats)
+        ws.add_chart(_bc, get_column_letter(15) + "20")
+        ws.freeze_panes = ws.cell(row=4, column=2)
+
+def buildAssessorSheet(wb, rows):   # per-assessor leniency / harshness across filtered records
+    from collections import defaultdict
+    from openpyxl.chart import BarChart, Reference
+    ws = wb.create_sheet("Assessor Analysis")
+    byck = defaultdict(list)
+    for r in rows:
+        byck[r.get("_clkey")].append(r)
+    plan = {}
+    for ck, g in byck.items():
+        if not ck:
+            continue
+        m = richestMeta(g)
+        mcs = sorted({k for r in g for k in (r.get("_ad") or {}).get(ck, {}) if str(k).startswith("MC")}, key=_mcNum)
+        if mcs:
+            _, cols = sectionPlan(mcs, m); plan[ck] = (m, cols[-1])
+    byasr = defaultdict(lambda: {"ov": [], "gr": [], "stu": set(), "ck": set()})
+    allov = []
+    for r in rows:
+        ck = r.get("_clkey"); asr = (r.get("Assessor") or "—").strip() or "—"
+        ov = None
+        if ck in plan:
+            m, (kind, mm, _l) = plan[ck]
+            ov = colVal(kind, mm, (r.get("_ad") or {}).get(ck, {}), m)
+        d = byasr[asr]
+        if ov is not None:
+            d["ov"].append(ov); allov.append(ov)
+        try: d["gr"].append(int(r.get("GR")))
+        except (ValueError, TypeError): pass
+        d["stu"].add((r.get("Student") or "").strip().lower()); d["ck"].add(ck)
+    grand = float(np.mean(allov)) if allov else 0.0
+    data = []
+    for asr, d in byasr.items():
+        n = len(d["ov"]); mean = float(np.mean(d["ov"])) if n else None
+        sd = float(np.std(d["ov"])) if n > 1 else 0.0
+        mgr = float(np.mean(d["gr"])) if d["gr"] else None
+        lean = (mean - grand) if mean is not None else None
+        data.append([asr, len(d["stu"]), len(d["ov"]) + (len(d["gr"]) if not d["ov"] else 0) if False else _asrForms(d),
+                     None if mean is None else round(mean, 1), round(sd, 1),
+                     None if mgr is None else round(mgr, 2),
+                     None if lean is None else round(lean, 1), "",
+                     ", ".join(sorted(x for x in d["ck"] if x))])
+    means = [row[3] for row in data if row[3] is not None]
+    sg = float(np.std(means)) if len(means) > 1 else 0.0
+    cut = max(5.0, 0.67 * sg)
+    for row in data:
+        lv = row[6]
+        row[7] = "" if (lv is None) else ("Lenient" if lv > cut else ("Harsh" if lv < -cut else "Typical"))
+    data.sort(key=lambda r: (r[3] is None, -(r[3] or 0)))
+    ws.cell(row=1, column=1, value="Assessor Analysis — leniency vs cohort (Overall %)").font = xlFont(True, "1E293B", 12)
+    ws.cell(row=2, column=1, value=f"cohort mean Overall % = {round(grand,1)} · Leniency Δ = assessor mean − cohort mean · flag at ±{round(cut,1)}").font = xlFont(size=8, color="64748B")
+    cols = ["Assessor", "Students", "Forms", "Mean Overall %", "SD", "Mean GR", "Leniency Δ", "Flag", "Checklists"]
+    for c, h in enumerate(cols, 1):
+        cc = ws.cell(row=3, column=c, value=h); cc.fill = xlFill("010D44"); cc.font = xlFont(True, "FFFFFF", 9)
+        cc.alignment = xlAlign("center", wrap=True); cc.border = xlBorder()
+    flagFill = {"Lenient": "FED7AA", "Harsh": "FECACA", "Typical": "D1FAE5"}
+    for ri, row in enumerate(data, start=4):
+        for c, v in enumerate(row, 1):
+            cc = ws.cell(row=ri, column=c, value=v); cc.font = xlFont(size=9)
+            cc.alignment = xlAlign("left" if c in (1, 9) else "center"); cc.border = xlBorder()
+        ws.cell(row=ri, column=8).fill = xlFill(flagFill.get(row[7], "FFFFFF"))
+    last = 3 + len(data)
+    bc = BarChart(); bc.title = "Mean Overall % by assessor"; bc.height = 9; bc.width = 20; bc.legend = None
+    bc.y_axis.title = "Overall %"
+    cats = Reference(ws, min_col=1, min_row=4, max_row=last)
+    vals = Reference(ws, min_col=4, min_row=3, max_row=last)
+    bc.add_data(vals, titles_from_data=True); bc.set_categories(cats)
+    ws.add_chart(bc, "K3")
+    for c, w in enumerate([22, 9, 7, 13, 7, 9, 11, 10, 30], 1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.freeze_panes = "B4"
+
+def _asrForms(d):
+    return len(d["ov"]) if d["ov"] else len(d["gr"])
+
+def buildBlrSheet(wb, groups):   # borderline linear regression of Overall total vs GR (cut at GR=2)
+    from openpyxl.chart import ScatterChart, Reference, Series
+    from openpyxl.chart.trendline import Trendline
+    ws = wb.create_sheet("BLR")
+    t = ws.cell(row=1, column=1, value="Borderline Linear Regression — Overall % vs Global Rating (cut score read at GR = 2)")
+    t.font = xlFont(True, "1E293B", 12)
+    r0 = 3
+    for ck, grp in groups.items():
+        if not ck:
+            continue
+        meta = richestMeta(grp)
+        mcs = sorted({k for r in grp for k in (r.get("_ad") or {}).get(ck, {}) if str(k).startswith("MC")}, key=_mcNum)
+        if not mcs:
+            continue
+        mode, cols = sectionPlan(mcs, meta)
+        kind, mm, _lbl = cols[-1]                       # Overall
+        xs = []; ys = []
+        for r in grp:
+            ov = colVal(kind, mm, (r.get("_ad") or {}).get(ck, {}), meta)
+            try: gri = int(r.get("GR"))
+            except (ValueError, TypeError): gri = None
+            if gri is not None and ov is not None:
+                xs.append(gri); ys.append(ov)
+        hc = ws.cell(row=r0, column=1, value=ck); hc.font = xlFont(True, "FFFFFF", 11)
+        for c in range(1, 4):
+            ws.cell(row=r0, column=c).fill = xlFill("010D44")
+        ws.merge_cells(start_row=r0, start_column=1, end_row=r0, end_column=3)
+        if len(xs) < 3:
+            ws.cell(row=r0+1, column=1, value=f"Insufficient data (n={len(xs)})").font = xlFont(size=9, color="DC2626")
+            r0 += 4; continue
+        s = linregStats(xs, ys, borderline=2)
+        stats = [("n", s["n"]), ("Slope", round(s["slope"], 3)), ("Intercept", round(s["intercept"], 3)),
+                 ("R²", round(s["r2"], 3)), ("Pearson r", round(s["pearson"], 3)), ("SEM (residual)", round(s["sem"], 3)),
+                 ("Cut score % @ GR=2", round(s["cut"], 1)), ("Pass rate %", round(s["pass"], 1)),
+                 ("Mean overall %", round(s["mean"], 1)), ("SD overall %", round(s["sd"], 1))]
+        for i, (k, v) in enumerate(stats):
+            a = ws.cell(row=r0+1+i, column=1, value=k); a.font = xlFont(True, size=9); a.border = xlBorder()
+            b = ws.cell(row=r0+1+i, column=2, value=v); b.font = xlFont(size=9); b.border = xlBorder()
+        gcol, ocol = 20, 21                             # chart source data (off to the right)
+        ws.cell(row=r0, column=gcol, value="GR"); ws.cell(row=r0, column=ocol, value="Overall")
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            ws.cell(row=r0+1+i, column=gcol, value=x); ws.cell(row=r0+1+i, column=ocol, value=y)
+        ch = ScatterChart(); ch.title = f"{ck}: Overall % vs GR"
+        ch.x_axis.title = "Global Rating (GR)"; ch.y_axis.title = "Overall %"
+        ch.x_axis.delete = False; ch.y_axis.delete = False; ch.height = 7.5; ch.width = 13
+        xref = Reference(ws, min_col=gcol, min_row=r0+1, max_row=r0+len(xs))
+        yref = Reference(ws, min_col=ocol, min_row=r0+1, max_row=r0+len(ys))
+        ser = Series(yref, xref, title="students")
+        ser.marker.symbol = "circle"; ser.marker.size = 5
+        ser.graphicalProperties.line.noFill = True
+        ser.trendline = Trendline(trendlineType="linear", dispEq=True, dispRSqr=True)
+        ch.series.append(ser)
+        ws.add_chart(ch, f"D{r0}")
+        r0 += max(len(xs) + 2, 18)
+    ws.column_dimensions["A"].width = 18; ws.column_dimensions["B"].width = 12
+
+def do_export_detailed(rows, submitted_only, unsubmitted_only, search,
+                       sort_opt=DEFAULT_SORT, date_from="", date_to=""):
+    """Formatted multi-sheet XLSX: 'All Records' overview, one sheet per checklist
+    type (MC scores + section/OM/OS/Overall totals), and a BLR standard-setting sheet."""
+    filtered = apply_filters(rows, submitted_only, unsubmitted_only, search, sort_opt, date_from, date_to)
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    buildCombinedSheet(wb, filtered)
+    buildRosterSheet(wb, filtered)
+    groups = {}
+    for r in filtered:
+        groups.setdefault(r.get("_clkey"), []).append(r)
+    for ck, grp in groups.items():
+        if ck:
+            buildChecklistSheet(wb, ck, grp)
+            buildItemAnalysis(wb, ck, grp)
+    buildAssessorSheet(wb, filtered)
+    buildBlrSheet(wb, groups)
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False); tmp.close()
+    wb.save(tmp.name)
+    return tmp.name
+
+
 # ── Layout ────────────────────────────────────────────────────────────────────
 css = f"""
 .gradio-container {{ max-width: 1400px !important; margin: 0 auto; }}
@@ -422,8 +1329,8 @@ with gr.Blocks(title="DASH · SCBD Monitor", css=css,
 
     # ── Row 1: date range + refresh interval + load button ───────────────
     with gr.Row(elem_classes="compact-row"):
-        date_from   = gr.Textbox(label="From", value="2026-06-09", placeholder="YYYY-MM-DD", scale=2)
-        date_to     = gr.Textbox(label="To",   value="2026-06-10", placeholder="YYYY-MM-DD", scale=2)
+        date_from   = gr.Textbox(label="From", value="2026-10-18", placeholder="YYYY-MM-DD", scale=2)
+        date_to     = gr.Textbox(label="To",   value="2026-10-19", placeholder="YYYY-MM-DD", scale=2)
         interval_dd = gr.Dropdown(
             list(INTERVAL_MAP.keys()), value=DEFAULT_INTERVAL,
             label="Refresh", scale=2,
@@ -462,6 +1369,9 @@ with gr.Blocks(title="DASH · SCBD Monitor", css=css,
     with gr.Row(elem_classes="compact-row"):
         export_btn = gr.Button("⬇ Export CSV", size="sm", scale=1)
         csv_out    = gr.File(label="Download CSV", visible=False, scale=3)
+    with gr.Row(elem_classes="compact-row"):
+        export_det_btn = gr.Button("⬇ Export Detailed (MC)", size="sm", scale=1)
+        det_out        = gr.File(label="Download Detailed XLSX", visible=False, scale=3)
 
     # ── Event wiring ──────────────────────────────────────────────────────
     load_inputs  = [cohort_in, sub_only, unsub_only, search_in, sort_dd, date_from, date_to]
@@ -482,6 +1392,12 @@ with gr.Blocks(title="DASH · SCBD Monitor", css=css,
         outputs=[csv_out],
     ).then(fn=lambda: gr.update(visible=True), outputs=[csv_out])
 
+    export_det_btn.click(
+        fn=do_export_detailed,
+        inputs=[raw_state, sub_only, unsub_only, search_in, sort_dd, date_from, date_to],
+        outputs=[det_out],
+    ).then(fn=lambda: gr.update(visible=True), outputs=[det_out])
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -489,4 +1405,5 @@ if __name__ == "__main__":
     print("  ─────────────────────────────")
     print("  Opening at http://localhost:7860")
     print("  Press Ctrl+C to stop\n")
-    demo.launch(server_name="localhost", server_port=7860, share=True, auth =(LOGIN_USER, LOGIN_PASS) if LOGIN_USER and LOGIN_PASS else None)
+    ngrok.connect(7860, domain= "coerce-octane-gilled.ngrok-free.dev")
+    demo.launch(server_name="localhost", server_port=7860, share=False, auth =(LOGIN_USER, LOGIN_PASS) if LOGIN_USER and LOGIN_PASS else None)

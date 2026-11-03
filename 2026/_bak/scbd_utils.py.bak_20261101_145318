@@ -1,0 +1,650 @@
+"""
+scbd_utils.py — generic per-student feedback PDFs for the SCBD exam family
+(DDS3-CBD Case Based Discussion, SCBD_OM-OS Oral Med / Oral Surg, ...).
+
+Input  : a per-exam sheet exported by scbd_gradio.py (row 1 = merged section
+         headings, row 2 = column headings "MCn (/d)", one row per student),
+         e.g. SCBD/CBD/DDS3 CBD cleaned comments.xlsx -> "DDS3-CBD (2)".
+Output : one A4-landscape PDF per student (Surname_Given_ID_<tag>_Feedback.pdf,
+         ID is the first digit group -> works with StudentReportMailer) + _index.csv.
+
+Scoring is recomputed from the MC columns (sheet totals are only cross-checked):
+  * section total = Σ MC score / Σ MC max (blank MCs excluded from both)
+  * every exam config has "parts" -> part % by method
+        "sum"      : Σraw / Σmax over the matched sections         (pooled)
+        "itemNorm" : mean(score/max) over the matched MCs          (OS style)
+  * Overall % = Σ part% × weight  (weights should sum to 1)
+Add a new exam = add an entry to EXAM_CONFIGS.
+
+Usage (main.ipynb):
+    from scbd_utils import *
+    idx = buildScbdReports("SCBD/CBD/DDS3 CBD cleaned comments.xlsx", "DDS3-CBD (2)", "DDS3-CBD",
+                           outDir="SCBD/CBD/CBD_Feedback_Reports")
+"""
+import html
+import os
+import re
+
+import numpy as np
+import pandas as pd
+import openpyxl
+from reportlab.lib import colors as rlColors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import Flowable as RlFlowable
+from reportlab.platypus import (SimpleDocTemplate, Paragraph as RlParagraph, Table as RlTable,
+                                TableStyle as RlTableStyle, Spacer as RlSpacer, KeepTogether as RlKeepTogether)
+
+# Only these names leak into main.ipynb via `from scbd_utils import *`
+# (keeps reportlab Table/Paragraph from shadowing openpyxl names there).
+__all__ = ["EXAM_CONFIGS", "GRADE_BANDS", "loadExportSheet", "loadCriteria", "loadStudentIds",
+           "buildSections", "scoreCohort", "ScoreBar", "checkTotals", "gradeFor", "buildStudentPdf",
+           "buildScbdReports"]
+
+# ── Exam configs ─────────────────────────────────────────────────────────────
+# sectionPattern : regex on row-1 heading that STARTS a report section; headings that
+#                  don't match become sub-headings inside the current section (OM questions).
+#                  None -> every row-1 heading is its own section.
+# parts          : how sections roll up into Overall (label, regex on section title, method, weight)
+# excludeMcs     : MCs shown greyed "(excluded)" and left out of every total
+# fileTag        : filename tag — must contain NO digits (mailer takes the first digit group as ID)
+EXAM_CONFIGS = {
+    "DDS3-CBD": {
+        "title": "Case Based Discussion Assessment (CBD)",
+        "checklistKey": "DDS3-CBD",
+        "fileTag": "CBD",
+        "sectionPattern": r"^\s*DOMAIN\s*\d+",
+        "parts": [
+            {"label": "Domain 1", "match": r"^\s*DOMAIN\s*1\b", "method": "sum", "weight": 0.15},
+            {"label": "Domain 2", "match": r"^\s*DOMAIN\s*2\b", "method": "sum", "weight": 0.10},
+            {"label": "Domain 3", "match": r"^\s*DOMAIN\s*3\b", "method": "sum", "weight": 0.25},
+            {"label": "Domain 4", "match": r"^\s*DOMAIN\s*4\b", "method": "sum", "weight": 0.20},
+            {"label": "Domain 5", "match": r"^\s*DOMAIN\s*5\b", "method": "sum", "weight": 0.25},
+            {"label": "Domain 6", "match": r"^\s*DOMAIN\s*6\b", "method": "sum", "weight": 0.05},
+        ],
+        "excludeMcs": [],
+        "overallNote": "Overall = Σ (domain % × weight); weights D1 15%, D2 10%, D3 25%, D4 20%, D5 25%, D6 5%.",
+        # printed under the overall result when Overall < failCut (None/"" disables)
+        "failNote": "Any student that received less than 50% are welcome to reach out to Dr. Ross or Dr. Chen "
+                    "if they would like to discuss their results.",
+        "failCut": 50,
+        "showDomainBars": True,          # per-exam default; buildScbdReports(showDomainBars=...) overrides
+    },
+    "SCBD_OM-OS": {
+        "title": "Standardised Case Based Discussion Assessment (SCBD) — Oral Medicine & Oral Surgery",
+        "checklistKey": "SCBD_OM-OS",
+        "fileTag": "SCBD_OMOS",
+        "sectionPattern": r"^\s*Oral\s+(Medicine|Surgery)",
+        "parts": [
+            {"label": "Oral Medicine", "match": r"Oral\s+Medicine", "method": "sum", "weight": 0.5},
+            {"label": "Oral Surgery", "match": r"Oral\s+Surgery", "method": "itemNorm", "weight": 0.5},
+        ],
+        "excludeMcs": [],
+        "overallNote": "Overall = 50% Oral Medicine % (pooled marks) + 50% Oral Surgery % (each MC normalised).",
+    },
+}
+
+# University of Melbourne grade bands (lower bound %, label, colour-blind-safe blue→orange)
+GRADE_BANDS = [(80, "H1", "#0B3D78"), (75, "H2A", "#1F6FB2"), (70, "H2B", "#5B9BD5"),
+               (65, "H3", "#F2A541"), (50, "P", "#E07B00"), (0, "N", "#A84300")]
+
+NAVY = "#1F3864"          # header bands (matches the SCBD 2 reports)
+SUBHDR = "#7F9CC4"        # table column-header row
+TOTAL_BG = "#DCE3EF"      # section total row
+ALT_BG = "#F2F2F2"        # zebra rows
+SUBGRP_BG = "#E8EEF7"     # sub-heading rows (e.g. OM questions)
+AVG_COLOUR = "#E07B00"    # cohort-average marker (orange: colour-blind-safe against the blues)
+EMPTY_TXT = {"", "—", "-", "nan", "none"}
+
+# ── Loading ──────────────────────────────────────────────────────────────────
+def loadExportSheet(xlsxPath, sheetName):
+    """Read a scbd_gradio export sheet -> (df, mcMeta).
+    mcMeta = [{"mc": "MC1", "col": "MC1 (/3)", "den": 3.0, "group": "<row-1 heading>"}, ...]"""
+    ws = openpyxl.load_workbook(xlsxPath, read_only=True, data_only=True)[sheetName]
+    rows = ws.iter_rows(min_row=1, max_row=2, values_only=True)
+    top, head = list(next(rows)), list(next(rows))
+    groups, cur = [], None                     # forward-fill merged row-1 headings
+    for v in top:
+        if v is not None and str(v).strip():
+            cur = str(v).strip()
+        groups.append(cur)
+    df = pd.read_excel(xlsxPath, sheet_name=sheetName, header=1)
+    mcMeta = []
+    for i, h in enumerate(head):
+        m = re.match(r"^\s*(MC\d+)\s*\(/\s*([\d.]+)\s*\)", str(h or ""))
+        if m:
+            mcMeta.append({"mc": m.group(1), "col": df.columns[i], "den": float(m.group(2)), "group": groups[i]})
+    if not mcMeta:
+        raise ValueError(f"No 'MCn (/d)' columns found in {xlsxPath} / {sheetName}")
+    return df, mcMeta
+
+
+def loadCriteria(jsonPath, checklistKey):
+    """MC -> criterion text from the DASH API cache (temp <year> scbd.json); uses the
+    form version with the most fields. Returns {} if the file/key is missing."""
+    import json
+    if not jsonPath or not os.path.exists(jsonPath):
+        print(f"[criteria] {jsonPath} not found — criterion text will be blank")
+        return {}
+    with open(jsonPath, encoding="utf-8") as f:
+        recs = json.load(f)
+    best = {}
+    for r in recs:
+        fields = (((r.get("form") or {}).get("checklists") or {}).get(checklistKey) or {}).get("fields") or {}
+        if len(fields) > len(best):
+            best = fields
+    if not best:
+        print(f"[criteria] checklist '{checklistKey}' not in {jsonPath} — criterion text will be blank")
+    return {k: html.unescape(re.sub(r"<[^>]+>", " ", str(v))).strip() for k, v in best.items()}
+
+
+def normName(s):
+    s = re.sub(r"[\u2019\u2018'`]\s*", "", str(s or ""))       # O’Donoghue == O' Donoghue == ODonoghue
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def loadStudentIds(studentListPath, cohort=None):
+    """normalised student_name -> student_number (from RE_ Student List.xlsx / studentEmailList.csv)."""
+    if not studentListPath or not os.path.exists(studentListPath):
+        print(f"[ids] {studentListPath} not found — IDs will be blank")
+        return {}
+    sl = pd.read_csv(studentListPath) if str(studentListPath).lower().endswith(".csv") else pd.read_excel(studentListPath)
+    if cohort and "cohort" in sl.columns:
+        sl = sl[sl["cohort"].astype(str).str.upper() == str(cohort).upper()]
+    return {normName(n): str(int(i)) for n, i in zip(sl["student_name"], sl["student_number"]) if pd.notna(i)}
+
+# ── Structure + scoring ──────────────────────────────────────────────────────
+def buildSections(mcMeta, cfg):
+    """Group MCs into report sections (+ sub-headings) using cfg['sectionPattern']."""
+    pat = re.compile(cfg["sectionPattern"], re.I) if cfg.get("sectionPattern") else None
+    sections, lastGroup = [], object()
+    for m in mcMeta:
+        g = m["group"] or "Checklist"
+        if g != lastGroup:
+            if pat is None or pat.search(g) or not sections:
+                sections.append({"title": g, "items": []})
+            else:
+                sections[-1]["items"].append({"subheading": g})
+            lastGroup = g
+        sections[-1]["items"].append(m)
+    for s in sections:
+        s["mcs"] = [i for i in s["items"] if "mc" in i and i["mc"] not in cfg.get("excludeMcs", [])]
+        s["avail"] = sum(i["den"] for i in s["mcs"])
+    return sections
+
+
+def mcValue(row, m):
+    v = pd.to_numeric(row.get(m["col"]), errors="coerce")
+    return None if pd.isna(v) else float(v)
+
+
+def scoreStudent(row, sections, cfg):
+    """-> {"sections": [{raw, avail, pct}], "parts": [{label, pct, weight}], "overall": %}"""
+    secRes = []
+    for s in sections:
+        raw = avail = 0.0; got = False
+        for m in s["mcs"]:
+            v = mcValue(row, m)
+            if v is not None:
+                raw += v; avail += m["den"]; got = True
+        secRes.append({"raw": raw if got else None, "avail": avail if got else s["avail"],
+                       "pct": 100 * raw / avail if got and avail else None})
+    partRes = []
+    for p in cfg["parts"]:
+        pat = re.compile(p["match"], re.I)
+        idx = [i for i, s in enumerate(sections) if pat.search(s["title"])]
+        if p["method"] == "sum":
+            raw = sum(secRes[i]["raw"] or 0 for i in idx if secRes[i]["raw"] is not None)
+            av = sum(secRes[i]["avail"] for i in idx if secRes[i]["raw"] is not None)
+            pct = 100 * raw / av if av else None
+        elif p["method"] == "itemNorm":
+            vals = [mcValue(row, m) / m["den"] for i in idx for m in sections[i]["mcs"]
+                    if m["den"] and mcValue(row, m) is not None]
+            pct = 100 * float(np.mean(vals)) if vals else None
+        else:
+            raise ValueError(f"Unknown part method {p['method']}")
+        partRes.append({"label": p["label"], "pct": pct, "weight": p["weight"]})
+    scored = [p for p in partRes if p["pct"] is not None]
+    wSum = sum(p["weight"] for p in scored)
+    overall = sum(p["pct"] * p["weight"] for p in scored) / wSum * sum(pp["weight"] for pp in cfg["parts"]) \
+        if scored and wSum else None                 # re-scales only if a whole part is blank
+    totRaw = sum(r["raw"] for r in secRes if r["raw"] is not None)
+    totAvail = sum(r["avail"] for r in secRes if r["raw"] is not None)
+    return {"sections": secRes, "parts": partRes, "overall": overall, "totRaw": totRaw, "totAvail": totAvail}
+
+
+def scoreCohort(df, sections, cfg):
+    """Score every row; returns (results list aligned to df, cohortAvg dict)."""
+    results = [scoreStudent(r, sections, cfg) for _, r in df.iterrows()]
+    def avg(vals):
+        vals = [v for v in vals if v is not None]
+        return float(np.mean(vals)) if vals else None
+    cohortAvg = {
+        "sections": [avg([r["sections"][i]["raw"] for r in results]) for i in range(len(sections))],
+        "parts": [avg([r["parts"][j]["pct"] for r in results]) for j in range(len(cfg["parts"]))],
+        "overall": avg([r["overall"] for r in results]),
+        "totRaw": avg([r["totRaw"] for r in results]),
+        # % distributions for the score bars (avg + 25/50/75th percentiles)
+        "sectionPct": [avg([r["sections"][i]["pct"] for r in results]) for i in range(len(sections))],
+        "sectionQ": [quartiles([r["sections"][i]["pct"] for r in results]) for i in range(len(sections))],
+        "overallQ": quartiles([r["overall"] for r in results]),
+    }
+    return results, cohortAvg
+
+
+def quartiles(vals):
+    """(Q1, median, Q3) of the non-blank values, or None."""
+    vals = [v for v in vals if v is not None]
+    return tuple(float(x) for x in np.percentile(vals, [25, 50, 75])) if vals else None
+
+
+def quartileOf(v, q):
+    """1 = top 25% … 4 = bottom 25% (ties go to the higher quartile)."""
+    if v is None or q is None:
+        return None
+    return 1 if v >= q[2] else 2 if v >= q[1] else 3 if v >= q[0] else 4
+
+
+def checkTotals(df, results, sheetCol="Overall (%)", tol=0.15):
+    """Recomputed Overall vs the sheet's Overall column. Differences ≤ tol are rounding
+    (the export rounds section % before weighting). Returns rows that differ."""
+    if sheetCol not in df.columns:
+        print(f"[check] '{sheetCol}' not in sheet — skipped")
+        return pd.DataFrame()
+    out = pd.DataFrame({"Student": df["Student"].values,
+                        "Sheet": pd.to_numeric(df[sheetCol], errors="coerce").values,
+                        "Recomputed": [r["overall"] for r in results]})
+    out["Diff"] = (out["Recomputed"] - out["Sheet"]).round(3)
+    bad = out[out["Diff"].abs() > tol]
+    small = ((out["Diff"].abs() > 1e-6) & (out["Diff"].abs() <= tol)).sum()
+    print(f"[check] {len(out)} rows | {small} rounding-only diffs (≤{tol}) | {len(bad)} real mismatches")
+    return bad
+
+
+def gradeFor(pct):
+    """UoM grade band for an exact % (no rounding up: 79.6 -> H2A)."""
+    if pct is None:
+        return "—", "#808080"
+    for lo, lab, col in GRADE_BANDS:
+        if pct >= lo:
+            return lab, col
+    return GRADE_BANDS[-1][1], GRADE_BANDS[-1][2]
+
+# ── PDF ──────────────────────────────────────────────────────────────────────
+def fmtNum(v, dp=1):
+    if v is None:
+        return "–"
+    return f"{v:g}" if float(v).is_integer() else f"{v:.{dp}f}"
+
+
+def styles():
+    base = dict(fontName="Helvetica", fontSize=8.5, leading=11)
+    return {
+        "cell": ParagraphStyle("cell", **base),
+        "score": ParagraphStyle("score", **{**base, "fontSize": 9.5, "alignment": TA_CENTER, "textColor": rlColors.HexColor(NAVY)}),
+        "cellGrey": ParagraphStyle("cellGrey", **{**base, "textColor": rlColors.HexColor("#808080")}),
+        "sub": ParagraphStyle("sub", **{**base, "fontName": "Helvetica-Bold", "textColor": rlColors.HexColor(NAVY)}),
+        "hdr": ParagraphStyle("hdr", fontName="Helvetica-Bold", fontSize=10.5, leading=13, textColor=rlColors.white),
+        "comment": ParagraphStyle("comment", fontName="Helvetica-Oblique", fontSize=9, leading=12),
+        "foot": ParagraphStyle("foot", fontName="Helvetica", fontSize=7, leading=9, textColor=rlColors.HexColor("#404040")),
+        "big": ParagraphStyle("big", fontName="Helvetica-Bold", fontSize=26, leading=30, textColor=rlColors.white, alignment=TA_CENTER),
+        "white": ParagraphStyle("white", fontName="Helvetica", fontSize=9, leading=12, textColor=rlColors.white),
+        "whiteC": ParagraphStyle("whiteC", fontName="Helvetica", fontSize=8, leading=10, textColor=rlColors.white, alignment=TA_CENTER),
+    }
+
+
+def esc(s):
+    return html.escape(str(s or ""))
+
+
+def headerBand(info, cfg, W, st):
+    left = RlParagraph(f'<font size="17"><b>{esc(info["name"])}</b></font><br/>'
+                       f'<font size="9" color="#D0D8E8">Student ID: {esc(info["id"] or "—")} · {esc(info["cohort"])}</font>',
+                       ParagraphStyle("hl", parent=st["white"], leading=20))
+    right = RlParagraph(f'<para align="right"><font size="13"><b>{esc(info["subject"])}</b></font><br/>'
+                        f'<font size="8.5" color="#D0D8E8">{esc(cfg["title"])}<br/>{esc(info["period"])}</font></para>',
+                        ParagraphStyle("hr", parent=st["white"], leading=12))
+    t = RlTable([[left, right]], colWidths=[W * 0.5, W * 0.5])
+    t.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, -1), rlColors.HexColor(NAVY)),
+                             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                             ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                             ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12)]))
+    return t
+
+
+def sectionTable(sec, secRes, cohortRaw, row, criteria, cfg, W, st):
+    title = re.sub(r"\s*\(/?\s*[\d.]+\s*\)\s*$", "", sec["title"])
+    data = [[RlParagraph(f"{esc(title)} (/{fmtNum(sec['avail'])})", st["hdr"]), ""],
+            ["Criterion", "Score"]]
+    ts = [("SPAN", (0, 0), (-1, 0)), ("BACKGROUND", (0, 0), (-1, 0), rlColors.HexColor(NAVY)),
+          ("BACKGROUND", (0, 1), (-1, 1), rlColors.HexColor(SUBHDR)),
+          ("TEXTCOLOR", (0, 1), (-1, 1), rlColors.white), ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+          ("FONTSIZE", (0, 1), (-1, 1), 8.5), ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+          ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+          ("GRID", (0, 1), (-1, -1), 0.4, rlColors.HexColor("#C8C8C8")),
+          ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]
+    excluded, zebra = [], 0
+    for it in sec["items"]:
+        r = len(data)
+        if "subheading" in it:
+            data.append([RlParagraph(esc(it["subheading"]), st["sub"]), ""])
+            ts += [("SPAN", (0, r), (-1, r)), ("BACKGROUND", (0, r), (-1, r), rlColors.HexColor(SUBGRP_BG))]
+            continue
+        txt = esc(criteria.get(it["mc"], ""))
+        if it["mc"] in cfg.get("excludeMcs", []):
+            excluded.append([RlParagraph(f'<b>{it["mc"]}.</b> {txt} <i>(excluded)</i>', st["cellGrey"]), "–"])
+            continue
+        v = mcValue(row, it)
+        data.append([RlParagraph(f'<b>{it["mc"]}.</b> {txt}', st["cell"]),
+                     RlParagraph(f'<b>{fmtNum(v)}</b><font color="#707070">/{fmtNum(it["den"])}</font>', st["score"])])
+        if zebra % 2:
+            ts.append(("BACKGROUND", (0, r), (-1, r), rlColors.HexColor(ALT_BG)))
+        zebra += 1
+    data += excluded
+    r = len(data)
+    pctTxt = f" ({secRes['pct']:.0f}%)" if secRes["pct"] is not None else ""
+    data.append([RlParagraph(f'<b>Section Total</b>&nbsp;&nbsp;&nbsp;<font color="#606060" size="8">'
+                             f'Cohort Avg: {fmtNum(cohortRaw)}/{fmtNum(sec["avail"])}</font>', st["sub"]),
+                 f"{fmtNum(secRes['raw'])}/{fmtNum(secRes['avail'])}{pctTxt}"])
+    ts += [("BACKGROUND", (0, r), (-1, r), rlColors.HexColor(TOTAL_BG)),
+           ("FONTNAME", (1, r), (1, r), "Helvetica-Bold"), ("TEXTCOLOR", (1, r), (1, r), rlColors.HexColor(NAVY)),
+           ("FONTSIZE", (0, r), (-1, r), 8.5), ("LINEABOVE", (0, r), (-1, r), 1, rlColors.HexColor(NAVY))]
+    t = RlTable(data, colWidths=[W * 0.86, W * 0.14], repeatRows=2)
+    t.setStyle(RlTableStyle(ts))
+    return t
+
+
+def commentsBlock(row, W, st, includeCritical):
+    def clean(v):
+        s = "" if v is None or (isinstance(v, float) and np.isnan(v)) else str(v).strip()
+        return "" if s.lower() in EMPTY_TXT else s
+    parts = []
+    gen = clean(row.get("General"))
+    if gen:
+        parts.append(esc(gen).replace("\n", "<br/>"))
+    cc = clean(row.get("Critical comments"))
+    if includeCritical and (clean(row.get("Critical concerns")).lower() == "yes" or cc):
+        parts.append(f'<b>Critical concerns:</b> {esc(cc).replace(chr(10), "<br/>") or "Yes"}')
+    body = "<br/><br/>".join(parts) or "No comments recorded."
+    t = RlTable([[RlParagraph("Assessor Comments", st["hdr"])], [RlParagraph(body, st["comment"])]], colWidths=[W])
+    t.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, 0), rlColors.HexColor(NAVY)),
+                             ("BACKGROUND", (0, 1), (-1, 1), rlColors.HexColor("#EAF0F7")),
+                             ("LEFTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, -1), 6),
+                             ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    return t
+
+
+def overallBlock(res, cohortAvg, cfg, W, st, showComponentTable=False):
+    grade, gCol = gradeFor(res["overall"])
+    singleSum = len(cfg["parts"]) == 1 and cfg["parts"][0]["method"] == "sum"
+    yours = (f"{fmtNum(res['totRaw'])}/{fmtNum(res['totAvail'])} ({res['overall']:.0f}%)" if singleSum
+             else f"{res['overall']:.1f}%") if res["overall"] is not None else "–"
+    cav = (f"{fmtNum(cohortAvg['totRaw'])}/{fmtNum(res['totAvail'])} ({cohortAvg['overall']:.0f}%)" if singleSum
+           else f"{cohortAvg['overall']:.1f}%") if cohortAvg["overall"] is not None else "–"
+    score = RlParagraph(f'<b>Your Score</b><br/><font size="16"><b>{yours}</b></font><br/>'
+                        f'<font color="#E0E6F0">Cohort Average</font><br/>{cav}',
+                        ParagraphStyle("sc", parent=st["white"], leading=17))
+    gradeCell = RlParagraph(f'{grade}<br/><font size="8">Grade</font>', st["big"])
+    head = RlTable([[RlParagraph(f'{esc(cfg["title"])} — Overall Result', st["hdr"]), ""],
+                    [gradeCell, score]], colWidths=[W * 0.22, W * 0.78])
+    head.setStyle(RlTableStyle([("SPAN", (0, 0), (-1, 0)), ("BACKGROUND", (0, 0), (-1, 0), rlColors.HexColor(NAVY)),
+                                ("BACKGROUND", (0, 1), (-1, 1), rlColors.HexColor(gCol)),
+                                ("LINEAFTER", (0, 1), (0, 1), 0.6, rlColors.white),
+                                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                                ("TOPPADDING", (0, 1), (-1, 1), 12), ("BOTTOMPADDING", (0, 1), (-1, 1), 12),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 12)]))
+    flow = [head]
+    if showComponentTable and not singleSum:                # weighted breakdown table (optional)
+        rows = [["Component", "Your %", "Weight", "Weighted contribution", "Cohort Avg %"]]
+        for p, cp in zip(res["parts"], cohortAvg["parts"]):
+            rows.append([p["label"], fmtNum(p["pct"]), f"{p['weight'] * 100:g}%",
+                         fmtNum(p["pct"] * p["weight"] if p["pct"] is not None else None), fmtNum(cp)])
+        rows.append(["Overall", "", f"{sum(p['weight'] for p in cfg['parts']) * 100:g}%",
+                     fmtNum(res["overall"]), fmtNum(cohortAvg["overall"])])
+        bt = RlTable(rows, colWidths=[W * 0.32, W * 0.15, W * 0.13, W * 0.22, W * 0.18])
+        bt.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, 0), rlColors.HexColor(SUBHDR)),
+                                  ("TEXTCOLOR", (0, 0), (-1, 0), rlColors.white),
+                                  ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                                  ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                                  ("BACKGROUND", (0, -1), (-1, -1), rlColors.HexColor(TOTAL_BG)),
+                                  ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+                                  ("GRID", (0, 0), (-1, -1), 0.4, rlColors.HexColor("#C8C8C8"))]))
+        flow += [RlSpacer(1, 4), bt]
+    bounds = [b[0] for b in GRADE_BANDS]
+    labels = ["≥80"] + [f"{lo}–{hi - 1}" for lo, hi in zip(bounds[1:-1], bounds[:-2])] + ["<50"]
+    band = RlTable([[RlParagraph(f"<b>{lab}</b><br/>{rng}", st["whiteC"]) for (_, lab, _), rng in zip(GRADE_BANDS, labels)]],
+                   colWidths=[W / len(GRADE_BANDS)] * len(GRADE_BANDS))
+    band.setStyle(RlTableStyle([("BACKGROUND", (i, 0), (i, 0), rlColors.HexColor(c)) for i, (_, _, c) in enumerate(GRADE_BANDS)]
+                               + [("BOX", (i, 0), (i, 0), 2, rlColors.black) for i, (_, lab, _) in enumerate(GRADE_BANDS) if lab == grade]))
+    flow += [RlSpacer(1, 6), band]
+    return flow
+
+
+class ScoreBar(RlFlowable):
+    """Horizontal 0–100 bar shaded by the cohort's quartiles, with the cohort average
+    (orange line) and the student's score (navy diamond) marked; quartile boxes on the right
+    (1 = top 25%). value / avg / q are percentages; q = (Q1, median, Q3)."""
+    QUART_FILLS = ["#EEF3FA", "#DCE7F4", "#C5D7EC", "#A9C3E2"]     # bottom → top quartile
+
+    def __init__(self, width, value, avg, q, label="Score"):
+        super().__init__()
+        self.width, self.value, self.avg, self.q, self.label = width, value, avg, q, label
+        self.height = 58
+
+    def wrap(self, availW, availH):
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        navy, orange, grey = rlColors.HexColor(NAVY), rlColors.HexColor(AVG_COLOUR), rlColors.HexColor("#6B6B6B")
+        labW, boxAreaW, gap = 70, 150, 14
+        x0, x1 = labW, self.width - boxAreaW - gap               # bar extent
+        barY, barH = 18, 14
+        X = lambda v: x0 + (x1 - x0) * max(0.0, min(100.0, v)) / 100.0
+        c.setFont("Helvetica-Bold", 10); c.setFillColor(navy)
+        c.drawString(0, barY + 3, self.label)
+        # quartile segments
+        q = self.q
+        edges = [0.0, *q, 100.0] if q else [0.0, 100.0]
+        fills = self.QUART_FILLS if q else ["#EEF3FA"]
+        for (a, b), f in zip(zip(edges[:-1], edges[1:]), fills):
+            c.setFillColor(rlColors.HexColor(f)); c.setStrokeColor(rlColors.HexColor(f))
+            c.rect(X(a), barY, X(b) - X(a), barH, stroke=0, fill=1)
+        if q:                                                     # quartile dividers + labels
+            c.setStrokeColor(rlColors.white); c.setLineWidth(1.2)
+            for v in q:
+                c.line(X(v), barY, X(v), barY + barH)
+        c.setStrokeColor(navy); c.setLineWidth(0.6)
+        c.rect(x0, barY, x1 - x0, barH, stroke=1, fill=0)
+        # ticks + labels
+        c.setFont("Helvetica", 7); c.setFillColor(grey); c.setStrokeColor(grey); c.setLineWidth(0.4)
+        for t in range(0, 101, 5):
+            h = 3 if t % 10 == 0 else 1.5
+            c.line(X(t), barY, X(t), barY - h)
+            if t % 10 == 0:
+                c.drawCentredString(X(t), barY - 10, str(t))
+        # labels: anchored away from each other, kept inside the bar; avg label lifted if they still overlap
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        def place(x, txt, font, size, toLeft):
+            w = stringWidth(txt, font, size)
+            lo = x - 4 - w if toLeft else x + 4
+            lo = max(x0, min(lo, x1 - w))                       # clamp inside bar extent
+            return lo, lo + w
+        labY = barY + barH + 4
+        youTxt = f"You {fmtNum(round(self.value, 1))}" if self.value is not None else None     # 1 dp: 49.8 must not read as 50
+        avgTxt = f"Cohort avg {fmtNum(round(self.avg, 1))}" if self.avg is not None else None
+        youLeft = self.value is not None and self.avg is not None and self.value < self.avg
+        youBox = place(X(self.value), youTxt, "Helvetica-Bold", 8, youLeft) if youTxt else None
+        avgBox = place(X(self.avg), avgTxt, "Helvetica-Bold", 7.5, not youLeft) if avgTxt else None
+        avgY = labY + 9 if youBox and avgBox and not (avgBox[1] < youBox[0] - 2 or avgBox[0] > youBox[1] + 2) else labY
+        if avgTxt:
+            c.setStrokeColor(orange); c.setLineWidth(1.6)
+            c.line(X(self.avg), barY - 2, X(self.avg), barY + barH + 2)
+            c.setFont("Helvetica-Bold", 7.5); c.setFillColor(orange)
+            c.drawString(avgBox[0], avgY, avgTxt)
+        if youTxt:
+            vx, vy, r = X(self.value), barY + barH / 2, 5
+            p = c.beginPath(); p.moveTo(vx, vy + r); p.lineTo(vx + r, vy); p.lineTo(vx, vy - r); p.lineTo(vx - r, vy); p.close()
+            c.setFillColor(navy); c.setStrokeColor(rlColors.white); c.setLineWidth(1)
+            c.drawPath(p, stroke=1, fill=1)
+            c.setFont("Helvetica-Bold", 8); c.setFillColor(navy)
+            c.drawString(youBox[0], labY, youTxt)
+        # quartile boxes (4 … 1, 1 = top 25%)
+        qs = quartileOf(self.value, q)
+        bx0, bw, bh = self.width - boxAreaW, (boxAreaW - 9) / 4, barH + 4
+        c.setFont("Helvetica-Bold", 7.5); c.setFillColor(navy)
+        c.drawCentredString(bx0 + boxAreaW / 2, barY + barH + 6, "Cohort quartile")
+        for i, lab in enumerate([4, 3, 2, 1]):
+            bx = bx0 + i * (bw + 3)
+            on = qs == lab
+            c.setFillColor(navy if on else rlColors.white); c.setStrokeColor(navy); c.setLineWidth(0.6)
+            c.rect(bx, barY - 2, bw, bh, stroke=1, fill=1)
+            c.setFillColor(rlColors.white if on else navy); c.setFont("Helvetica-Bold" if on else "Helvetica", 8.5)
+            c.drawCentredString(bx + bw / 2, barY + 3, f"Q{lab}")
+        c.setFont("Helvetica", 6.5); c.setFillColor(grey)
+        c.drawCentredString(bx0 + boxAreaW / 2, barY - 11, "Q1 = top 25% of cohort")
+
+
+def buildStudentPdf(outPath, info, row, res, sections, cohortAvg, criteria, cfg, includeCritical=True,
+                    showComponentTable=False, showDomainBars=False, showOverallBar=True):
+    """Write one student's feedback PDF. Toggles: weighted component table, a quartile
+    score bar under every domain table, and one under the overall result."""
+    st = styles()
+    doc = SimpleDocTemplate(outPath, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm,
+                            topMargin=12 * mm, bottomMargin=14 * mm,
+                            title=f'{info["name"]} — {info["subject"]} {cfg["fileTag"]} Feedback')
+    W = doc.width - 12                  # frame has 6pt padding each side -> usable width
+    flow = [headerBand(info, cfg, W, st), RlSpacer(1, 8)]
+    for i, sec in enumerate(sections):
+        tbl = sectionTable(sec, res["sections"][i], cohortAvg["sections"][i], row, criteria, cfg, W, st)
+        if showDomainBars:                  # table + bar, then a gap and divider before the next domain
+            from reportlab.platypus.flowables import HRFlowable
+            flow += [RlKeepTogether([tbl, RlSpacer(1, 6), ScoreBar(W, res["sections"][i]["pct"], cohortAvg["sectionPct"][i],
+                                                                     cohortAvg["sectionQ"][i], "Section %")]),
+                     RlSpacer(1, 6),
+                     HRFlowable(width=W, thickness=0.8, color=rlColors.HexColor("#B8C4D6"), spaceBefore=0, spaceAfter=0),
+                     RlSpacer(1, 12)]
+        else:
+            flow.append(RlSpacer(1, 8))
+            flow.insert(-1, tbl)
+    overallBar = [RlSpacer(1, 8), ScoreBar(W, res["overall"], cohortAvg["overall"], cohortAvg["overallQ"], "Overall %")] \
+        if showOverallBar else []
+    failNote = cfg.get("failNote")
+    failBox = []
+    if failNote and res["overall"] is not None and res["overall"] < cfg.get("failCut", 50):
+        fb = RlTable([[RlParagraph(f"<b>{esc(failNote)}</b>", ParagraphStyle("fail", parent=st["cell"], fontSize=9.5,
+                                                                              leading=13, textColor=rlColors.HexColor("#7A3E00")))]],
+                     colWidths=[W])
+        fb.setStyle(RlTableStyle([("BACKGROUND", (0, 0), (-1, -1), rlColors.HexColor("#FDF0E1")),
+                                  ("LINEBEFORE", (0, 0), (0, -1), 3, rlColors.HexColor(AVG_COLOUR)),
+                                  ("LEFTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, -1), 7),
+                                  ("BOTTOMPADDING", (0, 0), (-1, -1), 7)]))
+        failBox = [RlSpacer(1, 8), fb]
+    flow += [RlKeepTogether([commentsBlock(row, W, st, includeCritical), RlSpacer(1, 8),
+                             *overallBlock(res, cohortAvg, cfg, W, st, showComponentTable), *overallBar, *failBox,
+                             RlSpacer(1, 6),
+                             RlParagraph("<b>MC</b> = Marking Criterion · Section totals exclude blank MCs. · "
+                                         f"{esc(cfg.get('overallNote', ''))} · Grade bands per University of Melbourne scale: "
+                                         "<b>H1</b> First-Class Honours, <b>H2A/H2B</b> Second-Class Honours, "
+                                         "<b>H3</b> Third-Class Honours, <b>P</b> Pass, <b>N</b> Fail.", st["foot"])])]
+
+    def footer(canvas, d):
+        canvas.saveState()
+        canvas.setStrokeColor(rlColors.HexColor("#C8C8C8"))
+        canvas.line(d.leftMargin, 9 * mm, d.leftMargin + d.width, 9 * mm)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawRightString(d.leftMargin + d.width, 6 * mm, f"Page {d.page}")
+        canvas.restoreState()
+    doc.build(flow, onFirstPage=footer, onLaterPages=footer)
+
+# ── Driver ───────────────────────────────────────────────────────────────────
+def fileStem(name, sid, tag):
+    toks = re.sub(r"[^A-Za-z\s'-]", "", str(name)).split()
+    surname = toks[-1] if toks else "Student"
+    given = "".join(toks[:-1]) or "X"
+    clean = lambda s: re.sub(r"[^A-Za-z]", "", s)
+    return f"{clean(surname)}_{clean(given)}_{sid or 'NOID'}_{re.sub(r'[0-9]', '', tag)}_Feedback"
+
+
+def buildScbdReports(xlsxPath, sheetName, examKey, outDir, jsonPath="temp 2026 scbd.json",
+                     studentListPath=None, cohort="DDS3", periodLabel=None, includeCritical=True,
+                     students=None, checkSheetTotals=True, showComponentTable=False,
+                     showDomainBars=None, showOverallBar=True):
+    """
+    Build per-student feedback PDFs for an SCBD-family exam.
+      xlsxPath / sheetName : scbd_gradio export (e.g. "DDS3-CBD (2)")
+      examKey              : key in EXAM_CONFIGS ("DDS3-CBD", "SCBD_OM-OS")
+      outDir               : output folder (created)
+      jsonPath             : DASH API cache for criterion text (refresh via the SCBD fetch cell)
+      studentListPath      : name -> student number list (default variableUtils.studentEmailFile)
+      periodLabel          : header sub-title, default "<Mon YYYY>" from the Date column
+      includeCritical      : also print Critical concerns/comments on the PDF (default True)
+      students             : optional list of names to build only those (testing)
+      showComponentTable   : weighted component table under the overall result (default False)
+      showDomainBars       : quartile score bar after every domain/section table
+                             (None -> EXAM_CONFIGS[examKey]["showDomainBars"], else False; CBD = True)
+      showOverallBar       : quartile score bar after the overall result (default True)
+    Returns the index DataFrame (also saved as <outDir>/_index.csv).
+    """
+    cfg = EXAM_CONFIGS[examKey]
+    if showDomainBars is None:
+        showDomainBars = cfg.get("showDomainBars", False)
+    if studentListPath is None:
+        try:
+            import variableUtils
+            studentListPath = variableUtils.studentEmailFile
+        except Exception:
+            studentListPath = "RE_ Student List.xlsx"
+    df, mcMeta = loadExportSheet(xlsxPath, sheetName)
+    if "Submitted" in df.columns:
+        df = df[df["Submitted"].astype(str).str.strip().str.lower().isin(["yes", "true", "1"])]
+    df = df[df["Student"].notna()].copy()
+    df["dateParsed"] = pd.to_datetime(df.get("Date"), errors="coerce", dayfirst=True)
+    df["nameKey"] = df["Student"].map(normName)
+    dup = df["nameKey"].duplicated(keep=False)
+    if dup.any():
+        print(f"[warn] duplicate students — keeping latest row: {sorted(df.loc[dup, 'Student'].unique())}")
+        df = df.sort_values("dateParsed").drop_duplicates("nameKey", keep="last")
+    df = df.reset_index(drop=True)
+
+    sections = buildSections(mcMeta, cfg)
+    results, cohortAvg = scoreCohort(df, sections, cfg)          # cohort avgs always use full cohort
+    if checkSheetTotals:
+        bad = checkTotals(df, results)
+        if len(bad):
+            print(bad.to_string(index=False))
+    criteria = loadCriteria(jsonPath, cfg["checklistKey"])
+    ids = loadStudentIds(studentListPath, cohort)
+    if periodLabel is None:
+        d = df["dateParsed"].dropna()
+        periodLabel = d.max().strftime("%B %Y") if len(d) else ""
+
+    os.makedirs(outDir, exist_ok=True)
+    wanted = {normName(s) for s in students} if students else None
+    index = []
+    for (_, row), res in zip(df.iterrows(), results):
+        if wanted and normName(row["Student"]) not in wanted:
+            continue
+        sid = ids.get(normName(row["Student"]), "")
+        if not sid:
+            print(f"[warn] no student number for {row['Student']}")
+        info = {"name": row["Student"], "id": sid, "cohort": row.get("Cohort", cohort),
+                "subject": row.get("Subject", ""), "period": periodLabel}
+        fname = fileStem(row["Student"], sid, cfg["fileTag"]) + ".pdf"
+        buildStudentPdf(os.path.join(outDir, fname), info, row, res, sections, cohortAvg, criteria, cfg, includeCritical,
+                        showComponentTable, showDomainBars, showOverallBar)
+        grade, _ = gradeFor(res["overall"])
+        rec = {"Student": row["Student"], "Student ID": sid}
+        for sec, sr in zip(sections, res["sections"]):
+            rec[f"{sec['title'].split(':')[0].strip()} (/{fmtNum(sec['avail'])})"] = sr["raw"]
+        for p in res["parts"]:
+            rec[f"{p['label']} %"] = None if p["pct"] is None else round(p["pct"], 1)
+        rec.update({"Overall %": None if res["overall"] is None else round(res["overall"], 1),
+                    "Grade (UoM)": grade, "PDF file": fname})
+        index.append(rec)
+    idx = pd.DataFrame(index).sort_values("Overall %", ascending=False)
+    idx.to_csv(os.path.join(outDir, "_index.csv"), index=False)
+    print(f"Built {len(idx)} {examKey} reports -> {outDir}")
+    return idx
