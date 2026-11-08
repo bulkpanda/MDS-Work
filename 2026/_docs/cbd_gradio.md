@@ -8,13 +8,13 @@
 
 | | |
 |---|---|
-| **Lines of code** | 750 |
-| **Top-level functions** | 24 (plus 12 nested — 36 in total) |
+| **Lines of code** | 1,213 † (750 on 2026-11-03 creation) |
+| **Top-level functions** | 35 † (53 incl. nested) |
 | **Classes** | 0 |
 | **Module constants** | 12 (`ENV_PATH`, `ENV_FILE`, `DASH_EMAIL`, `DASH_PASSWORD`, `ENV_TOKEN`, `LOGIN_USER`, `LOGIN_PASS`, `APP_BUILD`, `TOKEN_CACHE`, `FORM_MODAL_HANDLER`, `COMMENT_MODAL_HANDLER`, `css`) |
 | **Imports from this codebase** | `cbd_gradio_utils` — `import cbd_gradio_utils as cgu` and `from cbd_gradio_utils import *` |
 | **Imported by** | Nothing. Not used by `main.ipynb`. |
-| **Run how** | `python cbd_gradio.py` → `http://localhost:7861`. Public link via `pyngrok` inside `__main__` (see §6). |
+| **Run how** | `python cbd_gradio.py` → `http://localhost:<SERVER_PORT>` (currently 7860). Public link via `pyngrok` inside `__main__` (see §6). |
 | **Written** | 2026-11-03 (hand-written doc; counts from an `ast` pass on that date — not AST-generated like the 2026-08-14 docs). |
 
 ## 1. Purpose and role in the pipeline
@@ -47,7 +47,8 @@ cohort checkboxes also triggers `doLoad()` (cohort filtering is server-side).
 | `pandas` | `makeDf()` → summary XLSX. |
 | `openpyxl` | `doExportDetailed()` formatted workbook. |
 | `python-dotenv` | Loads `.env` with `override=True`. |
-| `pyngrok` | `ngrok.connect(7861, domain=…)` in `__main__` — permanent public URL. |
+| `pyngrok` | `ngrok.connect(SERVER_PORT, domain="app.mds-dash.ngrok.app")` in `__main__` — permanent public URL. |
+| `scipy` (optional) | Exact t-distribution p-values / 95% CIs in the Standard Setting sheet; falls back to a normal approximation (t ≈ 1.96) if missing. |
 | `json`, `tempfile`, `datetime`, `urllib.parse`, `pathlib`, `os` | Local JSON mode, temp export files, date parsing, query strings, `.env` path. |
 
 **Environment variables (`.env` next to `cbd_gradio_utils.py`)**
@@ -192,18 +193,79 @@ D6 17/21 → Total 53/105 → Overall 50.5 %.
 | `CC`, `CC_int` | Critical concerns text ("Yes"/"No"/"—") and 1/0 for sorting |
 | `Submitted`, `Comments` | "Yes"/"No"; combined comments string |
 
-### 5.9 Detailed XLSX layout
-Sheet `CBD Detailed`. Row 1 merged block headers, row 2 sub-headers, data from row 3,
-freeze at C3.
+### 5.9 Detailed XLSX layout (updated 2026-11-03)
+
+Three sheets, in this order:
+
+**1. `Scoring Guide`** (`buildGuideSheet`, L746–837) — export stamp + active filters;
+(1) item scoring table O1–O5 → 4…0 and the item-max rule; (2) domain/total/overall-%
+formula and a domain table (items, max points, weight) from the first record's
+checklist; (3) colour legends — MC cell fills, GR fills (labels read from the forms'
+own GR scale via `grLabelMap`, latest-dated record wins; GR 2 marked as the borderline level), Critical Concerns /
+Submitted fills; (4) standard-setting summary (BLR cut + R², BGM cut + n,
+PASS/WARN/FAIL counts); (5) score-sheet
+column key. Opens as the active sheet; fit-to-width for printing.
+
+**2. `CBD Detailed`** — unchanged score sheet. Row 1 merged block headers, row 2
+sub-headers, data from row 3, freeze at C3.
 - **Student Info:** Date, Student, Assessor, Examiner 2, Cohort, Submitted (green/red).
-- **One block per domain** (colours `XL_SCHEME`): `MC1 (/4)` … numeric item scores,
-  colour by score/max (full green → 0 red), then `Score /max`.
+- **One block per domain** (`XL_SCHEME`): `MC1 (/4)` … item points coloured by
+  score/max (full green → 0 red), then `Score /max`.
 - **Summary:** GR (colour by level), `Total /max`, Overall %, Critical Concerns (red if Yes).
 - **Comments:** General, D1–D6 Comments, Critical Concerns Comments.
 
-Item and domain maxes in the headers come from the **first** filtered record's
-checklist — if form versions are mixed, per-row cell colours are still correct but
-header maxes reflect that first record.
+Header maxima come from the first filtered record's checklist; per-row colours are
+always correct even with mixed form versions.
+
+**3. `Standard Setting`** (`buildStandardSettingSheet`, L840–1027) — see §5.10.
+
+### 5.10 Standard setting — BLR + BGM
+
+**Population:** filtered rows with `Submitted == "Yes"`, a GR (1–5) and an Overall %.
+Respects every dashboard filter (date window, Hide dummy/test, search …).
+Borderline level = `BORDERLINE_GR` (2 = "Borderline").
+
+| Method | Function | Cut score | Extras |
+|---|---|---|---|
+| **BLR** (borderline regression) | `computeBlr(xs, ys)` L623 | `a + b·BORDERLINE_GR` from OLS of Overall % on GR | slope, intercept, R², Pearson r, std error of estimate, slope p, 95% CI of the mean prediction at GR=2 (`SE = s·√(1/n + (2−x̄)²/Sxx)`), pass count |
+| **BGM** (borderline group) | `computeBgm(xs, ys)` L648 | mean Overall % of GR=2 candidates | median, SD, range, 95% CI (t, n−1), pass count |
+
+**Viability tests** (`viabilityChecks`, L678; thresholds in `cbd_gradio_utils`):
+
+| Scope | Test | PASS | Otherwise |
+|---|---|---|---|
+| BLR | Sample size n | ≥ `SS_MIN_N` (10) | WARN ≥ 5, else FAIL |
+| BLR | Distinct GR levels | ≥ 3 | WARN |
+| BLR | GR 2 inside observed GR range | yes | WARN (extrapolated cut) |
+| BLR | R² | ≥ `R2_MIN` (0.5, AMEE Guide 49) | FAIL |
+| BLR | Slope > 0 and p < 0.05 | yes | FAIL |
+| BLR | Inter-grade discrimination (slope, %-pts per GR) | `DISCRIM_LOW`–`DISCRIM_HIGH` (5–16.7; guide ≈ 10 = max/10) | WARN |
+| BLR | Cut 95% CI width | ≤ 10 %-pts | WARN |
+| BGM | Borderline group size | ≥ `BGM_MIN_BORDERLINE` (5) | WARN ≥ 2, else FAIL |
+| BGM | Borderline SD | ≤ 15 %-pts | WARN |
+| BGM | Cut 95% CI width | ≤ 10 %-pts | WARN |
+| Both | Mean Overall % non-decreasing across GR 1→5 | yes | WARN |
+| Both | Spearman ρ (GR vs score) > 0, p < 0.05 | yes | WARN |
+| Both | \|BLR − BGM\| | ≤ `METHOD_AGREE_TOL` (5) | WARN |
+
+**No automatic recommendation** (removed 2026-11-03 at Kunal's request): both cuts and
+their tests are shown side by side; the choice of cut is left to the reader.
+PASS = criterion met · WARN = usable but review · FAIL = method not supported.
+
+**Sheet layout:** BLR-vs-BGM statistics table (cut, 95% CI, pass count …);
+viability table (PASS green / WARN yellow / FAIL red); Overall % by GR table (GR label
+from the forms, n, mean, SD; borderline row orange); per-domain BLR and BGM cuts (domain % vs GR, with R²
+flag). Charts at G3 and G23: **BLR scatter** (candidates + linear trendline, red ◆ BLR
+cut and orange ▲ BGM cut at GR 2, R² in title; x-axis fixed to integer GR ticks 1–5) and **BGM bar chart** (mean Overall % per
+GR, borderline bar orange, value labels). Chart source data sits in columns AD–AJ
+(kept visible — Excel/LibreOffice charts skip hidden cells).
+
+Helpers: `tCrit`, `tPvalue` (scipy or normal fallback), `rankData` (average ranks for
+Spearman), `pearsonR`, `gradeMeans`, `grLabelMap` (GR labels from the latest-dated form's scale, fallback `GR_LABELS`).
+
+**Example** (synthetic 43-candidate test cohort): BLR 35.4% (R² 0.79, CI 30.4–40.4),
+BGM 37.4% (n = 11, SD 19.3); discrimination 19.1 %-pts/GR → WARN. Dummy Students 2–9
+(`Claude outputs/cbd_dummy_forms/`): BLR 45.6% (R² 0.99), BGM 46.5% (n = 3).
 
 ## 6. UI layout and run
 
@@ -213,8 +275,8 @@ header maxes reflect that first record.
 - Stats row + error bar + "Last loaded HH:MM:SS" (adds "(local JSON)" in offline mode).
 - Table, then Export Summary / Export Detailed.
 
-**Public link.** `__main__` calls `ngrok.connect(7861, domain="coerce-octane-gilled.ngrok-free.dev")`
-(same pattern as `scbd_gradio.py` on 7860), then `demo.launch(server_name="localhost",
+**Public link.** `__main__` calls `ngrok.connect(SERVER_PORT, domain="app.mds-dash.ngrok.app")`
+(same pattern as `scbd_gradio.py`), then `demo.launch(server_name="localhost",
 server_port=SERVER_PORT, auth=…)`. The free ngrok plan has one static domain, so only
 one of viva / SCBD / CBD can be public at a time.
 
@@ -225,8 +287,8 @@ Launch with `python cbd_gradio.py` — no `.bat` wrapper (the `pyngrok` call rep
 
 1. **Date window must cover the sitting**, otherwise the table looks empty
    (same gotcha as viva). Defaults: 2026-11-01 → 2026-11-30.
-2. **Port is hard-coded twice:** `SERVER_PORT` in utils and `7861` in `ngrok.connect`.
-   Change both together.
+2. **Port:** `SERVER_PORT` (utils) now drives both `demo.launch` and `ngrok.connect`; it is
+   currently 7860, the same as viva/SCBD, so only one of those can run at a time.
 3. **Dummy students** are shown by default (needed for testing). Tick *Hide dummy/test*,
    or set the checkbox `value=True` (line 715), once real data flows.
 4. **Endpoint name `cbd`** was inferred from the JSON filename; a 404 shows
@@ -240,7 +302,17 @@ Launch with `python cbd_gradio.py` — no `.bat` wrapper (the `pyngrok` call rep
    `""` for live use.
 8. Backups of this file live in `_bak/cbd_gradio.py.bak_<timestamp>`.
 
+## 7b. Open issue — 4-option rubrics (not yet fixed)
+Domain 2 on the current form has only O1–O4 (O1 = Done … O4 = Not Done). Slot scoring
+gives Done = 4 and Not Done = 1 there. Also, saved answers use the `options.assessor`
+labels (e.g. D5 MC4 saves "Mostly Done"/"Not Done" while the rubric displays Yes/No);
+`scoreItem` currently matches rubric labels and reaches the right D5 MC4 score only via
+the `MC_SCORE` fallback. Proposed fix: match on `options.assessor` labels and score
+bottom-aligned (last option = 0). Awaiting Kunal's go-ahead.
+
 ## 8. Change log
 | Date | Change |
 |---|---|
+| 2026-11-03 (late) | Recommended cut + `recommendCut` removed; GR labels read from the forms ("Borderline", was "Borderline Fail"); BLR scatter x-axis fixed to ticks 1–5. |
+| 2026-11-03 (eve) | Detailed export gains `Scoring Guide` (first) and `Standard Setting` (BLR + BGM, viability tests, charts) sheets — §5.9–5.10; standard-setting thresholds added to utils. |
 | 2026-11-03 | Created (with `cbd_gradio_utils.py`). Login gate via `CBD_USERNAME`/`CBD_PASSWORD` added same day. `pyngrok` tunnel + `server_name="localhost"` added by Kunal. |

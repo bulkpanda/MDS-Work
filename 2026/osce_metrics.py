@@ -46,14 +46,28 @@ def studentStationMatrix(specs):
     return colKeys, sorted(M), M
 
 
+def nonEmptySpecs(specs, blr=None):
+    """Drop stations with no scored rows (or no BLR entry) so every metric ignores them safely."""
+    keep, skipped = [], []
+    for sp in specs:
+        hasData = any(r.get("score") is not None for r in sp.get("rows", []))
+        if hasData and (blr is None or sp["ck"] in blr):
+            keep.append(sp)
+        else:
+            skipped.append(sp.get("ck"))
+    if skipped:
+        print(f"osce_metrics: ignoring empty station(s): {skipped}")
+    return keep
+
+
 def testAlpha(colKeys, students, M, dropCk=None):
     """Cronbach's alpha treating each station as an item (complete cases). dropCk leaves one out."""
     keys = [k for k in colKeys if k != dropCk]
     rows = [[M[s][k] for k in keys] for s in students if all(k in M[s] for k in keys)]
+    k = len(keys)
+    if k < 2 or len(rows) < 2:
+        return float("nan"), len(rows)
     A = np.array(rows, float)
-    k = A.shape[1]
-    if k < 2 or A.shape[0] < 2:
-        return float("nan"), A.shape[0]
     itemVar = A.var(axis=0, ddof=1).sum()
     totalVar = A.sum(axis=1).var(ddof=1)
     a = (k / (k - 1)) * (1 - itemVar / totalVar) if totalVar > 0 else float("nan")
@@ -124,6 +138,7 @@ def _styles():
 
 # ─────────── sheet builders ───────────
 def buildStationMetricsSheet(awb, specs, blr, position=None):
+    specs = nonEmptySpecs(specs, blr)
     hFont, bFont, hFill, box, ctrW, ctr = _styles()
     ws = awb.create_sheet("Station Metrics (AMEE)") if position is None else awb.create_sheet("Station Metrics (AMEE)", position)
     ws.sheet_view.showGridLines = False
@@ -199,6 +214,7 @@ def buildStationMetricsSheet(awb, specs, blr, position=None):
 
 def buildCircuitCutSheet(awb, specs, blr, borderlineGr=2, position=None):
     """Matrix of BLR cut scores computed WITHIN each circuit, per station, vs the overall cut."""
+    specs = nonEmptySpecs(specs, blr)
     hFont, bFont, hFill, box, ctrW, ctr = _styles()
     ws = awb.create_sheet("BLR Cut per Circuit") if position is None else awb.create_sheet("BLR Cut per Circuit", position)
     ws.sheet_view.showGridLines = False
@@ -234,6 +250,7 @@ def buildCircuitCutSheet(awb, specs, blr, borderlineGr=2, position=None):
 
 
 def buildAssessorAnalysisSheet(awb, specs, blr, imgDir, position=None):
+    specs = nonEmptySpecs(specs, blr)
     hFont, bFont, hFill, box, ctrW, ctr = _styles()
     ws = awb.create_sheet("Assessor Analysis (AMEE)") if position is None else awb.create_sheet("Assessor Analysis (AMEE)", position)
     ws.sheet_view.showGridLines = False

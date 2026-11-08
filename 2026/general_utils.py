@@ -205,7 +205,7 @@ def fetchAllAssessments(apiUrl, bearerToken):
     nextUrl = apiUrl
     with requests.Session() as session:
         while nextUrl:
-            resp = session.get(nextUrl, headers=headers, timeout=60)
+            resp = session.get(nextUrl, headers=headers, timeout=120)
             # print(f"Requesting: {nextUrl} - Status Code: {resp}")
             # print("status:", resp.status_code)
             # print("contentType:", resp.headers.get("content-type"))

@@ -44,7 +44,7 @@ MC_COLORS = {                                         # keys lowercase
     "sometimes done": "#d97706",
     "not done":       "#dc2626",
 }
-GR_LABELS = {1: "Fail", 2: "Borderline Fail", 3: "Pass", 4: "Good", 5: "Excellent"}   # fallback; form.scales wins
+GR_LABELS = {1: "Fail", 2: "Borderline", 3: "Pass", 4: "Good", 5: "Excellent"}   # fallback; form.scales wins
 
 # ── UI / layout ──────────────────────────────────────────────────────────────
 MAX_ROWS             = 500
@@ -124,3 +124,14 @@ XL_SCHEME = {
     "summary":  ("1E293B", "F1F5F9"),
     "comments": ("374151", "F3F4F6"),
 }
+
+# ── Standard setting (Detailed export → "Standard Setting" sheet) ─────────────
+# Uses SUBMITTED rows with a GR and an Overall % from the current dashboard filters.
+BORDERLINE_GR      = 2      # GR level treated as borderline (2 = "Borderline")
+SS_MIN_N           = 10     # BLR: minimum candidates for a usable regression
+BGM_MIN_BORDERLINE = 5      # BGM: minimum candidates in the borderline group
+R2_MIN             = 0.5    # BLR: R² ≥ 0.5 acceptable (AMEE Guide 49)
+DISCRIM_GUIDE      = 10.0   # BLR: inter-grade discrimination guideline, %-points per GR step (≈ max/10)
+DISCRIM_LOW        = 5.0    # below this the checklist barely separates grades
+DISCRIM_HIGH       = 100 / 6  # above this, slope likely driven by outliers/low performers (AMEE)
+METHOD_AGREE_TOL   = 5.0    # |BLR cut − BGM cut| ≤ this many %-points = methods agree

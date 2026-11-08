@@ -9,6 +9,7 @@ Usage in notebook:
 import os
 import re
 import json
+import random
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -2525,7 +2526,7 @@ def weaknessPiePlot(weaknessCounts, totalWeaknesses, uniColor):
 def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, styles,
                                   formsTable="dds4_boh3_forms_v3",
                                   subheadingStyle=None, uniColor=None, tableTextStyleSmall=None,
-                                  tocMark=None):
+                                  tocMark=None, redactComments=False):
     if subheadingStyle is None:
         subheadingStyle = styles.get("subheadingStyle")
     if uniColor is None:
@@ -2637,7 +2638,8 @@ def buildStudentVsAssessorSection(engine, cohort, studentNumber, elements, style
     # from ~July 2026. See getAllStudentComments.)
     buildStudentCommentsTables(elements, engine, cohort, studentNumber, formsTable,
                                subheadingStyle=subheadingStyle, uniColor=uniColor,
-                               tableTextStyleSmall=tableTextStyleSmall)
+                               tableTextStyleSmall=tableTextStyleSmall,
+                               redactComments=redactComments)
 
 
 def _enableRowSplit(flowable):
@@ -2657,11 +2659,31 @@ def _enableRowSplit(flowable):
 
 def buildStudentCommentsTables(elements, engine, cohort, studentNumber,
                                formsTable="dds4_boh3_forms_v3", subheadingStyle=None,
-                               uniColor=None, tableTextStyleSmall=None):
+                               uniColor=None, tableTextStyleSmall=None, redactComments=False):
     """Every written comment on the student's forms, in two tables (supervisor, then
     student): Date · Type · Comment · Item Codes. Driven by getAllStudentComments.
     Long comments are truncated (PDF_COMMENT_MAXCHARS) so a row never overflows a page;
-    the full text is in the Excel 'All Comments' sheet."""
+    the full text is in the Excel 'All Comments' sheet.
+
+    redactComments=True (anonymised reports): the two tables are NOT queried or drawn;
+    each is replaced by its heading plus ANON_COMMENT_PLACEHOLDER so the section (and
+    its contents entries) keeps the same shape as the personalised report."""
+    if redactComments:
+        noteStyle = ParagraphStyle("anonCommentNote", fontName="Helvetica-Oblique",
+                                   fontSize=9.5, leading=14,
+                                   textColor=colors.HexColor("#4a5170"))
+        headStyle = subheadingStyle or ParagraphStyle(
+            "anonCommentHead", fontName="Helvetica-Bold", fontSize=11, leading=15)
+        for title, tocText in (("Supervisor comments &amp; feedback (all forms)",
+                                "Supervisor comments &amp; feedback"),
+                               ("Your reflections &amp; comments (all forms)",
+                                "Your reflections &amp; comments")):
+            elements.append(_StudentTocMark(tocText, level=1))
+            elements.append(Paragraph(title, headStyle))
+            elements.append(Spacer(1, 4))
+            elements.append(Paragraph(ANON_COMMENT_PLACEHOLDER, noteStyle))
+            elements.append(Spacer(1, 14))
+        return
     allc = getAllStudentComments(engine, cohort, studentNumber, formsTable)
     if allc is None or allc.empty:
         return
@@ -3197,7 +3219,18 @@ def buildStudentPdf(engine, cohort, studentNumber, studentName, outputPath,
                     formsTable="dds4_boh3_forms_v3", pageSize=None,
                     leftMargin=36, rightMargin=36, topMargin=48, bottomMargin=36,
                     styles=None, subheadingStyle=None, subsubheadingStyleL=None,
-                    uniColor=None, tableTextStyleSmall=None):
+                    uniColor=None, tableTextStyleSmall=None,
+                    anonymize=False, anonLabel=None, redactComments=False):
+    """Per-student summary PDF.
+
+    anonymize      : True → the banner shows "Student <anonLabel>" instead of the
+                     student's name and number. (Supervisor names never appear in
+                     this PDF, so nothing else needs masking.)
+    anonLabel      : pseudonym from getAnonLabels (e.g. "S07"); used in the banner.
+    redactComments : True → the supervisor-comment and reflection tables are replaced
+                     by ANON_COMMENT_PLACEHOLDER (see buildStudentCommentsTables).
+    Defaults reproduce the personalised report exactly.
+    """
     if uniColor is None:
         uniColor = variableUtils.uniColor
     metricsDf, selfDf, assessorDf = getStudentSummaryTable(
@@ -3262,10 +3295,14 @@ def buildStudentPdf(engine, cohort, studentNumber, studentName, outputPath,
         subheadingStyle=subheadingStyle, uniColor=uniColor,
         tableTextStyleSmall=tableTextStyleSmall,
         tocMark=_StudentTocMark("Comparison with assessors &amp; comments"),
+        redactComments=redactComments,
     )
 
     bannerTitle = f"Student Summary - {cohort}"
-    bannerSubtitle = f"{studentName} ({studentNumber})" if studentNumber else studentName
+    if anonymize:
+        bannerSubtitle = f"Student {anonLabel}" if anonLabel else "Anonymised student"
+    else:
+        bannerSubtitle = f"{studentName} ({studentNumber})" if studentNumber else studentName
     firstPage, laterPage = _studentPageDecorators(bannerTitle, bannerSubtitle)
     doc.multiBuild(elements, onFirstPage=firstPage, onLaterPages=laterPage)
 
@@ -3274,11 +3311,37 @@ def buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_f
                               pageSize=None, leftMargin=36, rightMargin=36,
                               topMargin=48, bottomMargin=36, styles=None,
                               subheadingStyle=None, subsubheadingStyleL=None,
-                              uniColor=None, tableTextStyleSmall=None):
+                              uniColor=None, tableTextStyleSmall=None,
+                              anon=False, anonRedactComments=True, anonDir=None,
+                              anonMappingPath=None, anonSeed=None):
+    """One PDF per student → <outputDir>/<studentNumber>.pdf.
+
+    anon=True additionally writes an anonymised copy of every report to
+    <anonDir> (default <outputDir>/anonymised/) named <label>.pdf, where label comes
+    from getAnonLabels (S01, S02 … in random order). The student→label key is saved
+    to anonMappingPath (default <outputDir>/anon_mapping.csv) — pass the SAME path to
+    buildCohortStudentExcelReports so PDF and Excel anon files share labels. Keep that
+    CSV out of the anonymised folder. anonRedactComments controls whether the anon
+    copies also replace the comment tables with ANON_COMMENT_PLACEHOLDER.
+    Returns a DataFrame log (student_number, student_name, file, kind, status).
+    """
     outputDir = Path(outputDir)
     outputDir.mkdir(parents=True, exist_ok=True)
 
     studentsDf = getStudentsInCohort(engine, cohort, formsTable)
+    anonLabels = {}
+    if anon:
+        anonDir = Path(anonDir) if anonDir else outputDir / "anonymised"
+        anonDir.mkdir(parents=True, exist_ok=True)
+        anonLabels = getAnonLabels(studentsDf["student_number"].tolist(),
+                                   mappingPath=anonMappingPath or outputDir / "anon_mapping.csv",
+                                   seed=anonSeed)
+    pdfArgs = dict(engine=engine, cohort=cohort, formsTable=formsTable, pageSize=pageSize,
+                   leftMargin=leftMargin, rightMargin=rightMargin, topMargin=topMargin,
+                   bottomMargin=bottomMargin, styles=styles, subheadingStyle=subheadingStyle,
+                   subsubheadingStyleL=subsubheadingStyleL, uniColor=uniColor,
+                   tableTextStyleSmall=tableTextStyleSmall)
+    log = []
     for _, row in studentsDf.iterrows():
         studentNumber = row["student_number"]
         studentName = row["student_name"]
@@ -3287,15 +3350,20 @@ def buildCohortStudentReports(engine, cohort, outputDir, formsTable="dds4_boh3_f
         print(f"Building PDF for student: {studentName} ({studentNumber})")
         safeName = "".join(c for c in str(studentNumber) if c.isalnum() or c in (" ", "_", "-")).strip()
         outPath = outputDir / f"{safeName}.pdf"
-        buildStudentPdf(
-            engine=engine, cohort=cohort, studentNumber=studentNumber, studentName=studentName,
-            outputPath=outPath, formsTable=formsTable, pageSize=pageSize,
-            leftMargin=leftMargin, rightMargin=rightMargin, topMargin=topMargin,
-            bottomMargin=bottomMargin, styles=styles, subheadingStyle=subheadingStyle,
-            subsubheadingStyleL=subsubheadingStyleL, uniColor=uniColor,
-            tableTextStyleSmall=tableTextStyleSmall,
-        )
+        buildStudentPdf(studentNumber=studentNumber, studentName=studentName,
+                        outputPath=outPath, **pdfArgs)
+        log.append({"student_number": studentNumber, "student_name": studentName,
+                    "file": str(outPath), "kind": "pdf", "status": "ok"})
+        if anon:
+            label = anonLabels[int(studentNumber)]
+            anonPath = anonDir / f"{label}.pdf"
+            buildStudentPdf(studentNumber=studentNumber, studentName=studentName,
+                            outputPath=anonPath, anonymize=True, anonLabel=label,
+                            redactComments=anonRedactComments, **pdfArgs)
+            log.append({"student_number": studentNumber, "student_name": studentName,
+                        "file": str(anonPath), "kind": "pdf-anon", "status": "ok"})
         # break  # for testing, remove in production to generate fsda222222222
+    return pd.DataFrame(log)
 class _OutlineBookmark(Flowable):
     """Zero-size flowable that registers a clickable PDF outline (bookmark) entry at its
     position, so the generated PDF has a navigable student sidebar."""
@@ -6295,6 +6363,39 @@ def getStudentTrendDetail(engine, cohort, studentNumber, formsTable="dds4_boh3_f
     return readDf(engine, sql, {"cohort": cohort, "studentNumber": studentNumber})
 
 
+def _trendShortClinic(v):
+    # "Cohealth (Footscray)" -> "Cohealth"; the full name stays in the table
+    return str(v).split(" (")[0].strip() if isinstance(v, str) and v.strip() else None
+
+
+def _trendShortName(v):
+    # "Prof. L. Moreau" -> "L. Moreau"; "Dr Amy Chen" -> "A. Chen"
+    if not isinstance(v, str) or not v.strip():
+        return None
+    if v.startswith(ANON_SUPERVISOR_PREFIX):      # anonymised pseudonym — keep whole
+        return v
+    parts = [w for w in v.replace(".", ". ").split()
+             if w.lower().rstrip(".") not in ("dr", "prof", "a/prof", "assoc", "mr", "ms",
+                                              "mrs", "miss")]
+    if len(parts) >= 2:
+        return f"{parts[0][0].upper()}. {parts[-1]}"
+    return parts[0] if parts else None
+
+
+def _trendLabelFor(row):
+    # This string IS the Excel hover tooltip (native charts have no tooltip API),
+    # and it is also the axis tick label — so it has to stay short enough to read.
+    # Module-level (not nested in _collectTrendData) so anonymiseStudentExcelData can
+    # rebuild the labels after it has pseudonymised the Supervisor column.
+    bits = [f"Form {row['Form #']}"]
+    if pd.notna(row.get("Date")):
+        bits.append(pd.Timestamp(row["Date"]).strftime("%d %b"))
+    for v in (_trendShortClinic(row.get("Clinic")), _trendShortName(row.get("Supervisor"))):
+        if v:
+            bits.append(v)
+    return " · ".join(bits)
+
+
 def _collectTrendData(data, engine, cohort, studentNumber, formsTable):
     """Per-form ratings + the helper columns the trend chart plots.
 
@@ -6310,34 +6411,7 @@ def _collectTrendData(data, engine, cohort, studentNumber, formsTable):
     tsDf = tsDf.copy()
     tsDf["Date"] = pd.to_datetime(tsDf["Date"]).dt.date
     tsDf.insert(0, "Form #", range(1, len(tsDf) + 1))
-
-    def _shortClinic(v):
-        # "Cohealth (Footscray)" -> "Cohealth"; the full name stays in the table
-        return str(v).split(" (")[0].strip() if isinstance(v, str) and v.strip() else None
-
-    def _shortName(v):
-        # "Prof. L. Moreau" -> "L. Moreau"; "Dr Amy Chen" -> "A. Chen"
-        if not isinstance(v, str) or not v.strip():
-            return None
-        parts = [w for w in v.replace(".", ". ").split()
-                 if w.lower().rstrip(".") not in ("dr", "prof", "a/prof", "assoc", "mr", "ms",
-                                                  "mrs", "miss")]
-        if len(parts) >= 2:
-            return f"{parts[0][0].upper()}. {parts[-1]}"
-        return parts[0] if parts else None
-
-    def _label(row):
-        # This string IS the Excel hover tooltip (native charts have no tooltip API),
-        # and it is also the axis tick label — so it has to stay short enough to read.
-        bits = [f"Form {row['Form #']}"]
-        if pd.notna(row.get("Date")):
-            bits.append(pd.Timestamp(row["Date"]).strftime("%d %b"))
-        for v in (_shortClinic(row.get("Clinic")), _shortName(row.get("Supervisor"))):
-            if v:
-                bits.append(v)
-        return " · ".join(bits)
-
-    tsDf[TREND_LABEL_COL] = tsDf.apply(_label, axis=1)
+    tsDf[TREND_LABEL_COL] = tsDf.apply(_trendLabelFor, axis=1)
     ent = pd.to_numeric(tsDf[TREND_ENT_COL], errors="coerce")
     rd = pd.to_numeric(tsDf[TREND_RD_COL], errors="coerce")
     tsDf[TREND_ENT_PLOT] = (ent - TREND_PLOT_OFFSET).round(3)
@@ -6790,8 +6864,16 @@ def listStudentSheets():
 # ── 9.7 Public builders ─────────────────────────────────────────────────────
 def buildStudentWorkbook(engine, cohort, studentNumber, studentName, outPath,
                          sheets=None, formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
-                         titleSuffix="clinical feedback"):
+                         titleSuffix="clinical feedback",
+                         anonLabel=None, redactComments=False):
     """Build a student workbook from a list of sheet names.
+
+    anonLabel      : pseudonym (e.g. "S07") → student name/ID become "Student S07",
+                     every Supervisor/Assessor Name column is pseudonymised
+                     ("Supervisor 1", …) consistently across all sheets, and the trend
+                     chart labels are rebuilt. See anonymiseStudentExcelData.
+    redactComments : True → every free-text comment cell (ANON_COMMENT_COLS) becomes
+                     ANON_COMMENT_PLACEHOLDER. Works with or without anonLabel.
 
     sheets : list of keys from STUDENT_SHEETS, in the tab order you want.
              Defaults to DASHBOARD_SHEETS. Duplicates are ignored.
@@ -6830,6 +6912,9 @@ def buildStudentWorkbook(engine, cohort, studentNumber, studentName, outPath,
                    "studentName": studentName, "formsTable": formsTable,
                    "generatedOn": pd.Timestamp.today().strftime("%d %B %Y"),
                    "hasDashboard": "Dashboard" in ordered}
+    if anonLabel is not None or redactComments:
+        anonymiseStudentExcelData(ctx, anonLabel, redactComments=redactComments)
+        studentName = ctx["meta"]["studentName"]
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -6852,43 +6937,55 @@ def buildStudentWorkbook(engine, cohort, studentNumber, studentName, outPath,
 
 def buildStudentExcelReport(engine, cohort, studentNumber, studentName, outPath,
                             formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
-                            sheets=None):
+                            sheets=None, anonLabel=None, redactComments=False):
     """Excel mirror of the PDF student report, with live Excel charts.
 
     Default sheets: DASHBOARD_SHEETS. Pass sheets=[...] to pick your own.
+    anonLabel / redactComments: see buildStudentWorkbook.
     """
     return buildStudentWorkbook(
         engine, cohort, studentNumber, studentName, outPath,
         sheets=DASHBOARD_SHEETS if sheets is None else sheets,
         formsTable=formsTable, itemCodeLimit=itemCodeLimit,
-        titleSuffix="feedback dashboard")
+        titleSuffix="feedback dashboard",
+        anonLabel=anonLabel, redactComments=redactComments)
 
 
 def buildStudentFormExport(engine, cohort, studentNumber, studentName, outPath,
                            formsTable="dds4_boh3_forms_v3", includeChecklist=True,
-                           sheets=None):
+                           sheets=None, anonLabel=None, redactComments=False):
     """Flat 'one row per form' workbook — the file students ask for so they can
     compare all of their DASH feedback side by side.
 
     Default sheets: FORM_EXPORT_SHEETS (set includeChecklist=False for just
     Read Me + My Forms). Pass sheets=[...] to pick your own.
+    anonLabel / redactComments: see buildStudentWorkbook.
     """
     if sheets is None:
         sheets = list(FORM_EXPORT_SHEETS) if includeChecklist else ["Read Me", "My Forms"]
     return buildStudentWorkbook(
         engine, cohort, studentNumber, studentName, outPath, sheets=sheets,
-        formsTable=formsTable, titleSuffix="form-by-form feedback")
+        formsTable=formsTable, titleSuffix="form-by-form feedback",
+        anonLabel=anonLabel, redactComments=redactComments)
 
 
 def buildCohortStudentExcelReports(engine, cohort, outputDir, kind="both",
                                    formsTable="dds4_boh3_forms_v3", itemCodeLimit=55,
                                    studentNumbers=None, verbose=True,
-                                   dashboardSheets=None, exportSheets=None):
+                                   dashboardSheets=None, exportSheets=None,
+                                   anon=False, anonRedactComments=True, anonDir=None,
+                                   anonMappingPath=None, anonSeed=None):
     """Generate Excel reports for every student in a cohort.
 
     kind            : "dashboard" | "export" | "both"
     dashboardSheets : sheet list for the <id>.xlsx files (default DASHBOARD_SHEETS)
     exportSheets    : sheet list for the <id>_forms.xlsx files (default FORM_EXPORT_SHEETS)
+    anon            : True → ALSO write anonymised copies to anonDir (default
+                      <outputDir>/anonymised/) as <label>.xlsx / <label>_forms.xlsx,
+                      label from getAnonLabels; key saved to anonMappingPath (default
+                      <outputDir>/anon_mapping.csv — pass the same path used for the PDFs
+                      so labels agree). anonRedactComments → comment cells replaced by
+                      ANON_COMMENT_PLACEHOLDER in the anon copies.
 
     Files are named <studentNumber>.xlsx (dashboard) and <studentNumber>_forms.xlsx
     (flat export), matching the <studentNumber>.pdf convention used by the mailer.
@@ -6902,11 +6999,19 @@ def buildCohortStudentExcelReports(engine, cohort, outputDir, kind="both",
     if studentNumbers is not None:
         wanted = {int(s) for s in studentNumbers}
         studentsDf = studentsDf[studentsDf["student_number"].astype(int).isin(wanted)]
+    anonLabels = {}
+    if anon:
+        anonDir = Path(anonDir) if anonDir else outputDir / "anonymised"
+        anonDir.mkdir(parents=True, exist_ok=True)
+        anonLabels = getAnonLabels(studentsDf["student_number"].tolist(),
+                                   mappingPath=anonMappingPath or outputDir / "anon_mapping.csv",
+                                   seed=anonSeed)
 
     log = []
     for _, row in studentsDf.iterrows():
         studentNumber, studentName = row["student_number"], row["student_name"]
         safe = "".join(c for c in str(studentNumber) if c.isalnum() or c in (" ", "_", "-")).strip()
+        label = anonLabels.get(int(studentNumber)) if anon else None
         try:
             if kind in ("dashboard", "both"):
                 p = outputDir / f"{safe}.xlsx"
@@ -6915,12 +7020,27 @@ def buildCohortStudentExcelReports(engine, cohort, outputDir, kind="both",
                                         sheets=dashboardSheets)
                 log.append({"student_number": studentNumber, "student_name": studentName,
                             "file": str(p), "kind": "dashboard", "status": "ok"})
+                if anon:
+                    pa = anonDir / f"{label}.xlsx"
+                    buildStudentExcelReport(engine, cohort, studentNumber, studentName, pa,
+                                            formsTable=formsTable, itemCodeLimit=itemCodeLimit,
+                                            sheets=dashboardSheets, anonLabel=label,
+                                            redactComments=anonRedactComments)
+                    log.append({"student_number": studentNumber, "student_name": studentName,
+                                "file": str(pa), "kind": "dashboard-anon", "status": "ok"})
             if kind in ("export", "both"):
                 p = outputDir / f"{safe}_forms.xlsx"
                 buildStudentFormExport(engine, cohort, studentNumber, studentName, p,
                                        formsTable=formsTable, sheets=exportSheets)
                 log.append({"student_number": studentNumber, "student_name": studentName,
                             "file": str(p), "kind": "export", "status": "ok"})
+                if anon:
+                    pa = anonDir / f"{label}_forms.xlsx"
+                    buildStudentFormExport(engine, cohort, studentNumber, studentName, pa,
+                                           formsTable=formsTable, sheets=exportSheets,
+                                           anonLabel=label, redactComments=anonRedactComments)
+                    log.append({"student_number": studentNumber, "student_name": studentName,
+                                "file": str(pa), "kind": "export-anon", "status": "ok"})
             if verbose:
                 print(f"[excel] {cohort} {studentNumber} {studentName} ✓")
         except Exception as ex:  # one bad student must not kill the batch
@@ -7126,3 +7246,109 @@ def buildClinicComparisonWorkbook(engine, cohort, outPath, *, dtcName="DTC",
     wb.save(outPath)
     print(f"[clinic-exposure] {cohort}: wrote {outPath} ({0 if siteDf is None else len(siteDf)} sites)")
     return outPath
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 12. Anonymised student reports (PDF + Excel)
+# ---------------------------------------------------------------------------
+# Two independent switches, both OFF by default so existing calls are unchanged:
+#   anonymise  — replace the student's identity (and, in Excel, supervisor names) with
+#                pseudonyms from getAnonLabels ("S01", "S02", …, random order).
+#   redact     — replace every free-text comment with ANON_COMMENT_PLACEHOLDER.
+# The cohort builders (buildCohortStudentReports / buildCohortStudentExcelReports)
+# take anon=True to write the anonymised copies ALONGSIDE the normal files, into an
+# `anonymised/` sub-folder, and save the student→label key as anon_mapping.csv next
+# to the normal reports (never inside the anonymised folder).
+# Public names (no leading underscore) because main.ipynb does `from ... import *`.
+# ═══════════════════════════════════════════════════════════════════════════
+
+ANON_COMMENT_PLACEHOLDER = ("Personalised written comments are provided in your "
+                            "individual report.")
+ANON_SUPERVISOR_PREFIX = "Supervisor "        # pseudonym stem: "Supervisor 1", "Supervisor 2", …
+ANON_STUDENT_PREFIX = "Student "              # banner / sheet title: "Student S07"
+
+# Columns (any sheet) that carry a person's name.
+ANON_NAME_COLS = ("Supervisor", "Assessor Name", "Student Name")
+# Columns (any sheet) that carry free text written by a person. Standard-option
+# columns (Commendations, entrustment labels, item codes) are NOT comments and stay.
+ANON_COMMENT_COLS = ("My Reflection", "Supervisor Comments", "Commendations (Other)",
+                     "Other Feedback", "Clinical Incidents", "Additional Concerns",
+                     "Detail", "Comment", *WEAKNESS_KEY_LABELS.values())
+
+
+def getAnonLabels(studentNumbers, mappingPath=None, seed=None, prefix="S"):
+    """student_number → pseudonym ("S01", "S02", …) assigned in RANDOM order so the
+    label says nothing about roster position. If mappingPath exists its labels are
+    reused and only unseen students get new ones, so re-runs — and the PDF and Excel
+    builders when given the same path — agree. The mapping is written back to
+    mappingPath (CSV: student_number, anon_label). That file is the re-identification
+    key: keep it with the named reports, never in the anonymised folder."""
+    nums = [int(n) for n in studentNumbers]
+    mapping = {}
+    if mappingPath and Path(mappingPath).exists():
+        old = pd.read_csv(mappingPath)
+        mapping = dict(zip(old["student_number"].astype(int), old["anon_label"].astype(str)))
+    new = [n for n in nums if n not in mapping]
+    if new:
+        rng = random.Random(seed)
+        rng.shuffle(new)
+        used = set(mapping.values())
+        width = max(2, len(str(len(mapping) + len(new))))
+        i = 1
+        for n in new:
+            while f"{prefix}{i:0{width}d}" in used:
+                i += 1
+            mapping[n] = f"{prefix}{i:0{width}d}"
+            used.add(mapping[n])
+            i += 1
+    if mappingPath:
+        Path(mappingPath).parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(sorted(mapping.items()), columns=["student_number", "anon_label"]) \
+          .to_csv(mappingPath, index=False)
+    return {n: mapping[n] for n in nums}
+
+
+def anonymiseStudentExcelData(ctx, anonLabel=None, redactComments=True):
+    """Rewrite the collected Excel data (output of _collectStudentExcelData + meta) in
+    place, before any sheet is built, so every sheet sees the same masked values.
+
+    anonLabel given  → meta.studentName = "Student <label>", meta.studentNumber = label
+                       (Read Me / Dashboard titles and notes use these); every
+                       ANON_NAME_COLS column is pseudonymised with ONE mapping per
+                       workbook ("Supervisor 1", …) so distinct-supervisor counts and the
+                       Trend hover labels stay meaningful; Trend labels are rebuilt.
+    redactComments   → non-empty cells in ANON_COMMENT_COLS → ANON_COMMENT_PLACEHOLDER.
+    Column names are untouched, so the My Forms group band and chart references
+    (resolved by name) keep working. Records what it did in ctx["anon"]."""
+    meta = ctx.setdefault("meta", {})
+    supMap = {}
+
+    def _sup(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+            return v
+        if v not in supMap:
+            supMap[v] = f"{ANON_SUPERVISOR_PREFIX}{len(supMap) + 1}"
+        return supMap[v]
+
+    if anonLabel is not None:
+        meta["studentName"] = f"{ANON_STUDENT_PREFIX}{anonLabel}"
+        meta["studentNumber"] = anonLabel
+
+    for key, df in list(ctx.items()):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        df = df.copy()
+        for c in df.columns:
+            if anonLabel is not None and c in ANON_NAME_COLS:
+                if c == "Student Name":
+                    df[c] = df[c].where(df[c].isna(), meta["studentName"])
+                else:
+                    df[c] = df[c].map(_sup)
+            elif redactComments and c in ANON_COMMENT_COLS:
+                mask = df[c].notna() & (df[c].astype(str).str.strip() != "")
+                df[c] = df[c].astype(object).where(~mask, ANON_COMMENT_PLACEHOLDER)
+        if anonLabel is not None and key == "trendDf" and TREND_LABEL_COL in df.columns:
+            df[TREND_LABEL_COL] = df.apply(_trendLabelFor, axis=1)
+        ctx[key] = df
+    ctx["anon"] = {"label": anonLabel, "supervisors": supMap, "redactComments": redactComments}
+    return ctx

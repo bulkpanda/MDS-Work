@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+DASH · Assessment Monitor — one Gradio app for Viva, SCBD and CBD (replaces viva_gradio / scbd_gradio / cbd_gradio).
+──────────────────────────────────────────────────────────────────────────────
+Run:   python dash_app.py            → http://localhost:7863 (SERVER_PORT in dash_app_config.py)
+Files: dash_app_config.py  exam registry + scoring profiles + UI constants   (add exams here)
+       dash_app_core.py    API/token, per-exam cache, generic parser/scorer, filters, overrides, HTML
+       dash_app_export.py  Summary + Detailed Excel workbooks (same design for every exam)
+       <exam>_overrides.json  per-exam penalties / ignoreAssessors (cbd_overrides.json etc.), re-read live
+Install: pip install gradio requests pandas numpy openpyxl pyngrok  (optional: scipy, scikit-learn)
+
+How it works
+  • Exam dropdown picks the endpoint; each exam has ONE shared server-side cache (all tabs/users), refreshed at
+    most every CACHE_TTL s; timer ticks re-render only when the cache version changes.
+  • Cohort / checklist / date / status / critical-concern / dummy-test / search filters work in memory.
+  • Items, maxima, sections, GR labels are read from each form's own JSON; only the points rule per checklist
+    comes from PROFILES (picked by profileRules).
+  • Eye button → form HTML built on demand for that one record.
+"""
+import gradio as gr
+from pyngrok import ngrok
+
+import dash_app_config as cfg
+import dash_app_core as core
+import dash_app_export as exportMod
+
+import inspect
+NO_CHANGE = gr.skip() if hasattr(gr, "skip") else gr.update()
+HTML_KW = {"sanitize_html": False} if "sanitize_html" in inspect.signature(gr.HTML.__init__).parameters else {}   # keep onclick handlers
+DEF_SECS, DEF_ACTIVE = cfg.INTERVAL_MAP[cfg.DEFAULT_INTERVAL]
+
+
+# ── Handlers ─────────────────────────────────────────────────────────────────
+def isGrouped(sortOpt) -> bool:
+    """Status divider rows only under the status sort."""
+    return cfg.SORT_OPTIONS.get(sortOpt, ("",))[0] == "_status"
+
+
+def checklistChoices(examKey: str, cohorts) -> list:
+    """'All' + checklist templates that have forms in the selected cohorts."""
+    rows = core.caches[examKey].rows
+    present = {r["Checklist"] for r in rows if r["Cohort"] in set(cohorts or [])}
+    return ["All"] + sorted(present)
+
+
+def render(examKey, filterVals):
+    """(tableHtml, statsHtml) for the current filters from the exam cache."""
+    c = core.caches[examKey]
+    f = core.applyFilters(c.rows, *filterVals)
+    return core.tableHtml(f, c.templates, isGrouped(filterVals[7])), core.statsHtml(f)
+
+
+def doLoad(examKey, *filterVals, force=False):
+    """Exam cache (fetch if stale/forced) → filtered view. filterVals = cohorts, checklist, sub, unsub, cc, hide, q, sort, from, to."""
+    cohorts, checklist = filterVals[0], filterVals[1]
+    if not cohorts:
+        return 0, core.tableHtml([], {}), core.statsHtml([]), "", "❌ Select at least one cohort.", NO_CHANGE
+    if not cfg.LOCAL_JSON_DIR and not (core.DASH_EMAIL and core.DASH_PASSWORD) and not core.ENV_TOKEN:
+        return 0, core.tableHtml([], {}), core.statsHtml([]), "", "❌ No DASH_EMAIL / DASH_PASSWORD in .env.", NO_CHANGE
+    c = core.caches[examKey]
+    _, version, msg = c.get(force)
+    choices = checklistChoices(examKey, cohorts)
+    if checklist not in choices:
+        checklist = "All"
+    vals = (cohorts, checklist) + tuple(filterVals[2:])
+    tbl, stats = render(examKey, vals)
+    return version, tbl, stats, c.asOf(), msg, gr.update(choices=choices, value=checklist)
+
+
+def doLoadForce(examKey, *filterVals):
+    """Load button: bypass the TTL."""
+    return doLoad(examKey, *filterVals, force=True)
+
+
+def doTick(examKey, seenVersion, *filterVals):
+    """Timer: refresh this exam's cache if stale; re-render only when its version moved."""
+    _, version, msg = core.caches[examKey].get()
+    if version == seenVersion:
+        return seenVersion, NO_CHANGE, NO_CHANGE, core.caches[examKey].asOf(), msg, NO_CHANGE
+    return doLoad(examKey, *filterVals)
+
+
+def doFilter(examKey, *filterVals):
+    """Any filter change: in-memory re-render, no API call."""
+    return render(examKey, filterVals)
+
+
+def doExamChange(examKey):
+    """Exam switch → that exam's cohorts, default cohorts, dates; checklist reset."""
+    e = cfg.EXAMS[examKey]
+    return (gr.update(choices=e["cohorts"], value=e["defaultCohorts"]), e["dateFrom"], e["dateTo"],
+            gr.update(choices=["All"], value="All"), f"<p>{e['title']} live monitor</p>")
+
+
+def getFormHtml(examKey, req):
+    """Eye click: full form for one record id, built on demand."""
+    rid = (req or "").split("|")[0]
+    row = next((r for r in core.caches[examKey].rows if str(r["_id"]) == rid), None)
+    return core.formHtml(row, examKey) if row else '<p style="color:#94a3b8;">Form not found — click Load and try again.</p>'
+
+
+def doExport(examKey, *filterVals):
+    c = core.caches[examKey]
+    return exportMod.summaryExport(examKey, core.applyFilters(c.rows, *filterVals), c.templates, core.describeFilters(*filterVals))
+
+
+def doExportDetailed(examKey, *filterVals):
+    c = core.caches[examKey]
+    return exportMod.detailedExport(examKey, core.applyFilters(c.rows, *filterVals), c.templates, core.describeFilters(*filterVals))
+
+
+def setInterval(choice):
+    secs, active = cfg.INTERVAL_MAP.get(choice, (DEF_SECS, DEF_ACTIVE))
+    return gr.Timer(value=secs, active=active)
+
+
+# ── Layout ───────────────────────────────────────────────────────────────────
+e0 = cfg.EXAMS[cfg.DEFAULT_EXAM]
+with gr.Blocks(title=f"DASH · Assessment Monitor · {cfg.APP_BUILD}") as demo:
+    versionState = gr.State(0)                                  # cache version this tab last rendered
+    timer = gr.Timer(value=DEF_SECS, active=DEF_ACTIVE)
+
+    with gr.Row(elem_classes="compact-row"):
+        gr.HTML(f'<div id="dash-header"><h2>DASH</h2><span style="background:{cfg.PURPLE};color:#fff;padding:2px 8px;'
+                f'border-radius:6px;font-weight:700;font-size:11px;">{cfg.APP_BUILD}</span></div>', scale=1)
+        examDd = gr.Dropdown(list(cfg.EXAMS), value=cfg.DEFAULT_EXAM, label="Exam", scale=1)
+        subtitle = gr.HTML(f"<p>{e0['title']} live monitor</p>", scale=3)
+
+    with gr.Row(elem_classes="compact-row"):
+        dateFrom = gr.Textbox(label="From", value=e0["dateFrom"], placeholder="YYYY-MM-DD", scale=2)
+        dateTo = gr.Textbox(label="To", value=e0["dateTo"], placeholder="YYYY-MM-DD", scale=2)
+        intervalDd = gr.Dropdown(list(cfg.INTERVAL_MAP), value=cfg.DEFAULT_INTERVAL, label="Refresh", scale=2)
+        loadBtn = gr.Button("↻ Load", variant="primary", scale=1)
+
+    with gr.Row(elem_classes="compact-row"):
+        cohortIn = gr.CheckboxGroup(e0["cohorts"], value=e0["defaultCohorts"], label="Cohorts", scale=2)
+        checklistDd = gr.Dropdown(["All"], value="All", label="Checklist", scale=2, allow_custom_value=True)
+        searchIn = gr.Textbox(label="Search", placeholder="student · assessor · examiner · comments…", scale=3)
+        sortDd = gr.Dropdown(list(cfg.SORT_OPTIONS), value=cfg.DEFAULT_SORT, label="Sort by", scale=2)
+        with gr.Column(scale=1, min_width=170):
+            subOnly = gr.Checkbox(label="Submitted only", value=False)
+            unsubOnly = gr.Checkbox(label="Unsubmitted only", value=False)
+        with gr.Column(scale=1, min_width=170):
+            ccOnly = gr.Checkbox(label="Critical concerns only", value=False)
+            hideTest = gr.Checkbox(label="Hide dummy/test", value=True)
+
+    with gr.Row(elem_classes="compact-row"):
+        statsHtml = gr.HTML(core.statsHtml([]))
+    with gr.Row(elem_classes="compact-row"):
+        errorMd = gr.Markdown("", elem_id="err-bar")
+        updatedMd = gr.Markdown("", elem_id="ts-bar")
+
+    tableHtml = gr.HTML(core.tableHtml([], {}), elem_id="table-wrap", **HTML_KW)
+    formReq = gr.Textbox(elem_id="form-req", show_label=False)              # receives "id|nonce" from openForm()
+    formOut = gr.HTML("", elem_id="form-out", **HTML_KW)                               # one form's HTML, handed to the modal
+
+    with gr.Row(elem_classes="compact-row"):
+        exportBtn = gr.Button("⬇ Export Summary", size="sm", scale=1)
+        exportDetailBtn = gr.Button("⬇ Export Detailed (all analyses)", size="sm", scale=1)
+        fileOut = gr.File(label="Download", visible=False, scale=3)
+
+    filterArgs = [cohortIn, checklistDd, subOnly, unsubOnly, ccOnly, hideTest, searchIn, sortDd, dateFrom, dateTo]
+    inputs = [examDd] + filterArgs
+    loadOutputs = [versionState, tableHtml, statsHtml, updatedMd, errorMd, checklistDd]
+
+    loadBtn.click(doLoadForce, inputs, loadOutputs)
+    demo.load(doLoad, inputs, loadOutputs)
+    examDd.input(doExamChange, [examDd], [cohortIn, dateFrom, dateTo, checklistDd, subtitle]) \
+          .then(doLoad, inputs, loadOutputs)
+    cohortIn.input(doLoad, inputs, loadOutputs)                             # in-memory slice + checklist choices
+    for w in [checklistDd, subOnly, unsubOnly, ccOnly, hideTest, searchIn, sortDd, dateFrom, dateTo]:
+        w.input(doFilter, inputs, [tableHtml, statsHtml])
+    intervalDd.change(setInterval, [intervalDd], [timer])
+    timer.tick(doTick, [examDd, versionState] + filterArgs, loadOutputs)
+    formReq.change(getFormHtml, [examDd, formReq], [formOut]) \
+           .then(fn=None, inputs=[formOut],
+                 js="(h) => { var m=document.getElementById('_cfm'); if(m && m.style.display==='flex') showFormModal(h); }")
+    exportBtn.click(doExport, inputs, [fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
+    exportDetailBtn.click(doExportDetailed, inputs, [fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
+
+
+if __name__ == "__main__":
+    print(f"[DASH] login gate: {'ON' if core.LOGIN_USER and core.LOGIN_PASS else 'OFF (set DASH_APP_USERNAME/PASSWORD in .env)'}")
+    print(f"\n  DASH · Assessment Monitor — http://localhost:{cfg.SERVER_PORT}  (Ctrl+C to stop)\n")
+    if cfg.USE_NGROK:
+        ngrok.connect(cfg.SERVER_PORT, domain=cfg.NGROK_DOMAIN)
+    demo.queue(default_concurrency_limit=cfg.CONCURRENCY)
+    demo.launch(server_name="localhost", server_port=cfg.SERVER_PORT, share=False, max_threads=10, css=core.CSS,
+                head=core.FORM_JS, auth=(core.LOGIN_USER, core.LOGIN_PASS) if core.LOGIN_USER and core.LOGIN_PASS else None,
+                theme=gr.themes.Default(primary_hue="indigo"))

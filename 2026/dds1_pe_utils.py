@@ -2,7 +2,7 @@
 dds1_pe_utils.py — DDS1 Periodontics (PE) session progress report for coordinators.
 
 Source : the DASH CAF export (e.g. "temp 2026 caf.json"), forms whose
-         form_context.clinic_type == "PE" and checklist code PE-01 … PE-06.
+         form_context.clinic_type == "PE" and checklist code PE-01 … PE-09.
 Output : one Excel workbook (buildDds1PeProgressReport) with
          Read Me · Overview · Progress Grid · Flags · Student Tracker (dropdown + charts) ·
          Item Pivot · Criterion x Session · Self vs Assessor · Adjustments.
@@ -13,7 +13,9 @@ Scoring reproduces the per-session marking sheets (DDS1/DDS1_PE0x.xlsx):
     debridement /5, Damage /3 (No / Minor / Major damage).
   * an out-of-rubric selection is mapped to the nearest valid level AT OR BELOW it
     (worse); if nothing valid is below, the lowest valid level. Logged on "Adjustments".
-  * session % : Equal (mean of item %) and Proportional (PE_SESSIONS[...]['propWeights']).
+  * session % : weighted — sum(points/max × weight) / sum(weights of answered items) × 100,
+    weights from the Weighting sheet of DDS1/DDS1 Perio DASH Forms.xlsx (loadPeWeights),
+    the same calculation as the DDS1 student reports (peFormPercent).
 
 Usage (main.ipynb):
     from dds1_pe_utils import *
@@ -47,6 +49,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 __all__ = [
     "PE_SESSIONS", "PE_ITEMS", "PE_FLAG_CONFIG", "PE_MARKED_MIN_FRACTION",
     "loadPeForms", "scorePeForms", "buildPeTables", "validatePeScoring",
+    "PE_CRITERION_WATCH_CONFIG", "buildCriterionWatch",
     "buildDds1PeProgressReport",
     # Task 7 (Cons Dent) section scoring — 2026-09-24
     "TASK7_BANDS", "TASK7_LAYOUT", "TASK7_SECTIONS", "TASK7_SECTION_MAX",
@@ -85,28 +88,22 @@ PE_ITEMS = {
 }
 PE_SECTIONS = ["Ergonomics", "Instrument Handling", "Quality of Scaling", "Damage"]
 
-_W14 = {"seating": 6.25, "posture": 6.25, "lighting": 6.25, "infection": 6.25,
-        "instrUse": 12.5, "angulation": 12.5, "fingerRests": 12.5, "cheek": 2.5,
-        "debIncisor": 6.25, "debCanine": 6.25, "debPremolar": 6.25, "debMolar": 6.25,
-        "dmgTissue": 5, "dmgTooth": 5}
-
-# Scored items + proportional weights per session — copied from DDS1_PE0x.xlsx "Criterion Summary".
-# PE-01 excluded Cheek retraction; PE-02 excluded scaling/damage (still in the form, not marked).
-# PE-06 had no marking sheet yet → ASSUMED same scheme as PE-04/05 (change here if it differs).
+# Session metadata. Item weights (which items are scored, and how much) come from the Weighting
+# sheet of DDS1/DDS1 Perio DASH Forms.xlsx via loadPeWeights() — same source as the student reports.
 PE_SESSIONS = {
     # PE-01 sheet (DDS1 Perio.xlsx) scored the disabled middle option (O2 on the /2 items) as the
     # TOP level, i.e. mapped UP; every later sheet maps DOWN. adjustRule keeps S1 = published marks.
-    "PE-01": dict(short="S1", weightage=4, adjustRule="up", propWeights={
-        "seating": 12.5, "posture": 12.5, "lighting": 12.5, "infection": 25,
-        "instrUse": 12.5, "angulation": 12.5, "fingerRests": 12.5}),
-    "PE-02": dict(short="S2", weightage=8, propWeights={
-        "seating": 10, "posture": 10, "lighting": 10, "infection": 20,
-        "instrUse": 20, "angulation": 10, "fingerRests": 10, "cheek": 10}),
-    "PE-03": dict(short="S3", weightage=10, propWeights={
-        "debIncisor": 20, "debPremolar": 20, "debMolar": 40, "dmgTissue": 10, "dmgTooth": 10}),
-    "PE-04": dict(short="S4", weightage=8, propWeights=dict(_W14)),
-    "PE-05": dict(short="S5", weightage=8, propWeights=dict(_W14)),
-    "PE-06": dict(short="S6", weightage=None, propWeights=dict(_W14), assumedScheme=True),
+    "PE-01": dict(short="S1", weightage=4, adjustRule="up"),
+    "PE-02": dict(short="S2", weightage=8),
+    "PE-03": dict(short="S3", weightage=10),
+    "PE-04": dict(short="S4", weightage=8),
+    "PE-05": dict(short="S5", weightage=8),
+    "PE-06": dict(short="S6", weightage=20),
+    "PE-07": dict(short="S7", weightage=5),
+    "PE-08": dict(short="S8", weightage=10),
+    # PE-09 Final Preclinical Test: no assessor has submitted yet → score the assessor's SAVED
+    # (unsubmitted) answers too. Shown as "draft" in the workbook; may still change.
+    "PE-09": dict(short="S9", weightage=25, includeDrafts=True),
 }
 
 # Items whose BOTTOM level is a patient-safety event (flagged RED on any occurrence):
@@ -131,6 +128,22 @@ PE_FLAG_CONFIG = dict(
     missRed=2,               # RED when >= this many marked sessions have no scored form
     selfGapPts=15.0,         # AMBER when mean (self % - assessor %) >= +this (over-estimates)
     minSelfSessions=2,       # ... over at least this many sessions
+)
+
+# Criterion Watch — per student × checklist item across sessions, on the LEVEL scale
+# (level ÷ levels × 100, so lenient and strict sessions compare like-for-like).
+# Criterion Watch — per student × checklist item across sessions, in POINTS on the strict scale
+# (bottom level = 0; 2-level 0/1, 3-level 0/1/2, 5-level 0/2/3/4/5) for every session, so lenient and
+# strict sessions compare like-for-like. Thresholds are fractions of the item's max points.
+PE_CRITERION_WATCH_CONFIG = dict(
+    minSessions=3,           # item must be assessed in >= this many sessions to judge a trend
+    lowFrac=0.20,            # "low" = mean (student − cohort) <= −lowFrac × max pts (1-pt items: −0.2, 2: −0.4, 5: −1)
+    stagnantFrac=0.10,       # "stagnant" = (last-half − first-half, relative to cohort) <= +stagnantFrac × max
+    declineFrac=0.35,        # "declining" = that change <= −declineFrac × max
+    lateBelowFrac=0.20,      # a non-low "declining" item must also END <= −lateBelowFrac × max under the cohort
+    dropPts={1: 1, 2: 1, 5: 2},  # "latest drop" = latest pts − previous assessed session pts <= −this, AND latest under the cohort by lowFrac
+    bottomMin=2,             # "repeated bottom" = 0 pts in >= this many sessions AND not improving
+    bottomMinLevels=3,       # ... only on items with >= this many levels (2-level items are too coarse)
 )
 
 _MELB = "Australia/Melbourne"
@@ -277,12 +290,14 @@ def scorePeForms(forms, sessions=None):
     """
     Return (formsDf, itemsDf, adjustDf, dupDf).
       formsDf : one row per student × session (the chosen form) with status, GR/PR/Prof, comments,
-                Equal % and Proportional % (assessor), and student self Equal %.
+                weighted session % (assessor, 'pct') and student self weighted % ('selfPct') —
+                Weighting-sheet weights, same as peFormPercent / the student reports.
       itemsDf : long, one row per student × session × item × side ('assessor'/'student').
       adjustDf: out-of-rubric selections and the level they were mapped to.
       dupDf   : extra forms for the same student × session that were NOT used.
     """
     sessions = sessions or PE_SESSIONS
+    allWeights = loadPeWeights()
     # choose one form per student × session: assessor-submitted first, then latest update
     byKey = defaultdict(list)
     for f in forms:
@@ -291,54 +306,72 @@ def scorePeForms(forms, sessions=None):
     for key, fs in byKey.items():
         # tie-break on created_at (latest attempt), NOT updated_at: a later edit to an older
         # duplicate must not displace the newer attempt — matches the published PE-02 sheet.
-        fs = sorted(fs, key=lambda x: (x["subAssessor"], x["subStudent"], x["createdAt"] or ""), reverse=True)
+        if sessions[key[1]].get("includeDrafts"):   # drafts: prefer a form whose assessor saved answers
+            fs = sorted(fs, key=lambda x: (x["subAssessor"], _hasAssessorAnswers(x), x["subStudent"],
+                                           x["createdAt"] or ""), reverse=True)
+        else:
+            fs = sorted(fs, key=lambda x: (x["subAssessor"], x["subStudent"], x["createdAt"] or ""), reverse=True)
         chosen.append(fs[0])
         dups += [dict(studentNumber=x["studentNumber"], code=x["code"], formId=x["formId"],
                       keptFormId=fs[0]["formId"], subAssessor=x["subAssessor"]) for x in fs[1:]]
 
+    # Reference config per code × side = the form config with the most criteria. A few forms carry a
+    # truncated config (e.g. 5 PE-08 forms list only MC1-4 although 14 MCs are answered); their
+    # missing MCs are read from the reference so they score like the rest of the session.
+    refMeta = {}
+    for f in forms:
+        for side in ("assessor", "student"):
+            m = _checklistMeta(f["form"], f["code"], side) or {}
+            if len(m) > len(refMeta.get((f["code"], side), {})):
+                refMeta[(f["code"], side)] = m
+
     formRows, itemRows, adjRows = [], [], []
     for f in chosen:
         code, form = f["code"], f["form"]
-        weights = sessions[code]["propWeights"]
-        status = ("Scored" if f["subAssessor"] else
+        weights = allWeights.get(code) or {}
+        strict = code not in PE_LENIENT_CODES        # PE-01…04 lenient (worst = 1), PE-05+ strict (worst = 0)
+        draft = (not f["subAssessor"]) and bool(sessions[code].get("includeDrafts")) and _hasAssessorAnswers(f)
+        useA = f["subAssessor"] or draft
+        status = ("Scored" if useA else
                   "Assessor pending" if f["subStudent"] else "Form opened, not submitted")
         ad, sd = form.get("assessor_data") or {}, form.get("student_data") or {}
         row = dict(studentNumber=f["studentNumber"], code=code, formId=f["formId"], date=f["date"],
                    assessor=f["assessor"], status=status, subStudent=f["subStudent"],
-                   subAssessor=f["subAssessor"],
-                   gr=_scale(ad, "scale-global-rating") if f["subAssessor"] else None,
-                   pr=_scale(ad, "scale-practice-readiness") if f["subAssessor"] else None,
-                   prof=_scale(ad, "scale-professionalism") if f["subAssessor"] else None,
+                   subAssessor=f["subAssessor"], draft=draft, strict=strict,
+                   gr=_scale(ad, "scale-global-rating") if useA else None,
+                   pr=_scale(ad, "scale-practice-readiness") if useA else None,
+                   prof=_scale(ad, "scale-professionalism") if useA else None,
                    assessorComment=((ad.get("texts") or {}).get("reflection") or "").strip(),
                    studentComment=((sd.get("texts") or {}).get("reflection") or "").strip())
-        for side, data, submitted in (("assessor", ad, f["subAssessor"]), ("student", sd, f["subStudent"])):
+        for side, data, submitted in (("assessor", ad, useA), ("student", sd, f["subStudent"])):
             answers = ((data.get("checklists") or {}).get(code)) or {}
-            meta = _checklistMeta(form, code, side) or {}
-            pcts, wsum, wtot = [], 0.0, 0.0
+            meta = dict(refMeta.get((code, side), {}), **(_checklistMeta(form, code, side) or {}))
+            wsum, wtot = 0.0, 0.0
             if submitted and answers:
                 for mc, ans in answers.items():
                     m = meta.get(mc)
                     if not m or m["itemId"] not in weights:
-                        continue             # item not scored in this session (see PE_SESSIONS)
+                        continue             # item not weighted in this session (Weighting sheet)
                     level, denom, adj = _scoreOption((ans or {}).get("key"), m["valid"],
                                                      sessions[code].get("adjustRule", "down"))
                     if level is None:
                         continue
-                    pct = 100.0 * level / denom
-                    pcts.append(pct)
+                    pts, mx = peLevelPoints(level, denom, strict)
+                    if not mx:
+                        continue
+                    pct = 100.0 * pts / mx
                     wsum += pct * weights[m["itemId"]]
                     wtot += weights[m["itemId"]]
                     itemRows.append(dict(studentNumber=f["studentNumber"], code=code, side=side,
                                          itemId=m["itemId"], mc=mc, level=level, denom=denom, pct=pct,
+                                         points=pts, maxPts=mx, strict=strict, draft=draft and side == "assessor",
                                          optionKey=ans.get("key"), label=m["labels"].get(adj, adj)))
                     if adj != ans.get("key"):
                         adjRows.append(dict(studentNumber=f["studentNumber"], code=code, side=side,
                                             mc=mc, itemId=m["itemId"], criterion=m["name"],
                                             original=f"{ans.get('key')} · {ans.get('value')}",
                                             mappedTo=f"{adj} · {m['labels'].get(adj, adj)} ({level}/{denom})"))
-            pre = "" if side == "assessor" else "self"
-            row[f"{pre}{'eq' if not pre else 'Eq'}"] = float(np.mean(pcts)) if pcts else None
-            row[f"{pre}{'prop' if not pre else 'Prop'}"] = (wsum / wtot) if wtot else None
+            row["pct" if side == "assessor" else "selfPct"] = (wsum / wtot) if wtot else None
         formRows.append(row)
     formsDf = pd.DataFrame(formRows)
     itemsDf = pd.DataFrame(itemRows)
@@ -346,16 +379,19 @@ def scorePeForms(forms, sessions=None):
     return formsDf, itemsDf, adjustDf, pd.DataFrame(dups)
 
 
+def _hasAssessorAnswers(f):
+    """True when the assessor saved at least one checklist answer for this code (draft or submitted)."""
+    return bool(_peAnswers((f["form"].get("assessor_data") or {}), f["code"]))
+
+
 def validatePeScoring(formsDf, expected=None):
-    """Compare session class means to the published marking sheets (Equal, Prop)."""
-    expected = expected or {"PE-01": (None, 74.88), "PE-02": (77.53, 77.98), "PE-03": (58.75, 55.04),
-                            "PE-04": (79.88, 80.65), "PE-05": (82.18, 83.20)}
-    s = formsDf[formsDf["status"] == "Scored"].groupby("code")[["eq", "prop"]].mean().round(2)
+    """Compare weighted session class means to the published marking sheets (weighted means)."""
+    expected = expected or {"PE-01": 74.88, "PE-02": 77.98, "PE-03": 55.04, "PE-04": 80.65, "PE-05": 83.20}
+    s = formsDf[formsDf["status"] == "Scored"].groupby("code")["pct"].mean().round(2)
     out = []
-    for code, (eq, prop) in expected.items():
+    for code, sheet in expected.items():
         if code in s.index:
-            out.append(dict(code=code, eqCalc=s.loc[code, "eq"], eqSheet=eq,
-                            propCalc=s.loc[code, "prop"], propSheet=prop))
+            out.append(dict(code=code, calc=s.loc[code], sheet=sheet))
     return pd.DataFrame(out)
 
 
@@ -539,6 +575,83 @@ def _slope(y):
     return float(np.polyfit(x, y, 1)[0])
 
 
+def buildCriterionWatch(progDf, itemsDf, sessions=None, config=None):
+    """Students who are low and not improving, going backwards, or who just dropped, on individual
+    checklist items. One row per flagged student × item, everything in POINTS: each session is re-expressed
+    on the strict points scale (bottom = 0) so lenient (PE-01–04) and strict sessions compare.
+      vsCohort  : mean over assessed sessions of (student pts − cohort mean pts)
+      change    : (student − cohort) mean over the last half of assessed sessions minus the first half
+      latestDrop: latest session pts − previous assessed session pts
+    Flags (PE_CRITERION_WATCH_CONFIG), in priority order: Low & declining · Latest drop · Low & stagnant ·
+    Declining (last half also under the cohort) · Repeated bottom (>= 3-level items only, not improving).
+    Every row also carries latestDrop, so a drop on a row flagged for another reason is still visible."""
+    sessions = sessions or PE_SESSIONS
+    cfg = dict(PE_CRITERION_WATCH_CONFIG, **(config or {}))
+    codes = list(sessions)
+    if itemsDf is None or not len(itemsDf):
+        return pd.DataFrame()
+    ai = itemsDf[itemsDf["side"] == "assessor"].copy()
+    sp = [peLevelPoints(int(l), int(d), True) for l, d in zip(ai["level"], ai["denom"])]
+    ai["pts"] = [p for p, _ in sp]
+    ai["mx"] = [m for _, m in sp]
+    cohort = ai.groupby(["code", "itemId"])["pts"].mean().to_dict()
+    names = {r["studentNumber"]: (r["lastName"], r["firstName"]) for r in progDf.to_dict("records")}
+    order = {"Low & declining": 0, "Latest drop": 1, "Low & stagnant": 2, "Declining": 3, "Repeated bottom": 4}
+    rows = []
+    for (sn, itemId), g in ai.groupby(["studentNumber", "itemId"]):
+        if sn not in names:
+            continue
+        g = g.set_index("code")
+        seq = [(c, int(g.loc[c, "pts"]), int(g.loc[c, "mx"]), int(g.loc[c, "denom"])) for c in codes if c in g.index]
+        n = len(seq)
+        if n < 2:
+            continue
+        mx = max(m for _, _, m, _ in seq)
+        maxLevels = max(d for *_, d in seq)
+        vals = [float(v) for _, v, _, _ in seq]
+        rel = [v - cohort[(c, itemId)] for c, v, _, _ in seq]
+        bottoms = sum(1 for v in vals if v == 0)
+        half = n // 2
+        first = float(np.mean(vals[:half])) if half else None
+        last = float(np.mean(vals[-half:])) if half else None
+        change = (float(np.mean(rel[-half:])) - float(np.mean(rel[:half]))) if half else None
+        vsCohort = float(np.mean(rel))
+        latestDrop = vals[-1] - vals[-2]
+        low = vsCohort <= -cfg["lowFrac"] * mx
+        declining = change is not None and change <= -cfg["declineFrac"] * mx
+        stagnant = change is not None and change <= cfg["stagnantFrac"] * mx
+        lateBelow = half and float(np.mean(rel[-half:])) <= -cfg["lateBelowFrac"] * mx
+        dropped = latestDrop <= -cfg["dropPts"].get(mx, 1) and rel[-1] <= -cfg["lowFrac"] * mx   # and now under the cohort
+        trend = n >= cfg["minSessions"]
+        if trend and low and declining:
+            flag = "Low & declining"
+        elif dropped:
+            flag = "Latest drop"
+        elif trend and low and stagnant:
+            flag = "Low & stagnant"
+        elif trend and declining and lateBelow:
+            flag = "Declining"
+        elif trend and bottoms >= cfg["bottomMin"] and maxLevels >= cfg["bottomMinLevels"] and stagnant:
+            flag = "Repeated bottom"
+        else:
+            continue
+        lab, sec, _ = PE_ITEMS[itemId]
+        row = dict(flag=flag, rank=order[flag], lastName=names[sn][0], firstName=names[sn][1],
+                   studentNumber=sn, section=sec, item=lab, itemId=itemId, nSessions=n, maxPts=mx,
+                   meanPts=float(np.mean(vals)),
+                   cohortPts=float(np.mean([cohort[(c, itemId)] for c, *_ in seq])),
+                   vsCohort=vsCohort, firstHalf=first, lastHalf=last, change=change,
+                   latestDrop=latestDrop, bottoms=bottoms, latest=f"{seq[-1][1]}/{seq[-1][2]}",
+                   previous=f"{seq[-2][1]}/{seq[-2][2]}")
+        for c, v, m, _ in seq:
+            row[f"pts_{c}"] = (v, m)
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if len(df):
+        df = df.sort_values(["lastName", "firstName", "rank", "section"]).reset_index(drop=True)
+    return df
+
+
 def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
     """Session summary, per-student progress (with z-scores + flags) and self-vs-assessor gaps."""
     sessions = sessions or PE_SESSIONS
@@ -555,13 +668,14 @@ def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
         sessRows.append(dict(
             code=code, short=sessions[code]["short"], date=date, weightage=sessions[code]["weightage"],
             title=None, nRoster=nRoster, nForms=len(d), nScored=len(sc),
+            nDraft=int(sc["draft"].fillna(False).astype(bool).sum()) if "draft" in sc else 0,
             nPending=int((d["status"] == "Assessor pending").sum()),
             nOpened=int((d["status"] == "Form opened, not submitted").sum()),
             marked=len(sc) >= PE_MARKED_MIN_FRACTION * nRoster,
-            meanEq=sc["eq"].mean(), medianEq=sc["eq"].median(), sdEq=sc["eq"].std(),
-            meanProp=sc["prop"].mean(), grMean=sc["gr"].mean(), prMean=sc["pr"].mean(),
+            meanPct=sc["pct"].mean(), medianPct=sc["pct"].median(), sdPct=sc["pct"].std(),
+            grMean=sc["gr"].mean(), prMean=sc["pr"].mean(),
             gr=Counter(sc["gr"].dropna().astype(int)), pr=Counter(sc["pr"].dropna().astype(int)),
-            selfEq=d.loc[d["subStudent"], "selfEq"].mean()))
+            selfPct=d.loc[d["subStudent"], "selfPct"].mean()))
     sessDf = pd.DataFrame(sessRows)
 
     # ---- z within session (sessions differ in difficulty & items) ---------------
@@ -569,14 +683,14 @@ def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
     fd["z"] = None
     fd["pctile"] = None
     for code in codes:
-        m = (fd["code"] == code) & (fd["status"] == "Scored") & fd["eq"].notna()
-        v = fd.loc[m, "eq"]
+        m = (fd["code"] == code) & (fd["status"] == "Scored") & fd["pct"].notna()
+        v = fd.loc[m, "pct"]
         if len(v) > 1 and v.std() > 0:
             fd.loc[m, "z"] = (v - v.mean()) / v.std()
             fd.loc[m, "pctile"] = v.rank(pct=True, method="max")
 
     markedCodes = [c for c, mk in zip(sessDf["code"], sessDf["marked"]) if mk]
-    lowCut = {c: fd.loc[(fd["code"] == c) & (fd["status"] == "Scored"), "eq"].quantile(cfg["lowPercentile"])
+    lowCut = {c: fd.loc[(fd["code"] == c) & (fd["status"] == "Scored"), "pct"].quantile(cfg["lowPercentile"])
               for c in markedCodes}
 
     items = itemsDf[itemsDf["side"] == "assessor"] if len(itemsDf) else itemsDf
@@ -585,21 +699,21 @@ def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
         sn = s["studentNumber"]
         mine = fd[fd["studentNumber"] == sn].set_index("code")
         row = dict(studentNumber=sn, lastName=s["lastName"], firstName=s["firstName"])
-        zs, eqs = [], []
+        zs, pcts = [], []
         missing, lows, pendings = [], [], []
         for code in codes:
             st = mine.loc[code, "status"] if code in mine.index else "No form"
             row[f"status_{code}"] = st
-            for k in ("eq", "prop", "gr", "pr", "z", "selfEq", "assessor", "assessorComment",
-                      "studentComment", "date"):
+            for k in ("pct", "gr", "pr", "z", "selfPct", "assessor", "assessorComment",
+                      "studentComment", "date", "draft"):
                 row[f"{k}_{code}"] = (mine.loc[code, k] if code in mine.index and st == "Scored"
-                                      or (code in mine.index and k in ("selfEq", "studentComment", "date"))
+                                      or (code in mine.index and k in ("selfPct", "studentComment", "date"))
                                       else None)
             if st == "Scored":
-                eqs.append(row[f"eq_{code}"])
+                pcts.append(row[f"pct_{code}"])
                 if row[f"z_{code}"] is not None:
                     zs.append(float(row[f"z_{code}"]))
-                if code in lowCut and row[f"eq_{code}"] <= lowCut[code]:
+                if code in lowCut and row[f"pct_{code}"] <= lowCut[code]:
                     lows.append(sessions[code]["short"])
             elif code in markedCodes:
                 missing.append(sessions[code]["short"])
@@ -607,9 +721,9 @@ def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
                     pendings.append(sessions[code]["short"])
         scoredCodes = [c for c in codes if row[f"status_{c}"] == "Scored"]
         row["nScored"] = len(scoredCodes)
-        row["meanEq"] = float(np.mean(eqs)) if eqs else None
+        row["meanPct"] = float(np.mean(pcts)) if pcts else None
         row["latestCode"] = scoredCodes[-1] if scoredCodes else None
-        row["latestEq"] = row[f"eq_{scoredCodes[-1]}"] if scoredCodes else None
+        row["latestPct"] = row[f"pct_{scoredCodes[-1]}"] if scoredCodes else None
         row["latestGr"] = row[f"gr_{scoredCodes[-1]}"] if scoredCodes else None
         row["latestPr"] = row[f"pr_{scoredCodes[-1]}"] if scoredCodes else None
         row["meanZ"] = float(np.mean(zs)) if zs else None
@@ -628,8 +742,8 @@ def buildPeTables(roster, formsDf, itemsDf, sessions=None, flagConfig=None):
                 if what:
                     dmgSess.append(f"{sessions[c]['short']} ({' & '.join(what)})")
         # self vs assessor
-        gaps = [row[f"selfEq_{c}"] - row[f"eq_{c}"] for c in scoredCodes
-                if row[f"selfEq_{c}"] is not None and not pd.isna(row[f"selfEq_{c}"])]
+        gaps = [row[f"selfPct_{c}"] - row[f"pct_{c}"] for c in scoredCodes
+                if row[f"selfPct_{c}"] is not None and not pd.isna(row[f"selfPct_{c}"])]
         row["selfGap"] = float(np.mean(gaps)) if gaps else None
         row["nSelf"] = len(gaps)
 
@@ -818,6 +932,7 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
     wsTr = wb.create_sheet("Student Tracker")
     wsSc = wb.create_sheet("Student Charts")
     wsPiv = wb.create_sheet("Item Pivot")
+    wsWatch = wb.create_sheet("Criterion Watch")
     wsCx = wb.create_sheet("Criterion x Session")
     wsSelf = wb.create_sheet("Self vs Assessor")
     wsAdj = wb.create_sheet("Adjustments")
@@ -828,7 +943,7 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
     # ---------------- Overview -------------------------------------------------
     _title(wsOv, "DDS1 Periodontics — cohort progress by session", stamp)
     hdr = ["Session", "Code", "Title", "Date", "Weightage", "Roster", "Scored", "Assessor pending",
-           "Opened only", "No form", "Mean %\n(Equal)", "Median %", "SD", "Mean %\n(Prop)",
+           "Opened only", "No form", "Mean %", "Median %", "SD",
            "Mean self %", "Mean GR\n(1–5)", "Mean PR\n(1–4)", "GR 1/2/3/4/5", "PR 1/2/3/4", "Status"]
     _header(wsOv, 4, 1, hdr)
     for i, c in enumerate(codes):
@@ -836,32 +951,32 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         r = 5 + i
         vals = [s["short"], c, s["title"], s["date"], f"{s['weightage']:g}%" if isinstance(s["weightage"], (int, float)) and not pd.isna(s["weightage"]) else "TBC",
                 s["nRoster"], s["nScored"], s["nPending"], s["nOpened"], s["nRoster"] - s["nForms"],
-                s["meanEq"], s["medianEq"], s["sdEq"], s["meanProp"], s["selfEq"], s["grMean"], s["prMean"],
+                s["meanPct"], s["medianPct"], s["sdPct"], s["selfPct"], s["grMean"], s["prMean"],
                 " / ".join(str(s["gr"].get(k, 0)) for k in range(1, 6)),
                 " / ".join(str(s["pr"].get(k, 0)) for k in range(1, 5)),
                 ("Marked" if s["marked"] else "Awaiting marking")
-                + (" (scheme assumed = S5)" if sessions[c].get("assumedScheme") else "")]
-        fmts = [None, None, None, "dd mmm yyyy", None, "0", "0", "0", "0", "0", "0.0", "0.0", "0.0", "0.0",
+                + (f" · {s['nDraft']} assessor drafts (not submitted) included" if s.get("nDraft") else "")
+                + (" · strict" if c not in PE_LENIENT_CODES else " · lenient")]
+        fmts = [None, None, None, "dd mmm yyyy", None, "0", "0", "0", "0", "0", "0.0", "0.0", "0.0",
                 "0.0", "0.00", "0.00", None, None, None]
         for j, (v, fm) in enumerate(zip(vals, fmts)):
-            _put(wsOv, r, 1 + j, v, fm, fill=None if s["marked"] else _AMBER if j == 19 else None)
-    _widths(wsOv, {"A": 8, "B": 8, "C": 44, "D": 12, "E": 10, "R": 16, "S": 13, "T": 30})
-    for col in range(6, 18):
+            _put(wsOv, r, 1 + j, v, fm, fill=None if s["marked"] else _AMBER if j == 18 else None)
+    _widths(wsOv, {"A": 8, "B": 8, "C": 44, "D": 12, "E": 10, "Q": 16, "R": 13, "S": 52})
+    for col in range(6, 17):
         wsOv.column_dimensions[get_column_letter(col)].width = 10
     wsOv.row_dimensions[4].height = 42
     n = len(codes)
     # chart data (label row) in hidden helper area
     wsOv.cell(row=5 + n + 2, column=1, value="Chart data").font = _XlFont(italic=True, color="808080")
     base = 5 + n + 3
-    _header(wsOv, base, 1, ["Session", "Mean % (Equal)", "Mean % (Prop)", "Mean self %"], fill=TEAL)
+    _header(wsOv, base, 1, ["Session", "Mean %", "Mean self %"], fill=TEAL)
     for i, c in enumerate(codes):
         s = sessInfo[c]
         _put(wsOv, base + 1 + i, 1, labels[i])
-        _put(wsOv, base + 1 + i, 2, s["meanEq"] if s["marked"] else None, "0.0")
-        _put(wsOv, base + 1 + i, 3, s["meanProp"] if s["marked"] else None, "0.0")
-        _put(wsOv, base + 1 + i, 4, s["selfEq"], "0.0")
+        _put(wsOv, base + 1 + i, 2, s["meanPct"] if s["marked"] else None, "0.0")
+        _put(wsOv, base + 1 + i, 3, s["selfPct"], "0.0")
     ch = _lineChart("Cohort mean by session", "%")
-    ch.add_data(Reference(wsOv, min_col=2, max_col=4, min_row=base, max_row=base + n), titles_from_data=True)
+    ch.add_data(Reference(wsOv, min_col=2, max_col=3, min_row=base, max_row=base + n), titles_from_data=True)
     ch.set_categories(Reference(wsOv, min_col=1, min_row=base + 1, max_row=base + n))
     for sr, col in zip(ch.series, [NAVY, "70AD47", "ED7D31"]):
         _styleSeries(sr, col)
@@ -873,8 +988,9 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
                     "rank (Progress Grid z) for individual trends.").font = _XlFont(italic=True, size=9)
 
     # ---------------- Progress Grid -------------------------------------------
-    _title(wsGrid, "Progress grid — session % (Equal weighting) per student",
-           f"{stamp} · colours are relative within each session column · blank = no scored form")
+    _title(wsGrid, "Progress grid — weighted session % per student",
+           f"{stamp} · colours are relative within each session column · blank = no scored form · "
+           "purple italic = assessor draft (not submitted)")
     fixed = ["#", "Last Name", "First Name", "Student No"]
     grHdr = [f"GR {sessions[c]['short']}" for c in codes]
     prHdr = [f"PR {sessions[c]['short']}" for c in codes]
@@ -890,14 +1006,16 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
             _put(wsGrid, row, 1 + j, v)
         for k, c in enumerate(codes):
             st = r[f"status_{c}"]
-            cell = _put(wsGrid, row, c0 + k, r[f"eq_{c}"], "0.0", align="center")
+            cell = _put(wsGrid, row, c0 + k, r[f"pct_{c}"], "0.0", align="center")
             if st != "Scored" and sessInfo[c]["marked"]:
                 cell.value = "missing" if st == "No form" else "pending"
                 cell.font = _XlFont(italic=True, color="C00000", size=9)
+            elif st == "Scored" and r.get(f"draft_{c}") is not None and bool(r.get(f"draft_{c}")):
+                cell.font = _XlFont(italic=True, color="7030A0")     # purple italic = assessor draft
             _put(wsGrid, row, c0 + n + k, r[f"gr_{c}"], "0", align="center")
             _put(wsGrid, row, c0 + 2 * n + k, r[f"pr_{c}"], "0", align="center")
         t0 = c0 + 3 * n
-        vals = [r["nScored"], r["meanEq"], r["latestEq"], r["meanZ"], r["zSlope"], r["zChange"], r["selfGap"],
+        vals = [r["nScored"], r["meanPct"], r["latestPct"], r["meanZ"], r["zSlope"], r["zChange"], r["selfGap"],
                 r["flag"], "; ".join(r["reasons"])]
         fmts = ["0", "0.0", "0.0", "+0.00;-0.00", "+0.00;-0.00", "+0.00;-0.00", "+0;-0", None, None]
         for j, (v, fm) in enumerate(zip(vals, fmts)):
@@ -942,7 +1060,7 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         row = 5 + i
         lc = r["latestCode"] if isinstance(r["latestCode"], str) else None   # NaN-safe (pandas ≥ 3)
         vals = [r["flag"], r["lastName"], r["firstName"], r["studentNumber"], r["nScored"], r["meanZ"],
-                r["latestEq"], r["latestGr"], r["latestPr"], "\n".join("• " + x for x in r["reasons"]),
+                r["latestPct"], r["latestGr"], r["latestPr"], "\n".join("• " + x for x in r["reasons"]),
                 r[f"assessorComment_{lc}"] if lc else None]
         fmts = [None, None, None, None, "0", "+0.00;-0.00", "0.0", "0", "0", None, None]
         for j, (v, fm) in enumerate(zip(vals, fmts)):
@@ -958,13 +1076,14 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
 
     # ---------------- Item Pivot (long, one row per student × item) ------------
     _title(wsPiv, "Checklist item by session — every student (filterable)",
-           "Value = item % (level ÷ levels available × 100). Red = bottom level, green = top level. "
-           "Raw level in the right-hand block. Blank = item not assessed / no scored form.")
+           "Value = item % (points ÷ max × 100; S1–S4 lenient, S5+ strict). Red = bottom level, green = top level. "
+           "Points / max in the right-hand block. Blank = item not assessed / no scored form.")
     ph = ["Key", "Last Name", "First Name", "Student No", "Section", "Checklist item"] + labels + \
          [f"Level {sessions[c]['short']}" for c in codes] + ["Items at bottom level"]
     _header(wsPiv, 4, 1, ph)
     ai = itemsDf[itemsDf["side"] == "assessor"] if len(itemsDf) else itemsDf
-    aiIdx = {(r.studentNumber, r.code, r.itemId): (r.pct, r.level, r.denom, r.label) for r in ai.itertuples()}
+    aiIdx = {(r.studentNumber, r.code, r.itemId): (r.pct, r.level, r.denom, r.label, r.points, r.maxPts)
+             for r in ai.itertuples()}
     row = 5
     for r in progDf.to_dict("records"):
         sn = r["studentNumber"]
@@ -976,9 +1095,9 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
             for k, c in enumerate(codes):
                 hit = aiIdx.get((sn, c, itemId))
                 if hit:
-                    pct, lvl, den, olab = hit
+                    pct, lvl, den, olab, pts, mx = hit
                     _put(wsPiv, row, 7 + k, pct, "0", fill=_levelFill(lvl, den), align="center")
-                    cell = _put(wsPiv, row, 7 + n + k, f"{lvl}/{den}", align="center")
+                    cell = _put(wsPiv, row, 7 + n + k, f"{pts:g}/{mx:g}", align="center")
                     bottoms += lvl == 1
                 else:
                     _put(wsPiv, row, 7 + k, None)
@@ -993,8 +1112,76 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
     wsPiv.auto_filter.ref = f"A4:{get_column_letter(7 + 2 * n)}{row - 1}"
     pivLast = row - 1
 
+    # ---------------- Criterion Watch -----------------------------------------
+    watchDf = buildCriterionWatch(progDf, itemsDf, sessions)
+    wcfg = PE_CRITERION_WATCH_CONFIG
+    _title(wsWatch, "Criterion watch — low and not improving, going backwards, or just dropped, per checklist item",
+           f"{stamp} · all values in POINTS on the strict scale (bottom level = 0; 2-level 0/1, 3-level 0/1/2, "
+           f"5-level 0/2/3/4/5) for every session, so lenient and strict sessions compare · "
+           f"low = mean (student − cohort) ≤ −{wcfg['lowFrac']:g}×max · change = (student − cohort) last half of sessions "
+           f"minus first half: stagnant ≤ +{wcfg['stagnantFrac']:g}×max, declining ≤ −{wcfg['declineFrac']:g}×max · "
+           f"latest drop = latest − previous session ≤ −{wcfg['dropPts'][1]} pt (1–2 pt items) / −{wcfg['dropPts'][5]} pts "
+           f"(5 pt items) and now under the cohort · min {wcfg['minSessions']} sessions for trends · repeated bottom = 0 pts ≥{wcfg['bottomMin']}× "
+           f"on a ≥{wcfg['bottomMinLevels']}-level item and not improving")
+    wHdr = ["Flag", "Last Name", "First Name", "Student No", "Section", "Checklist item", "Sessions\nassessed",
+            "Max\npts", "Mean\npts", "Cohort\nmean pts", "vs cohort\n(pts)", "First half\npts", "Last half\npts",
+            "Change vs\ncohort (pts)", "Previous", "Latest", "Latest drop\n(pts)", "Times\nat 0"] + labels
+    nFixed = len(wHdr) - n
+    _header(wsWatch, 4, 1, wHdr)
+    wsWatch.row_dimensions[4].height = 42
+    wFill = {"Low & declining": _RED, "Latest drop": _RED, "Low & stagnant": _AMBER, "Declining": _AMBER,
+             "Repeated bottom": _LIGHT}
+    row = 5
+    for r in (watchDf.to_dict("records") if len(watchDf) else []):
+        vals = [r["flag"], r["lastName"], r["firstName"], r["studentNumber"], r["section"], r["item"],
+                r["nSessions"], r["maxPts"], r["meanPts"], r["cohortPts"], r["vsCohort"], r["firstHalf"],
+                r["lastHalf"], r["change"], r["previous"], r["latest"], r["latestDrop"], r["bottoms"]]
+        fmts = [None, None, None, None, None, None, "0", "0", "0.0", "0.0", "+0.0;-0.0;0", "0.0", "0.0",
+                "+0.0;-0.0;0", None, None, "+0;-0;0", "0"]
+        for j, (v, fm) in enumerate(zip(vals, fmts)):
+            fill = wFill[r["flag"]] if j == 0 else (_RED if j == 16 and r["latestDrop"] <= -wcfg["dropPts"].get(r["maxPts"], 1) else None)
+            _put(wsWatch, row, 1 + j, v, fm, fill=fill, align="center" if j >= 6 else None)
+        for k, c in enumerate(codes):
+            pm = r.get(f"pts_{c}")
+            if isinstance(pm, tuple):
+                _put(wsWatch, row, nFixed + 1 + k, f"{pm[0]}/{pm[1]}", align="center",
+                     fill=_RED if pm[0] == 0 else _GREEN if pm[0] == pm[1] else _AMBER)
+            else:
+                _put(wsWatch, row, nFixed + 1 + k, None)
+        row += 1
+    if row == 5:
+        _put(wsWatch, 5, 1, "No student × criterion meets the watch rules.")
+    _widths(wsWatch, {"A": 16, "B": 16, "C": 16, "D": 11, "E": 18, "F": 24})
+    for k in range(nFixed - 6 + n):
+        wsWatch.column_dimensions[get_column_letter(7 + k)].width = 9
+    wsWatch.freeze_panes = "G5"
+    wsWatch.auto_filter.ref = f"A4:{get_column_letter(nFixed + n)}{max(row - 1, 5)}"
+    # summary: students by number of flagged criteria
+    sc0 = nFixed + n + 2
+    _header(wsWatch, 4, sc0, ["Last Name", "First Name", "Student No", "Low &\ndeclining", "Latest\ndrop",
+                              "Low &\nstagnant", "Declining", "Repeated\nbottom", "Total", "Criteria"])
+    if len(watchDf):
+        summ = (watchDf.groupby(["lastName", "firstName", "studentNumber"])
+                .agg(ld=("flag", lambda x: int((x == "Low & declining").sum())),
+                     dr=("flag", lambda x: int((x == "Latest drop").sum())),
+                     ls=("flag", lambda x: int((x == "Low & stagnant").sum())),
+                     de=("flag", lambda x: int((x == "Declining").sum())),
+                     rb=("flag", lambda x: int((x == "Repeated bottom").sum())),
+                     total=("flag", "size"), items=("item", lambda x: ", ".join(x)))
+                .reset_index().sort_values(["total", "ld", "dr", "ls"], ascending=False))
+        for i, r in enumerate(summ.to_dict("records")):
+            for j, v in enumerate([r["lastName"], r["firstName"], r["studentNumber"], r["ld"], r["dr"], r["ls"],
+                                   r["de"], r["rb"], r["total"], r["items"]]):
+                _put(wsWatch, 5 + i, sc0 + j, v, "0" if 3 <= j <= 8 else None,
+                     fill=_RED if (j == 8 and r["total"] >= 3) else _AMBER if (j == 8 and r["total"] == 2) else None,
+                     align="center" if 3 <= j <= 8 else None, wrap=j == 9)
+    _widths(wsWatch, {get_column_letter(sc0): 16, get_column_letter(sc0 + 1): 16, get_column_letter(sc0 + 2): 11,
+                      get_column_letter(sc0 + 9): 60})
+    for k in range(3, 9):
+        wsWatch.column_dimensions[get_column_letter(sc0 + k)].width = 10
+
     # ---------------- TrackerData (hidden, one row per student) ----------------
-    tdFields = ["eq", "prop", "gr", "pr", "status", "assessor", "assessorComment", "studentComment", "selfEq"]
+    tdFields = ["pct", "gr", "pr", "status", "assessor", "assessorComment", "studentComment", "selfPct"]
     tdHdr = ["Student No", "Display"] + [f"{f}_{c}" for c in codes for f in tdFields]
     for j, h in enumerate(tdHdr):
         wsData.cell(row=1, column=1 + j, value=h)
@@ -1079,15 +1266,15 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
     # block 1: session summary
     r0 = 5
     _header(ws, r0, cn(1), ["", "Session"] + labels)
-    summ = [("Status", "status", None), ("Session % (Equal)", "eq", "0.0"), ("Session % (Prop)", "prop", "0.0"),
-            ("Cohort mean % (Equal)", None, "0.0"), ("Self-assessed %", "selfEq", "0.0"),
+    summ = [("Status", "status", None), ("Session %", "pct", "0.0"),
+            ("Cohort mean %", None, "0.0"), ("Self-assessed %", "selfPct", "0.0"),
             ("Global Rating (1–5)", "gr", "0"), ("Readiness (1–4)", "pr", "0"), ("Assessor", "assessor", None)]
     for i, (lab, fdn, fm) in enumerate(summ):
         rr = r0 + 1 + i
         _put(ws, rr, cn(2), lab, bold=True)
         for k, c in enumerate(codes):
             if fdn is None:
-                v = sessInfo[c]["meanEq"] if sessInfo[c]["marked"] else None
+                v = sessInfo[c]["meanPct"] if sessInfo[c]["marked"] else None
                 _put(ws, rr, cn(3 + k), v, fm, align="center")
                 continue
             col = tdCol[f"{fdn}_{c}"]
@@ -1119,7 +1306,7 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
     itemLast = itemRow0 + len(PE_ITEMS) - 1
     # block 3: raw levels (same layout) → drives red/green
     r2 = itemLast + 2
-    ws.cell(row=r2, column=cn(1), value="Raw level awarded (level / levels available)").font = _XlFont(bold=True, color=NAVY)
+    ws.cell(row=r2, column=cn(1), value="Points awarded (points / max; S1–S4 lenient, S5+ strict)").font = _XlFont(bold=True, color=NAVY)
     _header(ws, r2 + 1, cn(1), ["Item key", "Checklist item"] + labels)
     rawRow0 = r2 + 2
     for i, (itemId, (lab, sec, _)) in enumerate(PE_ITEMS.items()):
@@ -1135,7 +1322,11 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         rng = f"{cl(3)}{blk0}:{cl(2+n)}{blk0 + len(PE_ITEMS) - 1}"
         off = rawRow0 - blk0      # formulas reference the raw block
         tl = f"{cl(3)}{blk0 + off}"
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[f'LEFT({tl},2)="1/"'], fill=_RED))
+        for k, c in enumerate(codes):   # bottom level = "1/" (lenient sessions) or "0/" (strict)
+            colRng = f"{cl(3 + k)}{blk0}:{cl(3 + k)}{blk0 + len(PE_ITEMS) - 1}"
+            tlk = f"{cl(3 + k)}{blk0 + off}"
+            ws.conditional_formatting.add(colRng, FormulaRule(
+                formula=[f'LEFT({tlk},2)="{"1" if c in PE_LENIENT_CODES else "0"}/"'], fill=_RED))
         ws.conditional_formatting.add(rng, FormulaRule(
             formula=[f'AND(LEN({tl})>2,LEFT({tl},FIND("/",{tl}&"/")-1)=MID({tl},FIND("/",{tl}&"/")+1,5))'], fill=_GREEN))
         ws.conditional_formatting.add(rng, FormulaRule(formula=[f'LEN({tl})>2'], fill=_AMBER))
@@ -1206,16 +1397,16 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         wsGd.cell(row=1, column=2 + k, value=lab)
     wsGd.cell(row=2, column=1, value="Cohort mean")
     for k, c in enumerate(codes):
-        wsGd.cell(row=2, column=2 + k, value=round(sessInfo[c]["meanEq"], 1) if sessInfo[c]["marked"] else None)
+        wsGd.cell(row=2, column=2 + k, value=round(sessInfo[c]["meanPct"], 1) if sessInfo[c]["marked"] else None)
     flagLine = {"RED": "C00000", "AMBER": "BF8F00", "": NAVY}
-    _title(wsSc, "All students — session % (Equal) vs cohort mean",
+    _title(wsSc, "All students — weighted session % vs cohort mean",
            f"{stamp} · A–Z, left→right then down · line colour = flag (red RED, amber AMBER, navy none) · "
            "grey dashed = cohort mean · gaps = no scored form")
     for i, r in enumerate(progDf.to_dict("records")):
         gr = 3 + i
         wsGd.cell(row=gr, column=1, value="Student")
         for k, c in enumerate(codes):
-            v = r[f"eq_{c}"]
+            v = r[f"pct_{c}"]
             wsGd.cell(row=gr, column=2 + k, value=None if v is None or (isinstance(v, float) and math.isnan(v)) else round(v, 1))
         ch = _lineChart("", "%")
         ch.height, ch.width = 7.2, 12.5
@@ -1284,7 +1475,7 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         for j, v in enumerate([r["lastName"], r["firstName"], r["studentNumber"]]):
             _put(wsSelf, rr, 1 + j, v)
         for k, c in enumerate(codes):
-            s_, a_ = r[f"selfEq_{c}"], r[f"eq_{c}"]
+            s_, a_ = r[f"selfPct_{c}"], r[f"pct_{c}"]
             gap = (s_ - a_) if (s_ is not None and a_ is not None and not pd.isna(s_) and not pd.isna(a_)) else None
             _put(wsSelf, rr, 4 + k, gap, "+0;-0;0", align="center")
         g = r["selfGap"]
@@ -1354,22 +1545,29 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
     ws = wsRead
     _title(ws, "DDS1 Periodontics (PE) — coordinator progress report", stamp)
     lines = [
-        ("What this is", "Progress of every DDS1 student across the six PE sessions (PE-01 … PE-06), "
+        ("What this is", f"Progress of every DDS1 student across the {n} PE sessions ({codes[0]} … {codes[-1]}), "
                          "from the DASH CAF export. Built by dds1_pe_utils.buildDds1PeProgressReport."),
         ("Sheets", "Overview — per-session completion and cohort means.  Progress Grid — one row per student, "
                    "session %, GR/PR per session, trend and flag.  Flags — students to review with reasons.  "
                    "Student Tracker — click a name in the left-hand list (enable macros) or use the yellow dropdown: item × session table, raw levels, charts, comments.  Student Charts — every student's session % vs cohort mean, A–Z left→right then down.  "
-                   "Item Pivot — every student × checklist item × session (filterable).  Criterion x Session — "
+                   "Item Pivot — every student × checklist item × session (filterable).  Criterion Watch — student × "
+                   "criterion pairs that are low and not improving, declining, or dropped on the latest session (points, strict scale), with a per-student count on the right.  Criterion x Session — "
                    "which skills the cohort is improving on.  Self vs Assessor — calibration.  Adjustments — "
                    "out-of-rubric selections."),
         ("Item scoring", "Level = rank among the criterion's valid options (best = number of levels, worst = 1). "
                          "e.g. Seating /3, Lighting /2, debridement /5, Damage /3 (No/Minor/Major). "
-                         "Item % = level ÷ levels × 100."),
-        ("Session %", "Equal = mean of item %. Proportional = weighted per the marking sheets (PE_SESSIONS). "
+                         f"LENIENT ({', '.join(PE_LENIENT_CODES)}): points = level, item % = level ÷ levels × 100. "
+                         "STRICT (all later sessions): worst level scores 0 — 0/1, 0/1/2 for ≤3 levels, "
+                         "0/2/3/4/5 for 5 levels; item % = points ÷ max × 100."),
+        ("Session %", "Weighted: sum(points ÷ max × weight) ÷ sum(weights of answered items) × 100, weights from the "
+                      "Weighting sheet of DDS1 Perio DASH Forms.xlsx (same calculation as the student reports). "
                       "S1 excludes Cheek retraction; S2 scores ergonomics + instrument handling only; "
                       "S3 is scaling + damage only."),
         ("Only scored forms", "A session counts for a student only when the assessor has submitted the form. "
-                              "'pending' = student submitted, assessor has not; 'missing' = no form."),
+                              "'pending' = student submitted, assessor has not; 'missing' = no form. "
+                              "Exception: " + (", ".join(c for c in codes if sessions[c].get("includeDrafts")) or "none")
+                              + " also scores the assessor's saved but UNSUBMITTED answers (drafts, purple italic "
+                              "on Progress Grid) — these may still change."),
         ("Trend", "Sessions differ in content and difficulty (S3 practice test mean ≈59%), so trends use the "
                   "within-session z-score (student % vs that session's cohort). Trend = slope of z across "
                   "scored sessions; Change = latest z − mean of earlier z."),
@@ -1385,7 +1583,8 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         ("Marked session", f"A session is 'marked' once ≥{int(PE_MARKED_MIN_FRACTION*100)}% of the roster has a "
                            "scored form. Missing forms are not flagged before then."),
         ("Assumption", "PE-06 (Preclinical test) had no marking sheet — scored with the S4/S5 items and weights. "
-                       "Change PE_SESSIONS['PE-06'] if the test uses a different scheme."),
+                       "Change PE_SESSIONS['PE-06'] if the test uses a different scheme. PE-07 … PE-09 "
+                       "proportional weights = Weighting sheet of DDS1 Perio DASH Forms.xlsx."),
         ("Data", f"Roster {len(progDf)} students · {len(formsDf)} student×session forms · "
                  f"{len(dupDf)} duplicate forms ignored (assessor-submitted/latest kept) · "
                  f"{len(adjustDf)} out-of-rubric selections."),
@@ -1424,7 +1623,7 @@ def buildDds1PeProgressReport(jsonPath="temp 2026 caf.json",
         print(f"  roster {len(progDf)} · flags RED {cnt.get('RED', 0)} · AMBER {cnt.get('AMBER', 0)}")
         print(validatePeScoring(formsDf).to_string(index=False))
     return dict(roster=roster, formsDf=formsDf, itemsDf=itemsDf, adjustDf=adjustDf, dupDf=dupDf,
-                sessDf=sessDf, progDf=progDf)
+                sessDf=sessDf, progDf=progDf, watchDf=watchDf)
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -4,8 +4,23 @@ DASH · CBD (Case Based Discussion) Dashboard — Gradio App
 ──────────────────────────────────────────────────────────
 Mirrors viva_gradio.py for the DDS4 CBD exam (form keys d1-dds4 … d6-dds4).
 Install:  pip install gradio requests pandas python-dotenv openpyxl
-Run:      python cbd_gradio.py
-Opens at: http://localhost:7861   (viva/SCBD use 7860)
+Run:      python cbd_gradio_new.py
+Opens at: http://localhost:7862   (test copy of cbd_gradio.py)
+Changes vs cbd_gradio.py:
+  1. Shared server-side cache: DASH is hit at most once per CACHE_TTL for ALL tabs; cohort switch is in-memory;
+     timer ticks send nothing when the data hash is unchanged; demo.queue(default_concurrency_limit=5).
+  2. Full-form HTML is no longer embedded per row; the eye button sends the record id and the form is built on demand.
+  3. API page_size = 200 (paginated via 'next').
+  4. Overall % mode (SCORING_MODE): 'raw' Σscore/Σmax (default) | 'domain' equal-weighted domains | 'item' equal-weighted items.
+  5. Missing-domain check: amber where a domain is not in the form's checklists at all
+     (blank answers are left as normal blank cells). Shown in table, stats card, form modal and exports.
+  6. Form status: Submitted / In progress (any item scored OR any comment / GR / CC filled) / Not started.
+     Default sort groups them in that order (newest first within each), with divider rows and an x/y progress badge.
+  7. MC scoring by LABEL (Done Well 4 … Not Done 0) regardless of rubric slot; slot only for custom labels (Yes/No).
+  8. Manual overrides (cbd_overrides.json, re-read live — no restart): % penalties per student or form, shown in
+     the table/form view and as Excel cell comments on Total and Overall %. Standard setting uses pre-penalty %.
+  9. ignoreAssessors (cbd_overrides.json): their forms leave the main Excel score sheet + cut-score analysis and go
+     to a separate 'Ignored Assessors' sheet. The dashboard table is unchanged.
 """
 import os
 import json
@@ -21,10 +36,22 @@ from dotenv import load_dotenv
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import ScatterChart, BarChart, Reference, Series
+from openpyxl.chart.trendline import Trendline
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.marker import DataPoint
+import math
+try:                                     # optional: exact t-distribution p-values / CIs
+    from scipy import stats as spStats
+except Exception:
+    spStats = None
 
 import cbd_gradio_utils as cgu
 from cbd_gradio_utils import *
 from pyngrok import ngrok
+import threading, time, hashlib, re
+from openpyxl.comments import Comment as XlComment
 
 # ── .env (file values win over stale shell vars) ─────────────────────────────
 ENV_PATH = Path(cgu.__file__).with_name(".env")
@@ -50,10 +77,41 @@ ENV_TOKEN     = ENV_FILE.get("DASH_TOKEN")    or os.getenv("DASH_TOKEN", "")
 LOGIN_USER    = ENV_FILE.get("CBD_USERNAME")  or os.getenv("CBD_USERNAME", "")   # app login gate (blank = no login)
 LOGIN_PASS    = ENV_FILE.get("CBD_PASSWORD")  or os.getenv("CBD_PASSWORD", "")
 
-APP_BUILD = "build 20261103"
+APP_BUILD = "build 20261104g-new"
 print(f"[CBD] Gradio {gr.__version__} · {APP_BUILD} · env={ENV_PATH} (exists={ENV_PATH.exists()})", flush=True)
 
 TOKEN_CACHE = {"token": None}
+
+PAGE_SIZE = 200          # API page size (pagination follows "next")
+CACHE_TTL = 30           # seconds; max age of the shared data cache before DASH is called again
+NEW_PORT  = 7862         # separate port so it can run beside the live cbd_gradio.py
+USE_NGROK = True        # live app owns the ngrok domain; set True only when this replaces it
+CONCURRENCY = 5          # parallel runs allowed per event handler (Gradio default is 1)
+
+# Overall % mode:
+#   "raw"    → Σ item points ÷ Σ item maxima (every point counts equally; domains with more/bigger items weigh more)
+#   "domain" → mean of domain % (each domain 1/6 of the total, however many items it has)
+#   "item"   → mean of item % (each item score ÷ its own max; every item counts equally)
+SCORING_MODE = "raw"
+DOMAIN_WEIGHTS = {d: 1 / len(DOMAIN_ORDER) for d in DOMAIN_ORDER} if SCORING_MODE == "domain" else None
+MISSING_DOMAIN_AS_ZERO = True   # "domain" mode only — True: domain not in form scores 0% (keeps its 1/6); False: re-weight over present domains
+# Manual overrides file (edit while running; picked up on the next refresh)
+OVERRIDES_PATH = Path(cgu.__file__).with_name("cbd_overrides.json")
+
+SCORING_MODE_TEXT = {"raw": "Raw total (Σ points ÷ Σ max)", "domain": "Equal-weighted domains (each 1/6)",
+                     "item": "Equal-weighted items (mean of item %)"}[SCORING_MODE]
+EXPORT_COLUMNS = list(EXPORT_COLUMNS) + ["Missing Domains"]
+CARD_LABELS = list(CARD_LABELS) + ["Domain not in form", "In progress"]
+EXPORT_COLUMNS = EXPORT_COLUMNS + ["Status", "Items scored", "Overall % before override", "Override"]
+
+# Form status (default sort): submitted → in progress → not started
+STATUS_RANK = {"Submitted": 0, "In progress": 1, "Not started": 2}
+STATUS_SORT = "Status: submitted → in progress → not started"
+SORT_OPTIONS = {STATUS_SORT: ("_status", False),
+                **{k: v for k, v in SORT_OPTIONS.items() if k != "Submitted first"}}   # old Yes/No-only sort replaced
+DEFAULT_SORT = STATUS_SORT
+SHOW_GROUP_DIVIDERS = True      # "SUBMITTED (n)" / "IN PROGRESS (n)" header rows under the status sort
+TABLE_COLS = {**TABLE_COLS, "Submitted": {**TABLE_COLS.get("Submitted", {}), "width": 74}}   # room for the x/y badge
 
 
 def getToken(force: bool = False) -> str:
@@ -81,7 +139,7 @@ def setInterval(choice):
 # ── API layer ────────────────────────────────────────────────────────────────
 def fetchAll(token: str, cohorts: list, year: str) -> list:
     """GET /assessment/cbd/get with pagination (DRF Token auth)."""
-    params = urlencode({"page_size": "max", "page": 1, "cohort": ",".join(cohorts),
+    params = urlencode({"page_size": PAGE_SIZE, "page": 1, "cohort": ",".join(cohorts),
                         "year": year, "ordering": "id"})
     url, headers, records = f"{API_BASE}/assessment/{ASSESS_TYPE}/get?{params}", {"Authorization": f"Token {token}"}, []
     while url:
@@ -118,16 +176,21 @@ def optionScore(oKey: str) -> int:
     return N_LEVELS - int(oKey[1:])
 
 
+def labelScore(oKey: str, label: str) -> int:
+    """Standard label → fixed points by NAME (Done Well 4 … Not Done 0), whatever slot it sits in; custom label (Yes/No) → by slot."""
+    return MC_SCORE.get(label.strip().lower(), optionScore(oKey))
+
+
 def scoreItem(value: str, rubricItem: dict):
-    """(score, max) for one MC; uses rubric option positions, falls back to MC_SCORE."""
+    """(score, max) for one MC; scored by label (slot only for custom labels), max = best enabled option."""
     opts = {k: (v or "").strip() for k, v in (rubricItem or {}).items() if k.startswith("O")}
-    enabled = [k for k, v in opts.items() if v]
-    itemMax = max((optionScore(k) for k in enabled), default=max(MC_SCORE.values()))
+    enabled = {k: v for k, v in opts.items() if v}                                  # options shown on the form
+    itemMax = max((labelScore(k, v) for k, v in enabled.items()), default=max(MC_SCORE.values()))
     if not value:
         return None, itemMax
     v = value.strip().lower()
-    hit = next((k for k in enabled if opts[k].lower() == v), None)
-    return (optionScore(hit) if hit else MC_SCORE.get(v)), itemMax
+    hit = next((k for k, lbl in enabled.items() if lbl.lower() == v), None)        # answer matches an option label
+    return (labelScore(hit, enabled[hit]) if hit else MC_SCORE.get(v)), itemMax
 
 
 def scoreDomain(answers: dict, clMeta: dict) -> dict:
@@ -145,12 +208,18 @@ def scoreDomain(answers: dict, clMeta: dict) -> dict:
 
 
 def overallPct(ds: dict):
-    """Unweighted Σraw/Σmax, or Σw·(raw/max) when DOMAIN_WEIGHTS set."""
+    """Overall % per SCORING_MODE: raw Σscore/Σmax | domain-weighted | item-normalised."""
     if not ds:
         return None
-    if DOMAIN_WEIGHTS:
-        return 100 * sum(w * ds[d]["score"] / ds[d]["max"] for d, w in DOMAIN_WEIGHTS.items()
-                         if d in ds and ds[d]["max"])
+    if SCORING_MODE == "item":                                       # each item scaled to its own max, then averaged
+        fracs = [(sc or 0) / mx for v in ds.values() for sc, mx in v["perItem"].values() if mx]
+        return 100 * sum(fracs) / len(fracs) if fracs else None
+    if SCORING_MODE == "domain" and DOMAIN_WEIGHTS:
+        present = {d: w for d, w in DOMAIN_WEIGHTS.items() if d in ds and ds[d]["max"]}
+        wSum = sum(DOMAIN_WEIGHTS.values()) if MISSING_DOMAIN_AS_ZERO else sum(present.values())
+        if not wSum:
+            return None
+        return 100 * sum(w * ds[d]["score"] / ds[d]["max"] for d, w in present.items()) / wSum
     tot, mx = sum(v["score"] for v in ds.values()), sum(v["max"] for v in ds.values())
     return 100 * tot / mx if mx else None
 
@@ -206,9 +275,24 @@ def parseRecords(raw: list) -> list:
         ds = {d: scoreDomain(ad[d], cl.get(d) or {}) for d in DOMAIN_ORDER if isinstance(ad.get(d), dict)}
         pct = overallPct(ds)
         cc = (ad.get("critical_concerns") or "").strip()
+        # Missing-domain check: whole domain absent (not just blank answers)
+        missing = [d for d in DOMAIN_ORDER if d not in cl]   # domain absent from the form's checklists (form built without it)
+        # Form status: scoring check + comment check (assessors often write comments before scoring)
+        scored = sum(v["answered"] for v in ds.values())                  # MC items with an answer (counted in scoreDomain)
+        items = sum(len((cl.get(d) or {}).get("fields") or {}) or (ds[d]["n"] if d in ds else 0)
+                    for d in DOMAIN_ORDER if d in cl)                     # MC items on the form (from its checklists, even if unanswered)
+        hasComments = any(isinstance(v, str) and v.strip()                # any *comments field: general, dN_comments, CC comments
+                          for k, v in ad.items() if k.endswith("comments"))
+        hasOther = grInt is not None or bool(cc)                          # GR or critical-concerns answer picked
+        if r.get("submitted"):
+            status = "Submitted"
+        elif scored or hasComments or hasOther:
+            status = "In progress"
+        else:
+            status = "Not started"
 
         rows.append({
-            "_ts": ts, "_ad": ad, "_checklists": cl, "_domain_scores": ds,
+            "_ts": ts, "_id": r.get("id"), "_missing": missing, "_scored": scored, "_items": items, "_hasComments": hasComments, "_stateRank": STATUS_RANK[status], "_ad": ad, "_checklists": cl, "_domain_scores": ds,
             "Date":      dtDisplay,
             "Student":   student,
             "Assessor":  (r.get("assessor") or "—").strip() or "—",
@@ -225,6 +309,8 @@ def parseRecords(raw: list) -> list:
             "CC_int":    1 if cc.lower() == "yes" else 0,
             "Submitted": "Yes" if r.get("submitted") else "No",
             "Comments":  buildCombinedComments(ad),
+            "Missing":   ", ".join(DOMAIN_LABELS[d] for d in missing) or "—",
+            "Status":    status,
         })
     return rows
 
@@ -256,6 +342,9 @@ def applyFilters(rows, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search,
         out = [r for r in out if any(q in (r.get(k) or "").lower()
                                      for k in ["Student", "Assessor", "Examiner2", "Cohort", "Subject", "Comments"])]
     col, desc = SORT_OPTIONS.get(sortOpt, ("_ts", True))
+    if col == "_status":                                   # status group, then newest first within the group
+        out.sort(key=lambda r: (r["_stateRank"], -r["_ts"]))
+        return out
     num = col in ("_ts", "GR_int", "Pct", "CC_int")
     out.sort(key=lambda r: float(r.get(col) or 0) if num else (r.get(col) or "").lower(), reverse=desc)
     return out
@@ -270,7 +359,10 @@ def makeDf(rows: list) -> pd.DataFrame:
                "Examiner 2": r["Examiner2"], "Cohort": r["Cohort"], "Subject": r["Subject"], "GR": r["GR"],
                "Total": r["Total"] if r["Total"] is not None else "", "Max": r["Max"] or "",
                "Overall %": r["Pct"] if r["Pct"] >= 0 else "", "Critical Concerns": r["CC"],
-               "Submitted": r["Submitted"], "Comments": r["Comments"]}
+               "Submitted": r["Submitted"], "Comments": r["Comments"], "Missing Domains": r["Missing"],
+               "Status": r["Status"], "Items scored": f'{r["_scored"]}/{r["_items"]}' if r["_items"] else "",
+               "Overall % before override": r.get("_pctBase", r["Pct"]) if r.get("_pctBase", r["Pct"]) >= 0 else "",
+               "Override": r.get("_overrideNote", "")}
         for d, lbl in DOMAIN_LABELS.items():
             rec[lbl] = ds[d]["score"] if d in ds else ""
         recs.append(rec)
@@ -293,6 +385,7 @@ def buildStatsHtml(rows):
     grV = [r["GR_int"] for r in sub if r["GR_int"] > 0]
     pcV = [r["Pct"] for r in sub if r["Pct"] >= 0]
     nCC = sum(r["CC_int"] for r in rows)
+    nMiss = sum(1 for r in rows if r["_missing"])
     cards = [
         statCard("Total records", len(rows)),
         statCard("Submitted", f"{len(sub)} ({round(100*len(sub)/len(rows))}%)", "#15803d"),
@@ -301,6 +394,8 @@ def buildStatsHtml(rows):
         statCard("Critical concerns", nCC, "#dc2626" if nCC else "#0f172a"),
         statCard("Unique students", len({r["Student"] for r in rows})),
         statCard("Assessors active", len({r["Assessor"] for r in rows if r["Assessor"] != "—"})),
+        statCard("Domain not in form", nMiss, "#d97706" if nMiss else "#0f172a"),
+        statCard("In progress", sum(r["Status"] == "In progress" for r in rows), "#d97706"),
     ]
     return f'<div style="{CARD_WRAP}">' + "".join(cards) + "</div>"
 
@@ -312,15 +407,20 @@ def pctColor(p):
 
 # ── Full form modal ──────────────────────────────────────────────────────────
 def buildFormHtml(row: dict) -> str:
-    """Full-form HTML for the View modal; " → &quot; for the data-html attribute, user text double-encoded."""
+    """Full-form HTML for the View modal (built on demand, inserted via innerHTML → single-escaped)."""
     def e(s):
-        return str(s or "").replace("&", "&amp;amp;").replace("<", "&amp;lt;").replace(">", "&amp;gt;")
+        return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     ad, cl, ds = row["_ad"], row["_checklists"], row["_domain_scores"]
     grInt = row["GR_int"]
     grColor = GR_COLORS[grInt] if 1 <= grInt <= 5 else "#64748b"
     subColor = "#15803d" if row["Submitted"] == "Yes" else "#94a3b8"
     pctTxt = f'{row["Pct"]}%' if row["Pct"] >= 0 else "—"
+    if row.get("_penalty"):
+        pctTxt += f' after −{row["_penalty"]:g} penalty, was {row["_pctBase"]}%'   # e.g. "62.0% after −10 penalty, was 72.0%"
+    statusTxt = row["Status"] if row["Status"] == "Submitted" else (                       # e.g. "In progress (13/28 items scored, comments started)"
+        f'{row["Status"]} ({row["_scored"]}/{row["_items"]} items scored'
+        + (", comments started" if row["_hasComments"] else "") + ")")
     p = [
         f'<div style="margin-bottom:20px;padding-bottom:14px;border-bottom:2px solid #e2e8f0;">'
         f'<div style="font-size:15px;font-weight:700;color:{NAVY};margin-bottom:8px;">'
@@ -329,11 +429,17 @@ def buildFormHtml(row: dict) -> str:
         f'<div><span style="color:#64748b;">Student:</span> <b>{e(row["Student"])}</b></div>'
         f'<div><span style="color:#64748b;">Assessor:</span> {e(row["Assessor"])}</div>'
         f'<div><span style="color:#64748b;">Examiner 2:</span> {e(row["Examiner2"])}</div>'
-        f'<div><span style="color:#64748b;">Submitted:</span> <span style="color:{subColor};font-weight:600;">{e(row["Submitted"])}</span></div>'
+        f'<div><span style="color:#64748b;">Status:</span> <span style="color:{subColor};font-weight:600;">{e(statusTxt)}</span></div>'
         f'<div><span style="color:#64748b;">GR:</span> <b style="color:{grColor};">{e(row["GR"])} — {e(row["GR_label"])}</b></div>'
         f'<div><span style="color:#64748b;">Overall:</span> <b>{e(row["Total"] if row["Total"] is not None else "—")}/{e(row["Max"] or "—")} ({pctTxt})</b></div>'
         f'</div></div>'
     ]
+    if row["_missing"]:
+        p.append(f'<div style="margin-bottom:16px;padding:9px 12px;border:1px solid #fcd34d;border-radius:6px;background:#fffbeb;'
+                 f'color:#b45309;font-size:12px;"><b>&#9888; Domain(s) not in this form:</b> {e(row["Missing"])}</div>')
+    if row.get("_overrideNote"):
+        p.append(f'<div style="margin-bottom:16px;padding:9px 12px;border:1px solid #fecaca;border-radius:6px;background:#fff5f5;'
+                 f'color:#b91c1c;font-size:12px;"><b>Override:</b> {e(row["_overrideNote"])}</div>')
     for d in DOMAIN_ORDER:
         info = ds.get(d)
         if not info:
@@ -372,10 +478,41 @@ def buildFormHtml(row: dict) -> str:
              f'<div style="font-weight:600;color:#334155;font-size:11px;text-transform:uppercase;letter-spacing:.4px;'
              f'margin-bottom:4px;">Additional Comments</div>'
              f'<div style="font-size:12px;color:#475569;">{e(gen) if gen else "<i>None provided</i>"}</div></div>')
-    return "".join(p).replace('"', "&quot;")
+    return "".join(p)
 
 
 # Self-contained onclick handler; modal lives on document.body so it survives table re-renders
+FORM_JS = """
+<script>
+function showFormModal(html){                       // builds the modal once on <body>, then fills it
+  var m=document.getElementById('_cfm');
+  if(!m){
+    m=document.createElement('div');m.id='_cfm';
+    m.style.cssText='display:none;position:fixed;inset:0;background:rgba(1,13,68,.45);z-index:9999;align-items:center;justify-content:center';
+    var w=document.createElement('div');
+    w.style.cssText='background:#fff;border-radius:10px;max-width:860px;width:95%;max-height:88vh;overflow-y:auto;padding:28px 32px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.3)';
+    var x=document.createElement('button');x.textContent='\\u2715';
+    x.style.cssText='position:absolute;top:12px;right:14px;background:none;border:1px solid #e2e8f0;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:13px;color:#64748b';
+    x.onclick=function(){m.style.display='none'};
+    var b=document.createElement('div');b.id='_cfb';
+    w.appendChild(x);w.appendChild(b);m.appendChild(w);
+    m.onclick=function(e){if(e.target===m)m.style.display='none'};
+    document.addEventListener('keydown',function(e){if(e.key==='Escape')m.style.display='none'});
+    document.body.appendChild(m);
+  }
+  document.getElementById('_cfb').innerHTML=html;m.style.display='flex';
+}
+function openForm(id){                              // eye click → send "id|nonce" to Python via hidden textbox
+  var box=document.querySelector('#form-req textarea, #form-req input');
+  if(!box){console.warn('[CBD] #form-req not found');return;}
+  box.value=id+'|'+Date.now();                      // nonce: re-clicking the same row still fires
+  box.dispatchEvent(new Event('input',{bubbles:true}));
+  showFormModal('<div style="padding:40px;text-align:center;color:#94a3b8;">Loading form…</div>');
+}
+</script>
+"""
+
+# (legacy inline handler, unused in this file)
 FORM_MODAL_HANDLER = (
     "(function(el){var m=document.getElementById('_cfm');if(!m){"
     "m=document.createElement('div');m.id='_cfm';"
@@ -419,7 +556,7 @@ COMMENT_MODAL_HANDLER = (
 
 
 # ── Table ────────────────────────────────────────────────────────────────────
-def makeTableHtml(rows: list) -> str:
+def makeTableHtml(rows: list, grouped: bool = False) -> str:
     """Styled HTML table driven by TABLE_COLS."""
     if not rows:
         return ('<div style="text-align:center;padding:60px 0;color:#94a3b8;"><p style="font-size:14px;">'
@@ -451,7 +588,7 @@ def makeTableHtml(rows: list) -> str:
             return '<span title="Critical concerns: Yes" style="background:#fee2e2;color:#dc2626;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:700;">⚠</span>'
         return '<span style="color:#94a3b8;font-size:11px;">No</span>' if r["CC"] != "—" else dash
 
-    def domainCell(ds, d):
+    def domainCell(ds, d, r=None):
         info = ds.get(d)
         if not info:
             return dash
@@ -488,14 +625,21 @@ def makeTableHtml(rows: list) -> str:
         lbl = DOMAIN_LABELS[d]
         addCol(lbl, f'<th style="{TH}text-align:center;" title="{d}">{lbl}</th>')
     addCol("Total",     f'<th style="{TH}text-align:center;">Total</th>')
-    addCol("Pct",       f'<th style="{TH}text-align:center;" title="{"Weighted" if DOMAIN_WEIGHTS else "Unweighted"} overall %">%</th>')
+    addCol("Pct",       f'<th style="{TH}text-align:center;" title="Overall % — {SCORING_MODE_TEXT}">%</th>')
     addCol("CC",        f'<th style="{TH}text-align:center;" title="Critical concerns">CC</th>')
-    addCol("Submitted", f'<th style="{TH}text-align:center;">Sub</th>')
+    addCol("Submitted", f'<th style="{TH}text-align:center;" title="Submitted / in progress (items scored) / not started">Status</th>')
     addCol("View",      f'<th style="{TH}text-align:center;" title="Full form view">&#128065;</th>')
     addCol("Comments",  f'<th style="{TH}">Comments</th>')
 
     body = []
+    groupN = {s_: sum(1 for x in rows if x["Status"] == s_) for s_ in STATUS_RANK} if grouped else {}
+    lastStatus = None
     for i, r in enumerate(rows[:MAX_ROWS]):
+        if grouped and SHOW_GROUP_DIVIDERS and r["Status"] != lastStatus:   # group header row
+            lastStatus = r["Status"]
+            body.append(f'<tr><td colspan="{len(cols)}" style="background:#eef2ff;color:{NAVY};font-weight:700;font-size:11px;'
+                        f'letter-spacing:.4px;text-transform:uppercase;padding:5px 10px;border-bottom:1px solid #c7d2fe;">'
+                        f'{lastStatus} ({groupN[lastStatus]})</td></tr>')
         bg = "#fff5f5" if r["CC_int"] else ("#ffffff" if i % 2 == 0 else "#f8fafc")
         ds, t = r["_domain_scores"], []
         if on("Date"):      t.append(f'<td style="{TD}color:#64748b;white-space:nowrap;">{r["Date"]}</td>')
@@ -506,7 +650,8 @@ def makeTableHtml(rows: list) -> str:
         if on("GR"):        t.append(f'<td style="{TD}text-align:center;">{grBadge(r["GR"])}</td>')
         for d in DOMAIN_ORDER:
             if on(DOMAIN_LABELS[d]):
-                t.append(f'<td style="{TD}text-align:center;">{domainCell(ds, d)}</td>')
+                t.append(f'<td style="{TD}text-align:center;background:#fef3c7;" title="Domain not in this form">{dash}</td>'
+                         if d in r["_missing"] else f'<td style="{TD}text-align:center;">{domainCell(ds, d, r)}</td>')
         if on("Total"):
             t.append(f'<td style="{TD}text-align:center;">' + (
                 f'<span style="font-weight:700;">{r["Total"]}</span><span style="color:#94a3b8;font-size:10px;">/{r["Max"]}</span>'
@@ -514,15 +659,22 @@ def makeTableHtml(rows: list) -> str:
         if on("Pct"):
             t.append(f'<td style="{TD}text-align:center;">' + (
                 f'<span style="font-weight:700;color:{pctColor(r["Pct"])};">{r["Pct"]:.0f}%</span>'
+                + (f'<sup title="{r["_overrideNote"].replace(chr(34), "&quot;")}" style="color:#dc2626;font-weight:700;'
+                   f'font-size:9px;margin-left:2px;cursor:help;">−{r["_penalty"]:g}</sup>' if r.get("_penalty") else "")
                 if r["Pct"] >= 0 else dash) + "</td>")
         if on("CC"):        t.append(f'<td style="{TD}text-align:center;">{ccCell(r)}</td>')
         if on("Submitted"):
             t.append(f'<td style="{TD}text-align:center;">' + (
                 '<span style="color:#15803d;font-weight:600;">✓</span>' if r["Submitted"] == "Yes"
+                else (f'<span title="In progress: {r["_scored"]} of {r["_items"]} items scored'
+                      f'{", comments started" if r["_hasComments"] else ""}" style="background:#fef3c7;color:#b45309;'
+                      f'font-weight:600;font-size:10px;padding:1px 5px;border-radius:4px;white-space:nowrap;">'
+                      f'{r["_scored"]}/{r["_items"]}{" ✎" if r["_hasComments"] else ""}</span>')
+                if r["Status"] == "In progress"
                 else '<span style="color:#94a3b8;">✗</span>') + "</td>")
         if on("View"):
-            t.append(f'<td style="{TD}text-align:center;padding:4px 6px;"><span onclick="{FORM_MODAL_HANDLER}" '
-                     f'data-html="{buildFormHtml(r)}" title="View full form" style="cursor:pointer;font-size:13px;'
+            t.append(f'<td style="{TD}text-align:center;padding:4px 6px;"><span onclick="openForm(&#39;{r["_id"]}&#39;)" '
+                     f'title="View full form" style="cursor:pointer;font-size:13px;'
                      f'color:#6366f1;display:inline-block;padding:2px 5px;border-radius:4px;border:1px solid #e0e7ff;'
                      f'background:#eef2ff;">&#128065;</span></td>')
         if on("Comments"):  t.append(f'<td style="{TD}vertical-align:top;padding-top:6px;">{commentsCell(r["Comments"])}</td>')
@@ -536,40 +688,646 @@ def makeTableHtml(rows: list) -> str:
 
 
 # ── Event handlers ───────────────────────────────────────────────────────────
+# ── Shared data cache (one DASH pull per CACHE_TTL for every tab) ───────────
+dataCache = {"rows": [], "hash": None, "version": 0, "fetchedAt": 0.0, "error": ""}
+cacheLock = threading.Lock()                      # concurrent requests wait for one fetch instead of duplicating it
+NO_CHANGE = gr.skip() if hasattr(gr, "skip") else gr.update()
+
+
+def httpErrorMsg(e) -> str:
+    """HTTPError → friendly message."""
+    code = e.response.status_code if e.response is not None else "?"
+    return {401: "❌ Unauthorised — check DASH credentials",
+            403: "❌ Forbidden — account may lack CBD permissions",
+            404: f"❌ 404 — endpoint /assessment/{ASSESS_TYPE}/get not found"}.get(code, f"❌ HTTP {code} from API")
+
+
+# ── Manual overrides (cbd_overrides.json) ───────────────────────────────────
+overrideState = {"mtime": None, "items": [], "ignoreAssessors": set(), "error": ""}
+
+
+def normName(s: str) -> str:
+    """Case/space-insensitive name key; drops nicknames in brackets, e.g. 'Yue Heng Xu (Kevin)' → 'yue heng xu'."""
+    return " ".join(re.sub(r"\(.*?\)", " ", s or "").lower().split())
+
+
+def loadOverrides() -> bool:
+    """Re-read the overrides file only when its modified time changes; True if (re)loaded."""
+    try:
+        mt = OVERRIDES_PATH.stat().st_mtime
+    except FileNotFoundError:
+        mt = None
+    if mt == overrideState["mtime"]:
+        return False
+    overrideState["mtime"] = mt
+    try:
+        cfg = json.load(open(OVERRIDES_PATH, encoding="utf-8")) if mt else {}
+        items = cfg.get("overrides", [])
+        overrideState.update(items=[o for o in items if isinstance(o, dict)],
+                             ignoreAssessors={normName(a) for a in cfg.get("ignoreAssessors", []) if a}, error="")
+    except Exception as e:                                      # bad JSON → keep last good overrides, show error
+        overrideState["error"] = f"❌ cbd_overrides.json not applied ({e}) — previous overrides kept"
+    print(f"[CBD-new] overrides loaded: {len(overrideState['items'])} {overrideState['error']}", flush=True)
+    return True
+
+
+def overrideMatches(o: dict, r: dict) -> bool:
+    """Override targets a row by student name and/or formId (both must match when both given)."""
+    hasStudent, hasForm = bool(o.get("student")), o.get("formId") not in (None, "")
+    if not (hasStudent or hasForm):
+        return False
+    if hasForm and str(o["formId"]) != str(r["_id"]):
+        return False
+    return not hasStudent or normName(o["student"]) == normName(r["Student"])
+
+
+def applyOverrides(rows: list) -> list:
+    """Reset each row to its computed % then apply penalties (idempotent); returns unmatched override labels."""
+    used = set()
+    for r in rows:
+        r.setdefault("_pctBase", r["Pct"])                       # % before any override
+        r["Pct"], r["_penalty"], r["_overrideNote"] = r["_pctBase"], 0.0, ""
+        notes = []
+        for i, o in enumerate(overrideState["items"]):
+            if not overrideMatches(o, r):
+                continue
+            used.add(i)
+            pen = float(o.get("penaltyPct") or 0)
+            if r["_pctBase"] < 0 or not pen:
+                continue
+            relative = str(o.get("method", "absolute")).strip().lower() == "relative"   # default: absolute (subtract % points); "points" = alias
+            r["Pct"] = round(max(0.0, r["Pct"] * (1 - pen / 100) if relative else r["Pct"] - pen), 1)
+            r["_penalty"] += pen
+            notes.append(f'−{pen:g}{"% of score" if relative else " percentage points"}'
+                         f'{" — " + o["reason"] if o.get("reason") else ""}'
+                         f'{" (by " + o["by"] + ")" if o.get("by") else ""}')
+        if notes:
+            r["_overrideNote"] = (f'Manual override: {"; ".join(notes)}. '
+                                  f'Overall % {r["_pctBase"]}% → {r["Pct"]}%. Raw total unchanged.')
+    seenAssessors = {normName(r["Assessor"]) for r in rows}
+    return ([o.get("student") or f'form {o.get("formId")}' for i, o in enumerate(overrideState["items"]) if i not in used]
+            + [f"assessor '{a}'" for a in sorted(overrideState["ignoreAssessors"] - seenAssessors)])
+
+
+def isIgnoredAssessor(r: dict) -> bool:
+    """Form by an assessor listed in ignoreAssessors (Excel exports only)."""
+    return normName(r["Assessor"]) in overrideState["ignoreAssessors"]
+
+
+def getCachedRows(force: bool = False):
+    """Parsed rows for ALL cohorts; refetch only when stale/forced; re-parse only when the payload hash changes."""
+    with cacheLock:
+        if force or time.time() - dataCache["fetchedAt"] >= CACHE_TTL:
+            t0 = time.time()
+            try:
+                raw = loadRaw(ALL_COHORTS)
+                h = hashlib.md5(json.dumps(raw, sort_keys=True, default=str).encode()).hexdigest()
+                if h != dataCache["hash"]:
+                    dataCache.update(rows=parseRecords(raw), hash=h, version=dataCache["version"] + 1)
+                    dataCache["needOverrides"] = True
+                dataCache["error"] = ""
+            except requests.HTTPError as e:
+                dataCache["error"] = httpErrorMsg(e)
+            except Exception as e:
+                dataCache["error"] = f"❌ Load error: {e}"
+            if dataCache["error"] and dataCache["rows"]:
+                dataCache["error"] += " (showing last good data)"
+            dataCache["fetchedAt"] = time.time()      # set on failure too → no hammering a failing API
+            print(f"[CBD-new] refresh {time.time() - t0:.2f}s v{dataCache['version']} "
+                  f"rows={len(dataCache['rows'])} {dataCache['error']}", flush=True)
+        if loadOverrides() or dataCache.pop("needOverrides", False):    # overrides file edited, or new data
+            dataCache["unmatched"] = applyOverrides(dataCache["rows"])
+            dataCache["version"] += 1                                     # tabs re-render on next tick
+        msgs = [dataCache["error"], overrideState["error"]]
+        if dataCache.get("unmatched"):
+            msgs.append("⚠ Override not matched: " + ", ".join(dataCache["unmatched"]))
+        return dataCache["rows"], dataCache["version"], " · ".join(m for m in msgs if m)
+
+
+def asOfText() -> str:
+    src = " (local JSON)" if LOCAL_JSON else ""
+    fa = datetime.fromtimestamp(dataCache["fetchedAt"]) if dataCache["fetchedAt"] else datetime.now()
+    return f"*Data as of {fa:%H:%M:%S}{src}*"
+
+
 def doLoad(cohorts, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search,
-           sortOpt=DEFAULT_SORT, dateFrom="", dateTo=""):
-    """Fetch → parse → cache in State → filtered view."""
-    empty = ([], makeTableHtml([]), buildStatsHtml([]), "")
+           sortOpt=DEFAULT_SORT, dateFrom="", dateTo="", force=False):
+    """Shared cache → cohort slice (in memory) → filtered view."""
+    empty = ([], 0, makeTableHtml([]), buildStatsHtml([]), "")
     if not cohorts:
         return *empty, "❌ Please select at least one cohort."
     if not LOCAL_JSON and not (DASH_EMAIL and DASH_PASSWORD) and not ENV_TOKEN:
         return *empty, "❌ No DASH_EMAIL / DASH_PASSWORD in .env (needed to fetch API token)."
-    try:
-        rows = parseRecords(loadRaw(cohorts))
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else "?"
-        return *empty, {401: "❌ Unauthorised — check DASH credentials",
-                        403: "❌ Forbidden — account may lack CBD permissions",
-                        404: f"❌ 404 — endpoint /assessment/{ASSESS_TYPE}/get not found"}.get(code, f"❌ HTTP {code} from API")
-    except Exception as e:
-        return *empty, f"❌ Load error: {e}"
+    allRows, version, err = getCachedRows(force)
+    rows = [r for r in allRows if r["Cohort"] in cohorts]
     filtered = applyFilters(rows, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search, sortOpt, dateFrom, dateTo)
-    print(f"[CBD] parsed={len(rows)} shown={len(filtered)}", flush=True)
-    src = " (local JSON)" if LOCAL_JSON else ""
-    return rows, makeTableHtml(filtered), buildStatsHtml(filtered), f"*Last loaded {datetime.now():%H:%M:%S}{src}*", ""
+    return rows, version, makeTableHtml(filtered, isGrouped(sortOpt)), buildStatsHtml(filtered), asOfText(), err
+
+
+def doLoadForce(*args):
+    """Load button: bypass the TTL."""
+    return doLoad(*args, force=True)
+
+
+def doTick(cohorts, seenVersion, rows, *filterVals):
+    """Timer: re-render only if the cache version moved since this tab last rendered."""
+    _, version, err = getCachedRows()
+    if version == seenVersion:
+        return rows, seenVersion, NO_CHANGE, NO_CHANGE, asOfText(), err
+    return doLoad(cohorts, *filterVals)
+
+
+def getFormHtml(rows, req):
+    """Eye click: build the full-form HTML for one record."""
+    rid = (req or "").split("|")[0]
+    row = next((r for r in (rows or []) if str(r.get("_id")) == rid), None)
+    return buildFormHtml(row) if row else '<p style="color:#94a3b8;">Form not found — click Load and try again.</p>'
+
+
+def isGrouped(sortOpt) -> bool:
+    """Group header rows only under the status sort."""
+    return SORT_OPTIONS.get(sortOpt, ("",))[0] == "_status"
 
 
 def doFilter(rows, *args):
     """Re-filter cached rows without hitting the API."""
     f = applyFilters(rows, *args)
-    return makeTableHtml(f), buildStatsHtml(f)
+    return makeTableHtml(f, isGrouped(args[5] if len(args) > 5 else DEFAULT_SORT)), buildStatsHtml(f)
 
 
 def doExport(rows, *args):
     """Summary XLSX of the filtered view."""
     tmp = tempfile.NamedTemporaryFile(suffix="_CBD_Summary.xlsx", delete=False); tmp.close()
-    makeDf(applyFilters(rows, *args)).to_excel(tmp.name, index=False)
+    filtered = applyFilters(rows, *args)
+    mainRows = [r for r in filtered if not isIgnoredAssessor(r)]          # ignored assessors → own sheet
+    ignRows = [r for r in filtered if isIgnoredAssessor(r)]
+    with pd.ExcelWriter(tmp.name, engine="openpyxl") as xw:
+        makeDf(mainRows).to_excel(xw, sheet_name="Summary", index=False)
+        if ignRows:
+            makeDf(ignRows).to_excel(xw, sheet_name="Ignored Assessors", index=False)
+    if any(r.get("_overrideNote") for r in filtered):                     # Excel comments on Total + Overall % cells
+        wb = openpyxl.load_workbook(tmp.name)
+        for sheetName, sheetRows in (("Summary", mainRows), ("Ignored Assessors", ignRows)):
+            if sheetName not in wb.sheetnames:
+                continue
+            ws = wb[sheetName]; colIdx = {c.value: c.column for c in ws[1]}
+            for ri, r in enumerate(sheetRows, start=2):
+                if r.get("_overrideNote"):
+                    for name in ("Total", "Overall %"):
+                        if name in colIdx:
+                            cm = XlComment(r["_overrideNote"], "CBD dashboard"); cm.width, cm.height = 320, 110
+                            ws.cell(ri, colIdx[name]).comment = cm
+        wb.save(tmp.name)
     return tmp.name
+
+
+# ── Standard setting (BLR + BGM) ─────────────────────────────────────────────
+def tCrit(df, alpha=0.05):
+    """Two-sided t critical value (scipy if present, else normal approx)."""
+    if spStats and df > 0:
+        return float(spStats.t.ppf(1 - alpha / 2, df))
+    return 1.96
+
+
+def tPvalue(t, df):
+    """Two-sided p for a t statistic (scipy if present, else normal approx)."""
+    if t != t or df <= 0:
+        return float("nan")
+    if spStats:
+        return float(2 * spStats.t.sf(abs(t), df))
+    return math.erfc(abs(t) / math.sqrt(2))
+
+
+def rankData(v):
+    """Average ranks (ties share the mean rank)."""
+    order = sorted(range(len(v)), key=lambda i: v[i])
+    ranks = [0.0] * len(v); i = 0
+    while i < len(v):
+        j = i
+        while j + 1 < len(v) and v[order[j + 1]] == v[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return ranks
+
+
+def pearsonR(xs, ys):
+    n = len(xs); mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs); syy = sum((y - my) ** 2 for y in ys)
+    return sxy / math.sqrt(sxx * syy) if sxx and syy else float("nan")
+
+
+def computeBlr(xs, ys, borderline=BORDERLINE_GR):
+    """Borderline linear regression of score on GR; cut = prediction at GR=borderline, with 95% CI."""
+    n = len(xs)
+    out = {"n": n, "ok": False}
+    if n < 3 or len(set(xs)) < 2:
+        return out
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs); syy = sum((y - my) ** 2 for y in ys)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx; a = my - b * mx
+    ssRes = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1 - ssRes / syy if syy else 0.0
+    see = math.sqrt(ssRes / (n - 2)) if n > 2 else 0.0              # standard error of estimate
+    seSlope = see / math.sqrt(sxx) if sxx else float("nan")
+    tSlope = b / seSlope if seSlope else float("nan")
+    cut = a + b * borderline
+    seCut = see * math.sqrt(1 / n + (borderline - mx) ** 2 / sxx)     # SE of the mean prediction at GR=borderline
+    tc = tCrit(n - 2)
+    out.update(ok=True, slope=b, intercept=a, r2=r2, r=pearsonR(xs, ys), see=see, seSlope=seSlope,
+               pSlope=tPvalue(tSlope, n - 2), cut=cut, cutLo=cut - tc * seCut, cutHi=cut + tc * seCut,
+               seCut=seCut, mean=my, sd=math.sqrt(syy / (n - 1)) if n > 1 else 0.0,
+               nPass=sum(1 for y in ys if y >= cut), minGr=min(xs), maxGr=max(xs), nLevels=len(set(xs)))
+    return out
+
+
+def computeBgm(xs, ys, borderline=BORDERLINE_GR):
+    """Borderline group method: cut = mean score of candidates rated GR=borderline (95% CI via t)."""
+    grp = [y for x, y in zip(xs, ys) if x == borderline]
+    nb = len(grp)
+    out = {"nB": nb, "ok": nb >= 1}
+    if not nb:
+        return out
+    m = sum(grp) / nb
+    sd = math.sqrt(sum((y - m) ** 2 for y in grp) / (nb - 1)) if nb > 1 else float("nan")
+    se = sd / math.sqrt(nb) if nb > 1 else float("nan")
+    tc = tCrit(nb - 1) if nb > 1 else float("nan")
+    srt = sorted(grp)
+    med = srt[nb // 2] if nb % 2 else (srt[nb // 2 - 1] + srt[nb // 2]) / 2
+    out.update(cut=m, median=med, sd=sd, se=se, cutLo=m - tc * se if nb > 1 else float("nan"),
+               cutHi=m + tc * se if nb > 1 else float("nan"), minB=min(grp), maxB=max(grp),
+               nPass=sum(1 for y in ys if y >= m))
+    return out
+
+
+def gradeMeans(xs, ys):
+    """{GR: (n, mean, sd)} for GR 1–5."""
+    res = {}
+    for g in range(1, 6):
+        v = [y for x, y in zip(xs, ys) if x == g]
+        if v:
+            m = sum(v) / len(v)
+            res[g] = (len(v), m, math.sqrt(sum((y - m) ** 2 for y in v) / (len(v) - 1)) if len(v) > 1 else 0.0)
+    return res
+
+
+def viabilityChecks(xs, ys, blr, bgm):
+    """List of (method, test, value, criterion, status, note); status in PASS/WARN/FAIL."""
+    chk = []
+    def add(m, t, v, c, st, note=""): chk.append((m, t, v, c, st, note))
+    n = len(xs)
+    # ── BLR
+    add("BLR", "Sample size (n)", n, f"≥ {SS_MIN_N}", "PASS" if n >= SS_MIN_N else ("WARN" if n >= 5 else "FAIL"),
+        "Small n makes the regression line unstable.")
+    if blr.get("ok"):
+        add("BLR", "GR levels used", blr["nLevels"], "≥ 3 distinct", "PASS" if blr["nLevels"] >= 3 else "WARN",
+            "Few GR levels = line fixed by too few points.")
+        inside = blr["minGr"] <= BORDERLINE_GR <= blr["maxGr"]
+        add("BLR", f"GR={BORDERLINE_GR} within observed GR range", f"{blr['minGr']}–{blr['maxGr']}",
+            "Borderline inside range", "PASS" if inside else "WARN",
+            "Outside the range the cut is an extrapolation.")
+        add("BLR", "R² (score vs GR)", round(blr["r2"], 3), f"≥ {R2_MIN}", "PASS" if blr["r2"] >= R2_MIN else "FAIL",
+            "AMEE Guide 49: R² > 0.5 = checklist and global judgement agree.")
+        sigOk = blr["slope"] > 0 and blr["pSlope"] < 0.05
+        add("BLR", "Slope positive & significant", f"{blr['slope']:.2f} (p={blr['pSlope']:.3g})", "slope > 0, p < 0.05",
+            "PASS" if sigOk else "FAIL", "Higher GR must mean higher score.")
+        d = blr["slope"]
+        add("BLR", "Inter-grade discrimination (%-pts per GR)", round(d, 2),
+            f"≈ {DISCRIM_GUIDE:g} ({DISCRIM_LOW:g}–{DISCRIM_HIGH:.1f})",
+            "PASS" if DISCRIM_LOW <= d <= DISCRIM_HIGH else "WARN",
+            "Low = checklist barely separates grades; high = outlier-driven.")
+        w = blr["cutHi"] - blr["cutLo"]
+        add("BLR", "Cut score 95% CI width", f"{w:.1f}", "≤ 10 %-pts", "PASS" if w <= 10 else "WARN",
+            "Wide CI = imprecise cut.")
+    else:
+        add("BLR", "Regression computable", "No", "≥ 3 points, ≥ 2 GR levels", "FAIL", "")
+    # ── BGM
+    nb = bgm.get("nB", 0)
+    add("BGM", f"Borderline group size (GR={BORDERLINE_GR})", nb, f"≥ {BGM_MIN_BORDERLINE}",
+        "PASS" if nb >= BGM_MIN_BORDERLINE else ("WARN" if nb >= 2 else "FAIL"),
+        "BGM uses only borderline candidates — needs enough of them.")
+    if nb >= 2:
+        add("BGM", "Borderline group SD", round(bgm["sd"], 2), "≤ 15 %-pts", "PASS" if bgm["sd"] <= 15 else "WARN",
+            "Large spread = assessors disagree on what 'borderline' looks like.")
+        w = bgm["cutHi"] - bgm["cutLo"]
+        add("BGM", "Cut score 95% CI width", f"{w:.1f}", "≤ 10 %-pts", "PASS" if w <= 10 else "WARN", "")
+    gm = gradeMeans(xs, ys)
+    means = [gm[g][1] for g in sorted(gm)]
+    mono = all(b2 >= a2 for a2, b2 in zip(means, means[1:]))
+    add("Both", "Mean score rises with GR (monotonic)", " < ".join(f"{m:.0f}" for m in means) if means else "—",
+        "non-decreasing", "PASS" if mono and len(means) >= 2 else "WARN", "Checks GR and checklist rank candidates alike.")
+    if n >= 3:
+        rho = pearsonR(rankData(xs), rankData(ys))
+        tRho = rho * math.sqrt((n - 2) / (1 - rho ** 2)) if rho == rho and abs(rho) < 1 else float("inf")
+        pRho = tPvalue(tRho, n - 2) if tRho != float("inf") else 0.0
+        add("Both", "Spearman ρ (GR vs score)", f"{rho:.3f} (p={pRho:.3g})", "ρ > 0, p < 0.05",
+            "PASS" if rho > 0 and pRho < 0.05 else "WARN", "Rank agreement without assuming linearity.")
+    if blr.get("ok") and nb >= 1:
+        diff = abs(blr["cut"] - bgm["cut"])
+        add("Both", "BLR vs BGM agreement", f"{diff:.1f} %-pts", f"≤ {METHOD_AGREE_TOL:g}",
+            "PASS" if diff <= METHOD_AGREE_TOL else "WARN", "Large gap = review before adopting either cut.")
+    return chk
+
+
+def grLabelMap(rows):
+    """{GR: label} from the forms' own scale (latest record wins); fallback GR_LABELS."""
+    m = dict(GR_LABELS)
+    for r in sorted(rows, key=lambda x: x["_ts"]):
+        if r["GR_int"] > 0 and r["GR_label"] not in ("", "—"):
+            m[r["GR_int"]] = r["GR_label"]
+    return m
+
+
+def buildGuideSheet(wb, filtered, clMeta, domMax, totMax, filterDesc, ssSummary):
+    """First sheet: how scores are calculated, legends, domain maxima, standard-setting summary."""
+    ws = wb.create_sheet("Scoring Guide", 0)
+    fill = lambda h: PatternFill(fill_type="solid", fgColor=h)
+    f = lambda bold=False, color="1E293B", size=10: Font(bold=bold, color=color, name="Calibri", size=size)
+    thin = Side(style="thin", color="E2E8F0"); bd = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.column_dimensions["A"].width = 30; ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22; ws.column_dimensions["D"].width = 60
+    r = 1
+    c = ws.cell(r, 1, "DDS4 Case Based Discussion (CBD) — Scoring Guide"); c.font = f(True, "FFFFFF", 14)
+    for cc in range(1, 5): ws.cell(r, cc).fill = fill("010D44")
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4); ws.row_dimensions[r].height = 26
+    r += 1
+    ws.cell(r, 1, f"Exported {datetime.now():%d %b %Y %H:%M} · {len(filtered)} records · {filterDesc}").font = f(size=9, color="64748B")
+    r += 2
+
+    def section(title):
+        nonlocal r
+        c = ws.cell(r, 1, title); c.font = f(True, "FFFFFF", 11)
+        for cc in range(1, 5): ws.cell(r, cc).fill = fill("4F5FB2")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4); r += 1
+
+    def para(text):
+        nonlocal r
+        c = ws.cell(r, 1, text); c.font = f(size=10); c.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+        ws.row_dimensions[r].height = 15 * max(1, math.ceil(len(text) / 120)); r += 1
+
+    def table(header, rowsT, fills=None):
+        nonlocal r
+        for i, h in enumerate(header, 1):
+            c = ws.cell(r, i, h); c.font = f(True, size=9); c.fill = fill("E0E7FF"); c.border = bd
+        r += 1
+        for k, rowT in enumerate(rowsT):
+            for i, v in enumerate(rowT, 1):
+                c = ws.cell(r, i, v); c.font = f(size=9); c.border = bd
+                c.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
+                if fills and fills[k] and i == 1: c.fill = fill(fills[k])
+            r += 1
+        r += 1
+
+    section("1. How each checklist item is scored")
+    para("Each MC answer scores by its LABEL, wherever it sits in the form's rubric: Done Well = 4, Done = 3, "
+         "Mostly Done = 2, Sometimes Done = 1, Not Done = 0. An item's maximum is the score of its best option shown on "
+         "the form — items that only go up to 'Done' are out of 3. Custom labels (e.g. Yes/No) score by the slot they "
+         "sit in (O1 = 4 … O5 = 0).")
+    table(["Answer", "Points", "Note"],
+          [["Done Well", 4, "Only where shown on the form"], ["Done", 3, ""], ["Mostly Done", 2, ""],
+           ["Sometimes Done", 1, ""], ["Not Done", 0, ""], ["Custom label (e.g. Yes/No)", "by slot", "O1 = 4 … O5 = 0"]])
+
+    section("2. Domain, total and overall %")
+    wTxt = ("Weighted: Overall % = Σ weight × (domain raw ÷ domain max) × 100, weights " +
+            ", ".join(f"{DOMAIN_LABELS[d]} {w:.1%}" for d, w in DOMAIN_WEIGHTS.items()) +
+            (". A domain missing from a form scores 0% and keeps its weight." if MISSING_DOMAIN_AS_ZERO
+             else ". A domain missing from a form is left out and the remaining weights are re-scaled to 100%.")) if DOMAIN_WEIGHTS else \
+           ("Item-normalised: Overall % = mean over all items of (item points ÷ item max) × 100 — every item counts equally."
+            if SCORING_MODE == "item" else "Raw total: Overall % = Total ÷ Max × 100 (every point counts equally).")
+    para("Domain score = sum of item points ÷ sum of item maxima (unanswered items score 0 but stay in the max). "
+         "Total = sum of the six domains. " + wTxt + " Each record is scored against its OWN form, so form versions "
+         "with different item maxima are handled; column headers on the score sheet show the first record's maxima.")
+    domRows = []
+    for d in DOMAIN_ORDER:
+        meta = clMeta.get(d) or {}
+        domRows.append([f"{DOMAIN_LABELS[d]} — {meta.get('name') or d}", len(meta.get("fields") or {}), domMax.get(d, "?"),
+                        f"{DOMAIN_WEIGHTS[d]:.1%}" if DOMAIN_WEIGHTS and d in DOMAIN_WEIGHTS else "—"])
+    domRows.append(["Total", sum(r_[1] for r_ in domRows), totMax, "100%" if DOMAIN_WEIGHTS else "—"])
+    table(["Domain", "Items", "Max points", "Weight"], domRows)
+
+    section("3. Colour legends (CBD Detailed sheet)")
+    table(["MC cell colour", "Meaning", "", ""],
+          [["", "Full marks (score = item max)"], ["", "≥ 70% of item max"], ["", "45–69% of item max"],
+           ["", "> 0 and < 45%"], ["", "0 (Not Done)"]],
+          fills=["BBFFD9", "BFDBFE", "A5F3FC", "FEF08A", "FECACA"])
+    grl = grLabelMap(filtered)
+    table(["Global Rating (GR)", "Label", "", ""],
+          [[g, grl.get(g, "") + (" (borderline level for standard setting)" if g == BORDERLINE_GR else "")] for g in (5, 4, 3, 2, 1)],
+          fills=["BBFFD9", "D1FAE5", "FEF9C3", "FED7AA", "FECACA"])
+    table(["Other", "Meaning", "", ""],
+          [["Yes", "Critical Concerns = Yes"], ["Yes / No", "Submitted (green) / not submitted (red)"]],
+          fills=["FECACA", "BBFFD9"])
+
+    section("4. Standard setting (see 'Standard Setting' sheet)")
+    para(f"Uses submitted forms with both a GR and an Overall %. Borderline level = GR {BORDERLINE_GR}. "
+         "BLR (borderline regression): regress Overall % on GR across all candidates; cut = predicted % at the borderline GR. "
+         "BGM (borderline group): cut = mean Overall % of candidates rated borderline. Viability tests (R², slope significance, "
+         "inter-grade discrimination, group size, monotonicity, method agreement) show how far each cut can be trusted.")
+    table(["Item", "Value", "", ""], ssSummary)
+
+    section("5. Score sheet columns")
+    table(["Column", "Meaning", "", ""],
+          [["MCk (/m)", "Points for item k, out of m"], ["Score /max", "Domain raw score"],
+           ["Total /max", "Sum of domain scores"], ["Overall %", "See section 2"],
+           ["Critical Concerns", "Assessor's Yes/No flag (comments in the Comments block)"],
+           ["Examiner 2", "Second examiner recorded on the form"]])
+    ws.sheet_view.showGridLines = False
+    ws.sheet_properties.pageSetUpPr.fitToPage = True; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+    return ws
+
+
+def buildStandardSettingSheet(wb, filtered):
+    """BLR + BGM cut scores on Overall % (and per domain), viability tests, scatter + grade-mean charts.
+    Returns summary rows for the Scoring Guide."""
+    ws = wb.create_sheet("Standard Setting")
+    fill = lambda h: PatternFill(fill_type="solid", fgColor=h)
+    f = lambda bold=False, color="1E293B", size=9: Font(bold=bold, color=color, name="Calibri", size=size)
+    thin = Side(style="thin", color="E2E8F0"); bd = Border(left=thin, right=thin, top=thin, bottom=thin)
+    stFill = {"PASS": "BBFFD9", "WARN": "FEF08A", "FAIL": "FECACA"}
+    for col, w in zip("ABCDEF", [34, 22, 22, 14, 52, 4]): ws.column_dimensions[col].width = w
+
+    pts = [(r["GR_int"], r.get("_pctBase", r["Pct"]), r) for r in filtered          # pre-penalty % (penalties are administrative)
+           if r["Submitted"] == "Yes" and r["GR_int"] > 0 and r.get("_pctBase", r["Pct"]) >= 0]
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    blr, bgm = computeBlr(xs, ys), computeBgm(xs, ys)
+    checks = viabilityChecks(xs, ys, blr, bgm) if pts else []
+
+    r = 1
+    c = ws.cell(r, 1, f"Standard Setting — Overall % vs Global Rating (borderline = GR {BORDERLINE_GR})")
+    c.font = f(True, "FFFFFF", 13)
+    for cc in range(1, 6): ws.cell(r, cc).fill = fill("010D44")
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=5); ws.row_dimensions[r].height = 24
+    r += 1
+    ws.cell(r, 1, f"{len(pts)} submitted forms with GR + Overall % (current dashboard filters applied)").font = f(size=9, color="64748B")
+    r += 2
+
+    def head(title, color="4F5FB2"):
+        nonlocal r
+        c = ws.cell(r, 1, title); c.font = f(True, "FFFFFF", 11)
+        for cc in range(1, 6): ws.cell(r, cc).fill = fill(color)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=5); r += 1
+
+    def kv(rowsKv):
+        nonlocal r
+        for k, v in rowsKv:
+            a = ws.cell(r, 1, k); a.font = f(True); a.border = bd
+            b = ws.cell(r, 2, v); b.font = f(); b.border = bd; r += 1
+        r += 1
+
+    fmt = lambda v, d=1: "—" if v is None or v != v else round(v, d)
+    # ── BLR / BGM side by side
+    head("Cut scores by method")
+    hdr = ["Statistic", "BLR (regression)", "BGM (borderline group)"]
+    for i, h in enumerate(hdr, 1):
+        cc = ws.cell(r, i, h); cc.font = f(True); cc.fill = fill("E0E7FF"); cc.border = bd
+    r += 1
+    blrOk, nb = blr.get("ok"), bgm.get("nB", 0)
+    rowsM = [
+        ("Cut score (Overall %)", fmt(blr.get("cut")) if blrOk else "—", fmt(bgm.get("cut")) if nb else "—"),
+        ("95% CI", f"{blr['cutLo']:.1f} – {blr['cutHi']:.1f}" if blrOk else "—",
+         f"{bgm['cutLo']:.1f} – {bgm['cutHi']:.1f}" if nb > 1 else "—"),
+        ("Candidates used", blr.get("n", 0), nb),
+        ("Pass at this cut", f"{blr['nPass']}/{len(ys)}" if blrOk else "—", f"{bgm['nPass']}/{len(ys)}" if nb else "—"),
+        ("Slope (%-pts per GR)", fmt(blr.get("slope"), 2) if blrOk else "—", "n/a"),
+        ("Intercept", fmt(blr.get("intercept"), 2) if blrOk else "—", "n/a"),
+        ("R²", fmt(blr.get("r2"), 3) if blrOk else "—", "n/a"),
+        ("Pearson r", fmt(blr.get("r"), 3) if blrOk else "—", "n/a"),
+        ("Std error of estimate", fmt(blr.get("see"), 2) if blrOk else "—", "n/a"),
+        ("Borderline mean / median", "n/a", f"{bgm['cut']:.1f} / {bgm['median']:.1f}" if nb else "—"),
+        ("Borderline SD / range", "n/a", f"{fmt(bgm.get('sd'))} / {bgm['minB']:.1f}–{bgm['maxB']:.1f}" if nb else "—"),
+    ]
+    for row in rowsM:
+        for i, v in enumerate(row, 1):
+            cc = ws.cell(r, i, v); cc.font = f(i == 1); cc.border = bd; cc.alignment = Alignment(horizontal="left")
+        r += 1
+    r += 1
+
+    # ── Viability tests
+    head("Viability tests")
+    for i, h in enumerate(["Test", "Value", "Criterion", "Result", "Why it matters"], 1):
+        cc = ws.cell(r, i, h); cc.font = f(True); cc.fill = fill("E0E7FF"); cc.border = bd
+    r += 1
+    for m, t, v, crit, st, note in checks:
+        vals = [f"[{m}] {t}", v, crit, st, note]
+        for i, v2 in enumerate(vals, 1):
+            cc = ws.cell(r, i, v2); cc.font = f(i == 4); cc.border = bd
+            cc.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
+        ws.cell(r, 4).fill = fill(stFill[st]); r += 1
+    if not checks:
+        ws.cell(r, 1, "No submitted forms with GR + Overall % — nothing to test.").font = f(color="DC2626"); r += 1
+    r += 1
+    para0 = ("PASS = criterion met · WARN = usable but review · FAIL = method not supported by the data. "
+             "Thresholds are set in cbd_gradio_utils.py.")
+    cc = ws.cell(r, 1, para0); cc.font = f(size=9, color="475569"); cc.alignment = Alignment(wrap_text=True)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=5); ws.row_dimensions[r].height = 28; r += 2
+
+    # ── Grade means table (feeds BGM chart)
+    head("Overall % by Global Rating")
+    gm = gradeMeans(xs, ys)
+    grl = grLabelMap(filtered)
+    for i, h in enumerate(["GR", "Label", "n", "Mean %", "SD"], 1):
+        cc = ws.cell(r, i, h); cc.font = f(True); cc.fill = fill("E0E7FF"); cc.border = bd
+    r += 1
+    gmStart = r
+    for g in range(1, 6):
+        n_, m_, sd_ = gm.get(g, (0, None, None))
+        vals = [g, grl.get(g, ""), n_, round(m_, 1) if m_ is not None else None, round(sd_, 1) if sd_ is not None else None]
+        for i, v in enumerate(vals, 1):
+            cc = ws.cell(r, i, v); cc.font = f(g == BORDERLINE_GR); cc.border = bd; cc.alignment = Alignment(horizontal="left")
+            if g == BORDERLINE_GR: cc.fill = fill("FED7AA")
+        r += 1
+    gmEnd = r - 1
+    r += 1
+
+    # ── Per-domain cuts
+    head("Per-domain cut scores (domain % vs GR)")
+    for i, h in enumerate(["Domain", "BLR cut % (R²)", "BGM cut % (n borderline)", "Mean %", "Note"], 1):
+        cc = ws.cell(r, i, h); cc.font = f(True); cc.fill = fill("E0E7FF"); cc.border = bd
+    r += 1
+    for d in DOMAIN_ORDER:
+        dx, dy = [], []
+        for g, _p, row in pts:
+            info = row["_domain_scores"].get(d)
+            if info and info["max"]:
+                dx.append(g); dy.append(100 * info["score"] / info["max"])
+        db, dg = computeBlr(dx, dy), computeBgm(dx, dy)
+        note = "No data" if not db.get("ok") else ("" if db["r2"] >= R2_MIN else "R² < threshold — indicative only")
+        vals = [f"{DOMAIN_LABELS[d]}",
+                f"{db['cut']:.1f} (R² {db['r2']:.2f})" if db.get("ok") else "—",
+                f"{dg['cut']:.1f} (n={dg['nB']})" if dg.get("nB") else "—",
+                round(sum(dy) / len(dy), 1) if dy else "—", note]
+        for i, v in enumerate(vals, 1):
+            cc = ws.cell(r, i, v); cc.font = f(i == 1); cc.border = bd; cc.alignment = Alignment(horizontal="left")
+        r += 1
+
+    # ── Chart data (column H onward) + charts
+    dc = 30                                                            # column AD: chart source data (kept visible — charts skip hidden cells)
+    ws.cell(1, dc, "GR"); ws.cell(1, dc + 1, "Overall %"); ws.cell(1, dc + 2, "Student")
+    for i, (g, p, row) in enumerate(pts, start=2):
+        ws.cell(i, dc, g); ws.cell(i, dc + 1, p); ws.cell(i, dc + 2, row["Student"])
+    lastPt = len(pts) + 1
+    # cut markers
+    ws.cell(1, dc + 4, "Marker"); ws.cell(1, dc + 5, "GR"); ws.cell(1, dc + 6, "%")
+    mk = []
+    if blrOk: mk.append(("BLR cut", BORDERLINE_GR, round(blr["cut"], 1)))
+    if nb: mk.append(("BGM cut", BORDERLINE_GR, round(bgm["cut"], 1)))
+    for i, (lbl, g, v) in enumerate(mk, start=2):
+        ws.cell(i, dc + 4, lbl); ws.cell(i, dc + 5, g); ws.cell(i, dc + 6, v)
+    for rr in ws.iter_rows(min_row=1, max_row=max(lastPt, 4), min_col=dc, max_col=dc + 6):
+        for cc in rr: cc.font = f(size=8, color="94A3B8")
+    ws.cell(1, dc - 1, "Chart data →").font = f(True, size=8, color="94A3B8")
+
+    if len(pts) >= 2:
+        sc = ScatterChart(); sc.style = 13
+        sc.title = f"BLR — Overall % vs GR (R² {blr['r2']:.2f})" if blrOk else "BLR — Overall % vs GR"
+        sc.x_axis.title = "Global Rating"; sc.y_axis.title = "Overall %"
+        sc.x_axis.scaling.min, sc.x_axis.scaling.max = 1, 5          # integer GR ticks 1–5
+        sc.x_axis.number_format = "0"
+        sc.y_axis.scaling.min, sc.y_axis.scaling.max = 0, 100
+        sc.x_axis.majorUnit = 1; sc.x_axis.delete = False; sc.y_axis.delete = False
+        sc.height, sc.width = 9, 15
+        xr = Reference(ws, min_col=dc, min_row=2, max_row=lastPt)
+        yr = Reference(ws, min_col=dc + 1, min_row=2, max_row=lastPt)
+        s1 = Series(yr, xr, title="Candidates")
+        s1.marker = Marker(symbol="circle", size=6); s1.marker.graphicalProperties.solidFill = "4F5FB2"
+        s1.graphicalProperties.line.noFill = True
+        if blrOk:
+            s1.trendline = Trendline(trendlineType="linear", dispEq=False, dispRSqr=False)   # stats are in the table
+        sc.series.append(s1)
+        for i, (lbl, g, v) in enumerate(mk, start=2):
+            s = Series(Reference(ws, min_col=dc + 6, min_row=i, max_row=i),
+                       Reference(ws, min_col=dc + 5, min_row=i, max_row=i), title=f"{lbl} {v}%")
+            s.marker = Marker(symbol="diamond" if lbl.startswith("BLR") else "triangle", size=11)
+            s.marker.graphicalProperties.solidFill = "DC2626" if lbl.startswith("BLR") else "E87722"
+            s.graphicalProperties.line.noFill = True
+            sc.series.append(s)
+        ws.add_chart(sc, "G3")
+
+        bc = BarChart(); bc.type = "col"; bc.title = "BGM — mean Overall % by GR"; bc.style = 10
+        bc.y_axis.title = "Mean Overall %"; bc.x_axis.title = "Global Rating"
+        bc.y_axis.scaling.min, bc.y_axis.scaling.max = 0, 100
+        bc.x_axis.delete = False; bc.y_axis.delete = False
+        bc.add_data(Reference(ws, min_col=4, min_row=gmStart - 1, max_row=gmEnd), titles_from_data=True)
+        bc.set_categories(Reference(ws, min_col=1, min_row=gmStart, max_row=gmEnd))
+        bc.dataLabels = DataLabelList(); bc.dataLabels.showVal = True
+        bc.dataLabels.showSerName = False; bc.dataLabels.showCatName = False; bc.dataLabels.showLegendKey = False
+        bc.series[0].graphicalProperties.solidFill = "094183"
+        dp = DataPoint(idx=BORDERLINE_GR - 1); dp.graphicalProperties.solidFill = "E87722"   # borderline bar in orange
+        bc.series[0].dPt.append(dp)
+        bc.height, bc.width = 9, 15; bc.legend = None
+        ws.add_chart(bc, "G23")
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation = "landscape"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True; ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
+
+    summary = [["BLR cut (R²)", f"{blr['cut']:.1f}% (R² {blr['r2']:.2f})" if blrOk else "—"],
+               ["BGM cut (n borderline)", f"{bgm['cut']:.1f}% (n={nb})" if nb else "—"],
+               ["Viability", ", ".join(f"{s}: {sum(1 for c_ in checks if c_[4] == s)}" for s in ("PASS", "WARN", "FAIL")) or "—"]]
+    return summary
 
 
 def doExportDetailed(rows, *args):
@@ -609,7 +1367,8 @@ def doExportDetailed(rows, *args):
                           if d in r["_domain_scores"] and k in r["_domain_scores"][d]["perItem"]), "?")
             cols.append((d, dname, hh, sh, f"{k} (/{itMax})", mcVal, mcF))
         cols.append((d, dname, hh, sh, f"Score /{domMax[d]}",
-                     lambda r, d=d: (r["_domain_scores"].get(d) or {}).get("score", ""), None))
+                     lambda r, d=d: (r["_domain_scores"].get(d) or {}).get("score", ""),
+                     lambda v, r, d=d: "FEF3C7" if d in r["_missing"] else None))   # amber = domain not in form
     sh2, ss2 = XL_SCHEME["summary"]
     cols += [
         ("summary", "Summary", sh2, ss2, "GR", lambda r: r["GR"], lambda v: grFill.get(int(v)) if str(v).isdigit() else None),
@@ -617,6 +1376,10 @@ def doExportDetailed(rows, *args):
         ("summary", "Summary", sh2, ss2, "Overall %", lambda r: r["Pct"] if r["Pct"] >= 0 else "", None),
         ("summary", "Summary", sh2, ss2, "Critical Concerns", lambda r: r["CC"],
          lambda v: "FECACA" if str(v).lower() == "yes" else None),
+        ("summary", "Summary", sh2, ss2, "Missing Domains", lambda r: r["Missing"],
+         lambda v: "FEF3C7" if v != "—" else None),
+        ("summary", "Summary", sh2, ss2, "Override", lambda r: r.get("_overrideNote") or "—",
+         lambda v: "FECACA" if v != "—" else None),
     ]
     ch, cs = XL_SCHEME["comments"]
     cols.append(("comments", "Comments", ch, cs, "General", lambda r: (r["_ad"].get("comments") or "").strip() or "—", None))
@@ -626,51 +1389,76 @@ def doExportDetailed(rows, *args):
     cols.append(("comments", "Comments", ch, cs, "Critical Concerns Comments",
                  lambda r: (r["_ad"].get("critical_concerns_comments") or "").strip() or "—", None))
 
-    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "CBD Detailed"
-    ws.row_dimensions[1].height, ws.row_dimensions[2].height = 22, 38
     fill = lambda h: PatternFill(fill_type="solid", fgColor=h)
-    font = lambda bold=False, color="1E293B", size=9: Font(bold=bold, color=color, name="Calibri", size=size)
-    thin, thick = Side(style="thin", color="E2E8F0"), Side(style="medium", color="94A3B8")
-    border = lambda l=False, rr=False: Border(left=thick if l else thin, right=thick if rr else thin, top=thin, bottom=thin)
 
-    blocks, prev = [], None
-    for ci, c in enumerate(cols, start=1):
-        if c[0] != prev:
-            if blocks: blocks[-1][4] = ci - 1
-            blocks.append([c[0], c[1], c[2], ci, ci]); prev = c[0]
-    blocks[-1][4] = len(cols)
-    lastCols = {b[4] for b in blocks}
-    for bk, bl, hh, sc, ec in blocks:
-        for c in range(sc, ec + 1):
-            cell = ws.cell(row=1, column=c)
-            cell.fill, cell.font = fill(hh), font(True, "FFFFFF", 10)
-            cell.alignment, cell.border = Alignment(horizontal="center", vertical="center"), border(c == sc, c == ec)
-        ws.cell(row=1, column=sc).value = bl
-        if ec > sc: ws.merge_cells(start_row=1, start_column=sc, end_row=1, end_column=ec)
-    for ci, (bk, bl, hh, sh, lbl, vf, ff) in enumerate(cols, start=1):
-        cell = ws.cell(row=2, column=ci, value=lbl)
-        cell.fill, cell.font = fill(sh), font(True)
-        cell.alignment, cell.border = Alignment(horizontal="center", vertical="center", wrap_text=True), border(rr=ci in lastCols)
+    def writeScoreSheet(ws, sheetRows):
+        """Score sheet layout (merged domain headers, colour-coded MCs, comments) for the given rows."""
+        ws.row_dimensions[1].height, ws.row_dimensions[2].height = 22, 38
+        fill = lambda h: PatternFill(fill_type="solid", fgColor=h)
+        font = lambda bold=False, color="1E293B", size=9: Font(bold=bold, color=color, name="Calibri", size=size)
+        thin, thick = Side(style="thin", color="E2E8F0"), Side(style="medium", color="94A3B8")
+        border = lambda l=False, rr=False: Border(left=thick if l else thin, right=thick if rr else thin, top=thin, bottom=thin)
 
-    for ri, r in enumerate(filtered, start=3):
-        rowBg = "FFFFFF" if ri % 2 else "F8FAFC"
+        blocks, prev = [], None
+        for ci, c in enumerate(cols, start=1):
+            if c[0] != prev:
+                if blocks: blocks[-1][4] = ci - 1
+                blocks.append([c[0], c[1], c[2], ci, ci]); prev = c[0]
+        blocks[-1][4] = len(cols)
+        lastCols = {b[4] for b in blocks}
+        for bk, bl, hh, sc, ec in blocks:
+            for c in range(sc, ec + 1):
+                cell = ws.cell(row=1, column=c)
+                cell.fill, cell.font = fill(hh), font(True, "FFFFFF", 10)
+                cell.alignment, cell.border = Alignment(horizontal="center", vertical="center"), border(c == sc, c == ec)
+            ws.cell(row=1, column=sc).value = bl
+            if ec > sc: ws.merge_cells(start_row=1, start_column=sc, end_row=1, end_column=ec)
         for ci, (bk, bl, hh, sh, lbl, vf, ff) in enumerate(cols, start=1):
-            v = vf(r)
-            cell = ws.cell(row=ri, column=ci, value=v)
-            cell.font, cell.border = font(), border(rr=ci in lastCols)
-            cell.alignment = Alignment(vertical="center", wrap_text=bk == "comments")
-            fc = None
-            if ff:
-                try:    fc = ff(v, r)
-                except TypeError: fc = ff(v)
-            cell.fill = fill(fc or rowBg)
+            cell = ws.cell(row=2, column=ci, value=lbl)
+            cell.fill, cell.font = fill(sh), font(True)
+            cell.alignment, cell.border = Alignment(horizontal="center", vertical="center", wrap_text=True), border(rr=ci in lastCols)
 
-    for ci, c in enumerate(cols, start=1):
-        lbl = c[4]
-        ws.column_dimensions[get_column_letter(ci)].width = (
-            32 if c[0] == "comments" else 8 if lbl.startswith("MC") else 18 if lbl in ("Student", "Assessor", "Examiner 2")
-            else 11 if lbl in ("Date", "Cohort", "Overall %", "Critical Concerns") else 9)
-    ws.freeze_panes = ws.cell(row=3, column=3)   # Date + Student frozen
+        for ri, r in enumerate(sheetRows, start=3):
+            rowBg = "FFFFFF" if ri % 2 else "F8FAFC"
+            for ci, (bk, bl, hh, sh, lbl, vf, ff) in enumerate(cols, start=1):
+                v = vf(r)
+                cell = ws.cell(row=ri, column=ci, value=v)
+                cell.font, cell.border = font(), border(rr=ci in lastCols)
+                cell.alignment = Alignment(vertical="center", wrap_text=False)   # no wrapping (comments stay on one line)
+                fc = None
+                if ff:
+                    try:    fc = ff(v, r)
+                    except TypeError: fc = ff(v)
+                cell.fill = fill(fc or rowBg)
+                if r.get("_overrideNote") and (lbl.startswith("Total") or lbl == "Overall %"):   # override note as cell comment
+                    cm = XlComment(r["_overrideNote"], "CBD dashboard"); cm.width, cm.height = 320, 110
+                    cell.comment = cm
+
+        for ci, c in enumerate(cols, start=1):
+            lbl = c[4]
+            ws.column_dimensions[get_column_letter(ci)].width = (
+                32 if c[0] == "comments" else 8 if lbl.startswith("MC") else 18 if lbl in ("Student", "Assessor", "Examiner 2")
+                else 11 if lbl in ("Date", "Cohort", "Overall %", "Critical Concerns") else 9)
+        ws.freeze_panes = ws.cell(row=3, column=3)   # Date + Student frozen
+
+    mainRows = [r for r in filtered if not isIgnoredAssessor(r)]        # main sheet + cut scores
+    ignRows = [r for r in filtered if isIgnoredAssessor(r)]             # ignored assessors → own sheet
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "CBD Detailed"
+    writeScoreSheet(ws, mainRows)
+
+    ssSummary = buildStandardSettingSheet(wb, mainRows)            # sheet 3 (after the score sheet) — ignored assessors excluded
+    if ignRows:                                                      # last sheet: forms by ignored assessors only
+        wsIgn = wb.create_sheet("Ignored Assessors")
+        writeScoreSheet(wsIgn, ignRows)
+        wsIgn.sheet_properties.tabColor = "94A3B8"
+    so, uo, cco, ht, q, srt, df_, dt_ = (list(args) + [None] * 8)[:8]
+    filterDesc = ", ".join(x for x in [
+        f"dates {df_ or '…'} → {dt_ or '…'}", "submitted only" if so else "", "unsubmitted only" if uo else "",
+        "critical concerns only" if cco else "", "dummy/test hidden" if ht else "", f"search '{q}'" if q else "",
+        (f"{len(ignRows)} forms by ignored assessors ({', '.join(sorted({r['Assessor'] for r in ignRows}))}) moved to the "
+         f"'Ignored Assessors' sheet and excluded from cut scores") if ignRows else ""] if x)
+    buildGuideSheet(wb, mainRows, clMeta, domMax, totMax, filterDesc, ssSummary)   # sheet 1
+    wb.active = 0
     tmp = tempfile.NamedTemporaryFile(suffix="_CBD_Detailed.xlsx", delete=False); tmp.close()
     wb.save(tmp.name)
     return tmp.name
@@ -688,10 +1476,12 @@ css = f"""
 .compact-row .gap {{ gap:4px !important; }}
 #table-wrap {{ width:100% !important; }}
 footer {{ display:none !important; }}
+#form-req, #form-out {{ display:none !important; }}
 """
 
 with gr.Blocks(title=f"DASH · CBD Monitor · {APP_BUILD}") as demo:
     rawState = gr.State([])
+    versionState = gr.State(0)                  # cache version this tab last rendered
     timer = gr.Timer(value=DEF_SECS, active=DEF_ACTIVE)
 
     gr.HTML('<div id="dash-header"><h2>DASH</h2><p>Case Based Discussion (CBD) Live Monitor &nbsp;&middot;&nbsp; '
@@ -712,7 +1502,7 @@ with gr.Blocks(title=f"DASH · CBD Monitor · {APP_BUILD}") as demo:
             unsubOnly = gr.Checkbox(label="Unsubmitted only", value=False)
         with gr.Column(scale=1, min_width=170):
             ccOnly = gr.Checkbox(label="Critical concerns only", value=False)
-            hideTest = gr.Checkbox(label="Hide dummy/test", value=False)
+            hideTest = gr.Checkbox(label="Hide dummy/test", value=True)
 
     with gr.Row(elem_classes="compact-row"):
         statsHtml = gr.HTML(buildStatsHtml([]))
@@ -720,6 +1510,8 @@ with gr.Blocks(title=f"DASH · CBD Monitor · {APP_BUILD}") as demo:
         updatedMd = gr.Markdown("", elem_id="ts-bar")
 
     tableHtml = gr.HTML(makeTableHtml([]), elem_id="table-wrap", sanitize_html=False)
+    formReq = gr.Textbox(elem_id="form-req", show_label=False)              # receives "id|nonce" from openForm()
+    formOut = gr.HTML("", elem_id="form-out", sanitize_html=False)          # one form's HTML, handed to the modal
 
     with gr.Row(elem_classes="compact-row"):
         exportBtn = gr.Button("⬇ Export Summary", size="sm", scale=1)
@@ -728,23 +1520,28 @@ with gr.Blocks(title=f"DASH · CBD Monitor · {APP_BUILD}") as demo:
 
     filterArgs = [subOnly, unsubOnly, ccOnly, hideTest, searchIn, sortDd, dateFrom, dateTo]
     loadInputs = [cohortIn] + filterArgs
-    loadOutputs = [rawState, tableHtml, statsHtml, updatedMd, errorMd]
+    loadOutputs = [rawState, versionState, tableHtml, statsHtml, updatedMd, errorMd]
     stateInputs = [rawState] + filterArgs
 
-    loadBtn.click(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
-    cohortIn.change(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
+    loadBtn.click(fn=doLoadForce, inputs=loadInputs, outputs=loadOutputs)          # forced fresh pull
+    cohortIn.change(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)            # in-memory slice
     demo.load(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
     for w in filterArgs:
         w.change(fn=doFilter, inputs=stateInputs, outputs=[tableHtml, statsHtml])
     intervalDd.change(fn=setInterval, inputs=[intervalDd], outputs=[timer])
-    timer.tick(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
+    timer.tick(fn=doTick, inputs=[cohortIn, versionState, rawState] + filterArgs, outputs=loadOutputs)
+    formReq.change(fn=getFormHtml, inputs=[rawState, formReq], outputs=[formOut]) \
+           .then(fn=None, inputs=[formOut],
+                 js="(h) => { var m=document.getElementById('_cfm'); if(m && m.style.display==='flex') showFormModal(h); }")
     exportBtn.click(fn=doExport, inputs=stateInputs, outputs=[fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
     exportDetailBtn.click(fn=doExportDetailed, inputs=stateInputs, outputs=[fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
 
 if __name__ == "__main__":
-    print(f"[CBD] login gate: {'ON' if LOGIN_USER and LOGIN_PASS else 'OFF (set CBD_USERNAME/CBD_PASSWORD in .env)'}")
-    print(f"\n  DASH · CBD Gradio Dashboard — http://localhost:{SERVER_PORT}  (Ctrl+C to stop)\n")
-    ngrok.connect(SERVER_PORT, domain= "app.mds-dash.ngrok.app")
-    demo.launch(server_name="localhost", server_port=SERVER_PORT, share=False, max_threads=10, css=css,
+    print(f"[CBD-new] login gate: {'ON' if LOGIN_USER and LOGIN_PASS else 'OFF (set CBD_USERNAME/CBD_PASSWORD in .env)'}")
+    print(f"\n  DASH · CBD Gradio Dashboard (NEW) — http://localhost:{NEW_PORT}  (Ctrl+C to stop)\n")
+    if USE_NGROK:
+        ngrok.connect(NEW_PORT, domain="app.mds-dash.ngrok.app")
+    demo.queue(default_concurrency_limit=CONCURRENCY)
+    demo.launch(server_name="localhost", server_port=NEW_PORT, share=False, max_threads=10, css=css, head=FORM_JS,
                 auth=(LOGIN_USER, LOGIN_PASS) if LOGIN_USER and LOGIN_PASS else None,
                 theme=gr.themes.Default(primary_hue="indigo"))

@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| **Lines of code** | 126 |
+| **Lines of code** | 137 † |
 | **Functions / classes** | 0 / 0 |
-| **Module constants** | 40 |
+| **Module constants** | 48 † |
 | **Imported by** | `cbd_gradio.py` only |
 | **Written** | 2026-11-03 (hand-written doc) |
 
@@ -47,7 +47,7 @@ Naming: no leading underscores, because the app uses `import *` (same rule as
 | `GR_COLORS` | GR 1–5 badge colours (index 0 unused) |
 | `COHORT_COLORS` | Cohort badges (DDS3, DDS4, BOH3) |
 | `MC_COLORS` | Answer-label colours in the form modal (lowercase keys) |
-| `GR_LABELS` | Fallback GR names (Fail … Excellent); `form.scales` wins |
+| `GR_LABELS` | Fallback GR names (Fail, Borderline, Pass, Good, Excellent); `form.scales` wins |
 | `XL_SCHEME` | Detailed-XLSX `(header, sub-header)` hex per block: identity, d1–d6, summary, comments |
 
 ### UI / layout
@@ -59,12 +59,22 @@ Naming: no leading underscores, because the app uses `import *` (same rule as
 | `TABLE_FONT_SIZE` | `"12px"` | Table text |
 | `STAT_VALUE_FONT_SIZE` / `STAT_LABEL_FONT_SIZE` | `"18px"` / `"10px"` | Stat cards |
 | `COMMENTS_MAX_HEIGHT` | `"36px"` | Comment cell height before scroll (double-click to expand) |
-| `SERVER_PORT` | `7861` | viva/SCBD use 7860. **Also update `ngrok.connect(7861, …)` in `cbd_gradio.py`.** |
+| `SERVER_PORT` | `7860` | Drives `demo.launch` and `ngrok.connect` (same port as viva/SCBD — run one at a time) |
 | `TABLE_COLS` | dict | `show` / `width` per column: Date (hidden), Student, Assessor, Examiner2, Cohort (hidden), GR, D1–D6, Total, Pct, CC, Submitted, View, Comments (`width: None` = fill) |
 | `EXPORT_COLUMNS` | list | Summary-XLSX column order |
 | `INTERVAL_MAP` / `DEFAULT_INTERVAL` / `DEF_SECS` / `DEF_ACTIVE` | | Auto-refresh options (default every 30 s) |
 | `SORT_OPTIONS` / `DEFAULT_SORT` | | Sort dropdown → `(row key, descending)`; adds Overall % and Critical-concerns sorts vs viva |
 | `CARD_WRAP` / `CARD_LABELS` | | Stat-card row style and empty-state labels |
+
+### Standard setting (added 2026-11-03)
+| Name | Value | Purpose |
+|---|---|---|
+| `BORDERLINE_GR` | 2 | GR level treated as borderline for BLR/BGM |
+| `SS_MIN_N` | 10 | BLR minimum candidates |
+| `BGM_MIN_BORDERLINE` | 5 | BGM minimum borderline candidates |
+| `R2_MIN` | 0.5 | BLR R² threshold (AMEE Guide 49) |
+| `DISCRIM_GUIDE` / `DISCRIM_LOW` / `DISCRIM_HIGH` | 10 / 5 / 16.7 | Inter-grade discrimination guide and acceptable band (%-pts per GR) |
+| `METHOD_AGREE_TOL` | 5.0 | Max BLR–BGM gap (%-pts) to count as agreeing |
 
 ## Common changes
 | Want to… | Edit |
@@ -74,8 +84,11 @@ Naming: no leading underscores, because the app uses `import *` (same rule as
 | Test offline | `LOCAL_JSON = "temp 2026 cbd.json"` |
 | Show/hide a table column | `TABLE_COLS[col]["show"]` |
 | Change sitting window | `DEFAULT_DATE_FROM` / `DEFAULT_DATE_TO` |
+| Tighten/loosen standard-setting tests | the Standard setting constants above |
 
 ## Change log
 | Date | Change |
 |---|---|
+| 2026-11-03 (late) | `GR_LABELS[2]` → "Borderline". |
+| 2026-11-03 (eve) | Standard-setting constants added; `SERVER_PORT` changed to 7860 by Kunal. |
 | 2026-11-03 | Created. |

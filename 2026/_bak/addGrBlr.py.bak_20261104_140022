@@ -1,0 +1,249 @@
+"""DDS1/pe03_06_09.xlsx: add DASH weighted % + DASH Global Rating beside each hand-marked session score,
+BLR cut per session (hand-marked and DASH), highlight fails, BLR Cutoffs sheet and an All Students sheet.
+Always runs from the pristine backup so it is re-runnable."""
+import os, re, math, shutil
+import numpy as np, openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.chart import ScatterChart, Reference, Series
+from openpyxl.utils import get_column_letter as colL
+import buildPeSheets as b
+from dds1_pe_utils import _scale, _peAnswers, peFormPercent
+
+SRC = os.path.expanduser('~/mnt/2026/_bak/pe03_06_09.xlsx.bak_20261104_041433')     # original hand-marked workbook
+PATH = os.environ.get("PE_OUT", os.path.expanduser('~/mnt/2026/DDS1/pe03_06_09.xlsx'))
+MANUAL = {("Sheet1", 6): "1356684", ("Sheet1", 18): "1811287", ("Sheet1", 38): "1356934",
+          ("Sheet2", 20): "1472796", ("Sheet2", 42): "1522173"}          # hand-confirmed name matches
+SESSIONS = [("Session 3", "PE-03"), ("Session 6", "PE-06"), ("Session 9", "PE-09")]
+GRL = {1: "Starting", 2: "Emerging", 3: "Developing", 4: "Competent", 5: "Exemplary"}
+RED, HEAD, DASHH, GREYF = "FFC7CE", "FFFFCC", "DDEBF7", "D9D9D9"
+fill = lambda c: PatternFill("solid", fgColor=c)
+thin = Side(style="thin", color="BFBFBF"); BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+# ── DASH form per student × code: assessor-submitted, then has GR, then has answers, then latest ──
+pick = {}
+for r in b.recs:
+    if r.get("cohort") != "DDS1": continue
+    sn = str((r.get("student") or {}).get("student_number", "")).strip()
+    for f in r.get("forms") or []:
+        for c in (f.get("form_context") or {}).get("checklists") or []:
+            code = c.get("code")
+            if code not in {s[1] for s in SESSIONS}: continue
+            ad = f.get("assessor_data") or {}
+            k = (bool(f.get("submitted_by_assessor")), _scale(ad, "scale-global-rating") is not None,
+                 len(_peAnswers(ad, code)) > 0, f.get("created_at") or "")
+            if (sn, code) not in pick or k > pick[(sn, code)]["k"]:
+                pct = peFormPercent(ad, f.get("assessor_config"), code)   # PE-03 lenient, PE-06/09 strict (Weighting sheet)
+                pick[(sn, code)] = dict(k=k, gr=_scale(ad, "scale-global-rating"), sub=bool(f.get("submitted_by_assessor")),
+                                        dash=round(pct, 1) if pct is not None else None)
+
+def toks(s): return set(t for t in re.split(r"[^a-z]+", (s or "").lower()) if t)
+def match(c1, c2):
+    allT = toks(c1) | toks(c2); best = []
+    for sn, v in b.roster.items():
+        s = (2 if toks(v["last"]) & allT else 0) + len(toks(v["first"]) & allT)
+        if s: best.append((s, sn))
+    best.sort(reverse=True)
+    return best[0][1] if best and best[0][0] >= 3 and (len(best) == 1 or best[1][0] < best[0][0]) else None
+
+shutil.copy(SRC, PATH)
+wb = openpyxl.load_workbook(PATH)
+# new layout: A Seat | B,C name | D S3 raw | E S3 % | F S3 DASH % | G S3 GR | H S6 % | I S6 DASH % | J S6 GR |
+#             K S9 % | L S9 DASH % | M S9 GR | N Student No | O Note
+COLS = {"PE-03": (5, 6, 7), "PE-06": (8, 9, 10), "PE-09": (11, 12, 13)}       # (hand %, DASH %, GR)
+HEADS = {5: "Session 3 %", 6: "Session 3 DASH %", 7: "Session 3 GR", 8: "Session 6 %", 9: "Session 6 DASH %",
+         10: "Session 6 GR", 11: "Session 9 %", 12: "Session 9 DASH % (draft)", 13: "Session 9 GR (draft)",
+         14: "Student No (DASH)", 15: "Note"}
+data = []
+for ws in [wb["Sheet1"], wb["Sheet2"]]:
+    lastRow = max(r for r in range(2, ws.max_row + 1) if ws.cell(r, 2).value)
+    old = {r: (ws.cell(r, 6).value, ws.cell(r, 7).value) for r in range(1, ws.max_row + 1)}
+    notes = {r: " ".join(str(ws.cell(r, c).value) for c in range(8, 14) if ws.cell(r, c).value) for r in range(2, lastRow + 1)}
+    for r in range(1, ws.max_row + 1):
+        for c in range(6, 16): ws.cell(r, c).value = None
+    for c, h in HEADS.items():
+        cell = ws.cell(1, c, h); cell.font = Font(bold=True); cell.alignment = CENTER
+        cell.fill = fill(DASHH if "DASH" in h or "GR" in h or "Student No" in h else HEAD)
+    ws.cell(1, 5).alignment = CENTER
+    for r in range(2, lastRow + 1):
+        sn = MANUAL.get((ws.title, r)) or match(ws.cell(r, 2).value, ws.cell(r, 3).value)
+        d3 = ws.cell(r, 4).value
+        hand = {"PE-03": round(d3 / 15 * 100, 1) if isinstance(d3, (int, float)) else None,
+                "PE-06": old[r][0] if isinstance(old[r][0], (int, float)) else None,
+                "PE-09": old[r][1] if isinstance(old[r][1], (int, float)) else None}
+        ws.cell(r, 8, old[r][0]); ws.cell(r, 11, old[r][1])
+        dash, grs = {}, {}
+        for code, (cH, cD, cG) in COLS.items():
+            p = pick.get((sn, code)) or {}
+            dash[code] = p.get("dash"); grs[code] = (p.get("gr"), p.get("sub"))
+            for col, v in ((cD, p.get("dash")), (cG, p.get("gr"))):
+                cell = ws.cell(r, col, v); cell.alignment = Alignment(horizontal="center")
+                if v is None: cell.fill = fill(GREYF)
+                elif p and not p["sub"]: cell.font = Font(italic=True)        # from an unsubmitted (draft) form
+            ws.cell(r, cD).number_format = "0.0"
+        ws.cell(r, 14, int(sn) if sn else "NOT MATCHED")
+        if notes[r]: ws.cell(r, 15, notes[r])
+        for c in (8, 11): ws.cell(r, c).alignment = Alignment(horizontal="center")
+        data.append(dict(ws=ws, r=r, sn=sn, seat=ws.cell(r, 1).value, name=f"{ws.cell(r, 2).value} {ws.cell(r, 3).value}",
+                         hand=hand, dash=dash, grs=grs))
+    ws.column_dimensions["B"].width = 18; ws.column_dimensions["C"].width = 16
+    for c in range(4, 14): ws.column_dimensions[colL(c)].width = 10.5
+    ws.column_dimensions["N"].width = 13; ws.column_dimensions["O"].width = 12
+    ws.row_dimensions[1].height = 44; ws.freeze_panes = "D2"
+
+# ── BLR per session, for hand-marked % and DASH % ──
+def blr(vals):
+    x = np.array([v[0] for v in vals], float); y = np.array([v[1] for v in vals], float); n = len(x)
+    slope, icpt = np.polyfit(x, y, 1); yh = slope * x + icpt
+    ssr, sst = ((y - yh) ** 2).sum(), ((y - y.mean()) ** 2).sum()
+    se = math.sqrt(ssr / (n - 2) / ((x - x.mean()) ** 2).sum()); bg = y[x == 2]
+    return dict(n=n, slope=slope, icpt=icpt, r2=1 - ssr / sst, p=b.tPval(slope / se, n - 2), cut=slope * 2 + icpt,
+                bgm=bg.mean() if len(bg) else None, nBg=len(bg), mean=y.mean(),
+                byGr={g: y[x == g] for g in sorted(set(x.astype(int)))})
+res = {}
+for label, code in SESSIONS:
+    for kind in ("hand", "dash"):
+        vals = [(d["grs"][code][0], d[kind][code]) for d in data if d["grs"][code][0] is not None and d[kind][code] is not None]
+        R = blr(vals); R["label"] = label
+        R["fails"] = [d for d in data if d[kind][code] is not None and d[kind][code] < R["cut"]]
+        res[(code, kind)] = R
+        col = COLS[code][0 if kind == "hand" else 1]
+        for d in R["fails"]:
+            c = d["ws"].cell(d["r"], col); c.fill = fill(RED); c.font = Font(bold=True, color="9C0006")
+    res[(code, "hand")]["noGr"] = [d for d in data if d["grs"][code][0] is None]
+    res[(code, "hand")]["drafts"] = sum(1 for d in data if d["grs"][code][0] is not None and not d["grs"][code][1])
+    res[(code, "hand")]["corr"] = np.corrcoef(*zip(*[(d["hand"][code], d["dash"][code]) for d in data
+                                                     if d["hand"][code] is not None and d["dash"][code] is not None]))[0, 1]
+
+cutTxt = lambda kind: ", ".join(f"{lab} < {res[(c, kind)]['cut']:.1f}%" for lab, c in SESSIONS)
+for ws in [wb["Sheet1"], wb["Sheet2"]]:
+    lr = max(d["r"] for d in data if d["ws"] is ws) + 2
+    for k, t in enumerate([f"RED hand-marked % = below its BLR cut: {cutTxt('hand')}.",
+                           f"RED DASH % = below the DASH-score BLR cut: {cutTxt('dash')}.",
+                           "DASH % = DASH checklist weighted % (Weighting sheet; Session 3 lenient levels, Sessions 6/9 strict). GR = DASH Global Rating (1 Starting … 5 Exemplary).",
+                           "Italic = from an assessor DRAFT (not submitted); grey = not in DASH. All Session 9 DASH values are drafts and may change."]):
+        ws.cell(lr + k, 1, t).font = Font(size=9, italic=True)
+
+# ── All Students (merged) ──
+al = wb.create_sheet("All Students", 2)
+hdr = ["Last Name", "First Name", "Student No", "Sheet", "Seat"]
+for lab, _ in SESSIONS: hdr += [f"{lab} %", f"{lab} DASH %", f"{lab} Diff (DASH − hand)", f"{lab} GR"]
+hdr += ["Fails (hand)", "Fails (DASH)"]
+for j, h in enumerate(hdr, 1):
+    c = al.cell(1, j, h); c.font = Font(bold=True); c.alignment = CENTER; c.border = BOX
+    c.fill = fill(DASHH if ("DASH" in h or "GR" in h) else HEAD)
+rows = sorted(data, key=lambda d: ((b.roster.get(d["sn"]) or {}).get("last", d["name"]).lower(),
+                                   (b.roster.get(d["sn"]) or {}).get("first", "").lower()))
+for i, d in enumerate(rows, 2):
+    st = b.roster.get(d["sn"]) or {}
+    vals = [st.get("last"), st.get("first"), int(d["sn"]) if d["sn"] else None, d["ws"].title, d["seat"]]
+    for _, code in SESSIONS:
+        h, ds, g = d["hand"][code], d["dash"][code], d["grs"][code][0]
+        vals += [h, ds, round(ds - h, 1) if h is not None and ds is not None else None, g]
+    fh = [lab.replace("Session ", "S") for lab, code in SESSIONS if d in res[(code, "hand")]["fails"]]
+    fd = [lab.replace("Session ", "S") for lab, code in SESSIONS if d in res[(code, "dash")]["fails"]]
+    vals += [", ".join(fh) or None, ", ".join(fd) or None]
+    for j, v in enumerate(vals, 1):
+        c = al.cell(i, j, v); c.border = BOX
+        if j > 3: c.alignment = Alignment(horizontal="center")
+    for s, (_, code) in enumerate(SESSIONS):
+        base = 6 + 4 * s
+        if d in res[(code, "hand")]["fails"]: al.cell(i, base).fill = fill(RED)
+        if d in res[(code, "dash")]["fails"]: al.cell(i, base + 1).fill = fill(RED)
+        for off in (1, 3):
+            if al.cell(i, base + off).value is None: al.cell(i, base + off).fill = fill(GREYF)
+            elif d["grs"][code][1] is False: al.cell(i, base + off).font = Font(italic=True)
+        diff = al.cell(i, base + 2); diff.number_format = "+0.0;-0.0;0.0"
+        if diff.value is not None and abs(diff.value) >= 15: diff.font = Font(bold=True, color="C55A11")
+    for j in (len(hdr) - 1, len(hdr)):
+        if al.cell(i, j).value: al.cell(i, j).fill = fill(RED)
+nR = len(rows) + 1
+al.cell(nR + 2, 1, "Class mean").font = Font(bold=True)
+for s, (_, code) in enumerate(SESSIONS):
+    base = 6 + 4 * s
+    for off, kind in ((0, "hand"), (1, "dash")):
+        c = al.cell(nR + 2, base + off, round(res[(code, kind)]["mean"], 1)); c.font = Font(bold=True); c.alignment = Alignment(horizontal="center")
+for k, t in enumerate(["RED % = below that score's BLR cut (see BLR Cutoffs). Diff ≥ 15 points in orange bold. Italic DASH value = unsubmitted draft; grey = not in DASH.",
+                       "Diff = DASH % − hand-marked %. Session 3 hand-marked % = raw / 15 × 100."]):
+    al.cell(nR + 4 + k, 1, t).font = Font(size=9, italic=True)
+widths = [16, 18, 11, 8, 7] + [9, 10, 11, 7] * 3 + [12, 12]
+for j, w in enumerate(widths, 1): al.column_dimensions[colL(j)].width = w
+al.row_dimensions[1].height = 46; al.freeze_panes = "D2"
+al.auto_filter.ref = f"A1:{colL(len(hdr))}{nR}"
+
+# ── BLR Cutoffs ──
+bs = wb.create_sheet("BLR Cutoffs")
+def put(r, c, v, bold=False, bg=None):
+    cell = bs.cell(r, c, v); cell.font = Font(bold=bold); cell.border = BOX
+    if bg: cell.fill = fill(bg)
+    return cell
+bs.cell(1, 1, "Borderline Regression (BLR) cut-scores — score regressed on DASH Global Rating; cut = predicted score at GR 2 (Emerging)").font = Font(bold=True, size=12)
+bs.cell(2, 1, "Computed separately for the hand-marked workbook % and the DASH weighted %. Fail = strictly below the cut. Session 9 GRs/DASH % are unsubmitted drafts.").font = Font(italic=True, size=9)
+hdr = ["Metric"] + [f"{lab} {'hand' if k == 'hand' else 'DASH'}" for lab, _ in SESSIONS for k in ("hand", "dash")]
+for j, h in enumerate(hdr, 1): put(4, j, h, True, HEAD if "hand" in h else DASHH)
+keys = [(c, k) for _, c in SESSIONS for k in ("hand", "dash")]
+metrics = [("Students with score + GR (n)", lambda v: v["n"]), ("Class mean %", lambda v: round(v["mean"], 2)),
+           ("BLR cut-score (%)", lambda v: round(v["cut"], 2)), ("Slope (% per GR level)", lambda v: round(v["slope"], 2)),
+           ("Intercept", lambda v: round(v["icpt"], 2)), ("R²", lambda v: round(v["r2"], 3)),
+           ("p-value (slope ≠ 0)", lambda v: "<0.0001" if v["p"] < 1e-4 else round(v["p"], 4)),
+           ("Borderline (GR 2) n", lambda v: v["nBg"]), ("BGM cut (mean of GR 2)", lambda v: round(v["bgm"], 2) if v["bgm"] is not None else "n/a"),
+           ("Fails (below BLR cut)", lambda v: len(v["fails"]))]
+for i, (lab, fn) in enumerate(metrics):
+    put(5 + i, 1, lab, "cut" in lab, RED if "Fails" in lab else None)
+    for j, key in enumerate(keys, 2): put(5 + i, j, fn(res[key]), "cut" in lab, RED if "Fails" in lab else None)
+r = 5 + len(metrics)
+put(r, 1, "Hand vs DASH correlation (r)")
+for s, (_, code) in enumerate(SESSIONS): put(r, 2 + 2 * s, round(res[(code, "hand")]["corr"], 3)); bs.merge_cells(start_row=r, start_column=2 + 2 * s, end_row=r, end_column=3 + 2 * s)
+put(r + 1, 1, "Students with no DASH GR")
+for s, (_, code) in enumerate(SESSIONS): put(r + 1, 2 + 2 * s, len(res[(code, "hand")]["noGr"])); bs.merge_cells(start_row=r + 1, start_column=2 + 2 * s, end_row=r + 1, end_column=3 + 2 * s)
+r += 3
+put(r, 1, "Mean % by GR", True, HEAD)
+for j, h in enumerate(hdr[1:], 2): put(r, j, h, True, HEAD if "hand" in h else DASHH)
+for g in range(1, 6):
+    put(r + g, 1, f"GR {g} {GRL[g]}")
+    for j, key in enumerate(keys, 2):
+        yy = res[key]["byGr"].get(g); put(r + g, j, f"{yy.mean():.1f} (n={len(yy)})" if yy is not None and len(yy) else "—")
+r += 7
+put(r, 1, "Failing students", True, HEAD)
+for j, h in enumerate(["Name (workbook)", "Student No", "Session", "Score type", "Score %", "BLR cut", "GR", "Other score %"], 1): put(r + 1, j, h, True, HEAD)
+k = r + 2
+for (code, kind), v in res.items():
+    other = "dash" if kind == "hand" else "hand"
+    for d in sorted(v["fails"], key=lambda d: d[kind][code]):
+        g = d["grs"][code][0]
+        for j, val in enumerate([d["name"], int(d["sn"]) if d["sn"] else None, v["label"], "Hand-marked" if kind == "hand" else "DASH",
+                                 d[kind][code], round(v["cut"], 1), f"{g} {GRL[g]}" if g else "no GR", d[other][code]], 1):
+            put(k, j, val, bg=RED if j == 5 else None)
+        k += 1
+k += 1
+put(k, 1, "No DASH GR (excluded from regression)", True, HEAD); k += 1
+for _, code in SESSIONS:
+    for d in res[(code, "hand")]["noGr"]:
+        for j, val in enumerate([d["name"], int(d["sn"]) if d["sn"] else None, res[(code, "hand")]["label"]], 1): put(k, j, val)
+        k += 1
+for col, w in zip("ABCDEFGH", [30, 13, 13, 13, 13, 13, 13, 13]): bs.column_dimensions[col].width = w
+# charts: score vs GR, hand and DASH series per session
+for i, (lab, code) in enumerate(SESSIONS):
+    base = 80 + i * 130
+    ch = ScatterChart(); ch.title = f"{lab}: score vs GR (hand cut {res[(code,'hand')]['cut']:.1f}, DASH cut {res[(code,'dash')]['cut']:.1f})"
+    ch.x_axis.title = "Global Rating"; ch.y_axis.title = "Score %"; ch.x_axis.scaling.min = 0.5; ch.x_axis.scaling.max = 5.5
+    ch.y_axis.scaling.min = 0; ch.y_axis.scaling.max = 100; ch.x_axis.delete = False; ch.y_axis.delete = False
+    for s, (kind, colr, xoff) in enumerate((("hand", "ED7D31", -0.08), ("dash", "2E75B6", 0.08))):
+        pts = [(d["grs"][code][0] + xoff, d[kind][code]) for d in data if d["grs"][code][0] is not None and d[kind][code] is not None]
+        cx, cy = 20 + 2 * s, 21 + 2 * s
+        bs.cell(base, cx, "GR"); bs.cell(base, cy, "Hand-marked" if kind == "hand" else "DASH")
+        for q, (gx, py) in enumerate(pts, 1): bs.cell(base + q, cx, gx); bs.cell(base + q, cy, py)
+        ser = Series(Reference(bs, min_col=cy, min_row=base, max_row=base + len(pts)),
+                     Reference(bs, min_col=cx, min_row=base + 1, max_row=base + len(pts)), title_from_data=True)
+        ser.marker.symbol = "circle"; ser.marker.size = 6; ser.marker.graphicalProperties.solidFill = colr
+        ser.marker.graphicalProperties.line.solidFill = colr; ser.graphicalProperties.line.noFill = True
+        ch.series.append(ser)
+    ch.height, ch.width = 8, 14; ch.visible_cells_only = False; ch.legend.position = "b"
+    bs.add_chart(ch, f"J{4 + i * 18}")
+for c in range(20, 24): bs.column_dimensions[colL(c)].hidden = True
+wb.save(PATH)
+for (code, kind), v in res.items():
+    print(code, kind, f"n={v['n']} mean={v['mean']:.1f} cut={v['cut']:.2f} r2={v['r2']:.3f} bgm={v['bgm']} fails={len(v['fails'])}",
+          [(d['name'], d[kind][code]) for d in v['fails']][:25])
+for _, code in SESSIONS: print(code, "corr", round(res[(code, 'hand')]['corr'], 3), "noGr", [d['name'] for d in res[(code, 'hand')]['noGr']])
+print("unmatched:", [d["name"] for d in data if not d["sn"]], "no DASH %:", {c: [d['name'] for d in data if d['dash'][c] is None] for _, c in SESSIONS})

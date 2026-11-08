@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+DASH · CBD (Case Based Discussion) Dashboard — Gradio App
+──────────────────────────────────────────────────────────
+Mirrors viva_gradio.py for the DDS4 CBD exam (form keys d1-dds4 … d6-dds4).
+Install:  pip install gradio requests pandas python-dotenv openpyxl
+Run:      python cbd_gradio.py
+Opens at: http://localhost:7861   (viva/SCBD use 7860)
+"""
+import os
+import json
+import tempfile
+from datetime import datetime
+from urllib.parse import urlencode
+from pathlib import Path
+
+import gradio as gr
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+import cbd_gradio_utils as cgu
+from cbd_gradio_utils import *
+from pyngrok import ngrok
+
+# ── .env (file values win over stale shell vars) ─────────────────────────────
+ENV_PATH = Path(cgu.__file__).with_name(".env")
+
+def readEnvFile(path):
+    """Parse KEY=VALUE lines from .env."""
+    d = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                d[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return d
+
+ENV_FILE = readEnvFile(ENV_PATH)
+load_dotenv(ENV_PATH, override=True)
+DASH_EMAIL    = ENV_FILE.get("DASH_EMAIL")    or os.getenv("DASH_EMAIL", "")
+DASH_PASSWORD = ENV_FILE.get("DASH_PASSWORD") or os.getenv("DASH_PASSWORD", "")
+ENV_TOKEN     = ENV_FILE.get("DASH_TOKEN")    or os.getenv("DASH_TOKEN", "")
+LOGIN_USER    = ENV_FILE.get("CBD_USERNAME")  or os.getenv("CBD_USERNAME", "")   # app login gate (blank = no login)
+LOGIN_PASS    = ENV_FILE.get("CBD_PASSWORD")  or os.getenv("CBD_PASSWORD", "")
+
+APP_BUILD = "build 20261103"
+print(f"[CBD] Gradio {gr.__version__} · {APP_BUILD} · env={ENV_PATH} (exists={ENV_PATH.exists()})", flush=True)
+
+TOKEN_CACHE = {"token": None}
+
+
+def getToken(force: bool = False) -> str:
+    """Login via POST /accounts/login (DASH_EMAIL/DASH_PASSWORD); cached, force=True re-logs in."""
+    if not force and TOKEN_CACHE["token"]:
+        return TOKEN_CACHE["token"]
+    if not (DASH_EMAIL and DASH_PASSWORD):
+        if ENV_TOKEN:
+            return ENV_TOKEN
+        raise RuntimeError("DASH_EMAIL / DASH_PASSWORD not set in .env")
+    resp = requests.post(f"{API_BASE}/accounts/login",
+                         json={"email": DASH_EMAIL, "password": DASH_PASSWORD}, timeout=60)
+    print(f"[CBD] login status={resp.status_code}", flush=True)
+    resp.raise_for_status()
+    TOKEN_CACHE["token"] = resp.json()["result"]["user"]["token"]
+    return TOKEN_CACHE["token"]
+
+
+def setInterval(choice):
+    """Refresh dropdown → timer."""
+    secs, active = INTERVAL_MAP.get(choice, INTERVAL_MAP[DEFAULT_INTERVAL])
+    return gr.Timer(value=secs, active=active)
+
+
+# ── API layer ────────────────────────────────────────────────────────────────
+def fetchAll(token: str, cohorts: list, year: str) -> list:
+    """GET /assessment/cbd/get with pagination (DRF Token auth)."""
+    params = urlencode({"page_size": "max", "page": 1, "cohort": ",".join(cohorts),
+                        "year": year, "ordering": "id"})
+    url, headers, records = f"{API_BASE}/assessment/{ASSESS_TYPE}/get?{params}", {"Authorization": f"Token {token}"}, []
+    while url:
+        resp = requests.get(url, headers=headers, timeout=60)
+        resp.raise_for_status()
+        d = resp.json()
+        if isinstance(d, list):
+            records.extend(d); url = None
+        else:
+            records.extend(d.get("results", [])); url = d.get("next")
+    print(f"[CBD] fetchAll: {len(records)} records ({','.join(cohorts)}, {year})", flush=True)
+    return records
+
+
+def loadRaw(cohorts: list) -> list:
+    """Live API, or LOCAL_JSON file when set (offline testing); local file is cohort-filtered here."""
+    if LOCAL_JSON:
+        p = Path(LOCAL_JSON)
+        p = p if p.is_absolute() else Path(cgu.__file__).with_name(LOCAL_JSON)
+        raw = json.load(open(p, encoding="utf-8"))
+        raw = raw.get("results", raw) if isinstance(raw, dict) else raw
+        return [r for r in raw if r.get("cohort") in cohorts]
+    try:
+        return fetchAll(getToken(), cohorts, YEAR)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (400, 401, 403):
+            return fetchAll(getToken(force=True), cohorts, YEAR)   # stale token → re-login once
+        raise
+
+
+# ── Scoring ──────────────────────────────────────────────────────────────────
+def optionScore(oKey: str) -> int:
+    """O1 → 4 … O5 → 0."""
+    return N_LEVELS - int(oKey[1:])
+
+
+def scoreItem(value: str, rubricItem: dict):
+    """(score, max) for one MC; uses rubric option positions, falls back to MC_SCORE."""
+    opts = {k: (v or "").strip() for k, v in (rubricItem or {}).items() if k.startswith("O")}
+    enabled = [k for k, v in opts.items() if v]
+    itemMax = max((optionScore(k) for k in enabled), default=max(MC_SCORE.values()))
+    if not value:
+        return None, itemMax
+    v = value.strip().lower()
+    hit = next((k for k in enabled if opts[k].lower() == v), None)
+    return (optionScore(hit) if hit else MC_SCORE.get(v)), itemMax
+
+
+def scoreDomain(answers: dict, clMeta: dict) -> dict:
+    """Domain raw score / max over ALL checklist items (unanswered = 0 but counted in max)."""
+    rubric = (clMeta.get("extra_config") or {}).get("rubric") or {}
+    keys = list((clMeta.get("fields") or {}).keys()) or sorted(k for k in answers if k.startswith("MC"))
+    score, mx, perItem = 0, 0, {}
+    for k in keys:
+        s, m = scoreItem(answers.get(k), rubric.get(k))
+        perItem[k] = (s, m)
+        mx += m
+        score += s or 0
+    return {"score": score, "max": mx, "items": answers, "perItem": perItem,
+            "answered": sum(1 for s, _ in perItem.values() if s is not None), "n": len(keys)}
+
+
+def overallPct(ds: dict):
+    """Unweighted Σraw/Σmax, or Σw·(raw/max) when DOMAIN_WEIGHTS set."""
+    if not ds:
+        return None
+    if DOMAIN_WEIGHTS:
+        return 100 * sum(w * ds[d]["score"] / ds[d]["max"] for d, w in DOMAIN_WEIGHTS.items()
+                         if d in ds and ds[d]["max"])
+    tot, mx = sum(v["score"] for v in ds.values()), sum(v["max"] for v in ds.values())
+    return 100 * tot / mx if mx else None
+
+
+# ── Comments ─────────────────────────────────────────────────────────────────
+def buildCombinedComments(ad: dict) -> str:
+    """General + per-domain + critical concerns comments → one '[Label] text' per line."""
+    parts = []
+    if (ad.get("comments") or "").strip():
+        parts.append(f"[General] {ad['comments'].strip()}")
+    for d in DOMAIN_ORDER:
+        val = (ad.get(f"{d}_comments") or "").strip()
+        if val:
+            parts.append(f"[{DOMAIN_LABELS[d]}] {val}")
+    cc = (ad.get("critical_concerns") or "").strip()
+    ccTxt = (ad.get("critical_concerns_comments") or "").strip()
+    if cc.lower() == "yes" or ccTxt:
+        parts.append(f"[Critical Concerns: {cc or '—'}] {ccTxt}")
+    return "\n".join(parts) if parts else "—"
+
+
+# ── Parse ────────────────────────────────────────────────────────────────────
+def isExcluded(name: str, hideTest: bool) -> bool:
+    n = name.lower()
+    return n in EXCLUDE or (hideTest and any(s in n for s in EXCLUDE_SUBSTRINGS))
+
+
+def parseRecords(raw: list) -> list:
+    """Raw API records → flat display rows (private keys start with _)."""
+    rows = []
+    for r in raw:
+        student = (r.get("student") or "").strip()
+        if not student:
+            continue
+        frm = r.get("form") if isinstance(r.get("form"), dict) else {}
+        ad = (frm.get("data") or {}).get("assessor") or {}
+        cl = frm.get("checklists") or {}
+        grFields = ((frm.get("scales") or {}).get("scale-global-rating") or {}).get("fields") or {}
+
+        grInt = None
+        try:
+            grInt = int((ad.get("scale-global-rating") or {}).get("scale"))
+        except (TypeError, ValueError):
+            pass
+
+        dtStr = r.get("datetime") or ""
+        try:
+            dt = datetime.fromisoformat(dtStr.replace("Z", "+00:00"))
+            dtDisplay, ts = f"{dt.day} {dt.strftime('%b %Y')}", dt.timestamp()
+        except Exception:
+            dtDisplay, ts = dtStr or "—", 0.0
+
+        ds = {d: scoreDomain(ad[d], cl.get(d) or {}) for d in DOMAIN_ORDER if isinstance(ad.get(d), dict)}
+        pct = overallPct(ds)
+        cc = (ad.get("critical_concerns") or "").strip()
+
+        rows.append({
+            "_ts": ts, "_ad": ad, "_checklists": cl, "_domain_scores": ds,
+            "Date":      dtDisplay,
+            "Student":   student,
+            "Assessor":  (r.get("assessor") or "—").strip() or "—",
+            "Examiner2": (frm.get("examiner_2") or "—").strip() if isinstance(frm.get("examiner_2"), str) else "—",
+            "Cohort":    r.get("cohort") or "—",
+            "Subject":   r.get("subject") or "—",
+            "GR":        str(grInt) if grInt is not None else "—",
+            "GR_int":    grInt if grInt is not None else -1,
+            "GR_label":  grFields.get(str(grInt)) or GR_LABELS.get(grInt, "—") if grInt else "—",
+            "Total":     sum(v["score"] for v in ds.values()) if ds else None,
+            "Max":       sum(v["max"] for v in ds.values()) if ds else None,
+            "Pct":       round(pct, 1) if pct is not None else -1,
+            "CC":        cc or "—",
+            "CC_int":    1 if cc.lower() == "yes" else 0,
+            "Submitted": "Yes" if r.get("submitted") else "No",
+            "Comments":  buildCombinedComments(ad),
+        })
+    return rows
+
+
+# ── Filters ──────────────────────────────────────────────────────────────────
+def parseDateTs(s: str, endOfDay: bool = False):
+    try:
+        dt = datetime.strptime(s.strip(), "%Y-%m-%d")
+        return (dt.replace(hour=23, minute=59, second=59) if endOfDay else dt).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def applyFilters(rows, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search,
+                 sortOpt=DEFAULT_SORT, dateFrom="", dateTo=""):
+    """Filter + sort cached rows (no API call)."""
+    tsFrom, tsTo = parseDateTs(dateFrom or ""), parseDateTs(dateTo or "", True)
+    out = [r for r in rows
+           if (tsFrom is None or r["_ts"] >= tsFrom) and (tsTo is None or r["_ts"] <= tsTo)
+           and not isExcluded(r["Student"], hideTest)]
+    if submittedOnly:
+        out = [r for r in out if r["Submitted"] == "Yes"]
+    elif unsubmittedOnly:
+        out = [r for r in out if r["Submitted"] == "No"]
+    if ccOnly:
+        out = [r for r in out if r["CC_int"]]
+    q = (search or "").lower().strip()
+    if q:
+        out = [r for r in out if any(q in (r.get(k) or "").lower()
+                                     for k in ["Student", "Assessor", "Examiner2", "Cohort", "Subject", "Comments"])]
+    col, desc = SORT_OPTIONS.get(sortOpt, ("_ts", True))
+    num = col in ("_ts", "GR_int", "Pct", "CC_int")
+    out.sort(key=lambda r: float(r.get(col) or 0) if num else (r.get(col) or "").lower(), reverse=desc)
+    return out
+
+
+def makeDf(rows: list) -> pd.DataFrame:
+    """Summary export frame (EXPORT_COLUMNS)."""
+    recs = []
+    for r in rows:
+        ds = r["_domain_scores"]
+        rec = {"Date": r["Date"], "Student": r["Student"], "Assessor": r["Assessor"],
+               "Examiner 2": r["Examiner2"], "Cohort": r["Cohort"], "Subject": r["Subject"], "GR": r["GR"],
+               "Total": r["Total"] if r["Total"] is not None else "", "Max": r["Max"] or "",
+               "Overall %": r["Pct"] if r["Pct"] >= 0 else "", "Critical Concerns": r["CC"],
+               "Submitted": r["Submitted"], "Comments": r["Comments"]}
+        for d, lbl in DOMAIN_LABELS.items():
+            rec[lbl] = ds[d]["score"] if d in ds else ""
+        recs.append(rec)
+    return pd.DataFrame(recs, columns=EXPORT_COLUMNS)
+
+
+# ── Stat cards ───────────────────────────────────────────────────────────────
+def statCard(label, value, color="#0f172a"):
+    return (f'<div style="flex:1;background:#fff;border:1px solid #e2e8f0;border-radius:6px;'
+            f'padding:5px 12px;display:flex;align-items:center;gap:10px;">'
+            f'<div style="font-size:{STAT_VALUE_FONT_SIZE};font-weight:700;color:{color};white-space:nowrap;">{value}</div>'
+            f'<div style="font-size:{STAT_LABEL_FONT_SIZE};color:#64748b;font-weight:500;text-transform:uppercase;'
+            f'letter-spacing:.4px;line-height:1.2;white-space:nowrap;">{label}</div></div>')
+
+
+def buildStatsHtml(rows):
+    if not rows:
+        return f'<div style="{CARD_WRAP}">' + "".join(statCard(l, "—") for l in CARD_LABELS) + "</div>"
+    sub = [r for r in rows if r["Submitted"] == "Yes"]
+    grV = [r["GR_int"] for r in sub if r["GR_int"] > 0]
+    pcV = [r["Pct"] for r in sub if r["Pct"] >= 0]
+    nCC = sum(r["CC_int"] for r in rows)
+    cards = [
+        statCard("Total records", len(rows)),
+        statCard("Submitted", f"{len(sub)} ({round(100*len(sub)/len(rows))}%)", "#15803d"),
+        statCard("Avg global rating", f"{sum(grV)/len(grV):.2f}" if grV else "—", PURPLE),
+        statCard("Avg overall %", f"{sum(pcV)/len(pcV):.1f}%" if pcV else "—", PURPLE),
+        statCard("Critical concerns", nCC, "#dc2626" if nCC else "#0f172a"),
+        statCard("Unique students", len({r["Student"] for r in rows})),
+        statCard("Assessors active", len({r["Assessor"] for r in rows if r["Assessor"] != "—"})),
+    ]
+    return f'<div style="{CARD_WRAP}">' + "".join(cards) + "</div>"
+
+
+# ── Colour helpers ───────────────────────────────────────────────────────────
+def pctColor(p):
+    return "#15803d" if p >= 85 else "#2563eb" if p >= 65 else "#d97706" if p >= 40 else "#dc2626"
+
+
+# ── Full form modal ──────────────────────────────────────────────────────────
+def buildFormHtml(row: dict) -> str:
+    """Full-form HTML for the View modal; " → &quot; for the data-html attribute, user text double-encoded."""
+    def e(s):
+        return str(s or "").replace("&", "&amp;amp;").replace("<", "&amp;lt;").replace(">", "&amp;gt;")
+
+    ad, cl, ds = row["_ad"], row["_checklists"], row["_domain_scores"]
+    grInt = row["GR_int"]
+    grColor = GR_COLORS[grInt] if 1 <= grInt <= 5 else "#64748b"
+    subColor = "#15803d" if row["Submitted"] == "Yes" else "#94a3b8"
+    pctTxt = f'{row["Pct"]}%' if row["Pct"] >= 0 else "—"
+    p = [
+        f'<div style="margin-bottom:20px;padding-bottom:14px;border-bottom:2px solid #e2e8f0;">'
+        f'<div style="font-size:15px;font-weight:700;color:{NAVY};margin-bottom:8px;">'
+        f'CBD &middot; {e(row["Cohort"])} &middot; {e(row["Subject"])} &middot; {e(row["Date"])}</div>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 24px;font-size:12px;">'
+        f'<div><span style="color:#64748b;">Student:</span> <b>{e(row["Student"])}</b></div>'
+        f'<div><span style="color:#64748b;">Assessor:</span> {e(row["Assessor"])}</div>'
+        f'<div><span style="color:#64748b;">Examiner 2:</span> {e(row["Examiner2"])}</div>'
+        f'<div><span style="color:#64748b;">Submitted:</span> <span style="color:{subColor};font-weight:600;">{e(row["Submitted"])}</span></div>'
+        f'<div><span style="color:#64748b;">GR:</span> <b style="color:{grColor};">{e(row["GR"])} — {e(row["GR_label"])}</b></div>'
+        f'<div><span style="color:#64748b;">Overall:</span> <b>{e(row["Total"] if row["Total"] is not None else "—")}/{e(row["Max"] or "—")} ({pctTxt})</b></div>'
+        f'</div></div>'
+    ]
+    for d in DOMAIN_ORDER:
+        info = ds.get(d)
+        if not info:
+            continue
+        meta = cl.get(d) or {}
+        fields = meta.get("fields") or {}
+        p.append(f'<div style="margin-bottom:20px;"><div style="display:flex;justify-content:space-between;'
+                 f'background:{NAVY};color:#c7d2fe;padding:7px 12px;border-radius:6px;margin-bottom:8px;">'
+                 f'<span style="font-weight:600;font-size:13px;">{e(meta.get("name") or d)}</span>'
+                 f'<span style="font-size:12px;opacity:.8;">{info["score"]}/{info["max"]}</span></div>')
+        for k in sorted(info["perItem"], key=lambda x: int(x[2:]) if x[2:].isdigit() else 0):
+            s, m = info["perItem"][k]
+            val = info["items"].get(k) or "—"
+            rc = MC_COLORS.get(val.lower(), "#64748b")
+            p.append(f'<div style="display:flex;justify-content:space-between;align-items:flex-start;'
+                     f'padding:4px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;">'
+                     f'<span style="color:#475569;flex:1;padding-right:12px;"><b>{k}</b> {e(fields.get(k, ""))}</span>'
+                     f'<span style="color:{rc};font-weight:600;white-space:nowrap;">{e(val)} '
+                     f'<span style="color:#94a3b8;font-weight:400;">({s if s is not None else "—"}/{m})</span></span></div>')
+        dc = (ad.get(f"{d}_comments") or "").strip()
+        if dc:
+            p.append(f'<div style="margin-top:7px;padding:5px 8px;background:#f8fafc;border-left:3px solid #c7d2fe;'
+                     f'font-size:12px;"><span style="color:#64748b;font-weight:600;">Comments: </span>'
+                     f'<span style="color:#475569;">{e(dc)}</span></div>')
+        p.append("</div>")
+
+    cc, ccTxt = row["CC"], (ad.get("critical_concerns_comments") or "").strip()
+    isCC = row["CC_int"] == 1
+    p.append(f'<div style="margin-bottom:14px;padding:9px 12px;border:1px solid {"#fecaca" if isCC else "#e2e8f0"};'
+             f'border-radius:6px;background:{"#fff5f5" if isCC else "#fff"};">'
+             f'<div style="font-weight:600;color:{"#dc2626" if isCC else "#334155"};font-size:11px;text-transform:uppercase;'
+             f'letter-spacing:.4px;margin-bottom:4px;">Critical Concerns: {e(cc)}</div>'
+             f'<div style="font-size:12px;color:#334155;">{e(ccTxt) if ccTxt else "<i>No comments</i>"}</div></div>')
+    gen = (ad.get("comments") or "").strip()
+    p.append(f'<div style="padding:9px 12px;border:1px solid #e2e8f0;border-radius:6px;">'
+             f'<div style="font-weight:600;color:#334155;font-size:11px;text-transform:uppercase;letter-spacing:.4px;'
+             f'margin-bottom:4px;">Additional Comments</div>'
+             f'<div style="font-size:12px;color:#475569;">{e(gen) if gen else "<i>None provided</i>"}</div></div>')
+    return "".join(p).replace('"', "&quot;")
+
+
+# Self-contained onclick handler; modal lives on document.body so it survives table re-renders
+FORM_MODAL_HANDLER = (
+    "(function(el){var m=document.getElementById('_cfm');if(!m){"
+    "m=document.createElement('div');m.id='_cfm';"
+    "m.style.cssText='display:none;position:fixed;inset:0;background:rgba(1,13,68,.45);z-index:9999;align-items:center;justify-content:center';"
+    "var w=document.createElement('div');"
+    "w.style.cssText='background:#fff;border-radius:10px;max-width:860px;width:95%;max-height:88vh;overflow-y:auto;padding:28px 32px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.3)';"
+    "var x=document.createElement('button');x.textContent='\\u2715';"
+    "x.style.cssText='position:absolute;top:12px;right:14px;background:none;border:1px solid #e2e8f0;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:13px;color:#64748b';"
+    "x.onclick=function(){m.style.display='none'};"
+    "var b=document.createElement('div');b.id='_cfb';"
+    "w.appendChild(x);w.appendChild(b);m.appendChild(w);"
+    "m.onclick=function(e){if(e.target===m)m.style.display='none'};"
+    "document.addEventListener('keydown',function(e){if(e.key==='Escape')m.style.display='none'});"
+    "document.body.appendChild(m);}"
+    "document.getElementById('_cfb').innerHTML=el.getAttribute('data-html');m.style.display='flex';})(this)"
+)
+
+# Double-click comments modal (DOM-built, no innerHTML with user text)
+COMMENT_MODAL_HANDLER = (
+    "(function(el){var m=document.getElementById('_ccm');if(!m){"
+    "m=document.createElement('div');m.id='_ccm';"
+    "m.style.cssText='display:none;position:fixed;inset:0;background:rgba(1,13,68,.45);z-index:9999;align-items:center;justify-content:center';"
+    "var w=document.createElement('div');"
+    "w.style.cssText='background:#fff;border-radius:10px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;padding:28px 32px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.3)';"
+    "var x=document.createElement('button');x.textContent='\\u2715';"
+    "x.style.cssText='position:absolute;top:12px;right:14px;background:none;border:1px solid #e2e8f0;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:13px;color:#64748b';"
+    "x.onclick=function(){m.style.display='none'};"
+    "var b=document.createElement('div');b.id='_ccb';b.style.cssText='font-size:13px;line-height:1.8';"
+    "w.appendChild(x);w.appendChild(b);m.appendChild(w);"
+    "m.onclick=function(e){if(e.target===m)m.style.display='none'};"
+    "document.addEventListener('keydown',function(e){if(e.key==='Escape')m.style.display='none'});"
+    "document.body.appendChild(m);}"
+    "var raw=el.getAttribute('data-comment');var bd=document.getElementById('_ccb');bd.innerHTML='';"
+    "raw.split('\\n').forEach(function(l){var r=document.createElement('div');r.style.marginBottom='12px';"
+    "if(l.charAt(0)==='['&&l.indexOf(']')!==-1){var i=l.indexOf(']')+1;"
+    "var s1=document.createElement('span');s1.style.cssText='color:#010d44;font-weight:700';s1.textContent=l.slice(0,i);"
+    "var s2=document.createElement('span');s2.style.color='#334155';s2.textContent=l.slice(i);"
+    "r.appendChild(s1);r.appendChild(s2);}else{r.style.color='#334155';r.textContent=l;}bd.appendChild(r);});"
+    "m.style.display='flex';})(this)"
+)
+
+
+# ── Table ────────────────────────────────────────────────────────────────────
+def makeTableHtml(rows: list) -> str:
+    """Styled HTML table driven by TABLE_COLS."""
+    if not rows:
+        return ('<div style="text-align:center;padding:60px 0;color:#94a3b8;"><p style="font-size:14px;">'
+                'No records to display.<br>Check cohorts / date range, then click Load.</p></div>')
+    TH = (f"background:{NAVY};color:#c7d2fe;padding:9px 10px;text-align:left;font-weight:500;"
+          f"white-space:nowrap;font-size:{TABLE_FONT_SIZE};")
+    TD = f"padding:8px 10px;border-bottom:1px solid #f1f5f9;font-size:{TABLE_FONT_SIZE};color:#334155;"
+    dash = '<span style="color:#cbd5e1;font-size:11px;">—</span>'
+
+    def on(k):  return TABLE_COLS.get(k, {}).get("show", True)
+    def col(k):
+        w = TABLE_COLS.get(k, {}).get("width")
+        return f'<col style="width:{w}px">' if w else "<col>"
+
+    def grBadge(g):
+        try:
+            gi = int(g); gc = GR_COLORS[gi]
+            return (f'<span style="background:{gc}33;color:{gc};border-radius:4px;padding:2px 9px;'
+                    f'font-size:11px;font-weight:700;">{gi}</span>')
+        except (ValueError, IndexError):
+            return dash
+
+    def cohortBadge(c):
+        cc = COHORT_COLORS.get(c, "#64748b")
+        return f'<span style="background:{cc}22;color:{cc};border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600;">{c}</span>'
+
+    def ccCell(r):
+        if r["CC_int"]:
+            return '<span title="Critical concerns: Yes" style="background:#fee2e2;color:#dc2626;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:700;">⚠</span>'
+        return '<span style="color:#94a3b8;font-size:11px;">No</span>' if r["CC"] != "—" else dash
+
+    def domainCell(ds, d):
+        info = ds.get(d)
+        if not info:
+            return dash
+        return (f'<span style="font-weight:700;color:{pctColor(100*info["score"]/info["max"] if info["max"] else 0)};">'
+                f'{info["score"]}</span><span style="color:#94a3b8;font-size:10px;">/{info["max"]}</span>')
+
+    def commentsCell(text):
+        if not text or text == "—":
+            return dash
+        esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines = []
+        for ln in esc.split("\n"):
+            if ln.startswith("[") and "]" in ln:
+                i = ln.index("]") + 1
+                lines.append(f'<span style="color:{NAVY};font-weight:600;">{ln[:i]}</span><span style="color:#475569;">{ln[i:]}</span>')
+            else:
+                lines.append(f'<span style="color:#475569;">{ln}</span>')
+        dataVal = esc.replace('"', "&quot;").replace("'", "&#39;")
+        return (f'<div ondblclick="{COMMENT_MODAL_HANDLER}" data-comment="{dataVal}" title="Double-click to read full comment" '
+                f'style="max-height:{COMMENTS_MAX_HEIGHT};overflow-y:auto;cursor:pointer;word-break:break-word;'
+                f'font-size:11px;line-height:1.5;padding-right:4px;">{"<br>".join(lines)}</div>')
+
+    hdr, cols = [], []
+    def addCol(k, th):
+        if on(k):
+            hdr.append(th); cols.append(col(k))
+    addCol("Date",      f'<th style="{TH}">Date</th>')
+    addCol("Student",   f'<th style="{TH}">Student</th>')
+    addCol("Assessor",  f'<th style="{TH}">Assessor</th>')
+    addCol("Examiner2", f'<th style="{TH}">Examiner 2</th>')
+    addCol("Cohort",    f'<th style="{TH}">Cohort</th>')
+    addCol("GR",        f'<th style="{TH}text-align:center;">GR</th>')
+    for d in DOMAIN_ORDER:
+        lbl = DOMAIN_LABELS[d]
+        addCol(lbl, f'<th style="{TH}text-align:center;" title="{d}">{lbl}</th>')
+    addCol("Total",     f'<th style="{TH}text-align:center;">Total</th>')
+    addCol("Pct",       f'<th style="{TH}text-align:center;" title="{"Weighted" if DOMAIN_WEIGHTS else "Unweighted"} overall %">%</th>')
+    addCol("CC",        f'<th style="{TH}text-align:center;" title="Critical concerns">CC</th>')
+    addCol("Submitted", f'<th style="{TH}text-align:center;">Sub</th>')
+    addCol("View",      f'<th style="{TH}text-align:center;" title="Full form view">&#128065;</th>')
+    addCol("Comments",  f'<th style="{TH}">Comments</th>')
+
+    body = []
+    for i, r in enumerate(rows[:MAX_ROWS]):
+        bg = "#fff5f5" if r["CC_int"] else ("#ffffff" if i % 2 == 0 else "#f8fafc")
+        ds, t = r["_domain_scores"], []
+        if on("Date"):      t.append(f'<td style="{TD}color:#64748b;white-space:nowrap;">{r["Date"]}</td>')
+        if on("Student"):   t.append(f'<td style="{TD}font-weight:500;">{r["Student"]}</td>')
+        if on("Assessor"):  t.append(f'<td style="{TD}">{r["Assessor"]}</td>')
+        if on("Examiner2"): t.append(f'<td style="{TD}">{r["Examiner2"]}</td>')
+        if on("Cohort"):    t.append(f'<td style="{TD}">{cohortBadge(r["Cohort"])}</td>')
+        if on("GR"):        t.append(f'<td style="{TD}text-align:center;">{grBadge(r["GR"])}</td>')
+        for d in DOMAIN_ORDER:
+            if on(DOMAIN_LABELS[d]):
+                t.append(f'<td style="{TD}text-align:center;">{domainCell(ds, d)}</td>')
+        if on("Total"):
+            t.append(f'<td style="{TD}text-align:center;">' + (
+                f'<span style="font-weight:700;">{r["Total"]}</span><span style="color:#94a3b8;font-size:10px;">/{r["Max"]}</span>'
+                if r["Total"] is not None else dash) + "</td>")
+        if on("Pct"):
+            t.append(f'<td style="{TD}text-align:center;">' + (
+                f'<span style="font-weight:700;color:{pctColor(r["Pct"])};">{r["Pct"]:.0f}%</span>'
+                if r["Pct"] >= 0 else dash) + "</td>")
+        if on("CC"):        t.append(f'<td style="{TD}text-align:center;">{ccCell(r)}</td>')
+        if on("Submitted"):
+            t.append(f'<td style="{TD}text-align:center;">' + (
+                '<span style="color:#15803d;font-weight:600;">✓</span>' if r["Submitted"] == "Yes"
+                else '<span style="color:#94a3b8;">✗</span>') + "</td>")
+        if on("View"):
+            t.append(f'<td style="{TD}text-align:center;padding:4px 6px;"><span onclick="{FORM_MODAL_HANDLER}" '
+                     f'data-html="{buildFormHtml(r)}" title="View full form" style="cursor:pointer;font-size:13px;'
+                     f'color:#6366f1;display:inline-block;padding:2px 5px;border-radius:4px;border:1px solid #e0e7ff;'
+                     f'background:#eef2ff;">&#128065;</span></td>')
+        if on("Comments"):  t.append(f'<td style="{TD}vertical-align:top;padding-top:6px;">{commentsCell(r["Comments"])}</td>')
+        body.append(f'<tr style="background:{bg}">' + "".join(t) + "</tr>")
+    if len(rows) > MAX_ROWS:
+        body.append(f'<tr><td colspan="{len(cols)}" style="padding:10px;color:#94a3b8;font-size:11px;">'
+                    f'Showing {MAX_ROWS} of {len(rows)} records — use search to narrow down</td></tr>')
+    return (f'<div style="overflow:auto;max-height:{TABLE_MAX_HEIGHT};border-radius:8px;border:1px solid #e2e8f0;">'
+            f'<table style="width:100%;border-collapse:collapse;table-layout:fixed;"><colgroup>{"".join(cols)}</colgroup>'
+            f'<thead style="position:sticky;top:0;z-index:1;"><tr>{"".join(hdr)}</tr></thead><tbody>{"".join(body)}</tbody></table></div>')
+
+
+# ── Event handlers ───────────────────────────────────────────────────────────
+def doLoad(cohorts, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search,
+           sortOpt=DEFAULT_SORT, dateFrom="", dateTo=""):
+    """Fetch → parse → cache in State → filtered view."""
+    empty = ([], makeTableHtml([]), buildStatsHtml([]), "")
+    if not cohorts:
+        return *empty, "❌ Please select at least one cohort."
+    if not LOCAL_JSON and not (DASH_EMAIL and DASH_PASSWORD) and not ENV_TOKEN:
+        return *empty, "❌ No DASH_EMAIL / DASH_PASSWORD in .env (needed to fetch API token)."
+    try:
+        rows = parseRecords(loadRaw(cohorts))
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        return *empty, {401: "❌ Unauthorised — check DASH credentials",
+                        403: "❌ Forbidden — account may lack CBD permissions",
+                        404: f"❌ 404 — endpoint /assessment/{ASSESS_TYPE}/get not found"}.get(code, f"❌ HTTP {code} from API")
+    except Exception as e:
+        return *empty, f"❌ Load error: {e}"
+    filtered = applyFilters(rows, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search, sortOpt, dateFrom, dateTo)
+    print(f"[CBD] parsed={len(rows)} shown={len(filtered)}", flush=True)
+    src = " (local JSON)" if LOCAL_JSON else ""
+    return rows, makeTableHtml(filtered), buildStatsHtml(filtered), f"*Last loaded {datetime.now():%H:%M:%S}{src}*", ""
+
+
+def doFilter(rows, *args):
+    """Re-filter cached rows without hitting the API."""
+    f = applyFilters(rows, *args)
+    return makeTableHtml(f), buildStatsHtml(f)
+
+
+def doExport(rows, *args):
+    """Summary XLSX of the filtered view."""
+    tmp = tempfile.NamedTemporaryFile(suffix="_CBD_Summary.xlsx", delete=False); tmp.close()
+    makeDf(applyFilters(rows, *args)).to_excel(tmp.name, index=False)
+    return tmp.name
+
+
+def doExportDetailed(rows, *args):
+    """Formatted XLSX: merged domain headers, MC scores colour-coded, per-domain Score/max, summary, comments."""
+    filtered = applyFilters(rows, *args)
+    clMeta = next((r["_checklists"] for r in filtered if r["_checklists"]), {})
+    mcKeys = {d: sorted((clMeta.get(d) or {}).get("fields", {}).keys(), key=lambda k: int(k[2:]) if k[2:].isdigit() else 0)
+              for d in DOMAIN_ORDER}
+    domMax = {}
+    for d in DOMAIN_ORDER:
+        domMax[d] = next((r["_domain_scores"][d]["max"] for r in filtered if d in r["_domain_scores"]), "?")
+    totMax = sum(v for v in domMax.values() if isinstance(v, int))
+
+    def mcFill(v, m):
+        if v == "" or v is None or not m: return None
+        f = v / m
+        return "BBFFD9" if f >= .99 else "BFDBFE" if f >= .7 else "A5F3FC" if f >= .45 else "FEF08A" if f > 0 else "FECACA"
+    grFill = {5: "BBFFD9", 4: "D1FAE5", 3: "FEF9C3", 2: "FED7AA", 1: "FECACA"}
+
+    cols = []   # (blockKey, blockLabel, hdrHex, subHex, colLabel, valFn, fillFn)
+    ih, isub = XL_SCHEME["identity"]
+    for lbl, key in [("Date", "Date"), ("Student", "Student"), ("Assessor", "Assessor"),
+                     ("Examiner 2", "Examiner2"), ("Cohort", "Cohort"), ("Submitted", "Submitted")]:
+        cols.append(("identity", "Student Info", ih, isub, lbl, (lambda r, k=key: r.get(k, "")),
+                     (lambda v: "BBFFD9" if v == "Yes" else "FECACA") if key == "Submitted" else None))
+    for d in DOMAIN_ORDER:
+        hh, sh = XL_SCHEME.get(d, ("4B5563", "F3F4F6"))
+        dname = (clMeta.get(d) or {}).get("name") or d
+        for k in mcKeys[d]:
+            def mcVal(r, d=d, k=k):
+                it = (r["_domain_scores"].get(d) or {}).get("perItem", {}).get(k)
+                return "" if not it or it[0] is None else it[0]
+            def mcF(v, r, d=d, k=k):
+                it = (r["_domain_scores"].get(d) or {}).get("perItem", {}).get(k)
+                return mcFill(v, it[1] if it else None)
+            itMax = next((r["_domain_scores"][d]["perItem"][k][1] for r in filtered
+                          if d in r["_domain_scores"] and k in r["_domain_scores"][d]["perItem"]), "?")
+            cols.append((d, dname, hh, sh, f"{k} (/{itMax})", mcVal, mcF))
+        cols.append((d, dname, hh, sh, f"Score /{domMax[d]}",
+                     lambda r, d=d: (r["_domain_scores"].get(d) or {}).get("score", ""), None))
+    sh2, ss2 = XL_SCHEME["summary"]
+    cols += [
+        ("summary", "Summary", sh2, ss2, "GR", lambda r: r["GR"], lambda v: grFill.get(int(v)) if str(v).isdigit() else None),
+        ("summary", "Summary", sh2, ss2, f"Total /{totMax}", lambda r: r["Total"] if r["Total"] is not None else "", None),
+        ("summary", "Summary", sh2, ss2, "Overall %", lambda r: r["Pct"] if r["Pct"] >= 0 else "", None),
+        ("summary", "Summary", sh2, ss2, "Critical Concerns", lambda r: r["CC"],
+         lambda v: "FECACA" if str(v).lower() == "yes" else None),
+    ]
+    ch, cs = XL_SCHEME["comments"]
+    cols.append(("comments", "Comments", ch, cs, "General", lambda r: (r["_ad"].get("comments") or "").strip() or "—", None))
+    for d in DOMAIN_ORDER:
+        cols.append(("comments", "Comments", ch, cs, f"{DOMAIN_LABELS[d]} Comments",
+                     lambda r, d=d: (r["_ad"].get(f"{d}_comments") or "").strip() or "—", None))
+    cols.append(("comments", "Comments", ch, cs, "Critical Concerns Comments",
+                 lambda r: (r["_ad"].get("critical_concerns_comments") or "").strip() or "—", None))
+
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "CBD Detailed"
+    ws.row_dimensions[1].height, ws.row_dimensions[2].height = 22, 38
+    fill = lambda h: PatternFill(fill_type="solid", fgColor=h)
+    font = lambda bold=False, color="1E293B", size=9: Font(bold=bold, color=color, name="Calibri", size=size)
+    thin, thick = Side(style="thin", color="E2E8F0"), Side(style="medium", color="94A3B8")
+    border = lambda l=False, rr=False: Border(left=thick if l else thin, right=thick if rr else thin, top=thin, bottom=thin)
+
+    blocks, prev = [], None
+    for ci, c in enumerate(cols, start=1):
+        if c[0] != prev:
+            if blocks: blocks[-1][4] = ci - 1
+            blocks.append([c[0], c[1], c[2], ci, ci]); prev = c[0]
+    blocks[-1][4] = len(cols)
+    lastCols = {b[4] for b in blocks}
+    for bk, bl, hh, sc, ec in blocks:
+        for c in range(sc, ec + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.fill, cell.font = fill(hh), font(True, "FFFFFF", 10)
+            cell.alignment, cell.border = Alignment(horizontal="center", vertical="center"), border(c == sc, c == ec)
+        ws.cell(row=1, column=sc).value = bl
+        if ec > sc: ws.merge_cells(start_row=1, start_column=sc, end_row=1, end_column=ec)
+    for ci, (bk, bl, hh, sh, lbl, vf, ff) in enumerate(cols, start=1):
+        cell = ws.cell(row=2, column=ci, value=lbl)
+        cell.fill, cell.font = fill(sh), font(True)
+        cell.alignment, cell.border = Alignment(horizontal="center", vertical="center", wrap_text=True), border(rr=ci in lastCols)
+
+    for ri, r in enumerate(filtered, start=3):
+        rowBg = "FFFFFF" if ri % 2 else "F8FAFC"
+        for ci, (bk, bl, hh, sh, lbl, vf, ff) in enumerate(cols, start=1):
+            v = vf(r)
+            cell = ws.cell(row=ri, column=ci, value=v)
+            cell.font, cell.border = font(), border(rr=ci in lastCols)
+            cell.alignment = Alignment(vertical="center", wrap_text=bk == "comments")
+            fc = None
+            if ff:
+                try:    fc = ff(v, r)
+                except TypeError: fc = ff(v)
+            cell.fill = fill(fc or rowBg)
+
+    for ci, c in enumerate(cols, start=1):
+        lbl = c[4]
+        ws.column_dimensions[get_column_letter(ci)].width = (
+            32 if c[0] == "comments" else 8 if lbl.startswith("MC") else 18 if lbl in ("Student", "Assessor", "Examiner 2")
+            else 11 if lbl in ("Date", "Cohort", "Overall %", "Critical Concerns") else 9)
+    ws.freeze_panes = ws.cell(row=3, column=3)   # Date + Student frozen
+    tmp = tempfile.NamedTemporaryFile(suffix="_CBD_Detailed.xlsx", delete=False); tmp.close()
+    wb.save(tmp.name)
+    return tmp.name
+
+
+# ── Layout ───────────────────────────────────────────────────────────────────
+css = f"""
+.gradio-container {{ max-width:{DASH_MAX_WIDTH} !important; width:100% !important; margin:0 auto !important;
+                     padding-left:12px !important; padding-right:12px !important; }}
+#dash-header {{ background:{NAVY}; border-radius:8px; padding:8px 16px; margin-bottom:4px; display:flex; align-items:center; gap:16px; }}
+#dash-header h2 {{ color:white; margin:0; font-size:16px; letter-spacing:1px; }}
+#dash-header p  {{ color:#c7d2fe; margin:0; font-size:11px; }}
+#err-bar {{ color:#dc2626; min-height:0; }}
+#ts-bar  {{ color:#94a3b8; font-size:11px; text-align:right; min-height:0; }}
+.compact-row .gap {{ gap:4px !important; }}
+#table-wrap {{ width:100% !important; }}
+footer {{ display:none !important; }}
+"""
+
+with gr.Blocks(title=f"DASH · CBD Monitor · {APP_BUILD}") as demo:
+    rawState = gr.State([])
+    timer = gr.Timer(value=DEF_SECS, active=DEF_ACTIVE)
+
+    gr.HTML('<div id="dash-header"><h2>DASH</h2><p>Case Based Discussion (CBD) Live Monitor &nbsp;&middot;&nbsp; '
+            f'<span style="background:{PURPLE};color:#fff;padding:2px 8px;border-radius:6px;font-weight:700;font-size:12px;">{APP_BUILD}</span></p></div>')
+
+    with gr.Row(elem_classes="compact-row"):
+        dateFrom = gr.Textbox(label="From", value=DEFAULT_DATE_FROM, placeholder="YYYY-MM-DD", scale=2)
+        dateTo = gr.Textbox(label="To", value=DEFAULT_DATE_TO, placeholder="YYYY-MM-DD", scale=2)
+        intervalDd = gr.Dropdown(list(INTERVAL_MAP), value=DEFAULT_INTERVAL, label="Refresh", scale=2)
+        loadBtn = gr.Button("↻ Load", variant="primary", scale=1)
+
+    with gr.Row(elem_classes="compact-row"):
+        cohortIn = gr.CheckboxGroup(ALL_COHORTS, value=DEFAULT_COHORTS, label="Cohorts", scale=2)
+        searchIn = gr.Textbox(label="Search", placeholder="student · assessor · examiner 2 · comments…", scale=3)
+        sortDd = gr.Dropdown(list(SORT_OPTIONS), value=DEFAULT_SORT, label="Sort by", scale=2)
+        with gr.Column(scale=1, min_width=170):
+            subOnly = gr.Checkbox(label="Submitted only", value=False)
+            unsubOnly = gr.Checkbox(label="Unsubmitted only", value=False)
+        with gr.Column(scale=1, min_width=170):
+            ccOnly = gr.Checkbox(label="Critical concerns only", value=False)
+            hideTest = gr.Checkbox(label="Hide dummy/test", value=False)
+
+    with gr.Row(elem_classes="compact-row"):
+        statsHtml = gr.HTML(buildStatsHtml([]))
+        errorMd = gr.Markdown("", elem_id="err-bar")
+        updatedMd = gr.Markdown("", elem_id="ts-bar")
+
+    tableHtml = gr.HTML(makeTableHtml([]), elem_id="table-wrap", sanitize_html=False)
+
+    with gr.Row(elem_classes="compact-row"):
+        exportBtn = gr.Button("⬇ Export Summary", size="sm", scale=1)
+        exportDetailBtn = gr.Button("⬇ Export Detailed", size="sm", scale=1)
+        fileOut = gr.File(label="Download", visible=False, scale=3)
+
+    filterArgs = [subOnly, unsubOnly, ccOnly, hideTest, searchIn, sortDd, dateFrom, dateTo]
+    loadInputs = [cohortIn] + filterArgs
+    loadOutputs = [rawState, tableHtml, statsHtml, updatedMd, errorMd]
+    stateInputs = [rawState] + filterArgs
+
+    loadBtn.click(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
+    cohortIn.change(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
+    demo.load(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
+    for w in filterArgs:
+        w.change(fn=doFilter, inputs=stateInputs, outputs=[tableHtml, statsHtml])
+    intervalDd.change(fn=setInterval, inputs=[intervalDd], outputs=[timer])
+    timer.tick(fn=doLoad, inputs=loadInputs, outputs=loadOutputs)
+    exportBtn.click(fn=doExport, inputs=stateInputs, outputs=[fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
+    exportDetailBtn.click(fn=doExportDetailed, inputs=stateInputs, outputs=[fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
+
+if __name__ == "__main__":
+    print(f"[CBD] login gate: {'ON' if LOGIN_USER and LOGIN_PASS else 'OFF (set CBD_USERNAME/CBD_PASSWORD in .env)'}")
+    print(f"\n  DASH · CBD Gradio Dashboard — http://localhost:{SERVER_PORT}  (Ctrl+C to stop)\n")
+    ngrok.connect(SERVER_PORT, domain= "app.mds-dash.ngrok.app")
+    demo.launch(server_name="localhost", server_port=SERVER_PORT, share=False, max_threads=10, css=css,
+                auth=(LOGIN_USER, LOGIN_PASS) if LOGIN_USER and LOGIN_PASS else None,
+                theme=gr.themes.Default(primary_hue="indigo"))

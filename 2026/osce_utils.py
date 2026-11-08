@@ -337,11 +337,108 @@ def levelsText(itemLevel):
     return f"{lv[0]}-level" if len(lv) == 1 else "mixed " + "/".join(str(x) for x in lv)
 
 
+GR_SCALE_KEYS = ("global-rating", "global-rating-scale")   # DDS2/DDS4 use the first, DDS3 the second
+
+
+def grScale(scales):
+    """Return the Global Rating scale entry from a scales dict, whichever key the form uses (or {})."""
+    scales = scales or {}
+    for k in GR_SCALE_KEYS:
+        if scales.get(k):
+            return scales[k]
+    return {}
+
+
+# Free-text key aliases (first non-blank wins) — forms name the same field differently per cohort.
+FEEDBACK_TEXT_KEYS = ("feedback-on-student-performance", "student-feedback", "comments")  # DDS2/DDS4, DDS3, BOH2
+BLFAIL_TEXT_KEYS = ("if-you-have-awarded-a-global-rating-of-borderline-or-fail-please-provide-additional-information",)
+OSCE_COMMENT_TEXT_KEYS = ("comments-on-the-osce",)
+
+
+# ── Readiness to Progress + pre-built comments (added 2026-11-06, BOH2 OSCE) ──────────────────
+# RTP: a 1..4 scale ("Level 1: will not be able to practice .." -> "Level 4: .. indirect supervision").
+# Pre-built comments: multi-select fields shown conditionally on the GR key (one field per GR band,
+# e.g. "polypharmacy-comments-good-rating"); the examiner ticks any of the canned statements.
+# Neither feeds scoring, GR or the BLR/validity workbook — station workbook display only.
+RTP_SCALE_KEYS = ("readiness-to-progress-scale",)
+RTP_FILL  = {1: "FFC7CE", 2: "FFEB9C", 3: "DDEBF7", 4: "C6EFCE"}
+RTP_FONTC = {1: "9C0006", 2: "7F6000", 3: "000000", 4: "000000"}
+PREBUILT_KEY_PATTERN = "comment"   # multi-select field keys containing this are treated as pre-built comments
+
+
+def rtpScale(scales):
+    """Return the Readiness to Progress scale entry from a scales dict (or {})."""
+    scales = scales or {}
+    for k in RTP_SCALE_KEYS:
+        if scales.get(k):
+            return scales[k]
+    return {}
+
+
+def rtpLevelFields(records):
+    """{level int: label} for the Readiness to Progress scale, from the first record that has it."""
+    for r in records or []:
+        f = rtpScale((r.get("form_config") or {}).get("scales")).get("fields") or {}
+        if f:
+            out = {}
+            for k, v in f.items():
+                try:
+                    out[int(k)] = str(v).strip()
+                except (TypeError, ValueError):
+                    pass
+            return dict(sorted(out.items()))
+    return {}
+
+
+def prebuiltFieldConfigs(cfg):
+    """Pre-built comment multi-select configs from a form_config: {fieldKey: {name, items, grKey}}.
+    grKey = the raw GR key the field is shown for (from its 'show' condition on scales.global-rating*)."""
+    out = OrderedDict()
+    ms = (cfg or {}).get("multi-select") or {}
+    for k, v in sorted(ms.items(), key=lambda kv: ((kv[1] or {}).get("order") or 0, kv[0])):
+        if PREBUILT_KEY_PATTERN not in k.lower() or not isinstance(v, dict):
+            continue
+        grKey = None
+        for c in v.get("conditions") or []:
+            w = (c or {}).get("when") or {}
+            if str(w.get("field", "")).startswith("scales.global-rating"):
+                grKey = str(w.get("value"))
+        out[k] = {"name": str(v.get("name") or k).strip(),
+                  "items": [(it.get("key"), str(it.get("value") or "").strip()) for it in (v.get("items") or [])],
+                  "grKey": grKey}
+    return out
+
+
+def prebuiltSelections(formData):
+    """Ticked pre-built comments on one form: list of (fieldKey, optionKey, text), O-key order per field."""
+    out = []
+    ms = (formData or {}).get("multi-select") or {}
+    for k in sorted(ms):
+        if PREBUILT_KEY_PATTERN not in k.lower():
+            continue
+        sel = [x for x in (ms.get(k) or []) if isinstance(x, dict)]
+        for x in sorted(sel, key=lambda x: _okeyNum(x.get("key"))):
+            txt = str(x.get("value") or "").strip()
+            if txt:
+                out.append((k, x.get("key"), txt))
+    return out
+
+
+def firstText(texts, keys):
+    """First non-blank string among `keys` in a form_data texts dict ('' if none)."""
+    texts = texts or {}
+    for k in keys:
+        v = texts.get(k)
+        if v is not None and str(v).strip():
+            return v
+    return ""
+
+
 def grScaleFields(records):
     """The Global Rating scale's {key: label} map from the first record's form_config (or {})."""
     if not records:
         return {}
-    return ((records[0].get("form_config", {}) or {}).get("scales", {}) or {}).get("global-rating", {}).get("fields", {}) or {}
+    return grScale((records[0].get("form_config", {}) or {}).get("scales")).get("fields", {}) or {}
 
 
 def shouldReverseGr(scaleFields):
@@ -439,7 +536,9 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
             else:                                              # normalize: mean of per-item fractions
                 fr = [frac[i] for i in answered if frac[i] is not None]
                 score = (sum(fr) / len(fr)) if fr else None
-            gk = r["form_data"].get("scales", {}).get("global-rating", {}).get("key")
+            gk = grScale(r["form_data"].get("scales")).get("key")
+            rk = rtpScale(r["form_data"].get("scales")).get("key")
+            pre = prebuiltSelections(r["form_data"])
             if str(gk).isdigit():
                 grval = (maxGr + 1 - int(gk)) if rev else int(gk)
             elif bands is not None:
@@ -463,10 +562,12 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
                 "grRaw": (lvTotal if bands is not None else None),
                 "labels": labels, "points": points, "frac": frac,
                 "score": score,                                    # 0..1, per scoreConfig aggregate mode
-                "feedback": r["form_data"].get("texts", {}).get("feedback-on-student-performance", "") or "",
-                "blfail": r["form_data"].get("texts", {}).get(
-                    "if-you-have-awarded-a-global-rating-of-borderline-or-fail-please-provide-additional-information", "") or "",
-                "optComments": r["form_data"].get("texts", {}).get("comments-on-the-osce", "") or "",
+                "feedback": firstText(r["form_data"].get("texts"), FEEDBACK_TEXT_KEYS),
+                "blfail": firstText(r["form_data"].get("texts"), BLFAIL_TEXT_KEYS),
+                "optComments": firstText(r["form_data"].get("texts"), OSCE_COMMENT_TEXT_KEYS),
+                "grKey": (str(gk) if gk is not None else None),        # raw form GR key (pre-built conditions)
+                "rtp": (int(rk) if str(rk).isdigit() else None),       # Readiness to Progress level 1..4
+                "prebuilt": pre,                                       # [(fieldKey, optionKey, text)]
             })
         maxSet = set(itemMax.values())
         specs.append({"st": st, "stations": stations, "ck": ck, "cfg": cfg, "rows": rows,
@@ -475,6 +576,7 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
                       "scales": scales, "optLabels": optLabels,
                       "levels": levelsText(itemLevel),
                       "droppedItems": sorted(dropItems),
+                      "prebuiltCfg": prebuiltFieldConfigs(recs[0]["form_config"]),
                       "grRemaps": remaps, "grRemapN": grRemapN,
                       "maxPerItem": (next(iter(maxSet)) if len(maxSet) == 1 else None)})
     return specs
@@ -910,10 +1012,12 @@ def buildHarshnessFigure(spec, harsh, stMeanPct, imgDir):
 # ───────────────────────── workbook assembly ─────────────────────────
 # ── OSCE examiner comments sheet (added 2026-10-28) ─────────────────────────────────────────
 # Free-text fields about the OSCE/station itself (not the per-student feedback). DDS2 forms use
-# "comments-on-the-osce"; DDS4 forms have no such box and use "internal-comments" instead.
+# "comments-on-the-osce"; DDS4 forms have no such box and use "internal-comments" instead;
+# DDS3 forms use "internal-feedback" (confidential, not released to students).
 OSCE_COMMENT_KEYS = OrderedDict([
     ("comments-on-the-osce", "OSCE Comments"),
     ("internal-comments", "Internal Comments"),
+    ("internal-feedback", "Internal Comments"),
 ])
 
 
@@ -1164,6 +1268,18 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
     if overrideNoteLines:
         overrideNoteLines = ["Custom result overrides applied (see each station):"] + overrideNoteLines
 
+    # Readiness to Progress / pre-built comments (BOH2 2026+): shown only when the forms carry them
+    rtpLevels = rtpLevelFields(records)
+    hasRtp = any(r.get("rtp") is not None for s in specs for r in s["rows"])
+    hasPrebuilt = any(s.get("prebuiltCfg") for s in specs)
+    rtpNote = []
+    if hasRtp:
+        rtpNote = ["RTP = Readiness to Progress (examiner judgement; display only — NOT used in Score, GR or BLR):"] + \
+                  [f"    {lv}: {lab}" for lv, lab in rtpLevels.items()]
+    if hasPrebuilt:
+        rtpNote += ["Pre-built Comments = canned statements the examiner ticked (the list offered depends on the GR given); "
+                    "Feedback = examiner free text. Tick counts per statement are on the 'Pre-built Comment Stats' sheet."]
+
     # =================== STATION WORKBOOK ===================
     wb = openpyxl.Workbook(); wb.remove(wb.active)
     readMe(wb.create_sheet("Read Me"), f"{cohortLabel} OSCE — Round 1 (stations)".strip(),
@@ -1171,12 +1287,15 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
             "BLR standard-setting, validity and assessor-harshness analysis are in the separate analysis workbook.",
             "Sheet names are abbreviated: e.g. S1 IC = Station 1 Infection Control, S1 Rad = Radiography.",
             "MC cells show the item's rank points; the fill is a red->green gradient by the item's normalised fraction (red=worst option, green=best option)."]
-           + derivedNote + overrideNoteLines)
+           + rtpNote + derivedNote + overrideNoteLines)
 
     # Station Summary
     summ = wb.create_sheet("Station Summary")
     sh = ["Station", "Checklist", "Levels", "N", "Mean %", "SD %", "Median %", "Min %", "Max %", "GR Mean",
           "Excellent", "Very good", "Pass", "Borderline", "Fail", "Fails", "Pass+ %", "Pass Cut %"]
+    rtpLvList = list(rtpLevels) or [1, 2, 3, 4]
+    if hasRtp:
+        sh = sh + ["RTP Mean"] + [f"RTP L{lv}" for lv in rtpLvList]
     summ.append(sh); styleHeader(summ, len(sh))
     for s in specs:
         rows = s["rows"]
@@ -1199,7 +1318,9 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
                      round(min(pcts), 1) if pcts else None, round(max(pcts), 1) if pcts else None,
                      round(statistics.mean(grs), 2) if grs else None,
                      lc["Excellent"], lc["Very good"], lc["Pass"], lc["Borderline"], lc["Fail"],
-                     failsCell, round(passplus / len(grs) * 100, 1) if grs else None, cutCell])
+                     failsCell, round(passplus / len(grs) * 100, 1) if grs else None, cutCell]
+                    + ([round(statistics.mean(rv), 2) if (rv := [r["rtp"] for r in rows if r.get("rtp") is not None]) else None]
+                       + [sum(1 for x in rv if x == lv) for lv in rtpLvList] if hasRtp else []))
     failCol = sh.index("Fails") + 1
     for rr in range(2, summ.max_row + 1):
         for c in range(1, len(sh) + 1):
@@ -1218,7 +1339,8 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
         st, ck, cfg, rows, items = s["st"], s["ck"], s["cfg"], s["rows"], s["items"]
         ws = wb.create_sheet(stationTitle(st, ck)[:31])
         hdr = ["Circuit", "Student Name", "Student No", "Assessor"] + [f"MC{i}\n(/{s['itemMax'][i]})" for i in items] + \
-              ["Score (%)", "GR", "Feedback", "Borderline/Fail Info"]
+              ["Score (%)", "GR"] + (["RTP"] if hasRtp else []) + \
+              (["Pre-built Comments"] if s.get("prebuiltCfg") else []) + ["Feedback", "Borderline/Fail Info"]
         ws.append(hdr); styleHeader(ws, len(hdr))
         C = {h: i + 1 for i, h in enumerate(hdr)}
         srt = sorted(rows, key=lambda r: (r["score"] if r["score"] is not None else -1), reverse=True)
@@ -1226,7 +1348,9 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
             pts = [r["points"][i] for i in items]
             pct = round(r["score"] * 100, 2) if r["score"] is not None else None
             ws.append([r["circuit"], r["student"], r["studentNo"], r["assessor"]] + pts +
-                      [pct, r["gr"], r["feedback"], r["blfail"]])
+                      [pct, r["gr"]] + ([r.get("rtp")] if hasRtp else []) +
+                      (["\n".join(f"\u2022 {t}" for _, _, t in r.get("prebuilt") or [])] if s.get("prebuiltCfg") else []) +
+                      [r["feedback"], r["blfail"]])
         nrow = ws.max_row; ncol = len(hdr)
         mc0 = C["Assessor"] + 1; gcol = C["GR"]; icol = C["Borderline/Fail Info"]; fcol = C["Feedback"]
         ws.row_dimensions[1].height = 28   # fit the two-line "MC n / max" headers
@@ -1234,7 +1358,7 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
         for ri, r in enumerate(srt, start=2):
             for c in range(1, ncol + 1):
                 cell = ws.cell(ri, c); cell.font = bFont; cell.border = box
-                cell.alignment = flatL if c in (icol, fcol) else (
+                cell.alignment = flatL if c in (icol, fcol, C.get("Pre-built Comments")) else (
                     Alignment(horizontal="left", vertical="center") if c in nameCols else ctr)
             for j, i in enumerate(items):
                 fr = r["frac"].get(i)
@@ -1247,6 +1371,9 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
             gv = ws.cell(ri, gcol).value
             if gv in GR_FILL:
                 ws.cell(ri, gcol).fill = PatternFill("solid", fgColor=GR_FILL[gv]); ws.cell(ri, gcol).font = Font(name="Arial", size=10, color=GR_FONTC[gv])
+            rv = ws.cell(ri, C["RTP"]).value if "RTP" in C else None
+            if rv in RTP_FILL:
+                ws.cell(ri, C["RTP"]).fill = PatternFill("solid", fgColor=RTP_FILL[rv]); ws.cell(ri, C["RTP"]).font = Font(name="Arial", size=10, color=RTP_FONTC[rv])
             if gv == 1:
                 ws.cell(ri, icol).fill = PatternFill("solid", fgColor="FFC7CE"); ws.cell(ri, icol).font = Font(name="Arial", size=10, bold=True, color="9C0006")
             elif gv == 2:
@@ -1261,6 +1388,10 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
         ws.column_dimensions[get_column_letter(gcol)].width = 5
         ws.column_dimensions[get_column_letter(fcol)].width = 55
         ws.column_dimensions[get_column_letter(icol)].width = 55
+        if "RTP" in C:
+            ws.column_dimensions[get_column_letter(C["RTP"])].width = 5
+        if "Pre-built Comments" in C:
+            ws.column_dimensions[get_column_letter(C["Pre-built Comments"])].width = 60
         ws.freeze_panes = f"{get_column_letter(C['Assessor']+1)}2"; ws.auto_filter.ref = f"A1:{get_column_letter(ncol)}{nrow}"
 
     # MC Item Stats  (per item: its own level, and the count on each option best->worst)
@@ -1331,6 +1462,40 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
     asr.column_dimensions["A"].width = 24; asr.column_dimensions["B"].width = 11
     asr.column_dimensions["C"].width = 15; asr.column_dimensions["D"].width = 90
     asr.freeze_panes = "A4"; asr.auto_filter.ref = f"A3:D{rr-1}"
+
+    # ---- Pre-built Comment Stats (how often each canned statement was ticked) ----
+    prebuiltForms = 0
+    if hasPrebuilt:
+        pcs = wb.create_sheet("Pre-built Comment Stats"); pcs.sheet_view.showGridLines = False; rp = 1
+        pcs.cell(rp, 1, f"{cohortLabel} OSCE — pre-built comment usage".strip()).font = Font(name="Arial", size=12, bold=True, color=HEAD); rp += 1
+        pcs.cell(rp, 1, "Forms shown = forms whose GR matched the list's rating (the list only appears for that GR). "
+                        "% Ticked = Times ticked / Forms shown.").font = Font(name="Arial", size=9, italic=True); rp += 2
+        ph = ["Rating List", "Option", "Comment", "Times Ticked", "Forms Shown", "% Ticked"]
+        for s in specs:
+            pc = s.get("prebuiltCfg")
+            if not pc:
+                continue
+            rows = s["rows"]
+            withAny = sum(1 for r in rows if r.get("prebuilt")); prebuiltForms += withAny
+            withBoth = sum(1 for r in rows if r.get("prebuilt") and str(r.get("feedback") or "").strip())
+            pcs.cell(rp, 1, f"{stationTitle(s['st'], s['ck'])} — {s['cfg']['name'].split('.')[0]}   "
+                            f"(forms with pre-built: {withAny}/{len(rows)}; also with free text: {withBoth})").font = Font(name="Arial", size=11, bold=True, color=HEAD); rp += 1
+            for c, h in enumerate(ph, 1):
+                cc = pcs.cell(rp, c, h); cc.font = hFont; cc.fill = hFill; cc.alignment = ctrW; cc.border = box
+            rp += 1
+            for fk, fcfg in pc.items():
+                shown = sum(1 for r in rows if fcfg["grKey"] is not None and r.get("grKey") == fcfg["grKey"])
+                band = fcfg["name"].split("(")[-1].rstrip(")").strip() if "(" in fcfg["name"] else fcfg["name"]
+                for ok, txt in fcfg["items"]:
+                    n = sum(1 for r in rows for (f2, k2, _t) in (r.get("prebuilt") or []) if f2 == fk and k2 == ok)
+                    vals = [band, ok, txt, n, shown, (round(n / shown * 100, 1) if shown else None)]
+                    for c, v in enumerate(vals, 1):
+                        cc = pcs.cell(rp, c, v); cc.font = bFont; cc.border = box
+                        cc.alignment = topL if c == 3 else ctr
+                    rp += 1
+            rp += 1
+        for c, w in zip("ABCDEF", (22, 8, 90, 12, 12, 10)):
+            pcs.column_dimensions[c].width = w
 
     # ---- OSCE Comments (examiner free text about the OSCE/station) ----
     osceComments = collectOsceComments(records, commentKeys)
@@ -1544,7 +1709,8 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
             assessorOf.setdefault(r["student"], {})[sp["ck"]] = r["assessor"]
         for a, vs in byA.items():
             aMean[(sp["ck"], a)] = sum(vs) / len(vs)
-    allMeans = list(aMean.values()); vmin = min(allMeans); vmax = max(allMeans)
+    allMeans = list(aMean.values())
+    vmin, vmax = (min(allMeans), max(allMeans)) if allMeans else (0.0, 100.0)   # fail-safe: no scored stations
     agStudents = sorted(assessorOf, key=lambda x: (x.split()[-1], x))
     AST0 = 3   # first station column (after Student Name, Student No)
     hdr = ["Student Name", "Student No"] + [stationTitle(sp["st"], sp["ck"]) for sp in analysisSpecs]
@@ -1835,6 +2001,7 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
                          "n": len(outcome)} if allowedStationFailures is not None else None),
         "recordsUsed": len(records),
         "osceComments": len(osceComments),
+        "rtpPresent": hasRtp, "prebuiltForms": prebuiltForms,
         "stationWorkbook": stationPath, "analysisWorkbook": analysisPath, "imgDir": imgDir,
         "ignored": sorted(IGNORE_STUDENT_NUMBERS if ignoreStudentNumbers is None else ignoreStudentNumbers),
     }

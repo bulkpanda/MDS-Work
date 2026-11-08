@@ -11,7 +11,7 @@ plus at-risk flagging, assessor-bias analysis and two live Gradio dashboards.
 
 | | |
 |---|---|
-| **Modules documented** | 25 † (cbd_gradio + cbd_gradio_utils added 2026-11-03) |
+| **Modules documented** | 29 † (cbd_gradio + cbd_gradio_utils added 2026-11-03; dash_app + dash_app_config/core/export added 2026-11-06) |
 | **Lines of Python** | 20,348 |
 | **Function definitions** | 537 (all documented) |
 | **Classes** | 15 |
@@ -67,7 +67,7 @@ Sorted by size. "Entry pts" = functions `main.ipynb` calls directly.
 | [`Utils.py`](Utils.md) | Shared core | 703 | 30 | 0 | 0 | 9 | variableUtils |
 | [`boh1_utils.py`](boh1_utils.md) | Cohort reporting | 692 | 15 | 0 | 8 | 2 | Utils, variableUtils |
 | [`scbd_gradio.py`](scbd_gradio.md) | Dashboards | 492 | 18 | 0 | 20 | — | — |
-| [`cbd_gradio.py`](cbd_gradio.md) | Dashboards (added 2026-11-03) | 750 | 36 | 0 | 12 | — | cbd_gradio_utils |
+| [`cbd_gradio.py`](cbd_gradio.md) | Dashboards (added 2026-11-03) | 1,213 † | 53 † | 0 | 12 | — | cbd_gradio_utils |
 | [`mcq_analysis_utils.py`](mcq_analysis_utils.md) | Statistical analysis — Canvas MCQ item analysis + Rasch (added 2026-10-01) | 485 | 20 | 0 | 5 | 1 | — |
 | [`osce_pdfs.py`](osce_pdfs.md) | Cohort reporting | 466 | 9 | 0 | 20 | 2 | — |
 | [`osce_utils.py`](osce_utils.md) | OSCE station reports + standard-setting + student feedback PDFs | 2,211 † | 57 † | 0 | 31 † | 1 | osce_metrics |
@@ -81,7 +81,11 @@ Sorted by size. "Entry pts" = functions `main.ipynb` calls directly.
 | [`variableUtils.py`](variableUtils.md) | Configuration | 262 | 9 | 5 | 71 | — | — |
 | [`dash_anonymize_pipeline.py`](dash_anonymize_pipeline.md) | Ingest & pipeline | 138 | 5 | 0 | 36 | — | — |
 | [`gradio_utils.py`](gradio_utils.md) | Configuration | 130 | 0 | 0 | 34 | — | — |
-| [`cbd_gradio_utils.py`](cbd_gradio_utils.md) | Configuration (added 2026-11-03) | 126 | 0 | 0 | 40 | — | — |
+| [`cbd_gradio_utils.py`](cbd_gradio_utils.md) | Configuration (added 2026-11-03) | 137 † | 0 | 0 | 48 † | — | — |
+| [`dash_app.py`](dash_app.md) | Dashboards — merged Viva + SCBD + CBD + Oral Presentation monitor (added 2026-11-06; oral 2026-11-09) | 189 † | 12 | 0 | 5 | — | dash_app_config, dash_app_core, dash_app_export |
+| [`dash_app_core.py`](dash_app_core.md) | Dashboards — engine: API, cache, generic scorer, HTML (added 2026-11-06) | 1,120 † | 52 † | 2 | 14 | — | dash_app_config |
+| [`dash_app_export.py`](dash_app_export.md) | Dashboards — Excel analysis workbook (added 2026-11-06) | 1,212 † | 49 † | 1 | 5 | — | dash_app_config, dash_app_core |
+| [`dash_app_config.py`](dash_app_config.md) | Configuration — exam registry + scoring rules for dash_app (added 2026-11-06) | 221 † | 0 | 0 | 53 † | — | — |
 
 ---
 
@@ -204,8 +208,8 @@ flowchart LR
 |---|---|
 | **Imported by `main.ipynb`** (the normal path) | `Utils`, `variableUtils`, `general_utils`, `flagging_utils`, `boh1_utils`, `boh2_dds2_dds3_utils`, `boh3_dds4_utils`, `writtenexam_utils`, `risk_report`, `osce_pdfs`, `assessor_analysis`, `assessor_confound` |
 | **Standalone script** (`python x.py`) | `blr_analysis`, `generate_reports`, `generate_mcex_reports`, `build_canned_comments`, `dash_anonymize_pipeline` |
-| **Gradio web app** (`python x.py`, or `start.bat`) | `viva_gradio`, `scbd_gradio`, `cbd_gradio` (port 7861, added 2026-11-03) |
-| **Config only** — never executed directly | `gradio_utils`, `cbd_gradio_utils` |
+| **Gradio web app** (`python x.py`, or `start.bat`) | `viva_gradio`, `scbd_gradio`, `cbd_gradio` (port = `SERVER_PORT`, added 2026-11-03); **`dash_app`** — one app for all three exams, port 7863 (added 2026-11-06) |
+| **Config only** — never executed directly | `gradio_utils`, `cbd_gradio_utils`, `dash_app_config` (and `dash_app_core`, `dash_app_export` — imported only by `dash_app`) |
 
 `generate_mcex_reports` and `build_canned_comments` each have a `__main__` guard
 and are **not** imported anywhere in `main.ipynb` — the notebook has its own
@@ -267,6 +271,9 @@ Exam Feedback Reports` → `DDS3 Research Progress Summary` → `Send Emails`.
 | Change the live viva dashboard | [`viva_gradio`](viva_gradio.md) + [`gradio_utils`](gradio_utils.md) |
 | Change the live SCBD dashboard | [`scbd_gradio`](scbd_gradio.md) |
 | Change the live DDS4 CBD dashboard | [`cbd_gradio`](cbd_gradio.md) + [`cbd_gradio_utils`](cbd_gradio_utils.md) |
+| Change the merged Viva / SCBD / CBD dashboard (`dash_app.py`) | [`dash_app`](dash_app.md) — architecture, data model, UI, recipes |
+| Change a dashboard scoring rule (label points, level schemes, blanks, section/overall %, DDS3-CBD weights, OM/OS 50:50, oral item weights, ECCA matrix / unsafe cap, borderline GR) or add an exam to the dashboard | [`dash_app_config`](dash_app_config.md) `PROFILES` / `EXAMS` — rules table in [`dash_app`](dash_app.md) §1 |
+| Change the dashboard's Excel workbook (standard setting, item/section/assessor analysis, follow-up) | [`dash_app_export`](dash_app_export.md) |
 
 ---
 
@@ -398,7 +405,7 @@ These produce output that looks fine and is not:
   records over a public Gradio tunnel. `viva_gradio` additionally binds `0.0.0.0`
   (L1070); `scbd_gradio` binds `localhost` (L492). In both, auth applies **only**
   if both the username and password env vars are set.
-- **Added 2026-11-03.** `cbd_gradio` binds `localhost:7861` and is published via `pyngrok`
+- **Added 2026-11-03.** `cbd_gradio` binds `localhost:SERVER_PORT` and is published via `pyngrok`
   on the shared static ngrok domain; its login gate (`CBD_USERNAME`/`CBD_PASSWORD`) is
   likewise only active when both are set in `.env`.
 
@@ -470,7 +477,11 @@ item 6) — all 2026-08-18, see
 (not AST-generated; its counts come from an `ast` pass on that date).
 `osce_utils.md` was amended on 2026-10-01 (§0: student OSCE feedback PDFs + station
 metadata workbook; header counts), see `_handover_docs/HANDOVER_osce_student_feedback_pdfs.md`. `cbd_gradio.md` and `cbd_gradio_utils.md` were hand-written on 2026-11-03 when the
-modules were added (counts from an `ast` pass on that date). A full regeneration would
+modules were added (counts from an `ast` pass on that date). `dash_app.md`, `dash_app_config.md`, `dash_app_core.md` and
+`dash_app_export.md` were hand-written on 2026-11-06 when the merged dashboard was added
+(counts and function tables from an `ast` pass on that date; `dash_app.md` §0 holds dated changes). All four were
+updated 2026-11-09 for the Oral Presentation exam, ECCA matrix scoring, checklist multi-select and Double Marking sheet;
+`dash_app_config.ORAL_ITEM_WEIGHTS` duplicates `oral_pres_utils.ORAL_ITEM_WEIGHTS` (keep in step). A full regeneration would
 replace all of them; §2 of `python-reference-docs` in project memory has the
 recipe.
 

@@ -1,0 +1,17 @@
+{
+  "_help": "Manual overrides for cbd_gradio_new.py. Edit and save while the app runs; applied on the next refresh (no restart). student: name as in DASH (case/spacing and bracketed nicknames ignored). formId: optional, limits to one form. penaltyPct: amount. method: 'relative' = reduce Overall % by that % of itself (default, e.g. 10 → 61% becomes 54.9%), 'points' = subtract percentage points (61% → 51%). reason/by: shown in the table tooltip, form view and Excel comments. ignoreAssessors: names whose forms are moved out of the main Excel score sheet and cut-score analysis onto a separate 'Ignored Assessors' sheet (dashboard table unchanged).",
+  "ignoreAssessors": [
+    "Lakshmi Gade",
+    "Vasilios Liam Petroulias"
+  ],
+  "overrides": [
+    {
+      "student": "Yue Heng Xu (Kevin)",
+      "penaltyPct": 10,
+      "method": "absolute",
+      "reason": "Late submission",
+      "by": "",
+      "formId": null
+    }
+  ]
+}
