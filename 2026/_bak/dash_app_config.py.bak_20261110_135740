@@ -1,0 +1,243 @@
+"""
+dash_app_config.py — settings + exam registry for dash_app.py (one DASH monitor for Viva / SCBD / CBD).
+
+Adding an exam = add an EXAMS entry (API endpoint, cohorts, default dates, scoring-profile rules).
+Scoring is read from each form's own JSON (form.checklists rubric/options/headers, form.scales),
+so nothing about items, maxima, sections or GR labels is hard-coded here — only HOW points are
+given (PROFILES) and which profile a checklist uses (profileRules).
+"""
+
+# ── API / data ───────────────────────────────────────────────────────────────
+API_BASE   = "https://api.unimelb-dash.com"
+YEAR       = "2026"
+PAGE_SIZE  = 200                  # DASH page size (pagination follows "next")
+CACHE_TTL  = 30                   # seconds: max age of an exam's shared cache before DASH is called again
+LOCAL_JSON_DIR = ""               # "" = live API; "." = read "temp 2026 <endpoint>.json" next to the app (offline testing)
+
+EXCLUDE            = {"kunal patel", "suhrid gupta", "test student"}   # exact lowercase names always dropped
+EXCLUDE_SUBSTRINGS = ["dummy", "test"]                                  # dropped only when "Hide dummy/test" is ticked
+
+# ── Server ───────────────────────────────────────────────────────────────────
+APP_BUILD    = "build 20261109a"
+SERVER_PORT  = 7860               # trial port (live: viva/SCBD 7860, CBD 7862)
+USE_NGROK    = True              # True once this replaces the live apps
+NGROK_DOMAIN = "app.mds-dash.ngrok.app"
+# NGROK_DOMAIN = "dashboard.unimelb-dash.com"
+# ngrok login (checked at ngrok's edge, so app restarts don't log anyone out)
+NGROK_AUTH         = "microsoft"         # "microsoft" | "google" | None (None = no ngrok login → Gradio login used)
+NGROK_EMAIL_DOMAIN = "@unimelb.edu.au"   # email must end with this (case-insensitive)
+# Allowed emails: NGROK_ALLOWED_EMAILS in .env (comma-separated); blank = any NGROK_EMAIL_DOMAIN account
+CONCURRENCY  = 5                  # parallel runs per event handler
+OVERRIDES_SUFFIX = "_overrides.json"   # per exam: cbd_, scbd_, viva_, oral_presentation_overrides.json
+ROSTER_CSV   = "studentEmailList.csv"  # roster check in the detailed export (columns: cohort, student_name)
+
+# ── Scoring profiles ─────────────────────────────────────────────────────────
+# points:   "labelMap" = points by the answer's option LABEL (fallback: by slot)
+#           "levels"   = rank among the item's enabled rubric options, scheme by level count (LEVEL_SCHEMES)
+#           "slot"     = linear by slot (best enabled = n-1 … worst = 0)
+#           "fromOne"  = best real option = n … worst = 1; a 'Missing' option or a blank item = 0 (oral presentations)
+# itemWeights: {checklistKey: {MC: weight}} multiplier on item points (unlisted = 1); totals/% use weighted points
+# sectionsByItem: True → each item of a single checklist is its own table/Excel column (itemShorts names them)
+# unansweredAsZero: True = unanswered item scores 0 but stays in the max; False = left out of score and max
+# sectionPct: "pooled" (Σpoints ÷ Σmax) | "itemMean" (mean of item point/max)
+# overall:  "raw"      = Σpoints ÷ Σmax over the whole form
+#           "item"     = mean of item point/max over the whole form
+#           "sections" = Σ weight × section % (weights by section short label; None = equal);
+#                        missingAsZero: a section with no score counts 0% and keeps its weight
+#           "groups"   = groups of sections (by name regex), each with its own % method, then weighted
+#           "matrix"   = % looked up in a 2-item matrix (row item × column item), optional safety item that caps it
+LABEL5 = {"done well": 4, "done": 3, "mostly done": 2, "sometimes done": 1, "not done": 0}
+LEVEL_SCHEMES = {2: [0, 1], 3: [0, 1, 2], 4: [0, 2, 3, 4], 5: [0, 1, 2, 3, 4]}   # worst → best
+
+# ECCA combined performance matrix — (presentation level, questioning level): (%, outcome, descriptor).
+# Levels are the stored option codes (O1 M2 · O2 M1 · O3 B2 · O4 B1).
+ECCA_MATRIX = {
+    ("B1", "B1"): (25, "Fail", "Significant omissions or errors in the presentation. Questioning reveals significant misconceptions or incorrect clinical decisions, with essential gaps remaining unresolved."),
+    ("B1", "B2"): (35, "Fail", "Significant presentation omissions or errors. Some correct answers emerge during questioning, but important gaps in essential clinical understanding remain."),
+    ("B1", "M1"): (50, "Pass", "Presentation does not meet minimum requirements. Questioning resolves essential omissions or errors and establishes correct clinical understanding."),
+    ("B1", "M2"): (65, "Pass", "Presentation contains significant omissions or errors. Questioning establishes all essential criteria, with accurate answers, strong clinical reasoning and appropriate application to extension questions."),
+    ("B2", "B1"): (38, "Fail", "Presentation demonstrates some correct information and reasoning but does not meet essential criteria. Questioning reveals significant misconceptions, contradictions or unresolved gaps in clinical understanding."),
+    ("B2", "B2"): (45, "Fail/Supp offered as marginal fail", "Some appropriate clinical reasoning is demonstrated in the presentation and questioning. However, important omissions, errors or inconsistencies in essential clinical understanding remain unresolved."),
+    ("B2", "M1"): (60, "Pass", "Presentation demonstrates partial competence but does not meet all essential criteria. Questioning resolves outstanding omissions or errors and establishes correct clinical understanding."),
+    ("B2", "M2"): (70, "Pass", "Presentation demonstrates some correct clinical reasoning but omits or incorrectly addresses essential criteria. Questioning establishes these criteria with strong justification and appropriate application to extension questions."),
+    ("M1", "B1"): (55, "Pass", "Presentation correctly demonstrates all essential criteria. Questioning reveals significant errors, misconceptions or contradictions in underlying clinical understanding, raising concerns about the student's clinical reasoning."),
+    ("M1", "B2"): (60, "Pass", "Presentation meets all essential criteria. Questioning demonstrates some correct reasoning but reveals important gaps or inconsistencies in essential clinical understanding."),
+    ("M1", "M1"): (75, "Pass", "Presentation correctly demonstrates all essential criteria, with limited supporting rationale. Questioning confirms essential clinical understanding, although the student may struggle to apply reasoning to more complex extension questions."),
+    ("M1", "M2"): (85, "Above standard", "Presentation correctly demonstrates all essential criteria, with limited initial rationale. Questioning provides strong clinical justification and demonstrates appropriate application of reasoning to extension questions."),
+    ("M2", "B1"): (60, "Pass", "Presentation independently demonstrates all essential criteria with strong clinical reasoning. However, questioning reveals significant misconceptions, contradictions or gaps in essential clinical understanding that substantially undermine the initial performance."),
+    ("M2", "B2"): (70, "Pass", "Presentation independently demonstrates all essential criteria with strong clinical reasoning. Questioning reveals important weaknesses or inconsistencies in the student's understanding or justification of clinical decisions."),
+    ("M2", "M1"): (85, "Above standard", "Presentation independently demonstrates all essential criteria with strong clinical reasoning and justification. Questioning confirms essential clinical understanding, although the student may struggle with more complex extension questions."),
+    ("M2", "M2"): (100, "Above standard", "Presentation independently demonstrates all essential criteria with strong, case-specific clinical reasoning. Questioning sustains accurate, well-justified responses and demonstrates appropriate adaptation of reasoning to extension questions."),
+}
+ECCA_ROW_LABELS = {"B1": "Below minimum, limited reasoning", "B2": "Below minimum, some reasoning",
+                   "M1": "Meets minimum, limited rationale", "M2": "Meets minimum, strong rationale"}
+ECCA_COL_LABELS = {"B1": "Significant gaps", "B2": "Partial understanding", "M1": "Meets minimum",
+                   "M2": "Strong reasoning and application"}
+
+# Oral presentation item weights (same as oral_pres_utils.ORAL_ITEM_WEIGHTS — keep the two in step)
+ORAL_ITEM_WEIGHTS = {"BOH3-OCT": {"MC1": 3, "MC2": 2, "MC3": 1, "MC4": 1, "MC5": 1}}
+
+PROFILES = {
+    "label5Raw": {
+        "title": "Label points, raw total",
+        "points": "labelMap", "labelMap": LABEL5, "unansweredAsZero": True,
+        "sectionPct": "pooled", "overall": "raw",
+        "guide": ("Each answer scores by its LABEL wherever it sits in the rubric: Done Well 4, Done 3, Mostly Done 2, "
+                  "Sometimes Done 1, Not Done 0. Custom labels (e.g. Yes/No, Complete/Incomplete) score by slot "
+                  "(best = n−1 … worst = 0). Item max = its best option shown on the form. Unanswered items score 0 "
+                  "but stay in the max. Overall % = Σ points ÷ Σ max × 100."),
+    },
+    "levelsItemMean": {
+        "title": "Level-count scheme, item mean",
+        "points": "levels", "unansweredAsZero": False,
+        "sectionPct": "itemMean", "overall": "item",
+        "guide": ("Each item scores by its rank among the options enabled for it (worst → best): 2 levels 0/1, "
+                  "3 levels 0/1/2, 4 levels 0/2/3/4, 5 levels 0/1/2/3/4; item max = best level. Section and Overall % "
+                  "= mean of (item points ÷ item max) over answered items × 100."),
+    },
+    "dds3CbdWeighted": {
+        "title": "DDS3 CBD, weighted domains",
+        "points": "labelMap", "unansweredAsZero": False,
+        "labelMap": {"done well": 3, "done": 2, "partially done": 1, "not done": 0, "yes": 2, "no": 0},
+        "sectionPct": "pooled", "overall": "sections", "missingAsZero": True,
+        "weights": {"D1": .15, "D2": .10, "D3": .25, "D4": .20, "D5": .25, "D6": .05},
+        "guide": ("Done Well 3, Done 2, Partially Done 1, Not Done 0 (Yes 2 / No 0). Item max = best enabled option. "
+                  "Domain % = Σ points ÷ Σ max over answered items. Overall % = Σ weight × domain % "
+                  "(D1 15%, D2 10%, D3 25%, D4 20%, D5 25%, D6 5%)."),
+    },
+    "omos": {
+        "title": "Oral Med / Oral Surg 50:50",
+        "points": "levels", "unansweredAsZero": False, "sectionPct": "pooled", "overall": "groups",
+        "groups": [  # (label, section-name regex, % method, weight)
+            ("OM", r"oral medicine", "pooled", 0.5),
+            ("OS", r"oral surgery", "itemMean", 0.5),
+        ],
+        "guide": ("Items score by level count (2 levels 0/1 … 4 levels 0/2/3/4). Oral Medicine % = Σ points ÷ Σ max over "
+                  "all OM items (each OM point = 0.5 mark). Oral Surgery % = mean of item point/max. "
+                  "Overall % = 50% OM % + 50% OS % (one side only if the other is absent)."),
+    },
+    "oralFromOne": {
+        "title": "Oral presentation, weighted levels",
+        "points": "fromOne", "unansweredAsZero": True, "sectionPct": "pooled", "overall": "raw",
+        "itemWeights": ORAL_ITEM_WEIGHTS, "sectionsByItem": True,
+        "guide": ("Options score from the top: best = n … worst = 1 (OCT: Exemplary 4, Proficient 3, Developing 2, "
+                  "Unsatisfactory 1; OHTR: Excellent 4, Good 3, Satisfactory 2, Poor 1); 'Missing' or blank = 0. "
+                  "Item weights (OCT: MC1 ×3, MC2 ×2, MC3–5 ×1; others ×1). Form % = Σ weight × points ÷ "
+                  "(max × Σ weight) × 100. Student % = mean of the examiners' form % (Students / Double marking sheets)."),
+    },
+    "eccaMatrix": {
+        "title": "ECCA combined performance matrix",
+        "points": "slot", "unansweredAsZero": False, "sectionPct": "pooled", "overall": "matrix",
+        "sectionsByItem": True, "showCodes": True,
+        "itemShorts": [(r"presentation", "Pres"), (r"question", "Quest"), (r"safety", "Safety")],
+        "matrix": {
+            "rowItem": r"presentation", "colItem": r"question",          # matched on the item's question text
+            "table": ECCA_MATRIX, "rowLabels": ECCA_ROW_LABELS, "colLabels": ECCA_COL_LABELS,
+            "safetyItem": r"safety", "unsafeRegex": r"^\s*unsafe",       # rubric wording of the chosen safety option
+            "passMark": 50, "unsafeCap": 45,                              # unsafe → auto fail: min(matrix %, unsafeCap)
+        },
+        "guide": ("Overall % comes from the combined performance matrix: Presentation level (rows) × Questioning level "
+                  "(columns), each B1 / B2 / M1 / M2. Pass mark 50%. Patient Safety = Unsafe is an automatic fail: "
+                  "the result is capped below the pass mark (min(matrix %, 45%)). Item points (for item analysis only): "
+                  "B1 0 · B2 1 · M1 2 · M2 3; Safe 1 · Unsafe 0."),
+    },
+}
+
+PROFILES["dds2ScbdRaw"] = {
+    **PROFILES["label5Raw"],                                   # same label points, raw total, unanswered = 0
+    "title": "DDS2 SCBD, label points, raw total",
+    "unscoredItems": ["MC31"],                                 # shown on the form, left out of score + max
+    "guide": PROFILES["label5Raw"]["guide"] + " MC31 is not scored.",
+}
+
+PROFILES["binaryRaw"] = {                       # BOH2 EOY viva: Yes/No checklist
+    "title": "Yes/No binary, raw total",
+    "points": "labelMap", "labelMap": {"yes": 1, "no": 0},   # scored by label, not slot
+    "unansweredAsZero": True,                   # blank = 0, stays in the max
+    "sectionPct": "pooled", "overall": "raw",   # Total = number of Yes; % = Yes ÷ items
+    "guide": "Yes = 1, No = 0 (blank = 0, kept in the max). Total = number of Yes; Overall % = Total ÷ items × 100.",
+}
+
+# ── Exams ────────────────────────────────────────────────────────────────────
+# profileRules: first match wins, tested on the checklist template's metadata
+#   optionsAny: any assessor option label (lowercase) in this list · headerRegex: any header title matches
+#   keyRegex: checklist key matches
+# grScales: preferred GR scale keys (first present wins; other scales become extra columns)
+EXAMS = {
+    "CBD": {
+        "title": "Case Based Discussion (CBD)", "endpoint": "cbd",
+        "cohorts": ["BOH3", "DDS3", "DDS4"], "defaultCohorts": ["DDS4"],
+        "dateFrom": "2026-11-01", "dateTo": "2026-11-30",
+        "defaultProfile": "label5Raw", "profileRules": [],
+        "grScales": ["scale-global-rating"], "borderline": 2,
+    },
+    "SCBD": {
+        "title": "Structured Case Based Discussion (SCBD)", "endpoint": "scbd",
+        "cohorts": ["DDS2", "DDS3"], "defaultCohorts": ["DDS2"],
+        "dateFrom": "2026-10-01", "dateTo": "2026-12-31",
+        "defaultProfile": "levelsItemMean",
+        "profileRules": [
+            {"optionsAny": ["partially done"], "profile": "dds3CbdWeighted"},
+            {"headerRegex": r"^\s*oral (medicine|surgery)", "profile": "omos"},
+            {"optionsAny": ["mostly done", "sometimes done"], "profile": "dds2ScbdRaw"},   # DDS2 SCBD: label points, straight total, MC31 unscored
+        ],
+        "grScales": ["scale-global-rating", "scale-global-rating-om"], "borderline": 2,
+    },
+    "Viva": {
+        "title": "Viva", "endpoint": "viva",
+        "cohorts": ["BOH2", "BOH3", "DDS2", "DDS3", "DDS4"], "defaultCohorts": ["BOH2"],
+        "dateFrom": "2026-06-01", "dateTo": "2026-12-31",
+        "defaultProfile": "label5Raw",
+        "profileRules": [{"optionsAny": ["yes"], "profile": "binaryRaw"}],   # BOH2 viva Yes/No checklists
+        "grScales": ["scale-global-rating", "scale-practice-readiness"], "borderline": 2,
+    },
+}
+EXAMS["Oral Presentation"] = {
+    "title": "Oral Presentation (OCT · OHTR · ECCA)", "endpoint": "oral-presentation",
+    "cohorts": ["BOH3"], "defaultCohorts": ["BOH3"],
+    "dateFrom": "2026-09-01", "dateTo": "2026-12-31",
+    "defaultProfile": "oralFromOne",
+    "profileRules": [{"keyRegex": r"ECCA", "profile": "eccaMatrix"}],
+    "grScales": ["scale-global-rating", "scale-practice-readiness"], "borderline": 2,
+}
+DEFAULT_EXAM = "Viva"
+
+# ── Colours (UniMelb navy / blue / orange + colour-blind-safe status colours) ─
+NAVY, PURPLE, UOM_BLUE, UOM_ORANGE = "#010d44", "#4f5fb2", "#094183", "#e87722"
+GR_COLORS = {1: "#ef4444", 2: "#f97316", 3: "#eab308", 4: "#22c55e", 5: "#10b981"}
+COHORT_COLORS = {"BOH1": "#60a5fa", "BOH2": "#38bdf8", "BOH3": "#2dd4bf", "DDS1": "#a3e635",
+                 "DDS2": "#f472b6", "DDS3": "#c084fc", "DDS4": "#e879f9"}
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+MAX_ROWS = 500
+DASH_MAX_WIDTH, TABLE_MAX_HEIGHT, TABLE_FONT_SIZE = "1800px", "620px", "12px"
+STAT_VALUE_FONT_SIZE, STAT_LABEL_FONT_SIZE, COMMENTS_MAX_HEIGHT = "18px", "10px", "36px"
+MAX_SECTION_COLS = 12             # more sections than this → table shows Total/% only (full detail in form view/Excel)
+TABLE_COLS = {                    # show / width px (None = fill)
+    "Date": (True, 78), "Student": (True, 120), "Assessor": (True, 110), "Examiner": (True, 100),
+    "Cohort": (True, 52), "Checklist": (True, 110), "GR": (True, 46), "Section": (True, 50),
+    "Total": (True, 62), "Pct": (True, 54), "CC": (True, 40), "Status": (True, 50), "View": (True, 36),
+    "Comments": (True, None),
+}
+INTERVAL_MAP = {"Manual only": (60, False), "Every 15 sec": (15, True), "Every 30 sec": (30, True),
+                "Every 1 min": (60, True), "Every 5 min": (300, True)}
+DEFAULT_INTERVAL = "Every 30 sec"
+STATUS_RANK = {"Submitted": 0, "In progress": 1, "Not started": 2}
+SORT_OPTIONS = {
+    "Status: submitted → in progress → not started": ("_status", False),
+    "Date — newest first": ("_ts", True), "Date — oldest first": ("_ts", False),
+    "Student A → Z": ("Student", False), "Student Z → A": ("Student", True),
+    "Assessor A → Z": ("Assessor", False),
+    "GR — highest first": ("GR_int", True), "GR — lowest first": ("GR_int", False),
+    "Overall % — highest": ("Pct", True), "Overall % — lowest": ("Pct", False),
+    "Critical concerns first": ("CC_int", True),
+}
+DEFAULT_SORT = "Status: submitted → in progress → not started"
+
+# ── Standard setting / analysis thresholds ───────────────────────────────────
+SS_MIN_N, BGM_MIN_BORDERLINE, R2_MIN = 10, 5, 0.5
+DISCRIM_GUIDE, DISCRIM_LOW, DISCRIM_HIGH = 10.0, 5.0, 100 / 6
+METHOD_AGREE_TOL = 5.0
+ALPHA_GOOD = 0.7                  # Cronbach α ≥ this = acceptable internal consistency
+DOUBLE_MARK_GAP = 10.0            # double-marked forms: examiner gap (%-points) flagged on the Double Marking sheet
+LENIENCY_MIN_CUT = 5.0            # assessor flagged when |Δ| > max(this, 0.67 × SD of assessor means)

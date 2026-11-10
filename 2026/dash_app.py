@@ -178,12 +178,37 @@ with gr.Blocks(title=f"DASH · Assessment Monitor · {cfg.APP_BUILD}") as demo:
     exportDetailBtn.click(doExportDetailed, inputs, [fileOut]).then(lambda: gr.update(visible=True), outputs=[fileOut])
 
 
+def buildNgrokPolicy() -> dict:
+    """ngrok traffic policy: OAuth sign-in → deny if email not on NGROK_EMAIL_DOMAIN → deny if not on the .env allowlist."""
+    email = "actions.ngrok.oauth.identity.email.lowerAscii()"
+    rules = [{"actions": [{"type": "oauth", "config": {"provider": cfg.NGROK_AUTH}}]},       # sign-in (ngrok-managed app)
+             {"expressions": [f"!{email}.endsWith('{cfg.NGROK_EMAIL_DOMAIN.lower()}')"],     # domain check
+              "actions": [{"type": "deny", "config": {"status_code": 403}}]}]
+    if core.NGROK_ALLOWED_EMAILS:                                                             # specific-email allowlist
+        allowed = ", ".join(f"'{e}'" for e in core.NGROK_ALLOWED_EMAILS)
+        rules.append({"expressions": [f"!({email} in [{allowed}])"],
+                      "actions": [{"type": "deny", "config": {"status_code": 403}}]})
+    return {"on_http_request": rules}
+
+
 if __name__ == "__main__":
-    print(f"[DASH] login gate: {'ON' if core.LOGIN_USER and core.LOGIN_PASS else 'OFF (set DASH_APP_USERNAME/PASSWORD in .env)'}")
+    ngrokLogin = cfg.USE_NGROK and bool(cfg.NGROK_AUTH)
+    gradioAuth = None if ngrokLogin else ((core.LOGIN_USER, core.LOGIN_PASS) if core.LOGIN_USER and core.LOGIN_PASS else None)
+    if ngrokLogin:
+        who = f"{len(core.NGROK_ALLOWED_EMAILS)} allowed emails" if core.NGROK_ALLOWED_EMAILS else \
+            f"ANY {cfg.NGROK_EMAIL_DOMAIN} account (set NGROK_ALLOWED_EMAILS in .env to restrict)"
+        print(f"[DASH] login gate: ngrok {cfg.NGROK_AUTH} sign-in · {cfg.NGROK_EMAIL_DOMAIN} only · {who}")
+    else:
+        print(f"[DASH] login gate: {'Gradio ON' if gradioAuth else 'OFF (set DASH_APP_USERNAME/PASSWORD in .env)'}")
     print(f"\n  DASH · Assessment Monitor — http://localhost:{cfg.SERVER_PORT}  (Ctrl+C to stop)\n")
     if cfg.USE_NGROK:
-        ngrok.connect(cfg.SERVER_PORT, domain=cfg.NGROK_DOMAIN)
+        kw = {"traffic_policy": buildNgrokPolicy()} if ngrokLogin else {}
+        try:
+            tunnel = ngrok.connect(cfg.SERVER_PORT, domain=cfg.NGROK_DOMAIN, **kw)
+            print(f"[DASH] public URL: {tunnel.public_url}")
+        except Exception as e:                                                        # fail closed: never expose without login
+            raise SystemExit(f"[DASH] ngrok tunnel failed — app NOT started: {e}")
     demo.queue(default_concurrency_limit=cfg.CONCURRENCY)
     demo.launch(server_name="localhost", server_port=cfg.SERVER_PORT, share=False, max_threads=10, css=core.CSS,
-                head=core.FORM_JS, auth=(core.LOGIN_USER, core.LOGIN_PASS) if core.LOGIN_USER and core.LOGIN_PASS else None,
+                head=core.FORM_JS, auth=gradioAuth,
                 theme=gr.themes.Default(primary_hue="indigo"))

@@ -19,9 +19,14 @@ EXCLUDE_SUBSTRINGS = ["dummy", "test"]                                  # droppe
 
 # ── Server ───────────────────────────────────────────────────────────────────
 APP_BUILD    = "build 20261109a"
-SERVER_PORT  = 7863               # trial port (live: viva/SCBD 7860, CBD 7862)
+SERVER_PORT  = 7860               # trial port (live: viva/SCBD 7860, CBD 7862)
 USE_NGROK    = True              # True once this replaces the live apps
 NGROK_DOMAIN = "app.mds-dash.ngrok.app"
+# NGROK_DOMAIN = "dashboard.unimelb-dash.com"
+# ngrok login (checked at ngrok's edge, so app restarts don't log anyone out)
+NGROK_AUTH         = "microsoft"         # "microsoft" | "google" | None (None = no ngrok login → Gradio login used)
+NGROK_EMAIL_DOMAIN = "@unimelb.edu.au"   # email must end with this (case-insensitive)
+# Allowed emails: NGROK_ALLOWED_EMAILS in .env (comma-separated); blank = any NGROK_EMAIL_DOMAIN account
 CONCURRENCY  = 5                  # parallel runs per event handler
 OVERRIDES_SUFFIX = "_overrides.json"   # per exam: cbd_, scbd_, viva_, oral_presentation_overrides.json
 ROSTER_CSV   = "studentEmailList.csv"  # roster check in the detailed export (columns: cohort, student_name)
@@ -138,6 +143,21 @@ PROFILES = {
     },
 }
 
+PROFILES["dds2ScbdRaw"] = {
+    **PROFILES["label5Raw"],                                   # same label points, raw total, unanswered = 0
+    "title": "DDS2 SCBD, label points, raw total",
+    "unscoredItems": ["MC31"],                                 # shown on the form, left out of score + max
+    "guide": PROFILES["label5Raw"]["guide"] + " MC31 is not scored.",
+}
+
+PROFILES["binaryRaw"] = {                       # BOH2 EOY viva: Yes/No checklist
+    "title": "Yes/No binary, raw total",
+    "points": "labelMap", "labelMap": {"yes": 1, "no": 0},   # scored by label, not slot
+    "unansweredAsZero": True,                   # blank = 0, stays in the max
+    "sectionPct": "pooled", "overall": "raw",   # Total = number of Yes; % = Yes ÷ items
+    "guide": "Yes = 1, No = 0 (blank = 0, kept in the max). Total = number of Yes; Overall % = Total ÷ items × 100.",
+}
+
 # ── Exams ────────────────────────────────────────────────────────────────────
 # profileRules: first match wins, tested on the checklist template's metadata
 #   optionsAny: any assessor option label (lowercase) in this list · headerRegex: any header title matches
@@ -153,21 +173,26 @@ EXAMS = {
     },
     "SCBD": {
         "title": "Structured Case Based Discussion (SCBD)", "endpoint": "scbd",
-        "cohorts": ["DDS2", "DDS3"], "defaultCohorts": ["DDS3"],
+        "cohorts": ["DDS2", "DDS3"], "defaultCohorts": ["DDS2"],
         "dateFrom": "2026-10-01", "dateTo": "2026-12-31",
         "defaultProfile": "levelsItemMean",
         "profileRules": [
             {"optionsAny": ["partially done"], "profile": "dds3CbdWeighted"},
             {"headerRegex": r"^\s*oral (medicine|surgery)", "profile": "omos"},
+            {"optionsAny": ["mostly done", "sometimes done"], "profile": "dds2ScbdRaw"},   # DDS2 SCBD: label points, straight total, MC31 unscored
         ],
         "grScales": ["scale-global-rating", "scale-global-rating-om"], "borderline": 2,
     },
     "Viva": {
         "title": "Viva", "endpoint": "viva",
-        "cohorts": ["BOH3", "DDS2", "DDS3", "DDS4"], "defaultCohorts": ["BOH3", "DDS4"],
+        "cohorts": ["BOH2", "BOH3", "DDS2", "DDS3", "DDS4"], "defaultCohorts": ["BOH2"],
         "dateFrom": "2026-06-01", "dateTo": "2026-12-31",
-        "defaultProfile": "label5Raw", "profileRules": [],
+        "defaultProfile": "label5Raw",
+        "profileRules": [{"keyRegex": r"^(BOH-Viva-EOY|BOH2-Viva)$", "profile": "binaryRaw"}],   # BOH2 viva Yes/No checklists, by key
         "grScales": ["scale-global-rating", "scale-practice-readiness"], "borderline": 2,
+        # BOH viva: each student has an Examiner 1 form (ratings + comments only) and an Examiner 2 form (checklist +
+        # ratings + comments). Exports merge them into ONE row per student; forms without a role (DDS4) are unchanged.
+        "pairing": {"roleField": "examiner", "scorerRole": 2, "otherRole": 1, "matchOn": ["Student", "Cohort"]},
     },
 }
 EXAMS["Oral Presentation"] = {
@@ -178,7 +203,7 @@ EXAMS["Oral Presentation"] = {
     "profileRules": [{"keyRegex": r"ECCA", "profile": "eccaMatrix"}],
     "grScales": ["scale-global-rating", "scale-practice-readiness"], "borderline": 2,
 }
-DEFAULT_EXAM = "CBD"
+DEFAULT_EXAM = "Viva"
 
 # ── Colours (UniMelb navy / blue / orange + colour-blind-safe status colours) ─
 NAVY, PURPLE, UOM_BLUE, UOM_ORANGE = "#010d44", "#4f5fb2", "#094183", "#e87722"

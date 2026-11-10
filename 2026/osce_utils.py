@@ -71,7 +71,46 @@ STUDENT_NUMBER_OVERRIDES = {
 # carries EQUAL WEIGHT in the checklist score regardless of its number of levels; the
 # checklist score is the mean of the answered items' fractions.
 LEVEL_POINTS = {4: [4, 3, 2, 0], 3: [2, 1, 0], 2: [1, 0]}   # index 0 = best option
+# ── Per-item WEIGHTS override (stationOverrides[ck]["itemWeights"]) ──
+# Give only the items you want to weight, as % of the station score: e.g. {5: 30, 3: 20}.
+# Every item NOT listed shares the leftover (100 - sum of listed) EQUALLY by default.
+#   e.g. DDS3 S7 (10 items): {5: 30, 3: 20} -> MC5 30%, MC3 20%, other 8 items 50/8 = 6.25% each.
+# Station score = sum(w_i * frac_i) / sum(w_i over ANSWERED items)  (blank items don't pull it down).
+# Listed weights must total <= 100 (if they cover every item they are rescaled to 100).
 LEVEL_MAX = {4: 4, 3: 2, 2: 1}
+
+
+def resolveItemWeights(items, weightSpec):
+    """
+    Expand a PARTIAL per-item weight spec into a full {item: weight%} map over `items`.
+      weightSpec : {mcNumber: pct} for the items to weight explicitly (keys may be 5, "5" or "MC5").
+      Unlisted items share (100 - sum(listed)) equally. Returns None when weightSpec is empty
+      (-> default equal weighting). Raises if listed weights exceed 100 or leave unlisted items
+      with nothing (sum == 100 but some items unlisted). Items not in `items` (dropped / absent)
+      are ignored with a printed warning.
+    """
+    if not weightSpec:
+        return None
+    spec = {}
+    for k, v in weightSpec.items():
+        n = int(str(k).upper().replace("MC", "").strip())
+        if n in items:
+            spec[n] = float(v)
+        else:
+            print(f"  itemWeights: MC{n} not a scored item for this station -> ignored")
+    listed = sum(spec.values())
+    rest = [i for i in items if i not in spec]
+    if listed > 100 + 1e-9:
+        raise ValueError(f"itemWeights total {listed}% > 100%")
+    if rest:
+        left = 100.0 - listed
+        if left <= 1e-9:
+            raise ValueError(f"itemWeights use all 100% but {len(rest)} item(s) unlisted: "
+                             + ", ".join(f"MC{i}" for i in rest))
+        spec.update({i: left / len(rest) for i in rest})
+    elif listed > 0:                                           # all items listed -> rescale to 100
+        spec = {i: w * 100.0 / listed for i, w in spec.items()}
+    return {i: spec[i] for i in items}
 
 # ── checklists to drop from the OSCE output entirely (incomplete / not-run stations) ──
 # 2026-09-16: all stations now have complete data (endodontics 104, orthodontics 104), so nothing is
@@ -469,6 +508,8 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
     DYNAMIC per-item scoring scales. Scoring is controlled by `scoreConfig` (see resolveScoreConfig):
     mode rank|label, the levelPoints/labelPoints table, and aggregate normalize|total. Default
     (scoreConfig=None) = rank / LEVEL_POINTS / normalize (mean of per-item fractions, equal weight).
+    stationOverrides[ck]["itemWeights"] = {mc: pct} -> weighted mean of item fractions for that station
+    (unlisted items share the leftover % equally; see resolveItemWeights). Overrides `aggregate`.
     GR is normalised to the standard 5=best..1=worst direction.
     Returns list of dicts: {st, ck, cfg, rows, items, itemLevel, itemMax, scales, optLabels,
                             levels(text), maxPerItem(None if mixed)}.
@@ -507,6 +548,7 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
         optLabels = checklistOptionLabels(cfg)
         itemLevel = {i: scales[i][2] for i in items}
         itemMax = {i: scales[i][1] for i in items}
+        itemWeights = resolveItemWeights(items, ((stationOverrides or {}).get(ck, {}) or {}).get("itemWeights"))
 
         bands = grScoreBands.get(ck) if grScoreBands else None   # derive GR from raw total (no-GR stations)
         remaps = ((stationOverrides or {}).get(ck, {}) or {}).get("remapGr")  # override: reassign GR values
@@ -530,7 +572,11 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
                 else:                                          # blank / not marked
                     points[i], frac[i], labels[i] = None, None, None
             answered = [i for i in items if points[i] is not None]
-            if sconf["aggregate"] == "total":                  # raw total / max denominator
+            if itemWeights:                                    # override: weighted mean of per-item fractions
+                wa = [(itemWeights[i], frac[i]) for i in answered if frac[i] is not None]
+                wsum = sum(w for w, _ in wa)
+                score = (sum(w * f for w, f in wa) / wsum) if wsum else None
+            elif sconf["aggregate"] == "total":                  # raw total / max denominator
                 denom = sum(itemMax[i] for i in answered)
                 score = (sum(points[i] for i in answered) / denom) if denom else None
             else:                                              # normalize: mean of per-item fractions
@@ -576,6 +622,7 @@ def buildStationSpecs(records, reverseGr="auto", excludeChecklists=None, grScore
                       "scales": scales, "optLabels": optLabels,
                       "levels": levelsText(itemLevel),
                       "droppedItems": sorted(dropItems),
+                      "itemWeights": itemWeights,                 # {i: %} when overridden, else None
                       "prebuiltCfg": prebuiltFieldConfigs(recs[0]["form_config"]),
                       "grRemaps": remaps, "grRemapN": grRemapN,
                       "maxPerItem": (next(iter(maxSet)) if len(maxSet) == 1 else None)})
@@ -874,6 +921,25 @@ def itemTotalCorrs(rows, items):
     return out
 
 
+def itemGrCorrs(rows, items, method="spearman"):
+    """Correlation of each MC item (normalised fraction 0..1) with the Global Rating (5=best..1=worst).
+    Pairwise-complete: only rows with BOTH a GR and that item marked count. method = "spearman"
+    (default; GR and item levels are ordinal) or "pearson". Returns (rList, nList) aligned to `items`;
+    r is NaN when n < 3 or either side has no variation."""
+    rs, ns = [], []
+    for i in items:
+        pairs = [(r["gr"], r["frac"].get(i)) for r in rows
+                 if r.get("gr") is not None and r["frac"].get(i) is not None]
+        ns.append(len(pairs))
+        if len(pairs) < 3:
+            rs.append(np.nan); continue
+        g, f = np.array(pairs, float).T
+        if np.std(g) == 0 or np.std(f) == 0:
+            rs.append(np.nan); continue
+        rs.append((stats.spearmanr(g, f)[0] if method == "spearman" else stats.pearsonr(g, f)[0]))
+    return rs, ns
+
+
 def alphaInterpretation(a):
     if a != a:
         return "-"
@@ -897,8 +963,10 @@ def stationTitle(st, ck):
     return f"S{st} {CHECKLIST_ABBR.get(ck, ck[:12])}"
 
 
-def buildBlrFigure(spec, blr, imgDir, borderlineGr=2):
-    """4-panel BLR figure. Saves a PNG into imgDir and returns (path, itemMeanFracs, itemCorrs)."""
+def buildBlrFigure(spec, blr, imgDir, borderlineGr=2, grCorrMethod="spearman"):
+    """4-panel BLR figure. Saves a PNG into imgDir and returns (path, itemMeanFracs, itemCorrs).
+    Panels: Score vs GR (BLR) | Item vs GR correlation | Item analysis (mean + item-total r) | Score histogram.
+    grCorrMethod = "spearman" (default) or "pearson" for the Item vs GR panel."""
     st, ck, cfg, rows = spec["st"], spec["ck"], spec["cfg"], spec["rows"]
     grs, scs = blr["grs"], blr["scs"]
     items = spec["items"]
@@ -921,15 +989,21 @@ def buildBlrFigure(spec, blr, imgDir, borderlineGr=2):
     a.set_title("Score vs Global Rating"); a.set_xlim(0.5, 5.5); a.set_ylim(-5, 105)
     a.set_xticks([1, 2, 3, 4, 5]); a.legend(fontsize=7, loc="upper left")
 
-    a = ax[0, 1]
-    order = sorted(set(grs)); data = [scs[grs == g] * 100 for g in order]
-    bp = a.boxplot(data, tick_labels=[GR_LABELS[g] for g in order], patch_artist=True, widths=0.5)
-    for i, patch in enumerate(bp["boxes"]):
-        patch.set_facecolor(GR_COLORS.get(order[i], "#888")); patch.set_alpha(0.45)
-        patch.set_edgecolor(GR_COLORS.get(order[i], "#888"))
-    a.axhline(blr["cut"] * 100, color="#E24B4A", ls=":", lw=1.6, label=f"BLR cut {blr['cut']*100:.1f}%")
-    a.set_ylabel("Checklist score (%)"); a.set_title("Score distribution by GR"); a.legend(fontsize=8)
-    a.tick_params(axis="x", rotation=30)
+    a = ax[0, 1]                                               # correlation of each MC item with GR
+    grR, grN = itemGrCorrs(rows, items, grCorrMethod)
+    xg = np.arange(len(items)); rv = np.nan_to_num(np.array(grR, float), nan=0.0)
+    cols = ["#1D9E75" if r >= 0.3 else ("#EF9F27" if r >= 0.2 else "#E24B4A") for r in rv]   # good / ok / weak
+    a.bar(xg, rv, color=cols, alpha=0.75, edgecolor=cols)
+    for k, (r, n) in enumerate(zip(grR, grN)):
+        a.text(k, (r if r == r else 0) + (0.02 if (r if r == r else 0) >= 0 else -0.06),
+               ("-" if r != r else f"{r:.2f}"), ha="center", va="bottom", fontsize=7)
+    a.axhline(0.3, color="#1D9E75", ls=":", lw=1, label="r = 0.3 (good)")
+    a.axhline(0.2, color="#EF9F27", ls=":", lw=1, label="r = 0.2 (acceptable)")
+    a.axhline(0, color="#333", lw=0.8)
+    a.set_ylim(min(-0.2, np.nanmin(rv) - 0.1) if len(rv) else -0.2, 1.05)
+    a.set_xticks(xg); a.set_xticklabels([f"MC{i}" for i in items], rotation=45, ha="right")
+    a.set_ylabel(f"{'Spearman ρ' if grCorrMethod == 'spearman' else 'Pearson r'} with GR")
+    a.set_title(f"Item vs Global Rating correlation (n≈{max(grN) if grN else 0})"); a.legend(fontsize=7, loc="upper right")
 
     a = ax[1, 0]; x = np.arange(len(items))
     a.bar(x, np.array(means) * 100, color="#3266ad", alpha=0.55, edgecolor="#3266ad", label="Item mean (%)")
@@ -1258,6 +1332,9 @@ def buildOsceWorkbook(srcPath, stationPath, analysisPath, imgDir, cohortLabel=""
         ck = s["ck"]; bits = []
         if s.get("droppedItems"):
             bits.append("dropped items " + ", ".join(f"MC{i}" for i in s["droppedItems"]))
+        if s.get("itemWeights"):
+            bits.append("item weights (score = weighted mean of item fractions) " +
+                        ", ".join(f"MC{i} {w:g}%" for i, w in s["itemWeights"].items()))
         rt = remapText(s)
         if rt:
             bits.append("GR remap [" + "; ".join(rt) + f"] — {s.get('grRemapN', 0)} rating(s) changed")

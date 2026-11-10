@@ -1,0 +1,1120 @@
+"""
+dash_app_core.py — data layer + rendering for dash_app.py.
+
+  env/token/API → per-exam shared cache → generic parser/scorer (reads each form's own rubric, options,
+  headers and scales) → filters → overrides → HTML (stat cards, table, on-demand form view).
+Exam-specific behaviour lives only in dash_app_config.EXAMS / PROFILES.
+"""
+import os, re, json, time, hashlib, threading, html
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlencode
+
+import requests
+import dash_app_config as cfg
+
+APP_DIR = Path(__file__).resolve().parent
+
+
+# ══ 1. Environment + auth ═══════════════════════════════════════════════════
+def readEnvFile(path: Path) -> dict:
+    """KEY=VALUE lines from .env; file values win over stale shell/Windows env vars."""
+    out = {}
+    try:
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return out
+
+
+ENV_FILE = readEnvFile(APP_DIR / ".env")
+
+
+def envVal(key: str) -> str:
+    """.env value, else OS env, quotes stripped."""
+    return (ENV_FILE.get(key) or os.getenv(key, "") or "").strip().strip("'\"")
+
+
+DASH_EMAIL, DASH_PASSWORD, ENV_TOKEN = envVal("DASH_EMAIL"), envVal("DASH_PASSWORD"), envVal("DASH_TOKEN")
+LOGIN_USER = envVal("DASH_APP_USERNAME") or envVal("CBD_USERNAME")     # app login gate (blank = no gate)
+LOGIN_PASS = envVal("DASH_APP_PASSWORD") or envVal("CBD_PASSWORD")
+
+tokenState, tokenLock = {"token": None}, threading.Lock()
+
+
+def getToken(force: bool = False) -> str:
+    """POST /accounts/login with DASH_EMAIL/DASH_PASSWORD; cached; force=True re-logs in. Never logs credentials."""
+    with tokenLock:
+        if tokenState["token"] and not force:
+            return tokenState["token"]
+        if not (DASH_EMAIL and DASH_PASSWORD):
+            if ENV_TOKEN:
+                return ENV_TOKEN
+            raise RuntimeError("DASH_EMAIL / DASH_PASSWORD not set in .env")
+        resp = requests.post(f"{cfg.API_BASE}/accounts/login",
+                             json={"email": DASH_EMAIL, "password": DASH_PASSWORD}, timeout=60)
+        print(f"[DASH] login status={resp.status_code}", flush=True)
+        resp.raise_for_status()
+        tokenState["token"] = resp.json()["result"]["user"]["token"]
+        return tokenState["token"]
+
+
+def fetchAll(endpoint: str, cohorts: list, token: str) -> list:
+    """GET /assessment/<endpoint>/get, all pages (DRF Token auth)."""
+    params = urlencode({"page_size": cfg.PAGE_SIZE, "page": 1, "cohort": ",".join(cohorts),
+                        "year": cfg.YEAR, "ordering": "id"})
+    url, headers, records = f"{cfg.API_BASE}/assessment/{endpoint}/get?{params}", {"Authorization": f"Token {token}"}, []
+    while url:
+        resp = requests.get(url, headers=headers, timeout=60)
+        resp.raise_for_status()
+        d = resp.json()
+        if isinstance(d, list):
+            records.extend(d); url = None
+        else:
+            records.extend(d.get("results", [])); url = d.get("next")
+    print(f"[DASH] {endpoint}: {len(records)} records ({','.join(cohorts)}, {cfg.YEAR})", flush=True)
+    return records
+
+
+def loadRaw(examKey: str) -> list:
+    """All cohorts of one exam: live API (re-login once on 400/401/403), or LOCAL_JSON_DIR file for offline tests."""
+    exam = cfg.EXAMS[examKey]
+    if cfg.LOCAL_JSON_DIR:
+        base = Path(cfg.LOCAL_JSON_DIR)
+        base = base if base.is_absolute() else APP_DIR / base
+        raw = json.load(open(base / f"temp {cfg.YEAR} {exam['endpoint']}.json", encoding="utf-8"))
+        raw = raw.get("results", raw) if isinstance(raw, dict) else raw
+        return [r for r in raw if r.get("cohort") in exam["cohorts"]]
+    try:
+        return fetchAll(exam["endpoint"], exam["cohorts"], getToken())
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (400, 401, 403):
+            return fetchAll(exam["endpoint"], exam["cohorts"], getToken(force=True))
+        raise
+
+
+def httpErrorMsg(e, endpoint: str) -> str:
+    code = e.response.status_code if e.response is not None else "?"
+    return {401: "❌ Unauthorised — check DASH credentials",
+            403: f"❌ Forbidden — account may lack {endpoint} permissions",
+            404: f"❌ 404 — /assessment/{endpoint}/get not found"}.get(code, f"❌ HTTP {code} from API")
+
+
+# ══ 2. Generic form reading ═════════════════════════════════════════════════
+def esc(s) -> str:
+    return html.escape(str(s if s is not None else ""), quote=True)
+
+
+def cleanText(s) -> str:
+    """Strip HTML tags + collapse whitespace."""
+    return " ".join(re.sub(r"<[^>]+>", " ", str(s or "")).split())
+
+
+def natKey(k):
+    """Natural sort key: MC2 < MC10, d1-dds4 < d2-dds4."""
+    return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", str(k))]
+
+
+def slotNum(o: str) -> int:
+    return int(o[1:]) if str(o)[1:].isdigit() else 99
+
+
+def isSlot(k) -> bool:
+    return bool(re.fullmatch(r"O\d+", str(k)))
+
+
+def optionLabels(meta: dict) -> dict:
+    """{O1: label, …} from extra_config.options.assessor (student as fallback)."""
+    opts = ((meta or {}).get("extra_config") or {}).get("options") or {}
+    o = opts.get("assessor") or opts.get("student") or {}
+    return {k: " ".join(str(v or "").split()) for k, v in o.items() if isSlot(k)}   # collapse "Sometimes\nDone" → "Sometimes Done"
+
+
+def rubricOf(meta: dict, mc: str) -> dict:
+    return (((meta or {}).get("extra_config") or {}).get("rubric") or {}).get(mc) or {}
+
+
+def enabledSlots(meta: dict, mc: str) -> list:
+    """Options shown for this item (non-empty rubric slots; all options when there is no rubric), best first."""
+    rub = rubricOf(meta, mc)
+    en = [k for k, v in rub.items() if isSlot(k) and str(v or "").strip()]
+    if not en:
+        en = [k for k, v in optionLabels(meta).items() if v]
+    return sorted(en, key=slotNum)
+
+
+def findSlot(value: str, optLbl: dict, rub: dict):
+    """Stored answer → O-slot (matches option label, then rubric label, then a literal O-code)."""
+    v = value.strip().lower()
+    for o, lbl in optLbl.items():
+        if lbl.lower() == v:
+            return o
+    for o, lbl in rub.items():
+        if isSlot(o) and str(lbl or "").strip().lower() == v:
+            return o
+    return value.strip().upper() if re.fullmatch(r"o\d+", v) else None
+
+
+def slotPoints(slot: str, enabled: list, optLbl: dict, rub: dict, profile: dict) -> int:
+    """Points for a slot under the profile's points method."""
+    kind = profile["points"]
+    if kind == "labelMap":
+        lm = profile["labelMap"]
+        for lbl in (optLbl.get(slot, ""), str(rub.get(slot) or "")):
+            p = lm.get(lbl.strip().lower())
+            if p is not None:
+                return p
+        nOpts = len([v for v in optLbl.values() if v]) or len(enabled)   # custom label → by slot (best = n−1)
+        return max(0, nOpts - slotNum(slot))
+    if kind == "fromOne":                                                # best real option = n … worst = 1; Missing = 0
+        real = [o for o in enabled if optLbl.get(o, "").lower() != "missing"]
+        return len(real) - real.index(slot) if slot in real else 0
+    rank = enabled.index(slot) if slot in enabled else len(enabled) - 1
+    if kind == "levels":
+        scheme = cfg.LEVEL_SCHEMES.get(len(enabled)) or list(range(len(enabled)))
+        return list(reversed(scheme))[rank]
+    return len(enabled) - 1 - rank                                       # "slot": linear
+
+
+def scoreItem(value, meta: dict, mc: str, profile: dict):
+    """(points | None, itemMax | None, display label, slot). Display = stored label + rubric wording when it differs."""
+    optLbl, rub = optionLabels(meta), rubricOf(meta, mc)
+    enabled = enabledSlots(meta, mc)
+    val = str(value or "").strip()
+    slot = findSlot(val, optLbl, rub) if val else None
+    if slot and slot not in enabled and profile["points"] != "labelMap":
+        enabled = sorted(enabled + [slot], key=slotNum)                  # answer outside rubric → still counted
+    pts = {o: slotPoints(o, enabled, optLbl, rub, profile) for o in enabled}
+    itemMax = max(pts.values()) if pts else None
+    itemMax = itemMax if itemMax else None
+    if not val:
+        return None, itemMax, "", None
+    if slot:
+        p = pts.get(slot, slotPoints(slot, enabled, optLbl, rub, profile))
+    else:
+        p = (profile.get("labelMap") or {}).get(val.lower())
+        if p is None:
+            m = re.search(r"\((\d+)\)", val)                             # e.g. "Good (3)"
+            p = int(m.group(1)) if m else None
+    rubLbl = cleanText(rub.get(slot)) if slot else ""
+    if ":" in rubLbl[:25]:                                               # "Unsafe: A significant…" → "Unsafe"
+        rubLbl = rubLbl.split(":")[0].strip()
+    disp = val + (f" · {rubLbl}" if rubLbl and rubLbl.lower() != val.lower() and len(rubLbl) < 60 else "")
+    return p, itemMax, disp, slot
+
+
+def headerTitles(meta: dict, mc: str) -> list:
+    hd = ((meta or {}).get("extra_config") or {}).get("headers") or {}
+    v = hd.get(mc)
+    return [cleanText(t.get("title")) for t in (v if isinstance(v, list) else []) if cleanText(t.get("title"))]
+
+
+def sectionMap(meta: dict, mcs: list, fallback: str) -> dict:
+    """{mc: (section, subsection)} from checklist headers. Multi-level headers ([top, sub]) → sections = tops."""
+    hd = ((meta or {}).get("extra_config") or {}).get("headers") or {}
+    multi = any(len(headerTitles(meta, k)) > 1 for k in hd)
+    top, sub, out = None, None, {}
+    for mc in mcs:
+        ts = headerTitles(meta, mc)
+        if ts:
+            if multi:
+                if len(ts) > 1:
+                    top, sub = ts[0], ts[-1]
+                else:
+                    sub = ts[0]
+            else:
+                top, sub = ts[0], None
+        out[mc] = (top or fallback, sub)
+    return out
+
+
+def shortLabel(title: str, idx: int) -> str:
+    """Compact column label: 'DOMAIN 2: …'→D2, 'Oral Medicine – Case Scenario 1'→OM1, '3. Treatment…'→S3."""
+    t = cleanText(title)
+    m = re.search(r"\bdomain\s*(\d+)", t, re.I)
+    if m:
+        return f"D{m.group(1)}"
+    om, osg = "oral medicine" in t.lower(), "oral surgery" in t.lower()
+    if om or osg:
+        m = re.search(r"case scenario\s*(\d+)", t, re.I)
+        return ("OM" if om else "OS") + (m.group(1) if m else "")
+    m = re.match(r"^\s*(\d+)\s*[.):\-]", t)
+    if m:
+        return f"S{m.group(1)}"
+    m = re.match(r"^\s*section\s+([A-Z0-9])\b", t, re.I)
+    return f"S{m.group(1).upper()}" if m else f"S{idx}"
+
+
+def itemShort(profile: dict, text: str, mc: str) -> str:
+    """Column label for an item-as-section: first itemShorts regex matching the question text, else the MC key."""
+    for rx, short in profile.get("itemShorts") or []:
+        if re.search(rx, text or "", re.I):
+            return short
+    return mc
+
+
+def shortList(names: list) -> list:
+    """Unique short labels for an ordered list of section names."""
+    out = []
+    for i, nm in enumerate(names, 1):
+        s = shortLabel(nm, i)
+        out.append(s if s not in out else f"S{i}")
+    return out
+
+
+def headerTops(meta: dict, mcs: list, fallback: str) -> list:
+    """Ordered distinct section names of one checklist."""
+    return list(OrderedDict((top, None) for top, _ in sectionMap(meta, mcs, fallback).values())) or [fallback]
+
+
+def mcKeysOf(meta: dict, answers: dict) -> list:
+    keys = [k for k in ((meta or {}).get("fields") or {}) if str(k).startswith("MC")]
+    keys = keys or [k for k in (answers or {}) if str(k).startswith("MC")]
+    return sorted(keys, key=natKey)
+
+
+def isRichMeta(meta: dict) -> bool:
+    return bool(optionLabels(meta)) and bool((meta or {}).get("fields"))
+
+
+# ══ 3. Templates (which checklists belong together) + profile choice ═════════
+def chooseProfile(exam: dict, metas: dict) -> str:
+    """First matching profileRule on the template's checklist metadata, else the exam default."""
+    for rule in exam.get("profileRules", []):
+        for key, meta in metas.items():
+            opts = {v.lower() for v in optionLabels(meta).values()}
+            titles = [t for mc in (((meta.get("extra_config") or {}).get("headers")) or {}) for t in headerTitles(meta, mc)]
+            if (("optionsAny" in rule and opts & set(rule["optionsAny"]))
+                    or ("headerRegex" in rule and any(re.search(rule["headerRegex"], t, re.I) for t in titles))
+                    or ("keyRegex" in rule and re.search(rule["keyRegex"], key))):
+                return rule["profile"]
+    return exam["defaultProfile"]
+
+
+def templateLabel(keys: list, metas: dict) -> str:
+    if len(keys) == 1:
+        return keys[0]
+    pre = os.path.commonprefix(keys)
+    suf = os.path.commonprefix([k[::-1] for k in keys])[::-1]
+    lbl = re.sub(r"^[\W_]+|[\W_]+$", "", pre if len(pre) >= len(suf) else suf)
+    return (lbl.upper() if lbl else "+".join(keys)) + f" ({len(keys)} parts)"
+
+
+def buildTemplates(raw: list, examKey: str) -> tuple:
+    """Group checklist keys that appear on the same forms (union-find) → templates; richest meta per key."""
+    exam, parent, metas = cfg.EXAMS[examKey], {}, {}
+
+    def root(k):
+        parent.setdefault(k, k)
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]; k = parent[k]
+        return k
+
+    for r in sorted(raw, key=lambda x: x.get("datetime") or ""):          # newest meta wins
+        cl = ((r.get("form") or {}).get("checklists") or {}) if isinstance(r.get("form"), dict) else {}
+        keys = [k for k, v in cl.items() if isinstance(v, dict)]
+        for k in keys:
+            if isRichMeta(cl[k]) or k not in metas:
+                metas[k] = cl[k]
+            parent[root(k)] = root(keys[0])
+    groups = {}
+    for k in parent:
+        groups.setdefault(root(k), []).append(k)
+    templates, keyToTid = {}, {}
+    for keys in groups.values():
+        keys = sorted(keys, key=natKey)
+        tid = "|".join(keys)
+        tMetas = {k: metas.get(k, {}) for k in keys}
+        multi = len(keys) > 1
+        profName = chooseProfile(exam, tMetas)
+        prof = cfg.PROFILES[profName]
+        if not multi and prof.get("sectionsByItem"):                       # sections = items (key = MC)
+            m = tMetas[keys[0]]
+            flds = m.get("fields") or {}
+            shorts = [(mc, cleanText(flds.get(mc)) or mc, itemShort(prof, cleanText(flds.get(mc)), mc))
+                      for mc in mcKeysOf(m, {})]
+        elif multi:                                                        # sections = checklists (key = checklist key)
+            names = [cleanText(tMetas[k].get("name")) or k for k in keys]
+            shorts = [(k, nm, s) for k, nm, s in zip(keys, names, shortList(names))]
+        else:                                                              # sections = header blocks (key = short label)
+            m = tMetas[keys[0]]
+            names = headerTops(m, mcKeysOf(m, {}), cleanText(m.get("name")) or keys[0])
+            shorts = [(s, nm, s) for nm, s in zip(names, shortList(names))]
+        templates[tid] = {"id": tid, "keys": keys, "multi": multi, "metas": tMetas, "sections": shorts,
+                          "label": templateLabel(keys, tMetas), "profile": profName}
+        for k in keys:
+            keyToTid[k] = tid
+    return templates, keyToTid
+
+
+# ══ 4. Aggregation ══════════════════════════════════════════════════════════
+def aggregate(items: list, unansweredAsZero: bool, method: str) -> dict:
+    """Section/overall maths over item dicts {points, max}."""
+    use = [it for it in items if it["max"] and (unansweredAsZero or it["points"] is not None)]
+    w = lambda it: it.get("weight", 1.0)                                  # itemWeights (oral OCT); 1 elsewhere
+    score = sum(w(it) * (it["points"] or 0) for it in use)
+    mx = sum(w(it) * it["max"] for it in use)
+    if method == "itemMean":
+        sw = sum(w(it) for it in use)
+        pct = 100 * sum(w(it) * (it["points"] or 0) / it["max"] for it in use) / sw if sw else None
+    else:
+        pct = 100 * score / mx if mx else None
+    return {"score": score, "max": mx, "pct": pct,
+            "answered": sum(1 for it in items if it["points"] is not None), "n": len(items)}
+
+
+def sectionMethod(profile: dict, sectionName: str) -> str:
+    """% method for one section: its group's method when the profile uses groups, else profile['sectionPct']."""
+    for label, rx, method, _ in profile.get("groups") or []:
+        if re.search(rx, sectionName or "", re.I):
+            return method
+    return profile["sectionPct"]
+
+
+def isUnsafe(it: dict, profile: dict) -> bool:
+    """Safety item answered with an option whose rubric wording matches the matrix unsafeRegex."""
+    mx = profile.get("matrix") or {}
+    return bool(it and it.get("value") and re.search(mx.get("unsafeRegex", r"^\s*unsafe"), it.get("rubric") or "", re.I))
+
+
+def matrixResult(items: list, profile: dict) -> tuple:
+    """(%, info) for overall='matrix': row item × column item lookup; unsafe safety answer caps below the pass mark."""
+    mx = profile["matrix"]
+    find = lambda rx: next((it for it in items if rx and re.search(rx, it["question"] or "", re.I)), None)
+    rowIt, colIt, safeIt = find(mx["rowItem"]), find(mx["colItem"]), find(mx.get("safetyItem"))
+    unsafe = isUnsafe(safeIt, profile)
+    rowC, colC = (rowIt or {}).get("code", ""), (colIt or {}).get("code", "")
+    cell = mx["table"].get((rowC, colC))
+    info = {"unsafe": unsafe, "row": rowC, "col": colC, "passMark": mx.get("passMark", 50)}
+    if not cell:
+        info["outcome"] = "Incomplete — presentation and questioning both needed" + (" · UNSAFE" if unsafe else "")
+        return None, info
+    pct, outcome, desc = cell
+    info.update(matrixPct=pct, descriptor=desc)
+    if unsafe:
+        cap = mx.get("unsafeCap", 45)
+        info["outcome"] = f"Fail — unsafe (auto fail): matrix {rowC}×{colC} = {pct:g}% capped to {min(pct, cap):g}%"
+        return min(pct, cap), info
+    info["outcome"] = f"{pct:g}% — {outcome}"
+    return pct, info
+
+
+def overallPct(sections: OrderedDict, items: list, profile: dict):
+    """(Overall %, {group: %}, info) per profile['overall']; info carries the matrix outcome / unsafe flag."""
+    o, uz = profile["overall"], profile["unansweredAsZero"]
+    if o == "matrix":
+        pct, info = matrixResult(items, profile)
+        return pct, {}, info
+    if o in ("raw", "item"):
+        return aggregate(items, uz, "pooled" if o == "raw" else "itemMean")["pct"], {}, {}
+    if o == "sections":
+        weights = profile.get("weights")
+        secs = list(sections.values())
+        if not any(s["pct"] is not None for s in secs):
+            return None, {}, {}
+        w = {s["short"]: (weights.get(s["short"], 0.0) if weights else 1.0) for s in secs}
+        keep = secs if profile.get("missingAsZero", True) else [s for s in secs if s["pct"] is not None]
+        den = sum(w[s["short"]] for s in keep)
+        return (sum(w[s["short"]] * (s["pct"] or 0) for s in keep) / den if den else None), {}, {}
+    if o == "groups":
+        res = {}
+        for label, rx, method, wt in profile["groups"]:
+            its = [it for it in items if re.search(rx, it["section"], re.I)]
+            if its:
+                res[label] = (aggregate(its, uz, method)["pct"], wt)
+        got = {k: v for k, v in res.items() if v[0] is not None}
+        den = sum(w for _, w in got.values())
+        return (sum(p * w for p, w in got.values()) / den if den else None), {k: v[0] for k, v in res.items()}, {}
+    raise ValueError(f"unknown overall mode {o}")
+
+
+# ══ 5. Parse ════════════════════════════════════════════════════════════════
+def meaningful(txt) -> bool:
+    t = str(txt or "").strip().lower()
+    return bool(t) and t not in {"none", "no", "nil", "n/a", "na", "-", "—", "nothing"}
+
+
+def readScales(ad: dict, scales: dict, exam: dict):
+    """Primary GR (preferred scale keys first) + other scales. Labels come from the form's own scale fields."""
+    keys = [k for k in exam.get("grScales", []) if k in scales or k in ad]
+    keys += [k for k in list(scales) + [k for k in ad if str(k).startswith("scale")] if k not in keys]
+    out = []
+    for k in OrderedDict.fromkeys(keys):
+        try:
+            v = int((ad.get(k) or {}).get("scale"))
+        except (TypeError, ValueError, AttributeError):
+            v = None
+        sc = scales.get(k) or {}
+        out.append({"key": k, "name": sc.get("name") or k, "value": v,
+                    "label": (sc.get("fields") or {}).get(str(v), "") if v is not None else "",
+                    "levels": len(sc.get("fields") or {}) or 5, "fields": sc.get("fields") or {}})
+    prim = next((s for s in out if s["value"] is not None), out[0] if out else None)
+    return prim, [s for s in out if s is not prim]
+
+
+def buildComments(ad: dict, tpl, shortOf: dict) -> str:
+    """'[Label] text' lines: general, per-checklist, other *_comments, critical fields."""
+    parts = []
+    if (ad.get("comments") or "").strip():
+        parts.append(f"[General] {ad['comments'].strip()}")
+    done = {"comments", "critical_concerns_comments"}
+    for ck in (tpl["keys"] if tpl else []):
+        v = (ad.get(f"{ck}_comments") or "").strip()
+        done.add(f"{ck}_comments")
+        if v:
+            parts.append(f"[{shortOf.get(ck, ck)}] {v}")
+    for k, v in ad.items():
+        if k.endswith("comments") and k not in done and isinstance(v, str) and v.strip():
+            parts.append(f"[{k.replace('_comments', '')}] {v.strip()}")
+    cc, ccTxt = (ad.get("critical_concerns") or "").strip(), (ad.get("critical_concerns_comments") or "").strip()
+    if cc.lower() == "yes" or ccTxt:
+        parts.append(f"[Critical Concerns: {cc or '—'}] {ccTxt}")
+    for fld, lbl in (("critical_error", "Critical Error"), ("clinical_incident", "Clinical Incident")):
+        if meaningful(ad.get(fld)):
+            parts.append(f"[{lbl}] {str(ad[fld]).strip()}")
+    return "\n".join(parts) if parts else "—"
+
+
+def parseRecord(r: dict, examKey: str, templates: dict, keyToTid: dict):
+    """One raw DASH record → flat row (private keys start with _)."""
+    exam = cfg.EXAMS[examKey]
+    student = (r.get("student") or "").strip()
+    if not student:
+        return None
+    frm = r.get("form") if isinstance(r.get("form"), dict) else {}
+    ad = (frm.get("data") or {}).get("assessor") or {}
+    cl = frm.get("checklists") or {}
+    tid = next((keyToTid[k] for k in cl if k in keyToTid), None)
+    tpl = templates.get(tid)
+    profile = cfg.PROFILES[tpl["profile"] if tpl else exam["defaultProfile"]]
+
+    items, sections = [], OrderedDict()
+    if tpl:
+        secInfo = {sk: (nm, s) for sk, nm, s in tpl["sections"]}
+        for ck in tpl["keys"]:
+            meta = cl.get(ck)
+            if meta is None:
+                continue
+            answers = ad.get(ck) if isinstance(ad.get(ck), dict) else {}
+            mcs = mcKeysOf(meta, answers)
+            fields = meta.get("fields") or {}
+            if tpl["multi"]:
+                smap = {mc: (ck, None) for mc in mcs}
+            elif profile.get("sectionsByItem"):                          # each item is its own section
+                smap = {mc: (mc, None) for mc in mcs}
+                for mc in mcs:
+                    q = cleanText(fields.get(mc)) or mc
+                    secInfo.setdefault(mc, (q, itemShort(profile, q, mc)))
+            else:                                                       # this form's own headers → short keys
+                fb = cleanText(meta.get("name")) or ck
+                sm = sectionMap(meta, mcs, fb)
+                tops = headerTops(meta, mcs, fb)
+                keyOf = dict(zip(tops, shortList(tops)))
+                smap = {mc: (keyOf[top], sub) for mc, (top, sub) in sm.items()}
+                for top in tops:
+                    secInfo.setdefault(keyOf[top], (top, keyOf[top]))
+            optLbl = optionLabels(meta)
+            wts = (profile.get("itemWeights") or {}).get(ck) or {}
+            for mc in mcs:
+                p, mx, disp, slot = scoreItem(answers.get(mc), meta, mc, profile)
+                secKey, sub = smap[mc]
+                items.append({"ck": ck, "mc": mc, "secKey": secKey, "sub": sub, "points": p, "max": mx,
+                              "value": str(answers.get(mc) or "").strip(), "disp": disp,
+                              "question": cleanText(fields.get(mc)),
+                              "section": secInfo.get(secKey, (secKey,))[0],
+                              "weight": float(wts.get(mc, 1)), "code": optLbl.get(slot, "") if slot else "",
+                              "rubric": cleanText(rubricOf(meta, mc).get(slot)) if slot else ""})
+        order = [sk for sk, _, _ in tpl["sections"]] + [it["secKey"] for it in items]
+        for i, sk in enumerate(OrderedDict.fromkeys(order), 1):
+            nm, short = secInfo.get(sk, (sk, sk))
+            its = [it for it in items if it["secKey"] == sk]
+            present = (sk in cl) if tpl["multi"] else bool(its)
+            agg = aggregate(its, profile["unansweredAsZero"], sectionMethod(profile, nm)) if its else \
+                {"score": None, "max": None, "pct": None, "answered": 0, "n": 0}
+            sections[sk] = {"key": sk, "name": nm, "short": short, "present": present, **agg}
+            if profile.get("showCodes") and len(its) == 1 and its[0]["value"]:   # table shows the level code
+                it = its[0]
+                isSafety = bool((profile.get("matrix") or {}).get("safetyItem")) and \
+                    re.search(profile["matrix"]["safetyItem"], it["question"] or "", re.I)
+                sections[sk]["label"] = ("Unsafe" if isUnsafe(it, profile) else "Safe") if isSafety else (it["code"] or it["value"])
+    anyAnswer = any(it["points"] is not None for it in items)              # nothing scored yet → blank, not 0%
+    pct, groupPct, info = overallPct(sections, items, profile) if anyAnswer else (None, {}, {})
+
+    gr, extraScales = readScales(ad, frm.get("scales") or {}, exam)
+    grInt = gr["value"] if gr else None
+    dtStr = r.get("datetime") or ""
+    try:
+        dt = datetime.fromisoformat(dtStr.replace("Z", "+00:00")).astimezone()
+        dtDisplay, ts = f"{dt.day} {dt:%b %H:%M}", dt.timestamp()
+    except Exception:
+        dtDisplay, ts = dtStr or "—", 0.0
+
+    cc = (ad.get("critical_concerns") or "").strip()
+    unsafe = bool(info.get("unsafe"))
+    ccFlag = cc.lower() == "yes" or meaningful(ad.get("critical_error")) or meaningful(ad.get("clinical_incident")) or unsafe
+    ccDisp = "Unsafe" if unsafe and cc.lower() != "yes" else (cc or ("Yes" if ccFlag else "—"))
+    missing = [s["short"] for s in sections.values() if not s["present"]]
+    scored = sum(1 for it in items if it["points"] is not None or it["value"])
+    hasComments = any(isinstance(v, str) and v.strip() for k, v in ad.items() if k.endswith("comments"))
+    hasOther = grInt is not None or bool(cc) or meaningful(ad.get("critical_error"))
+    submitted = bool(r.get("submitted"))
+    status = "Submitted" if submitted else ("In progress" if (scored or hasComments or hasOther) else "Not started")
+    incomplete = []                                                          # submitted but not fully filled
+    if submitted:
+        if gr is not None and grInt is None:                             # only when the form has a GR scale
+            incomplete.append("GR")
+        if missing:
+            incomplete.append("not in form: " + ", ".join(missing))
+        blanks = [it for it in items if not it["value"] and it["max"]]
+        if blanks:
+            incomplete.append(f"{len(blanks)} item(s) blank")
+        if tpl and not items:
+            incomplete.append("checklist empty")
+
+    ex2 = frm.get("examiner_2")
+    examiner = ex2.strip() if isinstance(ex2, str) and ex2.strip() else \
+        (f"Examiner {frm.get('examiner')}" if frm.get("examiner") not in (None, "") else "—")
+    shortOf = {sk: s for sk, _, s in tpl["sections"]} if tpl and tpl["multi"] else {}
+    showTotal = anyAnswer and profile["overall"] != "matrix"              # matrix % is not a points total
+    tot = sum(s["score"] or 0 for s in sections.values()) if showTotal else None
+    mxTot = sum(s["max"] or 0 for s in sections.values()) if showTotal else None
+    return {
+        "_id": r.get("id"), "_ts": ts, "_tid": tid, "_profile": tpl["profile"] if tpl else exam["defaultProfile"],
+        "_sec": sections, "_items": items, "_groupPct": groupPct, "_missing": missing, "_incomplete": incomplete,
+        "_scored": scored, "_nItems": len(items), "_hasComments": hasComments, "_stateRank": cfg.STATUS_RANK[status],
+        "_ad": ad, "_gr": gr, "_extraScales": extraScales, "_unsafe": unsafe,
+        "_outcome": info.get("outcome", ""), "_outcomeDesc": info.get("descriptor", ""),
+        "Date": dtDisplay, "Student": student, "Assessor": (r.get("assessor") or "—").strip() or "—",
+        "Examiner": examiner, "Cohort": r.get("cohort") or "—", "Subject": r.get("subject") or "—",
+        "Checklist": tpl["label"] if tpl else "—",
+        "GR": str(grInt) if grInt is not None else "—", "GR_int": grInt if grInt is not None else -1,
+        "GR_label": (gr["label"] if gr else "") or "—",
+        "Total": round(tot, 2) if tot is not None else None, "Max": round(mxTot, 2) if mxTot else None,
+        "Pct": round(pct, 1) if pct is not None else -1, "_pctExact": pct,
+        "CC": ccDisp, "CC_int": 1 if ccFlag else 0,
+        "Submitted": "Yes" if submitted else "No", "Status": status,
+        "Comments": buildComments(ad, tpl, shortOf), "Missing": ", ".join(missing) or "—",
+    }
+
+
+def parseRecords(raw: list, examKey: str) -> tuple:
+    templates, keyToTid = buildTemplates(raw, examKey)
+    rows = [x for x in (parseRecord(r, examKey, templates, keyToTid) for r in raw) if x]
+    return rows, templates
+
+
+# ══ 6. Manual overrides (<exam>_overrides.json, re-read live) ════════════════
+def normName(s: str) -> str:
+    """Case/space-insensitive; drops bracketed nicknames: 'Yue Heng Xu (Kevin)' → 'yue heng xu'."""
+    return " ".join(re.sub(r"\(.*?\)", " ", s or "").lower().split())
+
+
+class OverrideStore:
+    """Penalties per student/form + ignoreAssessors, reloaded when the file's mtime changes."""
+
+    def __init__(self, examKey: str):
+        self.path = APP_DIR / f"{re.sub(r'[^a-z0-9]+', '_', examKey.lower()).strip('_')}{cfg.OVERRIDES_SUFFIX}"
+        self.mtime, self.items, self.ignore, self.error = "unset", [], set(), ""
+
+    def load(self) -> bool:
+        try:
+            mt = self.path.stat().st_mtime
+        except FileNotFoundError:
+            mt = None
+        if mt == self.mtime:
+            return False
+        self.mtime = mt
+        try:
+            data = json.load(open(self.path, encoding="utf-8")) if mt else {}
+            self.items = [o for o in data.get("overrides", []) if isinstance(o, dict)]
+            self.ignore = {normName(a) for a in data.get("ignoreAssessors", []) if a}
+            self.error = ""
+        except Exception as e:                                             # bad JSON → keep last good
+            self.error = f"❌ {self.path.name} not applied ({e}) — previous overrides kept"
+        return True
+
+    @staticmethod
+    def matches(o: dict, r: dict) -> bool:
+        hasStudent, hasForm = bool(o.get("student")), o.get("formId") not in (None, "")
+        if not (hasStudent or hasForm):
+            return False
+        if hasForm and str(o["formId"]) != str(r["_id"]):
+            return False
+        return not hasStudent or normName(o["student"]) == normName(r["Student"])
+
+    def apply(self, rows: list) -> list:
+        """Reset each row to its computed % then apply penalties (idempotent); returns unmatched labels."""
+        used = set()
+        for r in rows:
+            r.setdefault("_pctBase", r["Pct"])
+            r["Pct"], r["_penalty"], r["_overrideNote"] = r["_pctBase"], 0.0, ""
+            notes = []
+            for i, o in enumerate(self.items):
+                if not self.matches(o, r):
+                    continue
+                used.add(i)
+                pen = float(o.get("penaltyPct") or 0)
+                if r["_pctBase"] < 0 or not pen:
+                    continue
+                relative = str(o.get("method", "absolute")).strip().lower() == "relative"
+                r["Pct"] = round(max(0.0, r["Pct"] * (1 - pen / 100) if relative else r["Pct"] - pen), 1)
+                r["_penalty"] += pen
+                notes.append(f'−{pen:g}{"% of score" if relative else " percentage points"}'
+                             f'{" — " + o["reason"] if o.get("reason") else ""}{" (by " + o["by"] + ")" if o.get("by") else ""}')
+            if notes:
+                r["_overrideNote"] = (f'Manual override: {"; ".join(notes)}. Overall % {r["_pctBase"]}% → {r["Pct"]}%. '
+                                      f'Raw total unchanged.')
+            r["_ignored"] = normName(r["Assessor"]) in self.ignore
+        seen = {normName(r["Assessor"]) for r in rows}
+        return ([o.get("student") or f'form {o.get("formId")}' for i, o in enumerate(self.items) if i not in used]
+                + [f"assessor '{a}'" for a in sorted(self.ignore - seen)])
+
+
+# ══ 7. Shared per-exam cache ════════════════════════════════════════════════
+class ExamCache:
+    """One DASH pull per CACHE_TTL for ALL browser tabs; re-parse only when the payload hash changes."""
+
+    def __init__(self, examKey: str):
+        self.key, self.lock = examKey, threading.Lock()
+        self.rows, self.templates, self.hash, self.version = [], {}, None, 0
+        self.fetchedAt, self.error, self.unmatched = 0.0, "", []
+        self.overrides = OverrideStore(examKey)
+
+    def get(self, force: bool = False):
+        """(rows, version, message); fetches only when stale/forced."""
+        with self.lock:
+            newData = False
+            if force or time.time() - self.fetchedAt >= cfg.CACHE_TTL:
+                t0 = time.time()
+                try:
+                    raw = loadRaw(self.key)
+                    h = hashlib.md5(json.dumps(raw, sort_keys=True, default=str).encode()).hexdigest()
+                    if h != self.hash:
+                        self.rows, self.templates = parseRecords(raw, self.key)
+                        self.hash, self.version, newData = h, self.version + 1, True
+                    self.error = ""
+                except requests.HTTPError as e:
+                    self.error = httpErrorMsg(e, cfg.EXAMS[self.key]["endpoint"])
+                except Exception as e:
+                    self.error = f"❌ Load error: {e}"
+                if self.error and self.rows:
+                    self.error += " (showing last good data)"
+                self.fetchedAt = time.time()                              # also on failure → no hammering
+                print(f"[DASH] {self.key} refresh {time.time() - t0:.2f}s v{self.version} rows={len(self.rows)} "
+                      f"{self.error}", flush=True)
+            if self.overrides.load() or newData:
+                self.unmatched = self.overrides.apply(self.rows)
+                self.version += 0 if newData else 1
+            msgs = [self.error, self.overrides.error]
+            if self.unmatched:
+                msgs.append("⚠ Override not matched: " + ", ".join(self.unmatched))
+            return self.rows, self.version, " · ".join(m for m in msgs if m)
+
+    def asOf(self) -> str:
+        fa = datetime.fromtimestamp(self.fetchedAt) if self.fetchedAt else datetime.now()
+        return f"*{self.key} data as of {fa:%H:%M:%S}{' (local JSON)' if cfg.LOCAL_JSON_DIR else ''}*"
+
+
+caches = {k: ExamCache(k) for k in cfg.EXAMS}
+
+
+# ══ 8. Filters ══════════════════════════════════════════════════════════════
+def parseDateTs(s: str, endOfDay: bool = False):
+    try:
+        dt = datetime.strptime((s or "").strip(), "%Y-%m-%d")
+        return (dt.replace(hour=23, minute=59, second=59) if endOfDay else dt).timestamp()
+    except ValueError:
+        return None
+
+
+def isExcluded(name: str, hideTest: bool) -> bool:
+    n = name.lower()
+    return n in cfg.EXCLUDE or (hideTest and any(s in n for s in cfg.EXCLUDE_SUBSTRINGS))
+
+
+def applyFilters(rows, cohorts, checklist, submittedOnly, unsubmittedOnly, ccOnly, hideTest, search,
+                 sortOpt=cfg.DEFAULT_SORT, dateFrom="", dateTo=""):
+    """Filter + sort cached rows (no API call)."""
+    tsFrom, tsTo = parseDateTs(dateFrom), parseDateTs(dateTo, True)
+    cohorts = set(cohorts or [])
+    wanted = selectedChecklists(checklist)
+    out = [r for r in rows if r["Cohort"] in cohorts
+           and (tsFrom is None or r["_ts"] >= tsFrom) and (tsTo is None or r["_ts"] <= tsTo)
+           and not isExcluded(r["Student"], hideTest)
+           and (not wanted or r["Checklist"] in wanted)]
+    if submittedOnly:
+        out = [r for r in out if r["Submitted"] == "Yes"]
+    elif unsubmittedOnly:
+        out = [r for r in out if r["Submitted"] == "No"]
+    if ccOnly:
+        out = [r for r in out if r["CC_int"]]
+    q = (search or "").lower().strip()
+    if q:
+        out = [r for r in out if any(q in str(r.get(k) or "").lower()
+                                     for k in ("Student", "Assessor", "Examiner", "Cohort", "Subject", "Checklist", "Comments"))]
+    col, desc = cfg.SORT_OPTIONS.get(sortOpt, ("_ts", True))
+    if col == "_status":
+        out.sort(key=lambda r: (r["_stateRank"], -r["_ts"]))
+    elif col in ("_ts", "GR_int", "Pct", "CC_int"):
+        out.sort(key=lambda r: float(r.get(col) or 0), reverse=desc)
+    else:
+        out.sort(key=lambda r: str(r.get(col) or "").lower(), reverse=desc)
+    return out
+
+
+def selectedChecklists(checklist) -> set:
+    """Multi-select value → set of checklist labels; empty / 'All' = no restriction."""
+    if not checklist:
+        return set()
+    vals = [checklist] if isinstance(checklist, str) else list(checklist)
+    return {v for v in vals if v and v != "All"}
+
+
+def describeFilters(cohorts, checklist, so, uo, cco, ht, q, srt, df, dt) -> str:
+    sel = selectedChecklists(checklist)
+    return ", ".join(x for x in [
+        f"cohorts {', '.join(cohorts or [])}", f"checklists {', '.join(sorted(sel))}" if sel else "",
+        f"dates {df or '…'} → {dt or '…'}", "submitted only" if so else "", "unsubmitted only" if uo else "",
+        "critical concerns only" if cco else "", "dummy/test hidden" if ht else "", f"search '{q}'" if q else ""] if x)
+
+
+# ══ 9. HTML rendering ═══════════════════════════════════════════════════════
+def pctColor(p) -> str:
+    return "#15803d" if p >= 85 else "#2563eb" if p >= 65 else "#d97706" if p >= 40 else "#dc2626"
+
+
+def statCard(label, value, color="#0f172a", tip=""):
+    return (f'<div title="{esc(tip)}" style="flex:1 1 130px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;padding:5px 12px;'
+            f'display:flex;align-items:center;gap:10px;min-width:0;">'
+            f'<div style="font-size:{cfg.STAT_VALUE_FONT_SIZE};font-weight:700;color:{color};white-space:nowrap;">{value}</div>'
+            f'<div style="font-size:{cfg.STAT_LABEL_FONT_SIZE};color:#64748b;font-weight:500;text-transform:uppercase;'
+            f'letter-spacing:.4px;line-height:1.2;">{label}</div></div>')
+
+
+def statsHtml(rows: list) -> str:
+    wrap = "display:flex;gap:8px;flex-wrap:wrap;width:100%;padding:2px 0 4px;"
+    labels = ["Records", "Submitted", "In progress", "Avg GR", "Avg overall %", "Critical concerns",
+              "Students", "Assessors", "Needs attention"]
+    if not rows:
+        return f'<div style="{wrap}">' + "".join(statCard(l, "—") for l in labels) + "</div>"
+    sub = [r for r in rows if r["Submitted"] == "Yes"]
+    grV = [r["GR_int"] for r in sub if r["GR_int"] > 0]
+    pcV = [r["Pct"] for r in sub if r["Pct"] >= 0]
+    nCC = sum(r["CC_int"] for r in rows)
+    nAtt = sum(1 for r in rows if r["_missing"] or r["_incomplete"])
+    return f'<div style="{wrap}">' + "".join([
+        statCard("Records", len(rows)),
+        statCard("Submitted", f"{len(sub)} ({round(100 * len(sub) / len(rows))}%)", "#15803d"),
+        statCard("In progress", sum(r["Status"] == "In progress" for r in rows), "#d97706"),
+        statCard("Avg GR", f"{sum(grV) / len(grV):.2f}" if grV else "—", cfg.PURPLE),
+        statCard("Avg overall %", f"{sum(pcV) / len(pcV):.1f}%" if pcV else "—", cfg.PURPLE),
+        statCard("Critical concerns", nCC, "#dc2626" if nCC else "#0f172a"),
+        statCard("Students", len({r["Student"] for r in rows})),
+        statCard("Assessors", len({r["Assessor"] for r in rows if r["Assessor"] != "—"})),
+        statCard("Needs attention", nAtt, "#d97706" if nAtt else "#0f172a",
+                 "Submitted with blank GR/items, or a section missing from the form"),
+    ]) + "</div>"
+
+
+COMMENT_MODAL_HANDLER = (   # double-click a comment cell → modal built with textContent (no HTML injection)
+    "(function(el){var m=document.getElementById('_ccm');if(!m){"
+    "m=document.createElement('div');m.id='_ccm';"
+    "m.style.cssText='display:none;position:fixed;inset:0;background:rgba(1,13,68,.45);z-index:9999;align-items:center;justify-content:center';"
+    "var w=document.createElement('div');"
+    "w.style.cssText='background:#fff;border-radius:10px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;padding:28px 32px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.3)';"
+    "var x=document.createElement('button');x.textContent='\\u2715';"
+    "x.style.cssText='position:absolute;top:12px;right:14px;background:none;border:1px solid #e2e8f0;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:13px;color:#64748b';"
+    "x.onclick=function(){m.style.display='none'};"
+    "var b=document.createElement('div');b.id='_ccb';b.style.cssText='font-size:13px;line-height:1.8';"
+    "w.appendChild(x);w.appendChild(b);m.appendChild(w);"
+    "m.onclick=function(e){if(e.target===m)m.style.display='none'};"
+    "document.addEventListener('keydown',function(e){if(e.key==='Escape')m.style.display='none'});"
+    "document.body.appendChild(m);}"
+    "var raw=el.getAttribute('data-comment');var bd=document.getElementById('_ccb');bd.innerHTML='';"
+    "raw.split('\\n').forEach(function(l){var r=document.createElement('div');r.style.marginBottom='12px';"
+    "if(l.charAt(0)==='['&&l.indexOf(']')!==-1){var i=l.indexOf(']')+1;"
+    "var s1=document.createElement('span');s1.style.cssText='color:#010d44;font-weight:700';s1.textContent=l.slice(0,i);"
+    "var s2=document.createElement('span');s2.style.color='#334155';s2.textContent=l.slice(i);"
+    "r.appendChild(s1);r.appendChild(s2);}else{r.style.color='#334155';r.textContent=l;}bd.appendChild(r);});"
+    "m.style.display='flex';})(this)"
+)
+
+FORM_JS = """
+<script>
+function showFormModal(html){                       // modal lives on <body> so it survives table re-renders
+  var m=document.getElementById('_cfm');
+  if(!m){
+    m=document.createElement('div');m.id='_cfm';
+    m.style.cssText='display:none;position:fixed;inset:0;background:rgba(1,13,68,.45);z-index:9999;align-items:center;justify-content:center';
+    var w=document.createElement('div');
+    w.style.cssText='background:#fff;border-radius:10px;max-width:900px;width:95%;max-height:88vh;overflow-y:auto;padding:28px 32px;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.3)';
+    var x=document.createElement('button');x.textContent='\\u2715';
+    x.style.cssText='position:absolute;top:12px;right:14px;background:none;border:1px solid #e2e8f0;border-radius:4px;width:26px;height:26px;cursor:pointer;font-size:13px;color:#64748b';
+    x.onclick=function(){m.style.display='none'};
+    var b=document.createElement('div');b.id='_cfb';
+    w.appendChild(x);w.appendChild(b);m.appendChild(w);
+    m.onclick=function(e){if(e.target===m)m.style.display='none'};
+    document.addEventListener('keydown',function(e){if(e.key==='Escape')m.style.display='none'});
+    document.body.appendChild(m);
+  }
+  document.getElementById('_cfb').innerHTML=html;m.style.display='flex';
+}
+function openForm(id){                              // eye click → "id|nonce" into hidden textbox → Python builds HTML
+  var box=document.querySelector('#form-req textarea, #form-req input');
+  if(!box){console.warn('[DASH] #form-req not found');return;}
+  box.value=id+'|'+Date.now();
+  box.dispatchEvent(new Event('input',{bubbles:true}));
+  showFormModal('<div style="padding:40px;text-align:center;color:#94a3b8;">Loading form…</div>');
+}
+</script>
+"""
+
+DASH = '<span style="color:#cbd5e1;font-size:11px;">—</span>'
+
+
+def grBadge(r: dict) -> str:
+    g = r["GR_int"]
+    if g < 1:
+        return DASH
+    c = cfg.GR_COLORS.get(g, "#64748b")
+    return (f'<span title="{esc((r["_gr"] or {}).get("name", ""))}: {esc(r["GR_label"])}" style="background:{c}33;color:{c};'
+            f'border-radius:4px;padding:2px 9px;font-size:11px;font-weight:700;">{g}</span>')
+
+
+def statusCell(r: dict) -> str:
+    if r["Submitted"] == "Yes":
+        if r["_incomplete"]:
+            return (f'<span title="Submitted but incomplete: {esc("; ".join(r["_incomplete"]))}" style="color:#b45309;'
+                    f'font-weight:700;">✓!</span>')
+        return '<span style="color:#15803d;font-weight:600;">✓</span>'
+    if r["Status"] == "In progress":
+        return (f'<span title="In progress: {r["_scored"]} of {r["_nItems"]} items scored'
+                f'{", comments started" if r["_hasComments"] else ""}" style="background:#fef3c7;color:#b45309;'
+                f'font-weight:600;font-size:10px;padding:1px 5px;border-radius:4px;white-space:nowrap;">'
+                f'{r["_scored"]}/{r["_nItems"]}{" ✎" if r["_hasComments"] else ""}</span>')
+    return '<span style="color:#94a3b8;">✗</span>'
+
+
+def commentsCell(text: str) -> str:
+    if not text or text == "—":
+        return DASH
+    lines = []
+    for ln in text.split("\n"):
+        if ln.startswith("[") and "]" in ln:
+            i = ln.index("]") + 1
+            lines.append(f'<span style="color:{cfg.NAVY};font-weight:600;">{esc(ln[:i])}</span>'
+                         f'<span style="color:#475569;">{esc(ln[i:])}</span>')
+        else:
+            lines.append(f'<span style="color:#475569;">{esc(ln)}</span>')
+    return (f'<div ondblclick="{COMMENT_MODAL_HANDLER}" data-comment="{esc(text)}" title="Double-click to read full comment" '
+            f'style="max-height:{cfg.COMMENTS_MAX_HEIGHT};overflow-y:auto;cursor:pointer;word-break:break-word;font-size:11px;'
+            f'line-height:1.5;padding-right:4px;">{"<br>".join(lines)}</div>')
+
+
+def tableHtml(rows: list, templates: dict, grouped: bool = False) -> str:
+    """Styled table. Section columns appear when the view holds a single checklist template."""
+    if not rows:
+        return ('<div style="text-align:center;padding:60px 0;color:#94a3b8;"><p style="font-size:14px;">'
+                'No records to display.<br>Check exam / cohorts / dates, then click Load.</p></div>')
+    TH = (f"background:{cfg.NAVY};color:#c7d2fe;padding:9px 8px;text-align:left;font-weight:500;white-space:nowrap;"
+          f"font-size:{cfg.TABLE_FONT_SIZE};overflow:hidden;text-overflow:ellipsis;")
+    TD = f"padding:7px 8px;border-bottom:1px solid #f1f5f9;font-size:{cfg.TABLE_FONT_SIZE};color:#334155;"
+    tids = {r["_tid"] for r in rows}
+    tpl = templates.get(next(iter(tids))) if len(tids) == 1 else None
+    secs = tpl["sections"] if tpl and len(tpl["sections"]) <= cfg.MAX_SECTION_COLS else []
+    show = {k: v[0] for k, v in cfg.TABLE_COLS.items()}
+    show["Cohort"] &= len({r["Cohort"] for r in rows}) > 1
+    show["Checklist"] &= len(tids) > 1
+    show["Examiner"] &= any(r["Examiner"] != "—" for r in rows)
+    grName = next((r["_gr"]["name"] for r in rows if r["_gr"]), "Global rating")
+
+    cols = [("Date", "Date", ""), ("Student", "Student", ""), ("Assessor", "Assessor", ""),
+            ("Examiner", "Examiner 2", "Second examiner / examiner role"), ("Cohort", "Cohort", ""),
+            ("Checklist", "Checklist", ""), ("GR", "GR", grName)]
+    cols += [("Section", s, nm) for _, nm, s in secs]
+    cols += [("Total", "Total", "Raw points / max"), ("Pct", "%", "Overall %"), ("CC", "CC", "Critical concerns"),
+             ("Status", "Status", "✓ submitted · ✓! submitted but incomplete · x/y in progress · ✗ not started"),
+             ("View", "&#128065;", "Full form view"), ("Comments", "Comments", "")]
+    cols = [c for c in cols if show.get(c[0], True)]
+    colgroup = "".join(f'<col style="width:{cfg.TABLE_COLS[c[0]][1]}px">' if cfg.TABLE_COLS[c[0]][1] else "<col>" for c in cols)
+    centred = {"GR", "Section", "Total", "Pct", "CC", "Status", "View"}
+    hdr = "".join(f'<th style="{TH}{"text-align:center;" if c[0] in centred else ""}" title="{esc(c[2])}">{c[1]}</th>' for c in cols)
+
+    def cell(r, c):
+        k = c[0]
+        if k == "Section":
+            s = next((x for x in r["_sec"].values() if x["short"] == c[1]), None)
+            if s is None or not s["present"]:
+                return f'<td style="{TD}text-align:center;background:#fef3c7;" title="Not in this form">{DASH}</td>'
+            if s.get("label"):                                           # ECCA: M2 / B1 / Safe / Unsafe
+                col = "#dc2626" if s["label"] == "Unsafe" else (pctColor(s["pct"]) if s["pct"] is not None else "#334155")
+                return (f'<td style="{TD}text-align:center;font-weight:700;color:{col};" title="{esc(s["name"])}">'
+                        f'{esc(s["label"])}</td>')
+            if s["pct"] is None:
+                return f'<td style="{TD}text-align:center;">{DASH}</td>'
+            val = f'{s["score"]:g}<span style="color:#94a3b8;font-size:10px;">/{s["max"]:g}</span>' \
+                if sectionMethod(cfg.PROFILES[r["_profile"]], s["name"]) == "pooled" else f'{s["pct"]:.0f}%'
+            return (f'<td style="{TD}text-align:center;font-weight:700;color:{pctColor(s["pct"])};" '
+                    f'title="{esc(s["name"])}: {s["pct"]:.1f}%">{val}</td>')
+        if k == "Date":
+            return f'<td style="{TD}color:#64748b;white-space:nowrap;">{esc(r["Date"])}</td>'
+        if k in ("Student", "Assessor", "Examiner", "Checklist"):
+            return f'<td style="{TD}{"font-weight:500;" if k == "Student" else ""}overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{esc(r[k])}">{esc(r[k])}</td>'
+        if k == "Cohort":
+            cc = cfg.COHORT_COLORS.get(r["Cohort"], "#64748b")
+            return (f'<td style="{TD}"><span style="background:{cc}22;color:{cc};border-radius:4px;padding:2px 6px;'
+                    f'font-size:11px;font-weight:600;">{esc(r["Cohort"])}</span></td>')
+        if k == "GR":
+            return f'<td style="{TD}text-align:center;">{grBadge(r)}</td>'
+        if k == "Total":
+            return (f'<td style="{TD}text-align:center;"><b>{r["Total"]:g}</b><span style="color:#94a3b8;font-size:10px;">'
+                    f'/{r["Max"]:g}</span></td>') if r["Total"] is not None and r["Max"] else f'<td style="{TD}text-align:center;">{DASH}</td>'
+        if k == "Pct":
+            if r["Pct"] < 0:
+                return f'<td style="{TD}text-align:center;">{DASH}</td>'
+            pen = (f'<sup title="{esc(r["_overrideNote"])}" style="color:#dc2626;font-weight:700;font-size:9px;margin-left:2px;'
+                   f'cursor:help;">−{r["_penalty"]:g}</sup>') if r.get("_penalty") else ""
+            gp = " · ".join(f"{g} total {v:.1f}%" for g, v in r["_groupPct"].items() if v is not None) or r.get("_outcome", "")
+            return (f'<td style="{TD}text-align:center;" title="{esc(gp)}"><span style="font-weight:700;color:{pctColor(r["Pct"])};">'
+                    f'{r["Pct"]:.0f}%</span>{pen}</td>')
+        if k == "CC":
+            if r["CC_int"]:
+                return f'<td style="{TD}text-align:center;"><span title="{esc(r["CC"])}" style="background:#fee2e2;color:#dc2626;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:700;">{"⛔" if r.get("_unsafe") else "⚠"}</span></td>'
+            return f'<td style="{TD}text-align:center;">' + ('<span style="color:#94a3b8;font-size:11px;">No</span>' if r["CC"] != "—" else DASH) + "</td>"
+        if k == "Status":
+            return f'<td style="{TD}text-align:center;">{statusCell(r)}</td>'
+        if k == "View":
+            return (f'<td style="{TD}text-align:center;padding:4px 6px;"><span onclick="openForm(&#39;{esc(r["_id"])}&#39;)" '
+                    f'title="View full form" style="cursor:pointer;font-size:13px;color:#6366f1;display:inline-block;padding:2px 5px;'
+                    f'border-radius:4px;border:1px solid #e0e7ff;background:#eef2ff;">&#128065;</span></td>')
+        return f'<td style="{TD}vertical-align:top;padding-top:6px;">{commentsCell(r["Comments"])}</td>'
+
+    body, last = [], None
+    groupN = {s: sum(1 for x in rows if x["Status"] == s) for s in cfg.STATUS_RANK} if grouped else {}
+    for i, r in enumerate(rows[:cfg.MAX_ROWS]):
+        if grouped and r["Status"] != last:
+            last = r["Status"]
+            body.append(f'<tr><td colspan="{len(cols)}" style="background:#eef2ff;color:{cfg.NAVY};font-weight:700;font-size:11px;'
+                        f'letter-spacing:.4px;text-transform:uppercase;padding:5px 10px;border-bottom:1px solid #c7d2fe;">'
+                        f'{last} ({groupN[last]})</td></tr>')
+        bg = "#fff5f5" if r["CC_int"] else ("#ffffff" if i % 2 == 0 else "#f8fafc")
+        body.append(f'<tr style="background:{bg}">' + "".join(cell(r, c) for c in cols) + "</tr>")
+    if len(rows) > cfg.MAX_ROWS:
+        body.append(f'<tr><td colspan="{len(cols)}" style="padding:10px;color:#94a3b8;font-size:11px;">Showing {cfg.MAX_ROWS} '
+                    f'of {len(rows)} records — narrow with search or filters</td></tr>')
+    note = ""
+    if tpl and not secs:
+        note = (f'<div style="font-size:11px;color:#64748b;padding:2px 4px;">{len(tpl["sections"])} sections — '
+                f'shown in the form view and Excel export.</div>')
+    elif len(tids) > 1:
+        note = ('<div style="font-size:11px;color:#64748b;padding:2px 4px;">Several checklist types in view — pick one in '
+                '<b>Checklist</b> to see section columns.</div>')
+    return (note + f'<div style="overflow:auto;max-height:{cfg.TABLE_MAX_HEIGHT};border-radius:8px;border:1px solid #e2e8f0;">'
+            f'<table style="width:100%;border-collapse:collapse;table-layout:fixed;"><colgroup>{colgroup}</colgroup>'
+            f'<thead style="position:sticky;top:0;z-index:1;"><tr>{hdr}</tr></thead><tbody>{"".join(body)}</tbody></table></div>')
+
+
+def formHtml(row: dict, examKey: str) -> str:
+    """Full-form view for the modal (built on demand)."""
+    ad, prof = row["_ad"], cfg.PROFILES[row["_profile"]]
+    g = row["GR_int"]
+    grColor = cfg.GR_COLORS.get(g, "#64748b")
+    pctTxt = f'{row["Pct"]}%' if row["Pct"] >= 0 else "—"
+    if row.get("_penalty"):
+        pctTxt += f' after −{row["_penalty"]:g} penalty, was {row["_pctBase"]}%'
+    gp = " · ".join(f"{k} total {v:.1f}%" for k, v in row["_groupPct"].items() if v is not None)
+    statusTxt = row["Status"] if row["Status"] != "In progress" else \
+        f'In progress ({row["_scored"]}/{row["_nItems"]} items scored{", comments started" if row["_hasComments"] else ""})'
+    kv = lambda k, v: f'<div><span style="color:#64748b;">{k}:</span> {v}</div>'
+    p = [f'<div style="margin-bottom:18px;padding-bottom:12px;border-bottom:2px solid #e2e8f0;">'
+         f'<div style="font-size:15px;font-weight:700;color:{cfg.NAVY};margin-bottom:8px;">{esc(cfg.EXAMS[examKey]["title"])} '
+         f'&middot; {esc(row["Checklist"])} &middot; {esc(row["Cohort"])} &middot; {esc(row["Subject"])} &middot; {esc(row["Date"])}</div>'
+         f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 24px;font-size:12px;">'
+         + kv("Student", f"<b>{esc(row['Student'])}</b>") + kv("Assessor", esc(row["Assessor"]))
+         + kv("Examiner 2", esc(row["Examiner"])) + kv("Status", f'<b>{esc(statusTxt)}</b>')
+         + kv(esc((row["_gr"] or {}).get("name", "GR")), f'<b style="color:{grColor};">{esc(row["GR"])} — {esc(row["GR_label"])}</b>')
+         + kv("Overall", f'<b>{row["Total"] if row["Total"] is not None else "—"}/{row["Max"] or "—"} ({pctTxt})</b>'
+              + (f' <span style="color:#64748b;">[{esc(gp)}]</span>' if gp else ""))
+         + "".join(kv(esc(s["name"]), f'{s["value"] if s["value"] is not None else "—"} — {esc(s["label"])}') for s in row["_extraScales"])
+         + kv("Scoring", esc(prof["title"])) + "</div></div>"]
+
+    def banner(color, bg, title, text):
+        p.append(f'<div style="margin-bottom:14px;padding:9px 12px;border:1px solid {color}55;border-radius:6px;background:{bg};'
+                 f'color:{color};font-size:12px;"><b>{title}</b> {esc(text)}</div>')
+    if row["_missing"]:
+        banner("#b45309", "#fffbeb", "⚠ Not in this form:", row["Missing"])
+    if row["_incomplete"]:
+        banner("#b45309", "#fffbeb", "⚠ Submitted but incomplete:", "; ".join(row["_incomplete"]))
+    if row.get("_overrideNote"):
+        banner("#b91c1c", "#fff5f5", "Override:", row["_overrideNote"])
+    if row.get("_outcome"):
+        fail = row.get("_unsafe") or (0 <= row["Pct"] < (prof.get("matrix") or {}).get("passMark", 50))
+        banner("#b91c1c" if fail else "#15803d", "#fff5f5" if fail else "#f0fdf4", "Result:",
+               row["_outcome"] + (f" — {row['_outcomeDesc']}" if row.get("_outcomeDesc") else ""))
+
+    multi = len({it["ck"] for it in row["_items"]}) > 1
+    for s in row["_sec"].values():
+        its = [it for it in row["_items"] if it["secKey"] == s["key"]]
+        right = f'{s["score"]:g}/{s["max"]:g} · {s["pct"]:.1f}%' if s["pct"] is not None else ("not in form" if not s["present"] else "—")
+        p.append(f'<div style="margin-bottom:18px;"><div style="display:flex;justify-content:space-between;gap:12px;'
+                 f'background:{cfg.NAVY if s["present"] else "#b45309"};color:#e0e7ff;padding:7px 12px;border-radius:6px;margin-bottom:6px;">'
+                 f'<span style="font-weight:600;font-size:13px;">{esc(s["short"])} · {esc(s["name"])}</span>'
+                 f'<span style="font-size:12px;opacity:.85;white-space:nowrap;">{right}</span></div>')
+        lastSub = None
+        for it in its:
+            if it["sub"] and it["sub"] != lastSub:
+                lastSub = it["sub"]
+                p.append(f'<div style="font-size:11px;font-weight:700;color:{cfg.PURPLE};padding:6px 8px 2px;">{esc(it["sub"])}</div>')
+            frac = (it["points"] / it["max"]) if it["points"] is not None and it["max"] else None
+            col = pctColor(100 * frac) if frac is not None else "#64748b"
+            p.append(f'<div style="display:flex;justify-content:space-between;align-items:flex-start;padding:4px 8px;'
+                     f'border-bottom:1px solid #f1f5f9;font-size:12px;"><span style="color:#475569;flex:1;padding-right:12px;">'
+                     f'<b>{esc(it["mc"])}</b> {esc(it["question"])}</span><span style="color:{col};font-weight:600;text-align:right;'
+                     f'max-width:45%;">{esc(it["disp"] or "—")} <span style="color:#94a3b8;font-weight:400;">'
+                     f'({it["points"] if it["points"] is not None else "—"}/{it["max"] if it["max"] is not None else "—"}'
+                     f'{" ×" + format(it["weight"], "g") if it.get("weight", 1) != 1 else ""})</span></span></div>')
+        ckc = (ad.get(f'{s["key"]}_comments') or "").strip() if multi else ""
+        if ckc:
+            p.append(f'<div style="margin-top:6px;padding:5px 8px;background:#f8fafc;border-left:3px solid #c7d2fe;font-size:12px;">'
+                     f'<span style="color:#64748b;font-weight:600;">Comments: </span><span style="color:#475569;">{esc(ckc)}</span></div>')
+        p.append("</div>")
+    if not multi:
+        for k, v in ad.items():
+            if k.endswith("_comments") and k != "critical_concerns_comments" and isinstance(v, str) and v.strip():
+                p.append(f'<div style="margin-bottom:10px;padding:5px 8px;background:#f8fafc;border-left:3px solid #c7d2fe;font-size:12px;">'
+                         f'<span style="color:#64748b;font-weight:600;">{esc(k.replace("_comments", ""))} comments: </span>'
+                         f'<span style="color:#475569;">{esc(v)}</span></div>')
+
+    isCC = row["CC_int"] == 1
+    critBits = [("Critical concerns", ad.get("critical_concerns_comments")), ("Critical error", ad.get("critical_error")),
+                ("Clinical incident", ad.get("clinical_incident"))]
+    critTxt = "<br>".join(f"<b>{k}:</b> {esc(v)}" for k, v in critBits if meaningful(v)) or "<i>None recorded</i>"
+    p.append(f'<div style="margin-bottom:12px;padding:9px 12px;border:1px solid {"#fecaca" if isCC else "#e2e8f0"};border-radius:6px;'
+             f'background:{"#fff5f5" if isCC else "#fff"};"><div style="font-weight:600;color:{"#dc2626" if isCC else "#334155"};'
+             f'font-size:11px;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px;">Critical concerns: {esc(row["CC"])}</div>'
+             f'<div style="font-size:12px;color:#334155;">{critTxt}</div></div>')
+    gen = (ad.get("comments") or "").strip()
+    p.append(f'<div style="padding:9px 12px;border:1px solid #e2e8f0;border-radius:6px;"><div style="font-weight:600;color:#334155;'
+             f'font-size:11px;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px;">General comments</div>'
+             f'<div style="font-size:12px;color:#475569;">{esc(gen) if gen else "<i>None provided</i>"}</div></div>')
+    return "".join(p)
+
+
+CSS = f"""
+.gradio-container {{ max-width:{cfg.DASH_MAX_WIDTH} !important; width:100% !important; margin:0 auto !important;
+                     padding-left:12px !important; padding-right:12px !important; }}
+#dash-header {{ background:{cfg.NAVY}; border-radius:8px; padding:8px 16px; margin-bottom:4px; display:flex; align-items:center; gap:16px; }}
+#dash-header h2 {{ color:white; margin:0; font-size:16px; letter-spacing:1px; }}
+#dash-header p  {{ color:#c7d2fe; margin:0; font-size:11px; }}
+#err-bar {{ color:#dc2626; min-height:0; }}
+#ts-bar  {{ color:#94a3b8; font-size:11px; text-align:right; min-height:0; }}
+.compact-row .gap {{ gap:4px !important; }}
+#table-wrap {{ width:100% !important; }}
+footer {{ display:none !important; }}
+#form-req, #form-out {{ display:none !important; }}
+"""

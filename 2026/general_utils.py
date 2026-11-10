@@ -268,6 +268,133 @@ def buildCohortList(useAll, allCohorts, includeCohorts, excludeCohorts):
     return [c for c in allCohorts if c in cohortSet]
 
 #========================================================================================================================================
+# Fast URL -> Postgres pull (2026-11-09): timings, parallel paging, COPY-based upsert.
+# Measured on the caf v3 endpoint: server caps page_size at 250; 25/page ≈ 45 rec/s,
+# 250/page × 4 workers ≈ 260 rec/s (~5.8× faster). More than 4 workers was slower.
+import time as _time
+import math as _math
+import json as _json
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+PULL_TIMINGS = {}   # stage label -> seconds, filled by stageTimer
+
+@contextmanager
+def stageTimer(label, timings=None):
+    """Time a block; prints it and stores it in `timings` (default PULL_TIMINGS)."""
+    timings = PULL_TIMINGS if timings is None else timings
+    t0 = _time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = _time.perf_counter() - t0
+        timings[label] = timings.get(label, 0.0) + dt
+        print(f"[timing] {label}: {dt:.1f}s")
+
+def printTimings(timings=None):
+    """Print a summary table of stage timings, slowest first, with % of total."""
+    timings = PULL_TIMINGS if timings is None else timings
+    total = sum(v for k, v in timings.items() if "total" not in k) or 1   # skip nested "... total" rows
+    print(f"\n{'Stage':40s} {'Seconds':>9s} {'%':>6s}")
+    for label, sec in sorted(timings.items(), key=lambda kv: -kv[1]):
+        print(f"{label:40s} {sec:9.1f} {100 * sec / total:5.1f}%")
+    print(f"{'TOTAL':40s} {total:9.1f}")
+
+def fetchAllAssessmentsFast(apiUrl, bearerToken, pageSize=250, maxWorkers=4, retries=3):
+    """Parallel version of fetchAllAssessments: reads 'count' from page 1, then fetches
+    pages 2..N with a thread pool. Order is preserved (pool.map). Retries each page on errors."""
+    headers = {"Authorization": f"Token {bearerToken}", "Accept": "application/json"}
+    parts = urlparse(apiUrl)
+    query = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    query["page_size"] = pageSize                                       # override URL's page_size
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=maxWorkers))
+
+    def getPage(pageNo):                                                # one page, with retry/backoff
+        url = urlunparse(parts._replace(query=urlencode({**query, "page": pageNo})))
+        for attempt in range(retries):
+            try:
+                resp = session.get(url, headers=headers, timeout=180)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.RequestException:
+                if attempt == retries - 1:
+                    raise
+                _time.sleep(2 ** attempt)
+
+    first = getPage(1)
+    records = list(first["results"])
+    total = first.get("count")
+    if total is None:                                                   # no count -> old sequential path
+        return records + fetchAllAssessments(first["next"], bearerToken) if first.get("next") else records
+    effSize = len(records) or 1                                         # server may cap page_size
+    nPages = _math.ceil(total / effSize)
+    print(f"count={total}, {effSize}/page, {nPages} pages, {maxWorkers} workers")
+    with ThreadPoolExecutor(maxWorkers) as pool:
+        for i, page in enumerate(pool.map(getPage, range(2, nPages + 1)), start=2):
+            records.extend(page["results"])
+            if i % 20 == 0 or i == nPages:
+                print(f"  page {i}/{nPages}, {len(records)} records")
+    if len(records) != total:
+        print(f"WARNING: fetched {len(records)} but API count is {total} (data changed mid-pull?)")
+    return records
+
+RAWFORMS_COPY_COLS = ["assessmentId", "student_number", "student_name", "student_email",
+                      "datetimeUtc", "cohort", "subject", "type", "completed", "forms"]
+
+def insertRowsCopy(engine, rows, replace=True, timings=None):
+    """Faster insertRows: COPY rows into a temp staging table, then one INSERT ... SELECT
+    upsert into rawforms. With replace=True only rows whose values actually changed are
+    rewritten (IS DISTINCT FROM), so unchanged forms are skipped. `rows` hold plain dicts
+    for 'forms' (not Json-wrapped). Returns (inserted/updated count)."""
+    cols = RAWFORMS_COPY_COLS
+    colList = ", ".join(cols)
+    setCols = cols[1:]
+    if replace:
+        onConflict = f"""ON CONFLICT (assessmentId) DO UPDATE SET
+            {', '.join(f'{c} = EXCLUDED.{c}' for c in setCols)}, insertedAt = now()
+            WHERE ({', '.join(f'{RAWFORMS_NAME}.{c}' for c in setCols)})
+                  IS DISTINCT FROM ({', '.join(f'EXCLUDED.{c}' for c in setCols)})"""
+    else:
+        onConflict = "ON CONFLICT (assessmentId) DO NOTHING"
+    raw = engine.raw_connection()
+    try:
+        with raw.cursor() as cur:
+            for stmt in CREATE_RAWFORMS_TABLE_SQL.strip().split(";"):     # ensure table + indexes
+                if stmt.strip():
+                    cur.execute(stmt)
+            cur.execute("""CREATE TEMP TABLE stagerawforms (
+                assessmentId BIGINT, student_number BIGINT, student_name TEXT, student_email TEXT,
+                datetimeUtc TIMESTAMPTZ, cohort TEXT, subject TEXT, type TEXT, completed BOOLEAN,
+                forms JSONB) ON COMMIT DROP""")
+            with stageTimer("db: COPY into staging", timings):
+                with cur.copy(f"COPY stagerawforms ({colList}) FROM STDIN") as cp:
+                    for r in rows:
+                        cp.write_row([_json.dumps(r[c], ensure_ascii=False) if c == "forms" else r[c] for c in cols])
+            with stageTimer("db: upsert staging -> rawforms", timings):
+                cur.execute(f"""INSERT INTO {RAWFORMS_NAME} ({colList})
+                                SELECT DISTINCT ON (assessmentId) {colList} FROM stagerawforms
+                                WHERE datetimeUtc >= TIMESTAMPTZ '2026-01-01'
+                                ORDER BY assessmentId
+                                {onConflict}""")
+                changed = cur.rowcount
+            with stageTimer("db: delete excluded/cleanup", timings):
+                deleteSql = getDeleteSql(RAWFORMS_NAME)
+                for stmt in deleteSql.strip().split(";"):
+                    if stmt.strip():
+                        cur.execute(stmt)
+        raw.commit()
+    except Exception:
+        raw.rollback()
+        raise
+    finally:
+        raw.close()
+    print(f"rawforms: {changed} rows inserted/updated (unchanged rows skipped)")
+    return changed
+
+
+#========================================================================================================================================
 # Now utils for form separation and creation of rawform_forms table
 
 def getInsertSqlRawform_forms(replace=False):

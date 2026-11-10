@@ -83,8 +83,8 @@ Sorted by size. "Entry pts" = functions `main.ipynb` calls directly.
 | [`gradio_utils.py`](gradio_utils.md) | Configuration | 130 | 0 | 0 | 34 | — | — |
 | [`cbd_gradio_utils.py`](cbd_gradio_utils.md) | Configuration (added 2026-11-03) | 137 † | 0 | 0 | 48 † | — | — |
 | [`dash_app.py`](dash_app.md) | Dashboards — merged Viva + SCBD + CBD + Oral Presentation monitor (added 2026-11-06; oral 2026-11-09) | 189 † | 12 | 0 | 5 | — | dash_app_config, dash_app_core, dash_app_export |
-| [`dash_app_core.py`](dash_app_core.md) | Dashboards — engine: API, cache, generic scorer, HTML (added 2026-11-06) | 1,120 † | 52 † | 2 | 14 | — | dash_app_config |
-| [`dash_app_export.py`](dash_app_export.md) | Dashboards — Excel analysis workbook (added 2026-11-06) | 1,212 † | 49 † | 1 | 5 | — | dash_app_config, dash_app_core |
+| [`dash_app_core.py`](dash_app_core.md) | Dashboards — engine: API, cache, generic scorer, HTML (added 2026-11-06) | 1,133 † | 53 † | 2 | 14 | — | dash_app_config |
+| [`dash_app_export.py`](dash_app_export.md) | Dashboards — Excel analysis workbook (added 2026-11-06) | 1,683 † | 64 † | 1 | 5 | — | dash_app_config, dash_app_core |
 | [`dash_app_config.py`](dash_app_config.md) | Configuration — exam registry + scoring rules for dash_app (added 2026-11-06) | 221 † | 0 | 0 | 53 † | — | — |
 
 ---
@@ -481,7 +481,9 @@ modules were added (counts from an `ast` pass on that date). `dash_app.md`, `das
 `dash_app_export.md` were hand-written on 2026-11-06 when the merged dashboard was added
 (counts and function tables from an `ast` pass on that date; `dash_app.md` §0 holds dated changes). All four were
 updated 2026-11-09 for the Oral Presentation exam, ECCA matrix scoring, checklist multi-select and Double Marking sheet;
-`dash_app_config.ORAL_ITEM_WEIGHTS` duplicates `oral_pres_utils.ORAL_ITEM_WEIGHTS` (keep in step). A full regeneration would
+`dash_app_config.ORAL_ITEM_WEIGHTS` duplicates `oral_pres_utils.ORAL_ITEM_WEIGHTS` (keep in step).
+Updated again 2026-11-11: BOH viva Examiner 1 + Examiner 2 forms merged into one row per student in the exports
+(`EXAMS["Viva"]["pairing"]`, Examiner Agreement sheet, paired standard setting) — see `dash_app.md` §0. A full regeneration would
 replace all of them; §2 of `python-reference-docs` in project memory has the
 recipe.
 

@@ -1,0 +1,66 @@
+# MDS Work/2026 — Python dependencies (generated 2026-11-09 from imports in all .py/.ipynb, excl. _bak/_to_delete)
+# Install:  pip install -r requirements.txt
+#           python -m spacy download en_core_web_sm
+# Django backend (dashboard/assessment-backend) has its own pinned file:
+#           pip install -r dashboard/assessment-backend/requirements.txt
+
+# --- Core data / analysis ---
+pandas                      # dataframes everywhere
+numpy                       # numeric ops
+scipy                       # stats tests, IRT/psychometrics
+statsmodels                 # regression / mixed models
+scikit-learn                # Utils.py, build_canned_comments.py (clustering)
+python-dateutil             # date parsing (Utils.py)
+tzdata                      # zoneinfo timezone data on Windows
+PyYAML                      # variableUtils.py
+ijson                       # streaming JSON (dds1_pe_utils, flatten.py)
+
+# --- Database ---
+SQLAlchemy                  # engines for DASH Postgres
+psycopg[binary]             # psycopg v3 (general_utils, postgresql+psycopg://)
+psycopg2-binary             # plain postgresql:// URLs
+python-dotenv               # .env credentials (gradio apps, main.ipynb)
+
+# --- Excel / Word / PDF output ---
+openpyxl                    # Excel read/write + styling/charts
+XlsxWriter                  # pandas engine='xlsxwriter'
+Jinja2                      # pandas DataFrame.style
+reportlab                   # PDF reports
+pikepdf                     # PDF post-processing (boh2_dds2_dds3_utils)
+PyPDF2                      # PDF merge/split (Utils.py)
+python-docx                 # Word reports (Placement analysis)
+Pillow                      # images (addReport.py)
+
+# --- Plotting ---
+matplotlib                  # charts in PDFs
+seaborn                     # statistical plots
+adjustText                  # label de-overlap (main.ipynb)
+plotly                      # webapp/ interactive charts
+
+# --- Dashboards / web apps ---
+gradio>=4.40                # dash_app, viva/scbd/cbd monitors (uses gr.Timer)
+pyngrok                     # public tunnels for gradio apps
+dash                        # webapp/ (Plotly Dash)
+requests                    # DASH API pulls
+
+# --- Notebook helpers ---
+jupyter                     # run main.ipynb and other notebooks
+ipykernel
+ipython                     # IPython.display (Utils, boh2_dds2_dds3_utils)
+itables                     # interactive tables
+dtale                       # dataframe explorer
+
+# --- NLP / anonymisation ---
+spacy                       # dash_anonymize_pipeline (needs en_core_web_sm, see top)
+wordfreq                    # name vs common-word check in anonymiser
+sentence-transformers       # build_canned_comments (all-MiniLM-L6-v2; pulls in torch, large)
+
+# --- External services ---
+QualtricsAPI                # DCD.ipynb mailing lists
+pywin32; sys_platform == "win32"   # win32com Outlook automation (Utils.py, main.ipynb)
+
+# --- VBA bin builder (_assets/dds1_pe_vba/build_bin.py only) ---
+oletools
+olefile
+ms-cfb
+ms-ovba-compression

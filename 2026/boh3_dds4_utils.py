@@ -1214,6 +1214,9 @@ _FMT_INCIDENT_FILL = PatternFill(bgColor="FFC7CE")   # red
 _FMT_INCIDENT_FONT = Font(name="Calibri", size=11, color="9C0006", bold=True)
 _FMT_CONCERN_FILL  = PatternFill(bgColor="FFEB9C")   # amber
 _FMT_CONCERN_FONT  = Font(name="Calibri", size=11, color="9C6500", bold=True)
+# static (non-CF) fills for the Section Pivot low-count flags - static fills need fgColor + solid
+_FMT_LOW_ZERO_FILL  = PatternFill("solid", fgColor="FFC7CE")   # red: 0/blank in a common section
+_FMT_LOW_SD_FILL    = PatternFill("solid", fgColor="FFEB9C")   # amber: >0 but < mean - 2SD
 
 # long free-text columns: left-align, single line, wide (no wrap)
 _FMT_TEXT_COLS = {"Clinical Incidents", "Additional Concerns", "Description", "Item Codes"}
@@ -1302,22 +1305,67 @@ def _fmtEntrustmentHighlights(ws):
                 end_type="max", end_color="F4B183"))
 
 
+def _fmtSectionPivotLowCounts(ws, sdMult=2.0, skipCols=("Student ID", "Student Name", "Unmapped")):
+    """Flag very low section counts on the Section Pivot sheet (per column, blanks = 0).
+
+    - red   : 0/blank in a section the cohort median does (> 0) - skips rare sections e.g. Orthodontics
+    - amber : > 0 but below mean - sdMult*SD
+    - header comment: mean / SD / threshold / flag counts for that column
+    """
+    from openpyxl.comments import Comment as _XlComment
+    rows = list(ws.iter_rows())
+    if len(rows) < 3:   # need >= 2 students for an SD
+        return
+    headers = [c.value for c in rows[0]]
+    for j, h in enumerate(headers):
+        if h is None or h in skipCols:
+            continue
+        cells = [r[j] for r in rows[1:]]
+        vals = np.array([float(c.value) if isinstance(c.value, (int, float)) and not isinstance(c.value, bool)
+                         else 0.0 for c in cells])
+        mean, sd, median = vals.mean(), vals.std(ddof=1), float(np.median(vals))
+        thr = mean - sdMult * sd
+        flagZero = median > 0
+        nRed = nAmber = 0
+        for c, v in zip(cells, vals):
+            if v == 0 and flagZero:
+                c.fill, c.font = _FMT_LOW_ZERO_FILL, _FMT_INCIDENT_FONT
+                nRed += 1
+            elif 0 < v < thr:
+                c.fill, c.font = _FMT_LOW_SD_FILL, _FMT_CONCERN_FONT
+                nAmber += 1
+        note = (f"mean {mean:.1f}, SD {sd:.1f}, median {median:g}\n"
+                f"amber: >0 and < {thr:.1f} (mean-{sdMult:g}SD): {nAmber}\n"
+                f"red: 0/blank: {nRed}" + ("" if flagZero else " (not flagged - median 0)"))
+        cm = _XlComment(note, "Auto")
+        cm.width, cm.height = 260, 80
+        rows[0][j].comment = cm
+
+
 def formatSummaryExcel(path, cohort, sheetOrder=None):
     """Apply professional formatting to an already-written *_Summary_Details.xlsx workbook.
 
     - Navy branded headers, frozen panes, zebra banding, borders, number formats, column widths.
     - Conditional highlights on any sheet whose title starts with 'Entrustment'.
-    - Optionally reorders sheets to `sheetOrder` (falls back to keeping rotation sheets after Entrustment).
+    - Low-count flags (red zero / amber < mean-2SD) on the Section Pivot sheet.
+    - Reorders sheets to `sheetOrder`; default groups all 'Entrustment R*' sheets after Entrustment.
     """
     import openpyxl
     wb = openpyxl.load_workbook(path)
 
-    if sheetOrder is None:
-        sheetOrder = [f"Age Counts {cohort}", f"Entrustment {cohort}",
-                      f"Entrustment R1-3 {cohort}", f"Entrustment R4-6 {cohort}",
-                      f"Incidents {cohort}", f"Concerns {cohort}",
-                      f"Merged Item-Section {cohort}", f"Section Pivot {cohort}"]
     byTitle = {ws.title: ws for ws in wb._sheets}
+    if sheetOrder is None:
+        # every rotation-split sheet ("Entrustment R1-3 X", "Entrustment R8 X", ...) sits
+        # directly after the main Entrustment sheet, ordered by rotation range
+        def rotKey(title):
+            nums = [int(n) for n in re.findall(r"\d+", title.split(" ")[1])]
+            return (nums[0], nums[-1])
+        rotSheets = sorted([t for t in byTitle
+                            if re.match(rf"^Entrustment R\d+(-\d+)? {re.escape(cohort)}$", t)],
+                           key=rotKey)
+        sheetOrder = ([f"Age Counts {cohort}", f"Entrustment {cohort}"] + rotSheets
+                      + [f"Incidents {cohort}", f"Concerns {cohort}",
+                         f"Section Pivot {cohort}", f"Merged Item-Section {cohort}"])
     wb._sheets = ([byTitle[t] for t in sheetOrder if t in byTitle]
                   + [ws for ws in wb._sheets if ws.title not in sheetOrder])
 
@@ -1325,6 +1373,8 @@ def formatSummaryExcel(path, cohort, sheetOrder=None):
         _fmtSheet(ws)
         if ws.title.startswith("Entrustment"):
             _fmtEntrustmentHighlights(ws)
+        if ws.title.startswith("Section Pivot"):
+            _fmtSectionPivotLowCounts(ws)
     wb.save(path)
     return path
 

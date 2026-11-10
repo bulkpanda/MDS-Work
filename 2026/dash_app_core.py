@@ -43,6 +43,7 @@ def envVal(key: str) -> str:
 DASH_EMAIL, DASH_PASSWORD, ENV_TOKEN = envVal("DASH_EMAIL"), envVal("DASH_PASSWORD"), envVal("DASH_TOKEN")
 LOGIN_USER = envVal("DASH_APP_USERNAME") or envVal("CBD_USERNAME")     # app login gate (blank = no gate)
 LOGIN_PASS = envVal("DASH_APP_PASSWORD") or envVal("CBD_PASSWORD")
+NGROK_ALLOWED_EMAILS = [e.strip().lower() for e in envVal("NGROK_ALLOWED_EMAILS").split(",") if e.strip()]   # ngrok login allowlist
 
 tokenState, tokenLock = {"token": None}, threading.Lock()
 
@@ -132,7 +133,7 @@ def optionLabels(meta: dict) -> dict:
     """{O1: label, …} from extra_config.options.assessor (student as fallback)."""
     opts = ((meta or {}).get("extra_config") or {}).get("options") or {}
     o = opts.get("assessor") or opts.get("student") or {}
-    return {k: str(v or "").strip() for k, v in o.items() if isSlot(k)}
+    return {k: " ".join(str(v or "").split()) for k, v in o.items() if isSlot(k)}   # collapse "Sometimes\nDone" → "Sometimes Done"
 
 
 def rubricOf(meta: dict, mc: str) -> dict:
@@ -480,6 +481,15 @@ def buildComments(ad: dict, tpl, shortOf: dict) -> str:
     return "\n".join(parts) if parts else "—"
 
 
+def examinerRole(frm: dict, exam: dict):
+    """Examiner role number on the form (BOH viva: form.examiner = 1 | 2); None when the exam/form has no role."""
+    v = frm.get((exam.get("pairing") or {}).get("roleField", "examiner"))
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def parseRecord(r: dict, examKey: str, templates: dict, keyToTid: dict):
     """One raw DASH record → flat row (private keys start with _)."""
     exam = cfg.EXAMS[examKey]
@@ -520,8 +530,11 @@ def parseRecord(r: dict, examKey: str, templates: dict, keyToTid: dict):
                     secInfo.setdefault(keyOf[top], (top, keyOf[top]))
             optLbl = optionLabels(meta)
             wts = (profile.get("itemWeights") or {}).get(ck) or {}
+            unscored = set(profile.get("unscoredItems") or [])           # items read but not scored (DDS2 SCBD MC31)
             for mc in mcs:
                 p, mx, disp, slot = scoreItem(answers.get(mc), meta, mc, profile)
+                if mc in unscored:
+                    p, mx = None, None                                   # max=None → aggregate() skips it in Total, Max and %
                 secKey, sub = smap[mc]
                 items.append({"ck": ck, "mc": mc, "secKey": secKey, "sub": sub, "points": p, "max": mx,
                               "value": str(answers.get(mc) or "").strip(), "disp": disp,
@@ -587,7 +600,7 @@ def parseRecord(r: dict, examKey: str, templates: dict, keyToTid: dict):
         "_id": r.get("id"), "_ts": ts, "_tid": tid, "_profile": tpl["profile"] if tpl else exam["defaultProfile"],
         "_sec": sections, "_items": items, "_groupPct": groupPct, "_missing": missing, "_incomplete": incomplete,
         "_scored": scored, "_nItems": len(items), "_hasComments": hasComments, "_stateRank": cfg.STATUS_RANK[status],
-        "_ad": ad, "_gr": gr, "_extraScales": extraScales, "_unsafe": unsafe,
+        "_ad": ad, "_gr": gr, "_extraScales": extraScales, "_unsafe": unsafe, "_role": examinerRole(frm, exam),
         "_outcome": info.get("outcome", ""), "_outcomeDesc": info.get("descriptor", ""),
         "Date": dtDisplay, "Student": student, "Assessor": (r.get("assessor") or "—").strip() or "—",
         "Examiner": examiner, "Cohort": r.get("cohort") or "—", "Subject": r.get("subject") or "—",

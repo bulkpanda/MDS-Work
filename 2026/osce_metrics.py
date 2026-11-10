@@ -306,3 +306,433 @@ def buildAssessorAnalysisSheet(awb, specs, blr, imgDir, position=None):
         "Flag: Harsh if Δ%<=-5 or ΔGR<=-0.4; Lenient if >=+5 or +0.4; else Typical."]):
         ws.cell(rp + i, 1, t).font = Font(name="Arial", size=9, italic=True, color="555555")
     return ws
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Station review Word table  (added 2026-11-09)
+# Reads an existing "<cohort> BLR & Validity*.xlsx" analysis workbook (no recompute) and writes a
+# landscape .docx with one row per station:
+#   Station | Key Station Metrics | Recommendation | Reasons for recommendation | Notes about the station
+# Metrics come from 'Station Metrics (AMEE)' (+ full names from 'BLR Analysis', assessor flags from
+# 'Assessor Analysis (AMEE)', applied cut from 'Standard Setting'). Recommendation/Reasons are a
+# rule-based DRAFT (REVIEW_THRESHOLDS) for the panel to edit in Word; Notes start blank unless given.
+# ═══════════════════════════════════════════════════════════════════════════════
+import os
+import re
+import datetime as _dt
+
+REVIEW_THRESHOLDS = {
+    "alphaMajor": 0.5,         # station (item) Cronbach's alpha below this -> major
+    "alphaMinor": 0.7,         # ... below this -> minor
+    "r2Major": 0.3,            # R^2 checklist vs global rating below this -> major
+    "r2Minor": 0.5,            # ... below this -> minor (AMEE: > 0.5 reasonable)
+    "failMajor": 30.0,         # % of cohort below the BLR cut above this -> major
+    "failMinor": 20.0,         # ... above this -> minor
+    "discrimFactor": 0.5,      # inter-grade discrimination < factor x guide (max/10) -> minor
+    "alphaDeletedGain": 0.005, # overall alpha rises by >= this when the station is dropped -> minor
+    "assessorModerate": 10.0,  # assessor eta^2 %: < this Low, else Moderate
+    "assessorHigh": 30.0,      # >= this High (AMEE 'watch') -> minor
+    "assessorConcern": 40.0,   # >= this (or ANOVA verdict hawks & doves) -> major
+}
+REVIEW_LABELS = {0: "Keep Station", 1: "Keep Station (minor review)", 2: "Review Station before reuse"}
+REVIEW_COLOURS = {0: "094183", 1: "9C5700", 2: "C55A11"}   # UniMelb blue / amber / orange
+REVIEW_HEAD = "000F46"                                     # UniMelb navy header
+
+
+def reviewNum(v):
+    """Cell value -> float or None."""
+    try:
+        f = float(v)
+        return None if f != f else f
+    except (TypeError, ValueError):
+        return None
+
+
+def reviewSheetRows(wb, name):
+    return [list(r) for r in wb[name].iter_rows(values_only=True)] if name in wb.sheetnames else []
+
+
+def reviewStationKey(v):
+    """1 / 1.0 / '1' / '1+5' -> '1' / '1+5'."""
+    f = reviewNum(v)
+    return str(int(f)) if f is not None and f == int(f) else str(v).strip()
+
+
+def readStationMetricsRows(rows):
+    """'Station Metrics (AMEE)' -> (list of row dicts, overall {alpha, k, n})."""
+    overall = {"alpha": None, "k": None, "n": None}
+    if rows and rows[0] and rows[0][0]:
+        t = str(rows[0][0])
+        m = re.search(r"=\s*(-?\d+(?:\.\d+)?)", t); overall["alpha"] = float(m.group(1)) if m else None
+        m = re.search(r"K\s*=\s*(\d+)", t); overall["k"] = int(m.group(1)) if m else None
+        m = re.search(r"N\s*=\s*(\d+)", t); overall["n"] = int(m.group(1)) if m else None
+    hi = next((i for i, r in enumerate(rows) if r and r[0] == "Station" and "Sheet" in r), None)
+    if hi is None:
+        return [], overall
+    hdr = [str(h).strip() if h is not None else "" for h in rows[hi]]
+    out = []
+    for r in rows[hi + 1:]:
+        if not r or r[0] in (None, "", "Average") or (isinstance(r[0], str) and len(r[0]) > 12):
+            break
+        out.append(dict(zip(hdr, r)))
+    return out, overall
+
+
+def readBlrTitles(rows):
+    """'BLR Analysis' title rows -> list of (stationKey, fullName)."""
+    out = []
+    for r in rows:
+        a = r[0] if r else None
+        if isinstance(a, str):
+            m = re.match(r"^Station\s+(\S+)\s+—\s+(.*?)\s*\(n=\d+", a)
+            if m:
+                out.append((m.group(1), m.group(2).strip()))
+    return out
+
+
+def readAssessorBlocks(rows):
+    """'Assessor Analysis (AMEE)' -> {sheetName: {k, eta2, p, verdict, assessors:[{name, dPct, dGr, flag}]}}."""
+    out, cur, inTbl = {}, None, False
+    for r in rows:
+        a = r[0] if r else None
+        if isinstance(a, str) and " — " in a and "(station mean" in a:
+            cur = {"k": None, "eta2": None, "p": None, "verdict": "", "assessors": []}
+            out[a.split(" — ")[0].strip()] = cur; inTbl = False
+            continue
+        if cur is None:
+            continue
+        if a == "Assessors (k)":
+            pairs = {r[i]: r[i + 1] for i in range(0, len(r) - 1, 2) if isinstance(r[i], str)}
+            cur["k"] = reviewNum(pairs.get("Assessors (k)"))
+            cur["eta2"] = reviewNum(pairs.get("Between-assessor var % (eta^2)"))
+            cur["p"] = reviewNum(pairs.get("p-value"))
+            cur["verdict"] = str(pairs.get("Verdict") or "")
+        elif a == "Assessor" and len(r) > 1 and r[1] == "n":
+            inTbl = True
+        elif inTbl:
+            if not a or len(r) < 8 or r[7] not in ("Harsh", "Lenient", "Typical"):
+                inTbl = False; continue
+            cur["assessors"].append({"name": a, "dPct": reviewNum(r[3]), "dGr": reviewNum(r[5]), "flag": r[7]})
+    return out
+
+
+def readStandardSetting(rows):
+    """'Standard Setting' -> list of {st, checklist, appliedCut, appliedFails}."""
+    out, mode, byKey = [], None, {}
+    for r in rows:
+        if not r or r[0] is None:
+            mode = None; continue
+        if r[0] == "Station" and "APPLIED cut %" in r:
+            mode = ("cut", r.index("APPLIED cut %")); continue
+        if r[0] == "Station" and "Fails APPLIED" in r:
+            mode = ("fails", r.index("Fails APPLIED")); continue
+        if mode and reviewNum(r[0]) is not None or (mode and isinstance(r[0], str) and len(r[0]) <= 8):
+            key = (reviewStationKey(r[0]), str(r[1] or "").strip())
+            d = byKey.setdefault(key, {"st": key[0], "checklist": key[1], "appliedCut": None, "appliedFails": None})
+            if mode[0] == "cut":
+                d["appliedCut"] = reviewNum(r[mode[1]])
+            else:
+                d["appliedFails"] = reviewNum(r[mode[1]])
+        else:
+            mode = None
+    return list(byKey.values())
+
+
+def matchByName(stKey, shortName, candidates, nameField):
+    """Pick the candidate with the same station key whose name starts with shortName (names are truncated)."""
+    short = (shortName or "").strip().lower()
+    same = [c for c in candidates if c[0] == stKey]
+    for c in same:
+        nm = (c[1] if nameField is None else c[1].get(nameField) or "").strip().lower()
+        if short and (nm.startswith(short) or short.startswith(nm)):
+            return c
+    return same[0] if len(same) == 1 else None
+
+
+def cleanStationName(name):
+    """'Station 01 - Polypharmacy' -> 'Polypharmacy'."""
+    s = re.sub(r"^\s*station\s*\d+\s*[-–—:.]?\s*", "", str(name or ""), flags=re.I).strip()
+    return s or str(name or "").strip()
+
+
+def lookupByStation(mapping, sheet, st, checklist):
+    """Optional per-station dict lookup by sheet name, station number (str/int) or checklist name."""
+    if not mapping:
+        return None
+    for k in (sheet, st, checklist):
+        if k in mapping:
+            return mapping[k]
+    stInt = reviewNum(st)
+    if stInt is not None and int(stInt) in mapping:
+        return mapping[int(stInt)]
+    return None
+
+
+def assessorInfluence(blk, t, showNames=False):
+    """-> (severity 0/1/2, text) e.g. 'Assessor influence – Moderate (η² 18.0%) – 1 of 2 assessors recorded as harsh'."""
+    if not blk or blk.get("eta2") is None:
+        return 0, None
+    eta, verdict = blk["eta2"], blk.get("verdict") or ""
+    if eta >= t["assessorConcern"] or verdict.lower().startswith("hawks"):
+        level, sev = "High", 2
+    elif eta >= t["assessorHigh"]:
+        level, sev = "High", 1
+    elif eta >= t["assessorModerate"]:
+        level, sev = "Moderate", 0
+    else:
+        level, sev = "Low", 0
+    txt = f"Assessor influence – {level} (between-assessor variance η² = {eta:.1f}%"
+    vClean = re.sub(r"\s*\(.*?\)", "", verdict).strip().lower()
+    txt += f", {vClean})" if vClean and vClean != "-" else ")"
+    nA = len(blk.get("assessors") or [])
+    parts = []
+    for flag in ("Harsh", "Lenient"):
+        who = [a["name"] for a in blk.get("assessors") or [] if a["flag"] == flag]
+        if who:
+            parts.append(f"{len(who)} {flag.lower()}" + (f" ({', '.join(who)})" if showNames else ""))
+    if parts:
+        nFlag = sum(a["flag"] in ("Harsh", "Lenient") for a in blk.get("assessors") or [])
+        txt += f" – {' and '.join(parts)} assessor{'s' if nFlag > 1 and len(parts) == 1 else ''} (of {nA})"
+    return sev, txt
+
+
+def draftStationRecommendation(m, overallAlpha=None, thresholds=None, showAssessorNames=False):
+    """
+    Rule-based draft for one station dict (from collectStationReview). Returns (label, reasons, level).
+    level 0 = Keep, 1 = Keep (minor review), 2 = Review before reuse. Thresholds: REVIEW_THRESHOLDS.
+    """
+    t = {**REVIEW_THRESHOLDS, **(thresholds or {})}
+    major, minor, info = [], [], []
+    a, r2 = m.get("itemAlpha"), m.get("r2")
+    if a is not None:
+        if a < t["alphaMajor"]:
+            major.append(f"Low internal consistency of checklist items (Cronbach's α = {a:.3f} < {t['alphaMajor']})")
+        elif a < t["alphaMinor"]:
+            minor.append(f"Modest internal consistency of checklist items (Cronbach's α = {a:.3f} < {t['alphaMinor']})")
+    if r2 is not None:
+        if r2 < t["r2Major"]:
+            major.append(f"Weak agreement between checklist score and global rating (R² = {r2:.3f} < {t['r2Major']})")
+        elif r2 < t["r2Minor"]:
+            minor.append(f"Moderate agreement between checklist score and global rating (R² = {r2:.3f} < {t['r2Minor']})")
+    n, fails = m.get("n"), m.get("blrFails")
+    if n and fails is not None:
+        fr = 100.0 * fails / n
+        if fr > t["failMajor"]:
+            major.append(f"High BLR failure rate ({int(fails)} of {int(n)}, {fr:.0f}% > {t['failMajor']:.0f}%) – check station difficulty / checklist")
+        elif fr > t["failMinor"]:
+            minor.append(f"Elevated BLR failure rate ({int(fails)} of {int(n)}, {fr:.0f}% > {t['failMinor']:.0f}%)")
+    d, g = m.get("discrim"), m.get("discrimGuide")
+    if d is not None and g:
+        if d < t["discrimFactor"] * g:
+            minor.append(f"Low inter-grade discrimination ({d:.2f} marks per grade vs guide ≈ {g:g})")
+    aDel = m.get("alphaIfDeleted")
+    if overallAlpha is not None and aDel is not None and aDel - overallAlpha >= t["alphaDeletedGain"]:
+        minor.append(f"Removing this station would raise overall OSCE α ({overallAlpha:.3f} → {aDel:.3f})")
+    sev, aTxt = assessorInfluence(m.get("assessorBlock"), t, showAssessorNames)
+    if aTxt:
+        (major if sev == 2 else minor if sev == 1 else info).append(aTxt)
+    level = 2 if major else (1 if minor else 0)
+    reasons = major + minor + info
+    if level == 0:
+        reasons = ["Station metrics within acceptable ranges"] + reasons
+    return REVIEW_LABELS[level], reasons, level
+
+
+def collectStationReview(analysisPath, stationTypes=None, notes=None, metaPath=None, cohortLabel="",
+                         thresholds=None, showAssessorNames=False):
+    """
+    Analysis workbook -> (stations, overall). One dict per 'Station Metrics (AMEE)' row:
+      st, sheet, name, type, n, blrCut, appliedCut, r2, itemAlpha, alphaIfDeleted, discrim, discrimGuide,
+      blrFails, blrPassed, grBorderline, grFail, assessorEta2, assessorVerdict, nHarsh, nLenient,
+      recommendation, reasons (list), level, notes
+    stationTypes / notes : optional {sheet | station number | checklist name: text}
+    metaPath             : optional 'OSCE Station Metadata.xlsx' (Station Type by Sheet Name, filtered to cohortLabel)
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(analysisPath, data_only=True, read_only=True)
+    try:
+        metricRows, overall = readStationMetricsRows(reviewSheetRows(wb, "Station Metrics (AMEE)"))
+        titles = readBlrTitles(reviewSheetRows(wb, "BLR Analysis"))
+        assessors = readAssessorBlocks(reviewSheetRows(wb, "Assessor Analysis (AMEE)"))
+        stdSet = readStandardSetting(reviewSheetRows(wb, "Standard Setting"))
+    finally:
+        wb.close()
+    if not metricRows:
+        raise ValueError(f"No 'Station Metrics (AMEE)' table found in {analysisPath}")
+    types = dict(stationTypes or {})
+    if metaPath and os.path.exists(metaPath):
+        try:
+            meta, _ = ou.loadStationMeta(metaPath, cohort=cohortLabel or "DDS4")
+            for sh, mm in meta.items():
+                if mm.get("type") and sh not in types:
+                    types[sh] = mm["type"]
+        except Exception as e:  # metadata is optional
+            print(f"[station review] metadata not used ({e})")
+    out = []
+    for r in metricRows:
+        st, sheet = reviewStationKey(r.get("Station")), str(r.get("Sheet") or "").strip()
+        shortNm = str(r.get("Checklist") or "").strip()
+        tm = matchByName(st, shortNm, titles, None)
+        fullNm = tm[1] if tm else shortNm
+        ss = matchByName(st, shortNm, [(d["st"], d) for d in stdSet], "checklist")
+        ss = ss[1] if ss else {}
+        n, fails = reviewNum(r.get("N")), reviewNum(r.get("Failures"))
+        blk = assessors.get(sheet)
+        m = {"st": st, "sheet": sheet, "name": cleanStationName(fullNm), "fullName": fullNm,
+             "type": lookupByStation(types, sheet, st, fullNm) or "",
+             "n": n, "blrCut": reviewNum(r.get("BLR cut %")), "appliedCut": ss.get("appliedCut"),
+             "appliedFails": ss.get("appliedFails"),
+             "r2": reviewNum(r.get("R^2")), "itemAlpha": reviewNum(r.get("Item a")),
+             "alphaIfDeleted": reviewNum(r.get("a if stn deleted")),
+             "discrim": reviewNum(r.get("Inter-grade discrim (pts/grade)")),
+             "discrimGuide": reviewNum(r.get("Discrim guide (max/10)")),
+             "blrFails": fails, "blrPassed": (n - fails) if n is not None and fails is not None else None,
+             "grBorderline": reviewNum(r.get("Borderline")), "grFail": reviewNum(r.get("Fail")),
+             "assessorBlock": blk,
+             "assessorEta2": blk.get("eta2") if blk else None,
+             "assessorVerdict": blk.get("verdict") if blk else "",
+             "nHarsh": sum(a["flag"] == "Harsh" for a in blk["assessors"]) if blk else 0,
+             "nLenient": sum(a["flag"] == "Lenient" for a in blk["assessors"]) if blk else 0,
+             "metricFlags": r.get("Flags") or ""}
+        m["recommendation"], m["reasons"], m["level"] = draftStationRecommendation(
+            m, overall.get("alpha"), thresholds, showAssessorNames)
+        m["notes"] = lookupByStation(notes, sheet, st, fullNm) or ""
+        out.append(m)
+    return out, overall
+
+
+def stationMetricLines(m):
+    """Key Station Metrics cell text, one line each (mirrors the panel's template)."""
+    def fi(v):
+        return "–" if v is None else str(int(round(v)))
+    lines = []
+    if m.get("type"):
+        lines.append(m["type"])
+    lines.append(f"BLR Cut-off – {m['blrCut']:.1f}%" if m.get("blrCut") is not None else "BLR Cut-off – n/a")
+    ac = m.get("appliedCut")
+    if ac is not None and m.get("blrCut") is not None and abs(ac - m["blrCut"]) >= 0.05:
+        lines.append(f"Applied cut-off – {ac:.1f}% (override)")
+    lines.append(f"Cronbach's α – {m['itemAlpha']:.3f}" if m.get("itemAlpha") is not None else "Cronbach's α – n/a")
+    lines.append(f"R-square value – {m['r2']:.3f}" if m.get("r2") is not None else "R-square value – n/a")
+    lines.append(f"Number passed (BLR) – {fi(m.get('blrPassed'))}")
+    lines.append(f"Number failed (BLR) – {fi(m.get('blrFails'))}")
+    lines.append(f"Number of borderline (Global Rating Score) – {fi(m.get('grBorderline'))}")
+    lines.append(f"Number of fail (Global Rating Score) – {fi(m.get('grFail'))}")
+    return lines
+
+
+def buildStationReviewDoc(analysisPath, outPath=None, cohortLabel="", title=None, stationTypes=None,
+                          notes=None, metaPath=None, thresholds=None, showAssessorNames=False,
+                          includeMethodNote=True):
+    """
+    Word (.docx) station-review table from a BLR & Validity analysis workbook.
+      analysisPath      : e.g. "OSCE/BOH2/BOH2 BLR & Validity new.xlsx"
+      outPath           : default "<same folder>/<cohort> OSCE Station Review.docx"
+      stationTypes      : {1: "Simulated Patient Station", ...} -> first line of Key Station Metrics
+      notes             : {1: "Lessons learned ...", ...} -> prefills 'Notes about the station'
+      metaPath          : optional OSCE Station Metadata.xlsx (Station Type column) instead of stationTypes
+      thresholds        : overrides for REVIEW_THRESHOLDS
+      showAssessorNames : list harsh/lenient assessor names in Reasons (default off – doc may be circulated)
+    Returns {"docPath", "stations", "overall"}. If the .docx is open in Word, saves "... (refreshed).docx".
+    """
+    try:
+        import docx
+        from docx.shared import Pt, Cm, RGBColor
+        from docx.enum.section import WD_ORIENT
+        from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+    except ImportError as e:
+        raise ImportError("python-docx is required: pip install python-docx") from e
+
+    stations, overall = collectStationReview(analysisPath, stationTypes, notes, metaPath, cohortLabel,
+                                             thresholds, showAssessorNames)
+    if outPath is None:
+        outPath = os.path.join(os.path.dirname(analysisPath), f"{cohortLabel or 'OSCE'} OSCE Station Review.docx")
+
+    doc = docx.Document()
+    sec = doc.sections[0]
+    sec.orientation = WD_ORIENT.LANDSCAPE
+    sec.page_width, sec.page_height = Cm(29.7), Cm(21.0)
+    for side in ("left_margin", "right_margin", "top_margin", "bottom_margin"):
+        setattr(sec, side, Cm(1.5))
+    base = doc.styles["Normal"]; base.font.name = "Arial"; base.font.size = Pt(9)
+    base.element.rPr.rFonts.set(qn("w:eastAsia"), "Arial")
+
+    def shade(cell, hexFill):
+        tcPr = cell._tc.get_or_add_tcPr(); sh = OxmlElement("w:shd")
+        sh.set(qn("w:val"), "clear"); sh.set(qn("w:color"), "auto"); sh.set(qn("w:fill"), hexFill); tcPr.append(sh)
+
+    def cellLines(cell, lines, bold=False, colour=None, size=9, bulletAfter=0):
+        cell.text = ""
+        for i, ln in enumerate(lines):
+            p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+            p.paragraph_format.space_after = Pt(2); p.paragraph_format.space_before = Pt(0)
+            txt = ("• " + ln) if bulletAfter and i >= bulletAfter - 1 else ln
+            run = p.add_run(txt); run.font.size = Pt(size); run.bold = bold
+            if colour:
+                run.font.color.rgb = RGBColor.from_string(colour)
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+
+    h = doc.add_paragraph(); r = h.add_run(title or f"{cohortLabel} OSCE — Station Review".strip())
+    r.bold = True; r.font.size = Pt(15); r.font.color.rgb = RGBColor.from_string(REVIEW_HEAD)
+    sub = f"Source: {os.path.basename(analysisPath)}   ·   Generated {_dt.date.today():%d %b %Y}"
+    if overall.get("alpha") is not None:
+        sub += (f"   ·   Overall OSCE Cronbach's α (stations as items) = {overall['alpha']:.3f}"
+                + (f" (K={overall['k']}, N={overall['n']})" if overall.get("k") else ""))
+    p = doc.add_paragraph(); rr = p.add_run(sub); rr.font.size = Pt(8.5); rr.italic = True
+    rr.font.color.rgb = RGBColor.from_string("555555")
+
+    hdr = ["Station", "Key Station Metrics", "Recommendation", "Reasons for recommendation", "Notes about the station"]
+    widths = [Cm(3.2), Cm(7.3), Cm(3.2), Cm(8.0), Cm(5.0)]
+    tbl = doc.add_table(rows=1, cols=len(hdr)); tbl.style = "Table Grid"; tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+    tbl.autofit = False
+    trPr = tbl.rows[0]._tr.get_or_add_trPr(); th = OxmlElement("w:tblHeader"); th.set(qn("w:val"), "true"); trPr.append(th)
+    for c, txt in enumerate(hdr):
+        cell = tbl.rows[0].cells[c]; cellLines(cell, [txt], bold=True, colour="FFFFFF", size=9.5); shade(cell, REVIEW_HEAD)
+    for m in stations:
+        row = tbl.add_row()
+        cs = OxmlElement("w:cantSplit"); row._tr.get_or_add_trPr().append(cs)
+        c0, c1, c2, c3, c4 = row.cells
+        cellLines(c0, [f"Station {m['st']}"], bold=True)
+        pn = c0.add_paragraph(); rn = pn.add_run(m["name"]); rn.font.size = Pt(9)
+        cellLines(c1, stationMetricLines(m))
+        cellLines(c2, [m["recommendation"]], bold=True, colour=REVIEW_COLOURS[m["level"]])
+        cellLines(c3, m["reasons"], bulletAfter=1)
+        cellLines(c4, [m["notes"]] if m["notes"] else [""])
+    for c, w in enumerate(widths):            # grid widths (LibreOffice/Word layout) + per-cell widths (Word)
+        tbl.columns[c].width = w
+    for row in tbl.rows:
+        for c, w in enumerate(widths):
+            row.cells[c].width = w
+
+    if includeMethodNote:
+        t = {**REVIEW_THRESHOLDS, **(thresholds or {})}
+        doc.add_paragraph()
+        for ln in [
+            "How the draft recommendation is made (edit freely – it is a starting point for the panel):",
+            f"Review Station before reuse = any MAJOR issue: item α < {t['alphaMajor']}, R² < {t['r2Major']}, "
+            f"BLR failure rate > {t['failMajor']:.0f}%, or assessor variance η² ≥ {t['assessorConcern']:.0f}% / hawks & doves.",
+            f"Keep Station (minor review) = MINOR issues only: item α < {t['alphaMinor']}, R² < {t['r2Minor']}, "
+            f"failure rate > {t['failMinor']:.0f}%, inter-grade discrimination < {t['discrimFactor']} × guide (max mark/10), "
+            f"overall α rises by ≥ {t['alphaDeletedGain']} without the station, or assessor η² ≥ {t['assessorHigh']:.0f}%.",
+            "Keep Station = none of the above.",
+            f"Assessor influence: Low < {t['assessorModerate']:.0f}% ≤ Moderate < {t['assessorHigh']:.0f}% ≤ High (one-way ANOVA η² of "
+            "checklist % by assessor). Harsh / lenient = assessor mean ≥ 5 pp or ≥ 0.4 GR below / above the station mean.",
+            "Number passed / failed (BLR) = students at or above / below the station BLR cut. Borderline / fail counts are examiner "
+            "global ratings. Metrics from the 'Station Metrics (AMEE)', 'Assessor Analysis (AMEE)' and 'Standard Setting' sheets.",
+        ]:
+            q = doc.add_paragraph(); q.paragraph_format.space_after = Pt(1)
+            rq = q.add_run(ln); rq.font.size = Pt(8); rq.italic = True; rq.font.color.rgb = RGBColor.from_string("555555")
+
+    os.makedirs(os.path.dirname(outPath) or ".", exist_ok=True)
+    try:
+        doc.save(outPath)
+    except PermissionError:
+        root, ext = os.path.splitext(outPath)
+        outPath = f"{root} (refreshed){ext}"
+        doc.save(outPath)
+        print(f"[station review] target open in Word – saved to {outPath}")
+    for m in stations:
+        m.pop("assessorBlock", None)
+    return {"docPath": outPath, "stations": stations, "overall": overall}

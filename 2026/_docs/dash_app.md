@@ -9,8 +9,8 @@
 
 | | |
 |---|---|
-| **Files** | `dash_app.py` (UI + launch, 189 LOC) · [`dash_app_config.py`](dash_app_config.md) (registry + rules, 221) · [`dash_app_core.py`](dash_app_core.md) (engine + HTML, 1,120) · [`dash_app_export.py`](dash_app_export.md) (Excel, 1,212) † 2026-11-09 |
-| **Top-level functions** | 12 here · 52 core (+2 classes) · 49 export (+1 class) † |
+| **Files** | `dash_app.py` (UI + launch, 214 LOC) · [`dash_app_config.py`](dash_app_config.md) (registry + rules, 246) · [`dash_app_core.py`](dash_app_core.md) (engine + HTML, 1,133) · [`dash_app_export.py`](dash_app_export.md) (Excel, 1,683) † 2026-11-11 |
+| **Top-level functions** | 13 here · 53 core (+2 classes) · 64 export (+1 class) † |
 | **Imports from this codebase** | only each other (`dash_app` → config, core, export; export → config, core; core → config). Does **not** use `gradio_utils` / `cbd_gradio_utils`. |
 | **Imported by** | Nothing. Not used by `main.ipynb`. |
 | **Run how** | `python dash_app.py` → `http://localhost:7863` (`SERVER_PORT`). ngrok inside `__main__` when `USE_NGROK = True` (domain `NGROK_DOMAIN`). |
@@ -21,6 +21,25 @@
 ---
 
 ## 0. Changes since this document was written
+
+> **Changed 2026-11-11 (paired examiners).** BOH viva has two forms per student: **Examiner 1** (ratings + comments + critical
+> error, no checklist) and **Examiner 2** (checklist + ratings + comments). New exam option
+> `EXAMS["Viva"]["pairing"] = {"roleField": "examiner", "scorerRole": 2, "otherRole": 1, "matchOn": ["Student", "Cohort"]}`.
+> Exports (Summary and Detailed) now merge them into **one row per student** (`pairSittings()` in `dash_app_export.py`):
+> per role the submitted, latest form; score / sections / items from E2; every scale shown as E1 · E2 · Δ; Assessor 1 / 2,
+> Comments E1 / E2, critical error E1 / E2. New/changed sheets for paired rows only: **Records (E1+E2)**, Scores (Student
+> block, rating E1/E2/Δ columns, both comment sets), **Std Setting** (BLR + BGM side by side on E2's rating, E1's independent
+> rating and their mean), **Examiner Agreement** (exact / adjacent %, linear κ, Spearman, E1 × E2 cross-tab, by examiner pair,
+> ≥ 2-level list), Assessors (+ ratings given as E1 / E2 and own − partner), Students (mean / lowest rating over both),
+> Follow-up (lower of the two ratings, missing / unsubmitted partner form, examiners ≥ 2 levels apart; mean-rating BLR cut
+> for "below cut"). Forms without a role (DDS4 viva) and CBD / SCBD / Oral Presentation exports are **unchanged** — verified
+> cell-for-cell against the previous code. Core: rows carry `_role` (`examinerRole()`). The dashboard table is unchanged
+> (one row per form).
+
+> **Changed 2026-11-11.** New profile **`binaryRaw`** (Yes = 1, No = 0 by label; blank = 0 kept in the max; Total = number
+> of Yes; Overall % = Total ÷ items). Viva rule `{"keyRegex": r"^(BOH-Viva-EOY|BOH2-Viva)$", "profile": "binaryRaw"}` (by checklist key) → BOH2 viva checklists
+> `BOH-Viva-EOY` (BOH2 EOY Viva, 97 items) and `BOH2-Viva` (68 items). Scores unchanged from the previous `label5Raw`
+> slot fallback (e.g. form 506 74/97 = 76.3%), now explicit.
 
 > **Changed 2026-11-09 (build 20261109a).**
 > 1. **Oral Presentation exam** (`oral-presentation` endpoint, BOH3): checklists BOH3-OCT, BOH3-OHTR, BOH3-ECCA. OCT/OHTR use
@@ -68,6 +87,7 @@ or GR labels is hard-coded — those are read from each form's JSON.
 | Add a new exam (e.g. OSCE, oral presentation) | add an `EXAMS` entry | endpoint + cohorts + profile; nothing else needed |
 | Penalties / ignored assessors | `<exam>_overrides.json` (no restart) | §6 |
 | Thresholds (R², BGM n, α, leniency) | bottom of `dash_app_config.py` | §8 |
+| Merge two examiners' forms into one row per student (exports) | `EXAMS[…]["pairing"]` (`roleField`, `scorerRole`, `otherRole`, `matchOn`) | Viva only (BOH viva `form.examiner` = 1 / 2); remove the key to export one row per form again |
 | Scoring Guide text shown in Excel | `PROFILES[…]["guide"]` | keep in step with the numbers |
 | Oral presentation item weights | `ORAL_ITEM_WEIGHTS` (used by `PROFILES["oralFromOne"]["itemWeights"]`) | **duplicate of `oral_pres_utils.ORAL_ITEM_WEIGHTS`** — change both |
 | ECCA matrix % / outcomes / descriptors | `ECCA_MATRIX` (+ `ECCA_ROW_LABELS`, `ECCA_COL_LABELS`) | keys = (presentation code, questioning code) |
@@ -85,6 +105,7 @@ or GR labels is hard-coded — those are read from each form's JSON.
 | `omos` | SCBD checklists whose headers start "Oral Medicine/Surgery" | level scheme (as SCBD) | excluded | OM sections pooled · OS sections item mean | 50% OM total (pooled over all OM items) + 50% OS total (item mean) |
 
 | `oralFromOne` | Oral Presentation OCT, OHTR (and any new oral checklist) | best real option = n … worst = 1; option "Missing" or blank = 0 (OCT Exemplary 4 … Unsatisfactory 1; OHTR Excellent 4 … Poor 1) | 0, kept in max | pooled with item weights | Σ w·points ÷ Σ w·max (OCT weights MC1 ×3, MC2 ×2, MC3–5 ×1) |
+| `binaryRaw` | Viva BOH2 (`BOH-Viva-EOY`, `BOH2-Viva`; rule `keyRegex: ^(BOH-Viva-EOY\|BOH2-Viva)$`) | Yes 1, No 0 (by label) | 0, kept in max | pooled | raw: Total = number of Yes ÷ items |
 | `eccaMatrix` | Oral Presentation BOH3-ECCA (rule `keyRegex: "ECCA"`) | B1 0 · B2 1 · M1 2 · M2 3; Safe 1 / Unsafe 0 (item analysis only) | excluded | per item | **matrix** lookup below; Unsafe → min(matrix %, 45%) |
 
 **ECCA combined performance matrix** (`ECCA_MATRIX`; Presentation rows × Questioning columns; pass mark 50%):
@@ -345,6 +366,17 @@ more than one). Sheets with nothing to show are skipped.
 | **Roster** | Per cohort vs `studentEmailList.csv` (`cohort`, `student_name`): missing, off-roster, same checklist twice |
 | **Double Marking** | Only when ≥ 3 students have 2+ submitted forms on the same checklist. Per checklist: pairs, mean \|gap\|, pairs with gap ≥ 10, mean E2 − E1, r(E1, E2); per item: exact agreement %, linear weighted κ, mean level gap; per student: E1/E2 assessor and %, gap, flag, Final % (mean of all forms), outcomes. E1/E2 = form-id order |
 | **Ignored Assessors** | Records-format sheet of excluded forms (grey tab) |
+| **Records (E1+E2)** | Paired exams (BOH viva): one row per student — E2/E1 form IDs, Assessor 1 (E1), Assessor 2 (E2, scorer), status of each form, pairing issues, each scale E1 · E2 · Δ (Δ ≥ 2 orange), section %, Total, Overall %, critical (E1 · E2), Comments E1, Comments E2. Named "Records" when every row is paired |
+| **Examiner Agreement** | Paired exams: per scale — exact %, adjacent (±1) %, mean E2 − E1, linear κ, Spearman ρ, E1 × E2 cross-tab; by examiner pair; students with ratings ≥ 2 levels apart (with both comments) |
+
+**Paired (BOH viva) versions of the other sheets** (2026-11-11): Scores — "Student" block with Assessor 1/2, Status E1/E2,
+pairing issues; summary has every scale as E1 · E2 · Δ; comments block Comments E1/E2 + critical error E1/E2. Std Setting —
+BLR + BGM against **E2 (scorer)**, **E1 (independent)** and **mean** rating side by side (mean: BGM borderline group = mean exactly
+the borderline level), viability tests per source, Overall % by rating level (half steps for the mean), per-section BLR per
+source, one scatter with three trendlines; the mean-rating BLR is the reference cut for Follow-up / Students. Assessors — extra
+table: ratings given as E1 and as E2, % ≤ borderline, mean (own − partner), tendency. Students / Follow-up — ratings from both
+examiners, the lower one drives the borderline flag; missing / unsubmitted partner form and ≥ 2-level disagreements are reasons.
+Sections / Items keep using E2's rating for ρ with GR.
 
 2026-11-09 additions: **Outcome** column on Records when any form has a matrix result; Overview prints the ECCA matrix and
 a count of forms per cell + unsafe count; Scores item cells show weight × points with "(×w, /max)" headers (colour still
@@ -389,6 +421,9 @@ EXAMS["Oral Pres"] = {"title": "Oral Presentation", "endpoint": "oral-presentati
     "defaultProfile": "label5Raw", "profileRules": [], "grScales": ["scale-global-rating"], "borderline": 2}
 ```
 Test offline first: `LOCAL_JSON_DIR = "."` with `temp 2026 oral-presentation.json` beside the app.
+
+**Merge examiners for another exam:** add `"pairing": {"roleField": "<form field holding 1/2>", "scorerRole": 2,
+"otherRole": 1, "matchOn": ["Student", "Cohort"]}` to its `EXAMS` entry. Only forms that carry a role are merged.
 
 **New scoring rule for one checklist:** add a `PROFILES` entry, then a `profileRules` line on the
 exam, e.g. `{"keyRegex": r"^DDS3-NEW", "profile": "myProfile"}`. Rules are tried in order.
@@ -435,6 +470,9 @@ section columns, eye → form modal (ECCA result banner), detailed export downlo
   has that parameter (`HTML_KW`); without it the eye/comment `onclick` handlers would be stripped on
   versions that sanitize. `css`, `head`, `theme` are passed to `launch()` (Gradio 6 API).
 - **Two exams, one timer:** the timer only refreshes the exam currently selected in that tab.
+- **Paired viva rows:** pairing is by examiner role, not cohort — a DDS3/DDS4 test form that happens to carry `examiner`
+  is merged too (it shows "Examiner 1 form missing" etc.). BOH3 examiner-1 forms carry only Readiness to Practice (BOH2: GR + RTP).
+  Items' RandomForest importance can shift slightly between runs because row order changes; all other statistics are unaffected.
 - **Not started vs blank:** a form with no answered item has `Pct = −1` (shown "—"), not 0%.
 - **Form versions:** every form is scored against its own rubric; Max can differ between forms of
   the same checklist (e.g. CBD 100 vs 101). Section keys on single-checklist templates are short
@@ -467,6 +505,7 @@ section columns, eye → form modal (ECCA result banner), detailed export downlo
 | 100 | `doExport` | `(examKey, *filterVals)` | Export Summary button → summaryExport on the filtered cache rows. |
 | 105 | `doExportDetailed` | `(examKey, *filterVals)` | Export Detailed button → detailedExport on the filtered cache rows. |
 | 110 | `setInterval` | `(choice)` | Refresh dropdown → new gr.Timer. |
+| 181 | `buildNgrokPolicy` | `()` | ngrok traffic policy: OAuth sign-in → deny if email not on NGROK_EMAIL_DOMAIN → deny if not on the .env allowlist. |
 
 Module-level: `NO_CHANGE` (`gr.skip()`), `HTML_KW` (sanitize flag when supported), `DEF_SECS`/`DEF_ACTIVE`, `e0` (default exam), `demo` (the Blocks app).
 Components: `examDd`, `dateFrom`, `dateTo`, `intervalDd`, `loadBtn`, `cohortIn`, `checklistDd` (multi-select), `searchIn`, `sortDd`, `subOnly`, `unsubOnly`, `ccOnly`, `hideTest`, `statsHtml`, `errorMd`, `updatedMd`, `tableHtml`, `formReq` (hidden), `formOut` (hidden), `exportBtn`, `exportDetailBtn`, `fileOut`, `versionState`, `timer`.

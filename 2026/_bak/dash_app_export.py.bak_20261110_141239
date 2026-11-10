@@ -1,0 +1,1247 @@
+"""
+dash_app_export.py — Excel exports for dash_app.py (same workbook design for every exam).
+
+Summary export : Records (+ Ignored Assessors)
+Detailed export:
+  Overview        KPIs, scoring method per checklist, section maxima/weights, GR scales, colour legend, sheet guide
+  Records         one row per form: identity, status, GR, section %, total, overall, CC, overrides, comments
+  Follow-up       forms needing action, with reasons (CC, incomplete, missing section, in progress, low GR, below cut)
+  Students        per student: forms, mean/min %, GR, CC, below-cut count, review flag
+  Scores …        per checklist: MC grid (points, colour by fraction) + section score/% + summary + comments
+  Std Setting …   per checklist: BLR + BGM cut scores, viability tests, grade means, per-section cuts, charts
+  Sections …      per checklist: section descriptives, α, r with GR/overall, mean % by GR, intercorrelations
+  Items …         per checklist: difficulty, discrimination, α-if-deleted, D27, 2PL-lite, importance, response mix
+  Assessors       leniency Δ, GR-adjusted Δ, GR mix, fail-level rate, CC rate, completion; chart
+  Roster          present / missing / off-roster / duplicates vs studentEmailList.csv
+  Ignored Assessors  forms excluded from every analysis (from <exam>_overrides.json)
+"""
+import math, re, csv, tempfile
+from collections import OrderedDict, defaultdict
+from datetime import datetime
+
+import numpy as np
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.comments import Comment as XlComment
+from openpyxl.chart import ScatterChart, BarChart, Reference, Series
+from openpyxl.chart.trendline import Trendline
+from openpyxl.chart.marker import Marker, DataPoint
+from openpyxl.chart.label import DataLabelList
+from openpyxl.worksheet.table import Table as XlTable, TableStyleInfo
+
+import dash_app_config as cfg
+import dash_app_core as core
+
+try:                                                   # optional: exact t-distribution p-values / CIs
+    from scipy import stats as spStats
+except Exception:
+    spStats = None
+
+# ══ Style helpers ═══════════════════════════════════════════════════════════
+THIN, THICK = Side(style="thin", color="E2E8F0"), Side(style="medium", color="94A3B8")
+FRAC_FILLS = [(0.99, "BBFFD9"), (0.70, "BFDBFE"), (0.45, "A5F3FC"), (1e-9, "FEF08A"), (-1, "FECACA")]
+GR_FILL = {5: "BBFFD9", 4: "D1FAE5", 3: "FEF9C3", 2: "FED7AA", 1: "FECACA"}
+FLAG_FILL = {"PASS": "BBFFD9", "WARN": "FEF08A", "FAIL": "FECACA", "Good": "D1FAE5", "Review": "FEF9C3",
+             "Poor": "FECACA", "Too easy": "FED7AA", "Too hard": "FED7AA", "No variance": "E2E8F0",
+             "Lenient": "FED7AA", "Harsh": "FECACA", "Typical": "D1FAE5", "Yes": "FECACA"}
+
+
+def xFill(h):  return PatternFill(fill_type="solid", fgColor=h)
+def xFont(bold=False, color="1E293B", size=9): return Font(bold=bold, color=color, name="Calibri", size=size)
+def xAlign(h="left", v="center", wrap=False): return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+def xBorder(l=False, r=False): return Border(left=THICK if l else THIN, right=THICK if r else THIN, top=THIN, bottom=THIN)
+
+
+def fracFill(v, m):
+    if v is None or v == "" or not m:
+        return None
+    f = v / m
+    return next(h for t, h in FRAC_FILLS if f >= t)
+
+
+def rhoColour(rho):
+    """Bar colour for an item-vs-GR correlation: green ≥ .30, amber .20–.30, red < .20 / NaN."""
+    return "1D9E75" if rho == rho and rho >= 0.30 else ("EF9F27" if rho == rho and rho >= 0.20 else "E24B4A")
+
+
+def rhoFill(rho):
+    """Light cell fill for ρ with GR (None when NaN)."""
+    if rho != rho:
+        return None
+    return "C6EFCE" if rho >= 0.30 else ("FFEB9C" if rho >= 0.20 else "FFC7CE")
+
+
+def pctFill(p):
+    return fracFill(p, 100) if isinstance(p, (int, float)) and p >= 0 else None
+
+
+def rnd(v, d=1):
+    return None if v is None or (isinstance(v, float) and v != v) else round(float(v), d)
+
+
+def sheetName(wb, base: str) -> str:
+    """Excel-safe unique sheet name (≤31 chars)."""
+    s = re.sub(r"[\[\]:*?/\\]", "-", base)[:31]
+    n, out = 1, s
+    while out in wb.sheetnames:
+        n += 1; out = f"{s[:28]}~{n}"
+    return out
+
+
+class SheetWriter:
+    """Row cursor + common blocks (title, section bar, header row, key/value, table)."""
+
+    def __init__(self, ws, width=6):
+        self.ws, self.r, self.width = ws, 1, width
+
+    def title(self, text, sub=""):
+        c = self.ws.cell(self.r, 1, text); c.font = xFont(True, "FFFFFF", 14)
+        for cc in range(1, self.width + 1):
+            self.ws.cell(self.r, cc).fill = xFill("010D44")
+        self.ws.row_dimensions[self.r].height = 26; self.r += 1
+        if sub:
+            self.ws.cell(self.r, 1, sub).font = xFont(size=9, color="64748B"); self.r += 1
+        self.r += 1
+
+    def bar(self, text, color="4F5FB2"):
+        c = self.ws.cell(self.r, 1, text); c.font = xFont(True, "FFFFFF", 11)
+        for cc in range(1, self.width + 1):
+            self.ws.cell(self.r, cc).fill = xFill(color)
+        self.r += 1
+
+    def para(self, text, size=9, color="334155"):
+        c = self.ws.cell(self.r, 1, text); c.font = xFont(size=size, color=color); c.alignment = xAlign(v="top", wrap=True)
+        self.ws.merge_cells(start_row=self.r, start_column=1, end_row=self.r, end_column=self.width)
+        self.ws.row_dimensions[self.r].height = 14 * max(1, math.ceil(len(text) / 140)); self.r += 1
+
+    def header(self, labels, start=1, fill="E0E7FF", color="1E293B"):
+        for i, h in enumerate(labels, start):
+            c = self.ws.cell(self.r, i, h); c.font = xFont(True, color); c.fill = xFill(fill); c.border = xBorder()
+            c.alignment = xAlign("center", wrap=True)
+        self.r += 1
+
+    def row(self, vals, start=1, bold0=False, fills=None, wrap=False):
+        for i, v in enumerate(vals):
+            c = self.ws.cell(self.r, start + i, v); c.font = xFont(bold0 and i == 0); c.border = xBorder()
+            c.alignment = xAlign("left" if isinstance(v, str) else "center", "top" if wrap else "center", wrap)
+            if fills and i < len(fills) and fills[i]:
+                c.fill = xFill(fills[i])
+        self.r += 1
+
+    def gap(self, n=1):
+        self.r += n
+
+    def widths(self, ws_):
+        for i, w in enumerate(ws_, 1):
+            self.ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def finishSheet(ws, landscape=True):
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+
+
+# ══ Statistics ══════════════════════════════════════════════════════════════
+def tCrit(df, alpha=0.05):
+    return float(spStats.t.ppf(1 - alpha / 2, df)) if spStats and df > 0 else 1.96
+
+
+def tPvalue(t, df):
+    if t != t or df <= 0:
+        return float("nan")
+    return float(2 * spStats.t.sf(abs(t), df)) if spStats else math.erfc(abs(t) / math.sqrt(2))
+
+
+def rankData(v):
+    order = sorted(range(len(v)), key=lambda i: v[i]); ranks = [0.0] * len(v); i = 0
+    while i < len(v):
+        j = i
+        while j + 1 < len(v) and v[order[j + 1]] == v[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return ranks
+
+
+def pearsonR(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return float("nan")
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs); syy = sum((y - my) ** 2 for y in ys)
+    return sxy / math.sqrt(sxx * syy) if sxx and syy else float("nan")
+
+
+def spearman(xs, ys):
+    """(rho, p)."""
+    n = len(xs)
+    if n < 3:
+        return float("nan"), float("nan")
+    rho = pearsonR(rankData(xs), rankData(ys))
+    if rho != rho:
+        return rho, float("nan")
+    t = rho * math.sqrt((n - 2) / (1 - rho ** 2)) if abs(rho) < 1 else float("inf")
+    return rho, (tPvalue(t, n - 2) if t != float("inf") else 0.0)
+
+
+def computeBlr(xs, ys, borderline):
+    """Borderline regression: score on GR, cut = prediction at the borderline GR (95% CI)."""
+    n = len(xs); out = {"n": n, "ok": False}
+    if n < 3 or len(set(xs)) < 2:
+        return out
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs); syy = sum((y - my) ** 2 for y in ys)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx; a = my - b * mx
+    ssRes = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+    see = math.sqrt(ssRes / (n - 2)) if n > 2 else 0.0
+    seSlope = see / math.sqrt(sxx) if sxx else float("nan")
+    cut = a + b * borderline
+    seCut = see * math.sqrt(1 / n + (borderline - mx) ** 2 / sxx)
+    tc = tCrit(n - 2)
+    out.update(ok=True, slope=b, intercept=a, r2=1 - ssRes / syy if syy else 0.0, r=pearsonR(xs, ys), see=see,
+               pSlope=tPvalue(b / seSlope if seSlope else float("nan"), n - 2), cut=cut,
+               cutLo=cut - tc * seCut, cutHi=cut + tc * seCut, mean=my, sd=math.sqrt(syy / (n - 1)) if n > 1 else 0.0,
+               nPass=sum(1 for y in ys if y >= cut), minGr=min(xs), maxGr=max(xs), nLevels=len(set(xs)))
+    return out
+
+
+def computeBgm(xs, ys, borderline):
+    """Borderline group: cut = mean score of candidates rated borderline (95% CI)."""
+    grp = [y for x, y in zip(xs, ys) if x == borderline]; nb = len(grp)
+    out = {"nB": nb, "ok": nb >= 1}
+    if not nb:
+        return out
+    m = sum(grp) / nb
+    sd = math.sqrt(sum((y - m) ** 2 for y in grp) / (nb - 1)) if nb > 1 else float("nan")
+    se = sd / math.sqrt(nb) if nb > 1 else float("nan")
+    tc = tCrit(nb - 1) if nb > 1 else float("nan")
+    srt = sorted(grp)
+    out.update(cut=m, median=srt[nb // 2] if nb % 2 else (srt[nb // 2 - 1] + srt[nb // 2]) / 2, sd=sd,
+               cutLo=m - tc * se if nb > 1 else float("nan"), cutHi=m + tc * se if nb > 1 else float("nan"),
+               minB=min(grp), maxB=max(grp), nPass=sum(1 for y in ys if y >= m))
+    return out
+
+
+def gradeMeans(xs, ys, levels=5):
+    res = {}
+    for g in range(1, levels + 1):
+        v = [y for x, y in zip(xs, ys) if x == g]
+        if v:
+            m = sum(v) / len(v)
+            res[g] = (len(v), m, math.sqrt(sum((y - m) ** 2 for y in v) / (len(v) - 1)) if len(v) > 1 else 0.0)
+    return res
+
+
+def viabilityChecks(xs, ys, blr, bgm, bl):
+    """[(method, test, value, criterion, PASS/WARN/FAIL, note)] — AMEE Guide 49 style checks."""
+    chk, n = [], len(xs)
+    add = lambda *a: chk.append(a)
+    add("BLR", "Sample size (n)", n, f"≥ {cfg.SS_MIN_N}", "PASS" if n >= cfg.SS_MIN_N else ("WARN" if n >= 5 else "FAIL"),
+        "Small n makes the regression unstable.")
+    if blr.get("ok"):
+        add("BLR", "GR levels used", blr["nLevels"], "≥ 3 distinct", "PASS" if blr["nLevels"] >= 3 else "WARN",
+            "Few levels = line fixed by few points.")
+        add("BLR", f"GR={bl} inside observed range", f"{blr['minGr']}–{blr['maxGr']}", "inside",
+            "PASS" if blr["minGr"] <= bl <= blr["maxGr"] else "WARN", "Outside = extrapolated cut.")
+        add("BLR", "R² (score vs GR)", round(blr["r2"], 3), f"≥ {cfg.R2_MIN}", "PASS" if blr["r2"] >= cfg.R2_MIN else "FAIL",
+            "Checklist and global judgement agree.")
+        add("BLR", "Slope positive & significant", f"{blr['slope']:.2f} (p={blr['pSlope']:.3g})", "> 0, p < 0.05",
+            "PASS" if blr["slope"] > 0 and blr["pSlope"] < 0.05 else "FAIL", "Higher GR must mean higher score.")
+        add("BLR", "Inter-grade discrimination (%-pts/GR)", round(blr["slope"], 2),
+            f"≈ {cfg.DISCRIM_GUIDE:g} ({cfg.DISCRIM_LOW:g}–{cfg.DISCRIM_HIGH:.1f})",
+            "PASS" if cfg.DISCRIM_LOW <= blr["slope"] <= cfg.DISCRIM_HIGH else "WARN",
+            "Low = barely separates grades; high = outlier-driven.")
+        w = blr["cutHi"] - blr["cutLo"]
+        add("BLR", "Cut 95% CI width", f"{w:.1f}", "≤ 10 %-pts", "PASS" if w <= 10 else "WARN", "Wide = imprecise cut.")
+    else:
+        add("BLR", "Regression computable", "No", "≥ 3 points, ≥ 2 GR levels", "FAIL", "")
+    nb = bgm.get("nB", 0)
+    add("BGM", f"Borderline group size (GR={bl})", nb, f"≥ {cfg.BGM_MIN_BORDERLINE}",
+        "PASS" if nb >= cfg.BGM_MIN_BORDERLINE else ("WARN" if nb >= 2 else "FAIL"), "BGM uses only borderline candidates.")
+    if nb >= 2:
+        add("BGM", "Borderline group SD", round(bgm["sd"], 2), "≤ 15 %-pts", "PASS" if bgm["sd"] <= 15 else "WARN",
+            "Large spread = assessors disagree on 'borderline'.")
+        w = bgm["cutHi"] - bgm["cutLo"]
+        add("BGM", "Cut 95% CI width", f"{w:.1f}", "≤ 10 %-pts", "PASS" if w <= 10 else "WARN", "")
+    means = [m for _, (_, m, _) in sorted(gradeMeans(xs, ys).items())]
+    add("Both", "Mean score rises with GR", " < ".join(f"{m:.0f}" for m in means) or "—", "non-decreasing",
+        "PASS" if len(means) >= 2 and all(b >= a for a, b in zip(means, means[1:])) else "WARN", "")
+    if n >= 3:
+        rho, p = spearman(xs, ys)
+        add("Both", "Spearman ρ (GR vs score)", f"{rho:.3f} (p={p:.3g})", "ρ > 0, p < 0.05",
+            "PASS" if rho > 0 and p < 0.05 else "WARN", "Rank agreement without assuming linearity.")
+    if blr.get("ok") and nb:
+        d = abs(blr["cut"] - bgm["cut"])
+        add("Both", "BLR vs BGM agreement", f"{d:.1f} %-pts", f"≤ {cfg.METHOD_AGREE_TOL:g}",
+            "PASS" if d <= cfg.METHOD_AGREE_TOL else "WARN", "Large gap = review before adopting either cut.")
+    return chk
+
+
+def cronbachAlpha(X):
+    """α for an (n × k) matrix with NaN → column mean imputation; None if k < 2 or n < 3."""
+    X = np.asarray(X, float)
+    if X.ndim != 2 or X.shape[1] < 2 or X.shape[0] < 3:
+        return None
+    X = np.where(np.isnan(X), np.nanmean(X, axis=0), X)
+    X = np.nan_to_num(X)
+    k = X.shape[1]; itemVar = X.var(axis=0, ddof=1).sum(); totVar = X.sum(axis=1).var(ddof=1)
+    return float(k / (k - 1) * (1 - itemVar / totVar)) if totVar > 0 else None
+
+
+def irtLite(item, ability):
+    """2PL-style logistic of item fraction on standardised rest-score (IRLS): (a = discrimination, b = difficulty)."""
+    m = ~np.isnan(item) & ~np.isnan(ability); y, a = item[m], ability[m]
+    if len(y) < 8 or len(np.unique(y)) < 2:
+        return (np.nan, np.nan)
+    Xd = np.column_stack([np.ones_like(a), a]); b = np.zeros(2)
+    for _ in range(50):
+        p = 1 / (1 + np.exp(-(Xd @ b))); W = np.clip(p * (1 - p), 1e-6, None)
+        try:
+            b = np.linalg.solve((Xd * W[:, None]).T @ Xd, (Xd * W[:, None]).T @ (Xd @ b + (y - p) / W))
+        except np.linalg.LinAlgError:
+            return (np.nan, np.nan)
+    slope = float(np.clip(b[1], -5, 5))
+    if abs(slope) < 0.2:
+        return (slope, np.nan)
+    diff = -b[0] / b[1]
+    return (slope, float(diff) if np.isfinite(diff) and abs(diff) <= 6 else np.nan)
+
+
+def importance(Xg, target):
+    """Per-item importance for predicting the total: RandomForest if scikit-learn exists, else |item-rest r|."""
+    k = Xg.shape[1]
+    Xi = np.nan_to_num(np.where(np.isnan(Xg), np.nanmean(Xg, axis=0), Xg))
+    try:
+        from sklearn.ensemble import RandomForestRegressor
+        rf = RandomForestRegressor(n_estimators=300, random_state=0, n_jobs=-1).fit(Xi, np.nan_to_num(target))
+        imp, lbl = np.asarray(rf.feature_importances_, float), "RandomForest importance"
+    except Exception:
+        imp = np.zeros(k)
+        for j in range(k):
+            rest = np.nansum(np.delete(Xg, j, axis=1), axis=1); col = Xg[:, j]; v = ~np.isnan(col)
+            imp[j] = abs(np.corrcoef(col[v], rest[v])[0, 1]) if v.sum() > 2 and np.nanstd(col[v]) > 0 and np.std(rest[v]) > 0 else 0
+        lbl = "Importance = |item-rest r| (install scikit-learn for RandomForest)"
+    s = imp.sum()
+    return (imp / s if s else imp), lbl
+
+
+# ══ Shared row helpers ══════════════════════════════════════════════════════
+def basePct(r):
+    """Overall % before administrative penalties, unrounded (used for all analysis)."""
+    if r.get("_pctExact") is not None:
+        return r["_pctExact"]
+    p = r.get("_pctBase", r["Pct"])
+    return p if p is not None and p >= 0 else None
+
+
+def ssPoints(rows):
+    """(GR, base %, row) for submitted forms with both."""
+    return [(r["GR_int"], basePct(r), r) for r in rows if r["Submitted"] == "Yes" and r["GR_int"] > 0 and basePct(r) is not None]
+
+
+def borderlineOf(examKey):
+    return cfg.EXAMS[examKey].get("borderline", 2)
+
+
+def grLabels(rows):
+    """{level: label} from the forms' own scale (latest wins)."""
+    m = {}
+    for r in sorted(rows, key=lambda x: x["_ts"]):
+        if r["_gr"]:
+            m.update({int(k): v for k, v in r["_gr"]["fields"].items() if str(k).isdigit()})
+    return m
+
+
+def tplTag(tpl, many):
+    """Short sheet suffix for a template."""
+    if not many or not tpl:
+        return ""
+    return " " + re.sub(r"\s*\(\d+ parts\)", "", tpl["label"])
+
+
+def itemColumns(rows, tpl):
+    """Ordered (ck, mc, secKey, sub, question) over the template's forms."""
+    cols = OrderedDict()
+    for r in sorted(rows, key=lambda x: -x["_ts"]):
+        for it in r["_items"]:
+            cols.setdefault((it["ck"], it["mc"]), (it["secKey"], it["sub"], it["question"]))
+    secOrder = [sk for sk, _, _ in tpl["sections"]]
+    keyOrder = {k: i for i, k in enumerate(tpl["keys"])}
+    return sorted(((ck, mc, *v) for (ck, mc), v in cols.items()),
+                  key=lambda c: (keyOrder.get(c[0], 99), secOrder.index(c[2]) if c[2] in secOrder else 99, core.natKey(c[1])))
+
+
+def itemLookup(r):
+    return {(it["ck"], it["mc"]): it for it in r["_items"]}
+
+
+def itemFrac(r, c):
+    """points ÷ max for item column c (NaN when unanswered/unscored; unansweredAsZero profiles count blanks as 0)."""
+    it = itemLookup(r).get((c[0], c[1]))
+    if not it or not it["max"]:
+        return np.nan
+    if it["points"] is None:
+        return 0.0 if cfg.PROFILES[r["_profile"]]["unansweredAsZero"] else np.nan
+    return it["points"] / it["max"]
+
+
+def weightedPoints(it):
+    """weight × points for an item cell (None when blank)."""
+    if not it or it.get("points") is None:
+        return None
+    v = it["points"] * it.get("weight", 1)
+    return int(v) if float(v).is_integer() else round(v, 2)
+
+
+def autoWidth(ws, minW=6, maxW=40):
+    for col in ws.columns:
+        L = max((len(str(c.value)) for c in col if c.value is not None), default=0)
+        ws.column_dimensions[get_column_letter(col[0].column)].width = max(minW, min(maxW, L + 2))
+
+
+# ══ Records (summary) sheet ═════════════════════════════════════════════════
+def recordColumns(rows, templates):
+    """(header, valueFn, fillFn) list; section % columns when one template is in view."""
+    tids = {r["_tid"] for r in rows}
+    tpl = templates.get(next(iter(tids))) if len(tids) == 1 else None
+    extraScaleNames = list(OrderedDict.fromkeys(s["name"] for r in rows for s in r["_extraScales"]))
+    groups = list(OrderedDict.fromkeys(g for r in rows for g in r["_groupPct"]))
+    cols = [("ID", lambda r: r["_id"], None), ("Date", lambda r: r["Date"], None), ("Student", lambda r: r["Student"], None),
+            ("Assessor", lambda r: r["Assessor"], None), ("Examiner 2", lambda r: r["Examiner"], None),
+            ("Cohort", lambda r: r["Cohort"], None), ("Subject", lambda r: r["Subject"], None),
+            ("Checklist", lambda r: r["Checklist"], None),
+            ("Status", lambda r: r["Status"], lambda v, r: {"Submitted": "BBFFD9", "In progress": "FEF08A"}.get(v, "FECACA")),
+            ("Items scored", lambda r: f'{r["_scored"]}/{r["_nItems"]}' if r["_nItems"] else "", None),
+            ("GR", lambda r: r["GR_int"] if r["GR_int"] > 0 else None, lambda v, r: GR_FILL.get(v)),
+            ("GR label", lambda r: r["GR_label"] if r["GR_int"] > 0 else "", None)]
+    cols += [(nm, (lambda r, nm=nm: next((s["value"] for s in r["_extraScales"] if s["name"] == nm), None)),
+              lambda v, r: GR_FILL.get(v)) for nm in extraScaleNames]
+    if tpl:
+        for sk, nm, short in tpl["sections"]:
+            cols.append((f"{short} %", (lambda r, sk=sk: rnd((r["_sec"].get(sk) or {}).get("pct"))),
+                         (lambda v, r, sk=sk: "FEF3C7" if sk in r["_sec"] and not r["_sec"][sk]["present"] else pctFill(v))))
+    cols += [(f"{g} total %", (lambda r, g=g: rnd(r["_groupPct"].get(g))), lambda v, r: pctFill(v)) for g in groups]
+    if any(r.get("_outcome") for r in rows):
+        cols.append(("Outcome", lambda r: r.get("_outcome", ""),
+                     lambda v, r: "FECACA" if r.get("_unsafe") or (v and v.startswith("Fail")) or "— Fail" in (v or "") else None))
+    cols += [("Total", lambda r: r["Total"], None), ("Max", lambda r: r["Max"], None),
+             ("Overall %", lambda r: r["Pct"] if r["Pct"] >= 0 else None, lambda v, r: pctFill(v)),
+             ("Overall % before override", lambda r: basePct(r), None),
+             ("Override", lambda r: r.get("_overrideNote") or "", lambda v, r: "FECACA" if v else None),
+             ("Critical concerns", lambda r: r["CC"], lambda v, r: "FECACA" if r["CC_int"] else None),
+             ("Not in form", lambda r: r["Missing"] if r["_missing"] else "", lambda v, r: "FEF3C7" if v else None),
+             ("Submitted incomplete", lambda r: "; ".join(r["_incomplete"]), lambda v, r: "FED7AA" if v else None),
+             ("Comments", lambda r: r["Comments"] if r["Comments"] != "—" else "", None)]
+    return cols
+
+
+def writeRecords(wb, title, rows, templates):
+    ws = wb.create_sheet(sheetName(wb, title))
+    cols = recordColumns(rows, templates)
+    for i, (h, _, _) in enumerate(cols, 1):
+        c = ws.cell(1, i, h); c.font = xFont(True, "FFFFFF"); c.fill = xFill("010D44")
+        c.alignment = xAlign("center", wrap=True); c.border = xBorder()
+    for ri, r in enumerate(rows, 2):
+        bg = "FFFFFF" if ri % 2 else "F8FAFC"
+        for ci, (h, vf, ff) in enumerate(cols, 1):
+            v = vf(r)
+            c = ws.cell(ri, ci, v); c.font = xFont(); c.border = xBorder(); c.alignment = xAlign(wrap=False)
+            c.fill = xFill((ff(v, r) if ff else None) or bg)
+            if h in ("Total", "Overall %") and r.get("_overrideNote"):
+                cm = XlComment(r["_overrideNote"], "DASH dashboard"); cm.width, cm.height = 320, 110; c.comment = cm
+    ws.row_dimensions[1].height = 30
+    autoWidth(ws)
+    for ci, (h, _, _) in enumerate(cols, 1):
+        if h in ("Comments", "Override", "Submitted incomplete"):
+            ws.column_dimensions[get_column_letter(ci)].width = 50
+    ws.freeze_panes = "D2"
+    if rows:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(rows) + 1}"
+    return ws
+
+
+# ══ Per-checklist score sheet (MC grid) ═════════════════════════════════════
+def writeScoreSheet(wb, title, rows, tpl):
+    ws = wb.create_sheet(sheetName(wb, title))
+    icols = itemColumns(rows, tpl)
+    secName = {sk: (nm, short) for sk, nm, short in tpl["sections"]}
+    blocks = []                                                  # (label, color, [(header, valueFn, fillFn)])
+    blocks.append(("Form", ("010D44", "C7D2FE"), [
+        ("Date", lambda r: r["Date"], None), ("Student", lambda r: r["Student"], None),
+        ("Assessor", lambda r: r["Assessor"], None), ("Examiner 2", lambda r: r["Examiner"], None),
+        ("Cohort", lambda r: r["Cohort"], None), ("Status", lambda r: r["Status"],
+                                                  lambda v, r: {"Submitted": "BBFFD9", "In progress": "FEF08A"}.get(v, "FECACA"))]))
+    palette = [("4338CA", "E0E7FF"), ("6D28D9", "EDE9FE"), ("0E7490", "CFFAFE"), ("065F46", "D1FAE5"),
+               ("92400E", "FEF3C7"), ("9D174D", "FCE7F3"), ("1D4ED8", "DBEAFE"), ("7C2D12", "FFEDD5")]
+    bySec = OrderedDict()
+    for c in icols:
+        bySec.setdefault(c[2], []).append(c)
+    for si, (sk, its) in enumerate(bySec.items()):
+        nm, short = secName.get(sk, (sk, sk))
+        col = palette[si % len(palette)]
+        subs = OrderedDict()
+        for c in its:
+            subs.setdefault(c[3], []).append(c)
+        for sub, scs in subs.items():
+            label = f"{short} · {nm}" + (f" | {sub}" if sub else "")
+            cs = []
+            for ck, mc, _, _, q in scs:
+                mxs = [itemLookup(r).get((ck, mc), {}).get("max") for r in rows]
+                mx = next((m for m in mxs if m), "?")
+                wt = next((itemLookup(r)[(ck, mc)].get("weight", 1) for r in rows if (ck, mc) in itemLookup(r)), 1)
+                if isinstance(mx, (int, float)):                               # weighted items show weight × points
+                    hdr = f"{mc} (/{mx:g})" if wt == 1 else f"{mc} (×{wt:g}, /{mx * wt:g})"
+                else:
+                    hdr = mc
+                cs.append((hdr, (lambda r, k=(ck, mc): weightedPoints(itemLookup(r).get(k))),
+                           (lambda v, r, k=(ck, mc): fracFill((itemLookup(r).get(k) or {}).get("points"),
+                                                              (itemLookup(r).get(k) or {}).get("max"))), q))
+            blocks.append((label, col, cs))
+        mxS = next((r["_sec"][sk]["max"] for r in rows if sk in r["_sec"] and r["_sec"][sk]["max"]), None)
+        blocks.append((f"{short} total", col, [
+            (f"Score /{mxS:g}" if mxS else "Score", lambda r, sk=sk: rnd((r["_sec"].get(sk) or {}).get("score"), 2),
+             lambda v, r, sk=sk: "FEF3C7" if sk in r["_sec"] and not r["_sec"][sk]["present"] else None),
+            ("%", lambda r, sk=sk: rnd((r["_sec"].get(sk) or {}).get("pct")), lambda v, r: pctFill(v))]))
+    groups = list(OrderedDict.fromkeys(g for r in rows for g in r["_groupPct"]))
+    extra = list(OrderedDict.fromkeys(s["name"] for r in rows for s in r["_extraScales"]))
+    blocks.append(("Summary", ("1E293B", "F1F5F9"),
+                   [("GR", lambda r: r["GR_int"] if r["GR_int"] > 0 else None, lambda v, r: GR_FILL.get(v))]
+                   + [(nm, (lambda r, nm=nm: next((s["value"] for s in r["_extraScales"] if s["name"] == nm), None)),
+                       lambda v, r: GR_FILL.get(v)) for nm in extra]
+                   + [(f"{g} total %", (lambda r, g=g: rnd(r["_groupPct"].get(g))), lambda v, r: pctFill(v)) for g in groups]
+                   + [("Total", lambda r: r["Total"], None), ("Max", lambda r: r["Max"], None),
+                      ("Overall %", lambda r: r["Pct"] if r["Pct"] >= 0 else None, lambda v, r: pctFill(v)),
+                      ("CC", lambda r: r["CC"], lambda v, r: "FECACA" if r["CC_int"] else None),
+                      ("Not in form", lambda r: r["Missing"] if r["_missing"] else "", lambda v, r: "FEF3C7" if v else None),
+                      ("Override", lambda r: r.get("_overrideNote") or "", lambda v, r: "FECACA" if v else None)]))
+    ckCom = [ck for ck in tpl["keys"] if any((r["_ad"].get(f"{ck}_comments") or "").strip() for r in rows)] if tpl["multi"] else []
+    shortOf = {sk: s for sk, _, s in tpl["sections"]}
+    comCols = [("General", lambda r: (r["_ad"].get("comments") or "").strip(), None)]
+    comCols += [(f"{shortOf.get(ck, ck)} comments", (lambda r, ck=ck: (r["_ad"].get(f"{ck}_comments") or "").strip()), None) for ck in ckCom]
+    for fld, lbl in (("critical_concerns_comments", "Critical concerns comments"), ("critical_error", "Critical error"),
+                     ("clinical_incident", "Clinical incident")):
+        if any(core.meaningful(r["_ad"].get(fld)) for r in rows):
+            comCols.append((lbl, (lambda r, f=fld: str(r["_ad"].get(f) or "").strip()), None))
+    blocks.append(("Comments", ("374151", "F3F4F6"), comCols))
+
+    ci = 1
+    for label, (hh, sh), cs in blocks:
+        start = ci
+        for c in cs:
+            h = ws.cell(2, ci, c[0]); h.fill = xFill(sh); h.font = xFont(True, size=8)
+            h.alignment = xAlign("center", wrap=True); h.border = xBorder(l=ci == start, r=ci == start + len(cs) - 1)
+            if len(c) > 3 and c[3]:
+                cm = XlComment(c[3][:400], "Question"); cm.width, cm.height = 300, 90; h.comment = cm
+            for ri, r in enumerate(rows, 3):
+                v = c[1](r)
+                cell = ws.cell(ri, ci, v); cell.font = xFont(size=8 if c[0].startswith("MC") else 9)
+                cell.border = xBorder(l=ci == start, r=ci == start + len(cs) - 1)
+                cell.alignment = xAlign("center" if not isinstance(v, str) or len(str(v)) < 12 else "left")
+                f = c[2](v, r) if c[2] else None
+                cell.fill = xFill(f or ("FFFFFF" if ri % 2 else "F8FAFC"))
+                if c[0] in ("Total", "Overall %") and r.get("_overrideNote"):
+                    cm = XlComment(r["_overrideNote"], "DASH dashboard"); cm.width, cm.height = 320, 110; cell.comment = cm
+            w = 7 if c[0].startswith("MC") else 34 if label == "Comments" else 18 if c[0] in ("Student", "Assessor", "Examiner 2") else 10
+            ws.column_dimensions[get_column_letter(ci)].width = w
+            ci += 1
+        for cc in range(start, ci):
+            x = ws.cell(1, cc); x.fill = xFill(hh); x.font = xFont(True, "FFFFFF", 9); x.alignment = xAlign("center", wrap=True)
+            x.border = xBorder(l=cc == start, r=cc == ci - 1)
+        ws.cell(1, start, label)
+        if ci - 1 > start:
+            ws.merge_cells(start_row=1, start_column=start, end_row=1, end_column=ci - 1)
+    ws.row_dimensions[1].height, ws.row_dimensions[2].height = 30, 30
+    ws.freeze_panes = ws.cell(3, 3)
+    return ws
+
+
+# ══ Standard setting sheet ══════════════════════════════════════════════════
+def writeStandardSetting(wb, title, rows, tpl, examKey):
+    """BLR + BGM on Overall % (pre-penalty) and per section; viability; grade means; charts. Returns summary dict."""
+    bl = borderlineOf(examKey)
+    pts = ssPoints(rows)
+    if not pts and not any(r["GR_int"] > 0 for r in rows):              # checklist has no global rating at all
+        return {"blr": {}, "bgm": {}, "checks": [], "n": 0, "sections": [], "skipped": "no GR on these forms"}
+    ws = wb.create_sheet(sheetName(wb, title)); w = SheetWriter(ws, 5)
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    blr, bgm = computeBlr(xs, ys, bl), computeBgm(xs, ys, bl)
+    checks = viabilityChecks(xs, ys, blr, bgm, bl) if pts else []
+    grl = grLabels(rows)
+    levels = max([5] + list(grl))
+    w.title(f"Standard Setting — {tpl['label'] if tpl else 'All'} (borderline = GR {bl}: {grl.get(bl, '')})",
+            f"{len(pts)} submitted forms with GR + Overall % (pre-penalty). BLR and BGM side by side — no recommended cut.")
+    w.bar("Cut scores by method")
+    w.header(["Statistic", "BLR (regression)", "BGM (borderline group)"])
+    ok, nb = blr.get("ok"), bgm.get("nB", 0)
+    f = lambda v, d=1: "—" if v is None or v != v else round(v, d)
+    for row in [("Cut score (Overall %)", f(blr.get("cut")) if ok else "—", f(bgm.get("cut")) if nb else "—"),
+                ("95% CI", f"{blr['cutLo']:.1f} – {blr['cutHi']:.1f}" if ok else "—",
+                 f"{bgm['cutLo']:.1f} – {bgm['cutHi']:.1f}" if nb > 1 else "—"),
+                ("Candidates used", blr.get("n", 0), nb),
+                ("Pass at this cut", f"{blr['nPass']}/{len(ys)}" if ok else "—", f"{bgm['nPass']}/{len(ys)}" if nb else "—"),
+                ("Slope (%-pts per GR)", f(blr.get("slope"), 2) if ok else "—", "n/a"),
+                ("Intercept", f(blr.get("intercept"), 2) if ok else "—", "n/a"),
+                ("R² / Pearson r", f"{blr['r2']:.3f} / {blr['r']:.3f}" if ok else "—", "n/a"),
+                ("Std error of estimate", f(blr.get("see"), 2) if ok else "—", "n/a"),
+                ("Borderline mean / median", "n/a", f"{bgm['cut']:.1f} / {bgm['median']:.1f}" if nb else "—"),
+                ("Borderline SD / range", "n/a", f"{f(bgm.get('sd'))} / {bgm['minB']:.1f}–{bgm['maxB']:.1f}" if nb else "—")]:
+        w.row(list(row), bold0=True)
+    w.gap()
+    w.bar("Viability tests")
+    w.header(["Test", "Value", "Criterion", "Result", "Why it matters"])
+    for m, t, v, crit, st, note in checks:
+        w.row([f"[{m}] {t}", v, crit, st, note], fills=[None, None, None, FLAG_FILL[st]], wrap=True)
+    if not checks:
+        w.para("No submitted forms with GR + Overall % — nothing to test.", color="DC2626")
+    w.para("PASS = criterion met · WARN = usable but review · FAIL = method not supported by the data. "
+           "Thresholds in dash_app_config.py.", color="64748B")
+    w.gap()
+    w.bar("Overall % by Global Rating")
+    w.header(["GR", "Label", "n", "Mean %", "SD"])
+    gm = gradeMeans(xs, ys, levels); gmStart = w.r
+    for g in range(1, levels + 1):
+        n_, m_, sd_ = gm.get(g, (0, None, None))
+        w.row([g, grl.get(g, ""), n_, rnd(m_), rnd(sd_)], fills=["FED7AA" if g == bl else None] * 5)
+    gmEnd = w.r - 1
+    w.gap()
+    secRows = []
+    if tpl:
+        w.bar("Per-section cut scores (section % vs GR)")
+        w.header(["Section", "BLR cut % (R²)", "BGM cut % (n borderline)", "Mean %", "Note"])
+        for sk, nm, short in tpl["sections"]:
+            dx, dy = [], []
+            for g, _, r in pts:
+                s = r["_sec"].get(sk)
+                if s and s["pct"] is not None:
+                    dx.append(g); dy.append(s["pct"])
+            db, dg = computeBlr(dx, dy, bl), computeBgm(dx, dy, bl)
+            note = "No data" if not db.get("ok") else ("" if db["r2"] >= cfg.R2_MIN else "R² < threshold — indicative only")
+            w.row([f"{short} · {nm}", f"{db['cut']:.1f} (R² {db['r2']:.2f})" if db.get("ok") else "—",
+                   f"{dg['cut']:.1f} (n={dg['nB']})" if dg.get("nB") else "—", rnd(sum(dy) / len(dy)) if dy else "—", note], bold0=True)
+            secRows.append((short, db, dg))
+    w.widths([44, 22, 24, 14, 52])
+
+    dc = 30                                                           # chart data (visible; charts skip hidden cells)
+    ws.cell(1, dc - 1, "Chart data →").font = xFont(True, size=8, color="94A3B8")
+    for i, h in enumerate(["GR", "Overall %", "Student", "", "Marker", "GR", "%"]):
+        ws.cell(1, dc + i, h).font = xFont(size=8, color="94A3B8")
+    for i, (g, p, r) in enumerate(pts, 2):
+        for j, v in enumerate([g, p, r["Student"]]):
+            ws.cell(i, dc + j, v).font = xFont(size=8, color="94A3B8")
+    mk = ([("BLR cut", bl, round(blr["cut"], 1))] if ok else []) + ([("BGM cut", bl, round(bgm["cut"], 1))] if nb else [])
+    for i, (lbl, g, v) in enumerate(mk, 2):
+        for j, x in enumerate([lbl, g, v]):
+            ws.cell(i, dc + 4 + j, x).font = xFont(size=8, color="94A3B8")
+    if len(pts) >= 2:
+        sc = ScatterChart(); sc.style = 13
+        sc.title = f"BLR — Overall % vs GR" + (f" (R² {blr['r2']:.2f})" if ok else "")
+        sc.x_axis.title, sc.y_axis.title = "Global rating", "Overall %"
+        sc.x_axis.scaling.min, sc.x_axis.scaling.max, sc.x_axis.majorUnit = 1, levels, 1
+        sc.y_axis.scaling.min, sc.y_axis.scaling.max = 0, 100
+        sc.x_axis.delete = sc.y_axis.delete = False; sc.height, sc.width = 9, 15
+        s1 = Series(Reference(ws, min_col=dc + 1, min_row=2, max_row=len(pts) + 1),
+                    Reference(ws, min_col=dc, min_row=2, max_row=len(pts) + 1), title="Candidates")
+        s1.marker = Marker(symbol="circle", size=6); s1.marker.graphicalProperties.solidFill = "094183"
+        s1.graphicalProperties.line.noFill = True
+        if ok:
+            s1.trendline = Trendline(trendlineType="linear")
+        sc.series.append(s1)
+        for i, (lbl, g, v) in enumerate(mk, 2):
+            s = Series(Reference(ws, min_col=dc + 6, min_row=i, max_row=i), Reference(ws, min_col=dc + 5, min_row=i, max_row=i),
+                       title=f"{lbl} {v}%")
+            s.marker = Marker(symbol="diamond" if lbl.startswith("BLR") else "triangle", size=11)
+            s.marker.graphicalProperties.solidFill = "DC2626" if lbl.startswith("BLR") else "E87722"
+            s.graphicalProperties.line.noFill = True; sc.series.append(s)
+        ws.add_chart(sc, "G3")
+        bc = BarChart(); bc.type = "col"; bc.title = "BGM — mean Overall % by GR"; bc.legend = None
+        bc.y_axis.scaling.min, bc.y_axis.scaling.max = 0, 100; bc.x_axis.delete = bc.y_axis.delete = False
+        bc.add_data(Reference(ws, min_col=4, min_row=gmStart - 1, max_row=gmEnd), titles_from_data=True)
+        bc.set_categories(Reference(ws, min_col=1, min_row=gmStart, max_row=gmEnd))
+        bc.dataLabels = DataLabelList(); bc.dataLabels.showVal = True
+        bc.series[0].graphicalProperties.solidFill = "094183"
+        dp = DataPoint(idx=bl - 1); dp.graphicalProperties.solidFill = "E87722"; bc.series[0].dPt.append(dp)
+        bc.height, bc.width = 9, 15
+        ws.add_chart(bc, "G23")
+    finishSheet(ws)
+    ws.print_area = f"A1:Q{max(w.r, 44)}"                              # chart data columns stay out of print
+    return {"blr": blr, "bgm": bgm, "checks": checks, "n": len(pts), "sections": secRows}
+
+
+# ══ Section analysis ════════════════════════════════════════════════════════
+def writeSections(wb, title, rows, tpl, examKey, ss):
+    bl = borderlineOf(examKey)
+    sub = [r for r in rows if r["Submitted"] == "Yes" and basePct(r) is not None]
+    if len(sub) < 3 or not tpl:
+        return None
+    ws = wb.create_sheet(sheetName(wb, title)); w = SheetWriter(ws, 12)
+    secs = tpl["sections"]
+    w.title(f"Section Analysis — {tpl['label']}", f"{len(sub)} submitted, scored forms · % = section percentage per form")
+    w.bar("Section descriptives")
+    w.header(["Section", "Name", "Items", "n", "Mean %", "SD", "Min", "Median", "Max", "% full marks",
+              "α (items)", "ρ with GR", "r with overall"])
+    icols = itemColumns(sub, tpl)
+    chartStart = w.r
+    for sk, nm, short in secs:
+        vals = [r["_sec"][sk]["pct"] for r in sub if sk in r["_sec"] and r["_sec"][sk]["pct"] is not None]
+        if not vals:
+            w.row([short, nm, "", 0]); continue
+        a = np.array(vals)
+        ks = [c for c in icols if c[2] == sk]
+        X = np.array([[itemFrac(r, c) for c in ks] for r in sub], float)
+        alpha = cronbachAlpha(X)
+        gx = [(r["GR_int"], r["_sec"][sk]["pct"]) for r in sub if r["GR_int"] > 0 and sk in r["_sec"] and r["_sec"][sk]["pct"] is not None]
+        rho = spearman([g for g, _ in gx], [p for _, p in gx])[0] if len(gx) >= 3 else None
+        ov = [(r["_sec"][sk]["pct"], basePct(r)) for r in sub if sk in r["_sec"] and r["_sec"][sk]["pct"] is not None]
+        rOv = pearsonR([x for x, _ in ov], [y for _, y in ov])
+        w.row([short, nm, len(ks), len(vals), rnd(a.mean()), rnd(a.std(ddof=1) if len(a) > 1 else 0), rnd(a.min()),
+               rnd(float(np.median(a))), rnd(a.max()), rnd(100 * np.mean(a >= 99.95)),
+               rnd(alpha, 3), rnd(rho, 3), rnd(rOv, 3)],
+              bold0=True, fills=[None, None, None, None, pctFill(a.mean())] + [None] * 5 +
+              ["BBFFD9" if alpha and alpha >= cfg.ALPHA_GOOD else ("FEF08A" if alpha else None)])
+    chartEnd = w.r - 1
+    Xall = np.array([[itemFrac(r, c) for c in icols] for r in sub], float)
+    aAll = cronbachAlpha(Xall)
+    w.para(f"Whole checklist: {len(icols)} items, Cronbach α = {rnd(aAll, 3) if aAll is not None else '—'} "
+           f"(≥ {cfg.ALPHA_GOOD} acceptable). ρ = Spearman with GR; r = Pearson with Overall %.", color="475569")
+    w.gap()
+    grl = grLabels(rows); levels = max([5] + list(grl))
+    w.bar("Mean section % by Global Rating")
+    w.header(["Section"] + [f"GR {g}" + (f" {grl[g][:14]}" if g in grl else "") for g in range(1, levels + 1)] + ["All"])
+    for sk, nm, short in secs:
+        cells, fills = [short], [None]
+        for g in range(1, levels + 1):
+            v = [r["_sec"][sk]["pct"] for r in sub if r["GR_int"] == g and sk in r["_sec"] and r["_sec"][sk]["pct"] is not None]
+            m = sum(v) / len(v) if v else None
+            cells.append(f"{m:.1f} (n={len(v)})" if v else "—"); fills.append(pctFill(m) if v else None)
+        allv = [r["_sec"][sk]["pct"] for r in sub if sk in r["_sec"] and r["_sec"][sk]["pct"] is not None]
+        cells.append(rnd(sum(allv) / len(allv)) if allv else "—")
+        w.row(cells, bold0=True, fills=fills)
+    w.gap()
+    if len(secs) > 1:
+        w.bar("Section intercorrelations (Pearson r of section %)")
+        w.header([""] + [s for _, _, s in secs])
+        for sk, _, short in secs:
+            cells, fills = [short], [None]
+            for sk2, _, _ in secs:
+                pr = [(r["_sec"][sk]["pct"], r["_sec"][sk2]["pct"]) for r in sub
+                      if sk in r["_sec"] and sk2 in r["_sec"] and r["_sec"][sk]["pct"] is not None and r["_sec"][sk2]["pct"] is not None]
+                rv = pearsonR([a for a, _ in pr], [b for _, b in pr]) if len(pr) >= 3 else float("nan")
+                cells.append(rnd(rv, 2))
+                fills.append(None if rv != rv else ("BBFFD9" if rv >= .7 else "D1FAE5" if rv >= .4 else "FEF9C3" if rv >= .2 else "FECACA"))
+            w.row(cells, bold0=True, fills=fills)
+    w.widths([10, 40, 7, 6, 9, 8, 8, 9, 8, 11, 10, 10, 12])
+    if chartEnd >= chartStart:
+        bc = BarChart(); bc.type = "bar"; bc.title = "Mean % by section"; bc.legend = None
+        bc.add_data(Reference(ws, min_col=5, min_row=chartStart - 1, max_row=chartEnd), titles_from_data=True)
+        bc.set_categories(Reference(ws, min_col=1, min_row=chartStart, max_row=chartEnd))
+        bc.x_axis.delete = bc.y_axis.delete = False; bc.y_axis.scaling.min, bc.y_axis.scaling.max = 0, 100
+        bc.series[0].graphicalProperties.solidFill = "094183"; bc.height, bc.width = 8, 14
+        ws.add_chart(bc, "O3")
+    finishSheet(ws)
+    return aAll
+
+
+# ══ Item analysis ═══════════════════════════════════════════════════════════
+def writeItems(wb, title, rows, tpl):
+    sub = [r for r in rows if r["Submitted"] == "Yes" and basePct(r) is not None]
+    icols = itemColumns(sub, tpl) if tpl else []
+    if len(sub) < 5 or len(icols) < 2:
+        return
+    X = np.array([[itemFrac(r, c) for c in icols] for r in sub], float)
+    tot = np.nansum(X, axis=1)
+    imp, impLbl = importance(X, tot)
+    order = np.argsort(tot); cut = max(1, int(round(0.27 * len(order))))
+    lo, hi = set(order[:cut].tolist()), set(order[-cut:].tolist())
+    aAll = cronbachAlpha(X)
+    secName = {sk: s for sk, _, s in tpl["sections"]}
+    ws = wb.create_sheet(sheetName(wb, title)); w = SheetWriter(ws, 19)
+    w.title(f"Item Analysis — {tpl['label']}",
+            f"n={len(sub)} submitted forms · {len(icols)} items · α = {rnd(aAll, 3)} · {impLbl} · "
+            f"difficulty p = mean item fraction · r = corrected item-rest · ρ GR = Spearman item vs Global Rating · "
+            f"D = top − bottom 27% · 2PL-lite on standardised rest score")
+    hdrs = ["Section", "Item", "Question", "n answered", "Blank", "Difficulty p", "SD", "Item-rest r", "ρ with GR", "α if deleted",
+            "D (27%)", "IRT a", "IRT b", "Importance", "Rank", "% full", "% partial", "% zero", "Flag"]
+    w.header(hdrs, fill="010D44", color="FFFFFF")
+    start = w.r
+    ranks = (-imp).argsort().argsort() + 1
+    grArr = np.array([r["GR_int"] for r in sub], float)                # GR per form (≤ 0 = no GR)
+    grRhos = []                                                         # ρ per item, for the chart colours
+    for j, c in enumerate(icols):
+        col = X[:, j]; v = ~np.isnan(col); n = int(v.sum())
+        p = float(np.nanmean(col)) if n else np.nan
+        sd = float(np.nanstd(col)) if n else np.nan
+        rest = np.nansum(np.delete(X, j, axis=1), axis=1)
+        rIt = float(np.corrcoef(col[v], rest[v])[0, 1]) if n > 2 and np.std(col[v]) > 0 and np.std(rest[v]) > 0 else np.nan
+        gv = v & (grArr > 0)                                            # pairwise: item marked AND GR given
+        rhoGr = spearman(grArr[gv].tolist(), col[gv].tolist())[0] if gv.sum() >= 3 else np.nan
+        grRhos.append(rhoGr)
+        aDel = cronbachAlpha(np.delete(X, j, axis=1))
+        hiV = [col[i] for i in hi if not np.isnan(col[i])]; loV = [col[i] for i in lo if not np.isnan(col[i])]
+        D = (np.mean(hiV) - np.mean(loV)) if hiV and loV else np.nan
+        ab = (rest - np.mean(rest)) / (np.std(rest) or 1)
+        a, b = irtLite(col, ab)
+        full = float(np.mean(col[v] >= 0.999)) if n else np.nan
+        zero = float(np.mean(col[v] <= 0.001)) if n else np.nan
+        novar = n > 0 and np.nanstd(col[v]) == 0
+        flag = ("No variance" if novar else "Poor" if not (rIt == rIt) or rIt < 0.10 else "Too easy" if p > 0.95
+                else "Too hard" if p < 0.10 else "Good" if rIt >= 0.20 and 0.20 <= p <= 0.90 else "Review")
+        if aDel is not None and aAll is not None and aDel > aAll + 0.01 and flag == "Good":
+            flag = "Review"
+        blank = sum(1 for r in sub if (itemLookup(r).get((c[0], c[1])) or {}).get("points") is None)
+        w.row([secName.get(c[2], c[2]), c[1], (c[4] or "")[:90], n, blank, rnd(p, 3), rnd(sd, 3), rnd(rIt, 3), rnd(rhoGr, 3), rnd(aDel, 3),
+               rnd(D, 3), rnd(a, 2), rnd(b, 2), rnd(imp[j], 3), int(ranks[j]), rnd(100 * full), rnd(100 * (1 - full - zero)),
+               rnd(100 * zero), flag],
+              fills=[None] * 5 + [fracFill(p, 1) if p == p else None] + [None] * 2 + [rhoFill(rhoGr)] + [None] * 9
+                    + [FLAG_FILL.get(flag)])
+    end = w.r - 1
+    w.gap()
+    w.para("ρ with GR: Spearman rank correlation of the item with the Global Rating (forms with both) — "
+           "green ≥ .30, amber .20–.30, red < .20 (item barely tracks the examiner's overall judgement).", color="64748B")
+    w.para("Flags: Good = r ≥ .20 and .20 ≤ p ≤ .90 · Review = borderline p/r or α rises when deleted · Poor = r < .10 · "
+           "Too easy/hard = p > .95 / < .10 · No variance = every candidate scored the same. Small samples: interpret with care.",
+           color="64748B")
+    w.widths([8, 7, 48, 9, 6, 10, 7, 10, 10, 10, 9, 7, 7, 10, 6, 7, 8, 7, 11])
+    ws.freeze_panes = ws.cell(start, 3)
+    ws.auto_filter.ref = f"A{start - 1}:{get_column_letter(len(hdrs))}{end}"
+    sc = ScatterChart(); sc.title = "Difficulty vs discrimination"; sc.style = 13
+    sc.x_axis.title, sc.y_axis.title = "Difficulty p", "Item-rest r"; sc.x_axis.delete = sc.y_axis.delete = False
+    s = Series(Reference(ws, min_col=8, min_row=start, max_row=end), Reference(ws, min_col=6, min_row=start, max_row=end), title="items")
+    s.marker = Marker(symbol="circle", size=6); s.marker.graphicalProperties.solidFill = "094183"
+    s.graphicalProperties.line.noFill = True; sc.series.append(s); sc.height, sc.width = 9, 14
+    ws.add_chart(sc, "U3")
+    bc = BarChart(); bc.title = "Item-rest r"; bc.legend = None; bc.height, bc.width = 9, 18
+    bc.add_data(Reference(ws, min_col=8, min_row=start - 1, max_row=end), titles_from_data=True)
+    bc.set_categories(Reference(ws, min_col=2, min_row=start, max_row=end))
+    bc.series[0].graphicalProperties.solidFill = "E87722"; bc.x_axis.delete = bc.y_axis.delete = False
+    ws.add_chart(bc, "U22")
+    if any(x == x for x in grRhos):                                     # item vs GR correlation chart
+        gc = BarChart(); gc.title = "Item vs Global Rating (Spearman ρ)"; gc.legend = None; gc.height, gc.width = 9, 18
+        gc.add_data(Reference(ws, min_col=9, min_row=start - 1, max_row=end), titles_from_data=True)
+        gc.set_categories(Reference(ws, min_col=2, min_row=start, max_row=end))
+        gc.y_axis.title = "ρ with GR"; gc.x_axis.delete = gc.y_axis.delete = False
+        gc.y_axis.scaling.max = 1.0; gc.y_axis.scaling.min = min(-0.2, min((x for x in grRhos if x == x), default=0) - 0.1)
+        gc.series[0].graphicalProperties.solidFill = "1D9E75"
+        for k, x in enumerate(grRhos):                                  # per-bar colour: good / acceptable / weak
+            dp = DataPoint(idx=k); dp.graphicalProperties.solidFill = rhoColour(x)
+            gc.series[0].dPt.append(dp)
+        gc.dataLabels = DataLabelList(showVal=True, showSerName=False, showCatName=False,   # value only
+                                      showLegendKey=False, showPercent=False, numFmt="0.00")
+        gc.dataLabels.position = "outEnd"
+        ws.add_chart(gc, "U41")
+    finishSheet(ws)
+
+
+# ══ Assessors ═══════════════════════════════════════════════════════════════
+def writeAssessors(wb, rows, templates, ssByTpl, examKey):
+    bl = borderlineOf(examKey)
+    if not rows:
+        return
+    ws = wb.create_sheet(sheetName(wb, "Assessors")); w = SheetWriter(ws, 18)
+    sub = [r for r in rows if r["Submitted"] == "Yes"]
+    allP = [basePct(r) for r in sub if basePct(r) is not None]
+    grand = float(np.mean(allP)) if allP else 0.0
+    # residual vs each template's BLR line = how far the assessor's % sits from what their own GR predicts
+    def resid(r):
+        blr = (ssByTpl.get(r["_tid"]) or {}).get("blr") or {}
+        if not blr.get("ok") or r["GR_int"] < 1 or basePct(r) is None:
+            return None
+        return basePct(r) - (blr["intercept"] + blr["slope"] * r["GR_int"])
+    grl = grLabels(rows); levels = max([5] + list(grl))
+    by = defaultdict(list)
+    for r in rows:
+        by[r["Assessor"]].append(r)
+    data = []
+    for asr, rs in by.items():
+        sr = [r for r in rs if r["Submitted"] == "Yes"]
+        ps = [basePct(r) for r in sr if basePct(r) is not None]
+        grs = [r["GR_int"] for r in sr if r["GR_int"] > 0]
+        res = [x for x in (resid(r) for r in sr) if x is not None]
+        data.append({"asr": asr, "forms": len(rs), "sub": len(sr), "stu": len({r["Student"] for r in rs}),
+                     "mean": float(np.mean(ps)) if ps else None, "sd": float(np.std(ps, ddof=1)) if len(ps) > 1 else None,
+                     "gr": float(np.mean(grs)) if grs else None, "grDist": [grs.count(g) for g in range(1, levels + 1)],
+                     "low": 100 * sum(1 for g in grs if g <= bl) / len(grs) if grs else None,
+                     "cc": sum(r["CC_int"] for r in rs), "open": sum(1 for r in rs if r["Status"] != "Submitted"),
+                     "delta": (float(np.mean(ps)) - grand) if ps else None,
+                     "adj": float(np.mean(res)) if res else None, "tpl": ", ".join(sorted({r["Checklist"] for r in rs}))})
+    means = [d["mean"] for d in data if d["mean"] is not None]
+    cutL = max(cfg.LENIENCY_MIN_CUT, 0.67 * float(np.std(means))) if len(means) > 1 else cfg.LENIENCY_MIN_CUT
+    for d in data:
+        d["flag"] = "" if d["delta"] is None or d["sub"] < 3 else ("Lenient" if d["delta"] > cutL else "Harsh" if d["delta"] < -cutL else "Typical")
+        d["flagAdj"] = "" if d["adj"] is None or d["sub"] < 3 else ("Lenient" if d["adj"] > cutL else "Harsh" if d["adj"] < -cutL else "Typical")
+    data.sort(key=lambda d: (d["mean"] is None, -(d["mean"] or 0)))
+    w.title("Assessor Analysis",
+            f"Cohort mean Overall % = {grand:.1f} · Δ = assessor mean − cohort mean · GR-adjusted Δ = mean of (score − score "
+            f"predicted from the GR they gave, BLR line) · flags at ±{cutL:.1f} %-pts, assessors with ≥ 3 submitted forms")
+    hdr = (["Assessor", "Forms", "Submitted", "Students", "Mean %", "SD", "Mean GR"] + [f"GR {g}" for g in range(1, levels + 1)]
+           + [f"% GR ≤ {bl}", "CC", "Open forms", "Δ vs cohort", "Flag", "GR-adjusted Δ", "Flag (adj.)", "Checklists"])
+    w.header(hdr, fill="010D44", color="FFFFFF"); start = w.r
+    for d in data:
+        vals = ([d["asr"], d["forms"], d["sub"], d["stu"], rnd(d["mean"]), rnd(d["sd"]), rnd(d["gr"], 2)] + d["grDist"]
+                + [rnd(d["low"]), d["cc"], d["open"], rnd(d["delta"]), d["flag"], rnd(d["adj"]), d["flagAdj"], d["tpl"]])
+        fills = [None] * len(vals)
+        fills[4] = pctFill(d["mean"]); fills[-4] = FLAG_FILL.get(d["flag"]); fills[-2] = FLAG_FILL.get(d["flagAdj"])
+        fills[7 + levels + 1] = "FECACA" if d["cc"] else None
+        w.row(vals, bold0=True, fills=fills)
+    end = w.r - 1
+    w.widths([24, 7, 9, 8, 8, 7, 8] + [6] * levels + [9, 5, 8, 10, 9, 12, 10, 30])
+    ws.freeze_panes = ws.cell(start, 2)
+    if end >= start:
+        bc = BarChart(); bc.type = "bar"; bc.title = "Mean Overall % by assessor"; bc.legend = None
+        bc.add_data(Reference(ws, min_col=5, min_row=start - 1, max_row=end), titles_from_data=True)
+        bc.set_categories(Reference(ws, min_col=1, min_row=start, max_row=end))
+        bc.series[0].graphicalProperties.solidFill = "094183"; bc.x_axis.delete = bc.y_axis.delete = False
+        bc.height, bc.width = max(8, 0.5 * len(data)), 16
+        ws.add_chart(bc, f"{get_column_letter(len(hdr) + 2)}3")
+    finishSheet(ws)
+
+
+# ══ Students + follow-up ════════════════════════════════════════════════════
+def cutOf(r, ssByTpl):
+    blr = (ssByTpl.get(r["_tid"]) or {}).get("blr") or {}
+    return blr.get("cut") if blr.get("ok") else None
+
+
+def writeStudents(wb, rows, ssByTpl, examKey):
+    bl = borderlineOf(examKey)
+    by = defaultdict(list)
+    for r in rows:
+        by[(r["Student"], r["Cohort"])].append(r)
+    if not by:
+        return
+    ws = wb.create_sheet(sheetName(wb, "Students")); w = SheetWriter(ws, 14)
+    w.title("Students", "One row per student · Review = any GR ≤ borderline, critical concern, or Overall % below that checklist's BLR cut")
+    w.header(["Student", "Cohort", "Forms", "Submitted", "Checklists", "Mean %", "Min %", "Max %", "Mean GR", "Lowest GR",
+              "CC", "Below BLR cut", "Review", "Assessors"], fill="010D44", color="FFFFFF")
+    out = []
+    for (stu, coh), rs in by.items():
+        sr = [r for r in rs if r["Submitted"] == "Yes"]
+        ps = [r["Pct"] for r in sr if r["Pct"] >= 0]
+        grs = [r["GR_int"] for r in sr if r["GR_int"] > 0]
+        below = sum(1 for r in sr if cutOf(r, ssByTpl) is not None and basePct(r) is not None and basePct(r) < cutOf(r, ssByTpl))
+        cc = sum(r["CC_int"] for r in rs)
+        review = bool(cc or below or (grs and min(grs) <= bl))
+        out.append([stu, coh, len(rs), len(sr), ", ".join(sorted({r["Checklist"] for r in rs})),
+                    rnd(np.mean(ps)) if ps else None, rnd(min(ps)) if ps else None, rnd(max(ps)) if ps else None,
+                    rnd(np.mean(grs), 2) if grs else None, min(grs) if grs else None, cc, below, "Yes" if review else "",
+                    ", ".join(sorted({r["Assessor"] for r in rs}))])
+    out.sort(key=lambda v: (v[12] != "Yes", v[5] if v[5] is not None else 999))
+    start = w.r
+    for v in out:
+        w.row(v, bold0=True, fills=[None] * 5 + [pctFill(v[5]), pctFill(v[6]), None, None, GR_FILL.get(v[9]),
+                                                 "FECACA" if v[10] else None, "FED7AA" if v[11] else None, "FECACA" if v[12] else None])
+    w.widths([24, 8, 7, 9, 26, 8, 8, 8, 9, 9, 5, 12, 8, 40])
+    ws.freeze_panes = ws.cell(start, 2)
+    ws.auto_filter.ref = f"A{start - 1}:N{w.r - 1}"
+    finishSheet(ws)
+
+
+def writeFollowUp(wb, rows, ssByTpl, examKey):
+    bl = borderlineOf(examKey)
+    items = []
+    for r in rows:
+        why = []
+        if r["CC_int"]:
+            why.append("Critical concern")
+        if r["_incomplete"]:
+            why.append("Submitted incomplete: " + "; ".join(r["_incomplete"]))
+        elif r["_missing"]:
+            why.append("Not in form: " + r["Missing"])
+        if r["Status"] != "Submitted":
+            why.append(r["Status"])
+        if r["Submitted"] == "Yes" and 0 < r["GR_int"] <= bl:
+            why.append(f"GR {r['GR_int']} ≤ borderline")
+        c = cutOf(r, ssByTpl)
+        if r["Submitted"] == "Yes" and c is not None and basePct(r) is not None and basePct(r) < c:
+            why.append(f"Below BLR cut ({basePct(r):.1f} < {c:.1f})")
+        if r.get("_unsafe"):
+            why.append("UNSAFE — auto fail")
+        elif r.get("_outcome") and 0 <= r["Pct"] < (cfg.PROFILES[r["_profile"]].get("matrix") or {}).get("passMark", 50):
+            why.append(f"Below pass mark ({r['_outcome']})")
+        if r.get("_overrideNote"):
+            why.append("Override applied")
+        if why:
+            items.append((r, why))
+    ws = wb.create_sheet(sheetName(wb, "Follow-up")); w = SheetWriter(ws, 11)
+    w.title("Follow-up", f"{len(items)} forms need attention (critical concerns first)")
+    w.header(["Date", "Student", "Assessor", "Cohort", "Checklist", "Status", "GR", "Overall %", "Reasons", "Critical / general comments", "Form ID"],
+             fill="010D44", color="FFFFFF")
+    items.sort(key=lambda x: (-x[0]["CC_int"], x[0]["_stateRank"], -x[0]["_ts"]))
+    for r, why in items:
+        crit = " | ".join(str(r["_ad"].get(k) or "").strip() for k in ("critical_concerns_comments", "critical_error", "clinical_incident")
+                          if core.meaningful(r["_ad"].get(k))) or (r["_ad"].get("comments") or "").strip()
+        w.row([r["Date"], r["Student"], r["Assessor"], r["Cohort"], r["Checklist"], r["Status"],
+               r["GR_int"] if r["GR_int"] > 0 else None, r["Pct"] if r["Pct"] >= 0 else None, " · ".join(why), crit, r["_id"]],
+              fills=[None] * 6 + [GR_FILL.get(r["GR_int"]), pctFill(r["Pct"]), "FECACA" if r["CC_int"] else "FEF3C7"])
+    w.widths([12, 22, 20, 8, 16, 11, 5, 9, 60, 60, 8])
+    ws.freeze_panes = "C5"
+    finishSheet(ws)
+
+
+# ══ Double marking ══════════════════════════════════════════════════════════
+def linearKappa(a, b):
+    """Linearly weighted Cohen's κ for two raters' integer levels (None if undefined)."""
+    pairs = [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
+    if len(pairs) < 3:
+        return None
+    cats = sorted({v for p in pairs for v in p})
+    if len(cats) < 2:
+        return None
+    k, n = len(cats), len(pairs); idx = {c: i for i, c in enumerate(cats)}
+    obs = np.zeros((k, k))
+    for x, y in pairs:
+        obs[idx[x], idx[y]] += 1
+    obs /= n
+    exp = np.outer(obs.sum(axis=1), obs.sum(axis=0))
+    wgt = np.array([[abs(i - j) / (k - 1) for j in range(k)] for i in range(k)])
+    de = (wgt * exp).sum()
+    return float(1 - (wgt * obs).sum() / de) if de else None
+
+
+def writeDoubleMarking(wb, rows, templates):
+    """Students with ≥ 2 submitted forms on the same checklist: E1 vs E2 (by form id = submission order)."""
+    groups = defaultdict(list)
+    for r in rows:
+        if r["Submitted"] == "Yes" and basePct(r) is not None and r["_tid"]:
+            groups[(r["_tid"], r["Student"], r["Cohort"])].append(r)
+    pairs = {k: sorted(v, key=lambda r: r["_id"] or 0) for k, v in groups.items() if len(v) >= 2}
+    if len(pairs) < 3:
+        return
+    gap = cfg.DOUBLE_MARK_GAP
+    ws = wb.create_sheet(sheetName(wb, "Double Marking")); w = SheetWriter(ws, 12)
+    w.title("Double marking — examiner agreement",
+            f"{len(pairs)} student × checklist pairs · E1 / E2 = form id order (submission order) · flag when |gap| ≥ {gap:g} %-points · "
+            f"Final % = mean of all that student's forms")
+    for tid in templates:
+        tp = {k: v for k, v in pairs.items() if k[0] == tid}
+        if not tp:
+            continue
+        tpl = templates[tid]
+        e1 = [basePct(v[0]) for v in tp.values()]; e2 = [basePct(v[1]) for v in tp.values()]
+        diffs = [b - a for a, b in zip(e1, e2)]
+        w.bar(f"{tpl['label']} — {len(tp)} double-marked students")
+        nFlag = sum(1 for d in diffs if abs(d) >= gap)
+        w.row(["Pairs", len(tp), "Mean |gap|", rnd(np.mean(np.abs(diffs))), f"Gap ≥ {gap:g}", f"{nFlag} ({100 * nFlag / len(tp):.0f}%)",
+               "Mean E2 − E1", rnd(np.mean(diffs)), "r (E1, E2)", rnd(pearsonR(e1, e2), 3)],
+              fills=["F1F5F9", None, "F1F5F9", None, "F1F5F9", "FED7AA" if nFlag else None, "F1F5F9", None, "F1F5F9", None])
+        icols = itemColumns([r for v in tp.values() for r in v], tpl)
+        if icols:
+            w.header(["Item", "Question", "Exact agreement %", "Linear weighted κ", "Mean |level gap|"])
+            for c in icols:
+                a = [(itemLookup(v[0]).get((c[0], c[1])) or {}).get("points") for v in tp.values()]
+                b = [(itemLookup(v[1]).get((c[0], c[1])) or {}).get("points") for v in tp.values()]
+                both = [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
+                ag = 100 * sum(1 for x, y in both if x == y) / len(both) if both else None
+                kap = linearKappa(a, b)
+                w.row([c[1], (c[4] or "")[:70], rnd(ag), rnd(kap, 3), rnd(np.mean([abs(x - y) for x, y in both]), 2) if both else None],
+                      fills=[None, None, pctFill(ag), None if kap is None else ("BBFFD9" if kap >= .6 else "FEF08A" if kap >= .4 else "FECACA")])
+        w.header(["Student", "Cohort", "E1 assessor", "E1 %", "E2 assessor", "E2 %", "Gap (E2 − E1)", "|Gap| flag",
+                  "Final %", "Forms", "E1 outcome", "E2 outcome"])
+        for (tid_, stu, coh), v in sorted(tp.items(), key=lambda kv: -abs(basePct(kv[1][1]) - basePct(kv[1][0]))):
+            a, b = basePct(v[0]), basePct(v[1]); d = b - a
+            fin = float(np.mean([basePct(x) for x in v]))
+            w.row([stu, coh, v[0]["Assessor"], rnd(a), v[1]["Assessor"], rnd(b), rnd(d), "Yes" if abs(d) >= gap else "",
+                   rnd(fin), len(v), v[0].get("_outcome", ""), v[1].get("_outcome", "")],
+                  bold0=True, fills=[None, None, None, pctFill(a), None, pctFill(b), None, "FED7AA" if abs(d) >= gap else None, pctFill(fin)])
+        w.gap()
+    w.widths([24, 30, 20, 8, 20, 8, 12, 10, 9, 7, 30, 30])
+    finishSheet(ws)
+
+
+# ══ Roster ══════════════════════════════════════════════════════════════════
+def loadRoster():
+    roster = {}
+    try:
+        with open(core.APP_DIR / cfg.ROSTER_CSV, encoding="utf-8-sig", newline="") as f:
+            for r in csv.DictReader(f):
+                ch, nm = (r.get("cohort") or "").strip().upper(), (r.get("student_name") or "").strip()
+                if ch and nm:
+                    roster.setdefault(ch, {})[core.normName(nm)] = nm
+    except FileNotFoundError:
+        return None
+    return roster
+
+
+def writeRoster(wb, rows):
+    roster = loadRoster()
+    if roster is None:
+        return
+    ws = wb.create_sheet(sheetName(wb, "Roster")); w = SheetWriter(ws, 6)
+    w.title("Roster check", f"Forms vs {cfg.ROSTER_CSV} (names matched case/space-insensitive, nicknames in brackets ignored)")
+    seen, disp, perCk = defaultdict(set), {}, defaultdict(lambda: defaultdict(int))
+    for r in rows:
+        ch, n = r["Cohort"].upper(), core.normName(r["Student"])
+        seen[ch].add(n); disp[n] = r["Student"]; perCk[ch][(n, r["Checklist"])] += 1
+    for ch in sorted(seen):
+        rost = roster.get(ch, {})
+        missing = sorted(rost[n] for n in rost if n not in seen[ch])
+        extra = sorted(disp[n] for n in seen[ch] if n not in rost)
+        dups = sorted(f"{disp[n]} — {ck} (x{c})" for (n, ck), c in perCk[ch].items() if c > 1)
+        w.bar(f"{ch} · enrolled {len(rost)} · present {len(seen[ch] & set(rost))} · missing {len(missing)} · "
+              f"off-roster {len(extra)} · same checklist twice {len(dups)}", "010D44")
+        w.header(["Missing (no form)", "Off-roster (form, not enrolled)", "Same checklist more than once"])
+        for i in range(max(len(missing), len(extra), len(dups), 1)):
+            w.row([missing[i] if i < len(missing) else "", extra[i] if i < len(extra) else "", dups[i] if i < len(dups) else ""],
+                  fills=["FECACA" if i < len(missing) else None, "FED7AA" if i < len(extra) else None, "FEF9C3" if i < len(dups) else None])
+        w.gap()
+    w.widths([32, 32, 40])
+    finishSheet(ws, False)
+
+
+# ══ Overview ════════════════════════════════════════════════════════════════
+def writeOverview(wb, examKey, rows, ign, templates, ssByTpl, alphaByTpl, filterDesc, sheetsMade):
+    ws = wb.create_sheet("Overview", 0); w = SheetWriter(ws, 8)
+    exam = cfg.EXAMS[examKey]; bl = borderlineOf(examKey)
+    w.title(f"DASH · {exam['title']} — detailed export",
+            f"Exported {datetime.now():%d %b %Y %H:%M} · {cfg.APP_BUILD} · {filterDesc}")
+    sub = [r for r in rows if r["Submitted"] == "Yes"]
+    ps = [basePct(r) for r in sub if basePct(r) is not None]; grs = [r["GR_int"] for r in sub if r["GR_int"] > 0]
+    w.bar("Key figures")
+    kpis = [("Forms", len(rows)), ("Submitted", len(sub)), ("In progress", sum(r["Status"] == "In progress" for r in rows)),
+            ("Not started", sum(r["Status"] == "Not started" for r in rows)),
+            ("Submitted but incomplete", sum(1 for r in rows if r["_incomplete"])),
+            ("Critical concerns", sum(r["CC_int"] for r in rows)), ("Students", len({r["Student"] for r in rows})),
+            ("Assessors", len({r["Assessor"] for r in rows})), ("Mean Overall % (submitted)", rnd(np.mean(ps)) if ps else "—"),
+            ("Mean GR (submitted)", rnd(np.mean(grs), 2) if grs else "—"),
+            ("Forms by ignored assessors (excluded)", len(ign))]
+    for i in range(0, len(kpis), 2):
+        vals = []
+        for k, v in kpis[i:i + 2]:
+            vals += [k, v]
+        w.row(vals, fills=["F1F5F9", None, "F1F5F9", None])
+    w.gap()
+    w.bar("Checklists in this export")
+    w.header(["Checklist", "Scoring profile", "Forms", "Submitted", "Mean %", "α", "BLR cut (R²)", "BGM cut (n)"])
+    for tid, tpl in templates.items():
+        rs = [r for r in rows if r["_tid"] == tid]
+        if not rs:
+            continue
+        ss = ssByTpl.get(tid) or {}; blr, bgm = ss.get("blr") or {}, ss.get("bgm") or {}
+        p = [basePct(r) for r in rs if r["Submitted"] == "Yes" and basePct(r) is not None]
+        w.row([tpl["label"], cfg.PROFILES[tpl["profile"]]["title"], len(rs), sum(r["Submitted"] == "Yes" for r in rs),
+               rnd(np.mean(p)) if p else "—", rnd(alphaByTpl.get(tid), 3) if alphaByTpl.get(tid) is not None else "—",
+               f"{blr['cut']:.1f} ({blr['r2']:.2f})" if blr.get("ok") else "—",
+               f"{bgm['cut']:.1f} ({bgm['nB']})" if bgm.get("nB") else "—"], bold0=True)
+    w.gap()
+    for tid, tpl in templates.items():
+        rs = [r for r in rows if r["_tid"] == tid]
+        if not rs:
+            continue
+        prof = cfg.PROFILES[tpl["profile"]]
+        w.bar(f"How {tpl['label']} is scored — {prof['title']}")
+        w.para(prof["guide"] + " Every form is scored against its OWN rubric, so form versions with different maxima are handled.")
+        w.header(["Section", "Name", "Items", "Max points", "Weight"])
+        weights = prof.get("weights")
+        itemW = (prof.get("itemWeights") or {})
+        for sk, nm, short in tpl["sections"]:
+            its = {(it["ck"], it["mc"]) for r in rs for it in r["_items"] if it["secKey"] == sk}
+            mx = next((r["_sec"][sk]["max"] for r in sorted(rs, key=lambda x: -x["_ts"]) if sk in r["_sec"] and r["_sec"][sk]["max"]), None)
+            if weights:
+                wt = f"{weights.get(short, 0):.0%}"
+            elif prof.get("sectionsByItem") and itemW:
+                wt = f"×{(itemW.get(tpl['keys'][0]) or {}).get(sk, 1):g}"
+            else:
+                wt = "equal" if prof["overall"] == "sections" else "—"
+            w.row([short, nm, len(its), rnd(mx, 2), wt], bold0=True)
+        if prof.get("matrix"):                                            # ECCA combined performance matrix
+            mxc = prof["matrix"]; codes = list(mxc["rowLabels"])
+            w.gap()
+            w.header(["Presentation ↓ / Questioning →"] + [f"{c} — {mxc['colLabels'][c]}" for c in codes])
+            for rc in codes:
+                cells, fills = [f"{rc} — {mxc['rowLabels'][rc]}"], [None]
+                for cc in codes:
+                    pct, outc, _ = mxc["table"][(rc, cc)]
+                    cells.append(f"{pct}% — {outc}"); fills.append(pctFill(pct))
+                w.row(cells, bold0=True, fills=fills, wrap=True)
+            w.para(f"Pass mark {mxc.get('passMark', 50)}%. Patient Safety = Unsafe → automatic fail: Overall % = "
+                   f"min(matrix %, {mxc.get('unsafeCap', 45)}%). Full descriptors are in the form view and Records 'Outcome'.",
+                   color="B91C1C")
+            rsu = [r for r in rs if r["Submitted"] == "Yes" and r.get("_outcome")]
+            if rsu:
+                w.header(["Presentation ↓ / Questioning → (forms)"] + codes)
+                codeOf = lambda r, rx: next((it["code"] for it in r["_items"] if re.search(rx, it["question"], re.I)), "")
+                for rc in codes:
+                    w.row([rc] + [sum(1 for r in rsu if codeOf(r, mxc["rowItem"]) == rc and codeOf(r, mxc["colItem"]) == cc)
+                                  for cc in codes], bold0=True)
+                w.para(f"Unsafe forms: {sum(1 for r in rsu if r.get('_unsafe'))} of {len(rsu)}.", color="475569")
+        w.gap()
+    grl = grLabels(rows)
+    w.bar("Global rating scale (from the forms) and colour legend")
+    w.header(["GR", "Label", "", "Cell colour", "Meaning"])
+    leg = [("BBFFD9", "Full marks / ≥ 99%"), ("BFDBFE", "≥ 70%"), ("A5F3FC", "45–69%"), ("FEF08A", "> 0 and < 45%"),
+           ("FECACA", "0 / critical concern / not submitted"), ("FEF3C7", "Section not in this form"),
+           ("FED7AA", "Submitted but incomplete / borderline GR")]
+    for i in range(max(len(grl), len(leg))):
+        g = sorted(grl, reverse=True)[i] if i < len(grl) else None
+        w.row([g, (grl[g] + (" ← borderline" if g == bl else "")) if g else "", "", "", leg[i][1] if i < len(leg) else ""],
+              fills=[GR_FILL.get(g), None, None, leg[i][0] if i < len(leg) else None])
+    w.gap()
+    w.bar("Sheets")
+    guide = {"Records": "Every form: identity, status, GR, section %, total, overall, CC, overrides, comments (filterable)",
+             "Follow-up": "Forms needing action, with reasons", "Students": "Per-student summary and review flag",
+             "Scores": "MC-level grid per checklist (hover a header for the question)",
+             "Std Setting": "BLR + BGM cut scores, viability tests, charts", "Sections": "Section descriptives, α, correlations",
+             "Items": "Item difficulty, discrimination, ρ with GR (+ chart), α-if-deleted, IRT-lite, importance",
+             "Assessors": "Leniency / harshness, GR mix, completion", "Roster": f"Coverage vs {cfg.ROSTER_CSV}",
+             "Double Marking": "Students marked by two examiners: E1 vs E2 %, gap, flags, agreement per item",
+             "Ignored Assessors": "Forms excluded from all analysis (overrides file)"}
+    for s in sheetsMade:
+        key = next((k for k in guide if s.startswith(k)), None)
+        w.row([s, guide.get(key, "")], bold0=True)
+    w.widths([34, 40, 12, 14, 30, 10, 14, 14])
+    finishSheet(ws, False)
+
+
+# ══ Entry points ════════════════════════════════════════════════════════════
+def splitIgnored(rows):
+    return [r for r in rows if not r.get("_ignored")], [r for r in rows if r.get("_ignored")]
+
+
+def summaryExport(examKey, rows, templates, filterDesc) -> str:
+    main, ign = splitIgnored(rows)
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    writeRecords(wb, "Records", main, templates)
+    if ign:
+        writeRecords(wb, "Ignored Assessors", ign, templates).sheet_properties.tabColor = "94A3B8"
+    ws = wb.create_sheet("About"); ws["A1"] = f"DASH · {cfg.EXAMS[examKey]['title']} — summary"; ws["A1"].font = xFont(True, size=12)
+    ws["A2"] = f"Exported {datetime.now():%d %b %Y %H:%M} · {filterDesc}"; ws["A2"].font = xFont(size=9, color="64748B")
+    tmp = tempfile.NamedTemporaryFile(suffix=f"_{examKey}_Summary.xlsx", delete=False); tmp.close()
+    wb.save(tmp.name)
+    return tmp.name
+
+
+def detailedExport(examKey, rows, templates, filterDesc) -> str:
+    main, ign = splitIgnored(rows)
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    tids = [t for t in templates if any(r["_tid"] == t for r in main)]
+    many = len(tids) > 1
+    writeRecords(wb, "Records", main, templates)
+    ssByTpl, alphaByTpl = {}, {}
+    for tid in tids:
+        tpl, rs = templates[tid], [r for r in main if r["_tid"] == tid]
+        tag = tplTag(tpl, many)
+        writeScoreSheet(wb, f"Scores{tag}", rs, tpl)
+        ssByTpl[tid] = writeStandardSetting(wb, f"Std Setting{tag}", rs, tpl, examKey)
+        alphaByTpl[tid] = writeSections(wb, f"Sections{tag}", rs, tpl, examKey, ssByTpl[tid])
+        writeItems(wb, f"Items{tag}", rs, tpl)
+    writeAssessors(wb, main, templates, ssByTpl, examKey)
+    writeStudents(wb, main, ssByTpl, examKey)
+    writeFollowUp(wb, main, ssByTpl, examKey)
+    writeDoubleMarking(wb, main, templates)
+    writeRoster(wb, main)
+    if ign:
+        writeRecords(wb, "Ignored Assessors", ign, templates).sheet_properties.tabColor = "94A3B8"
+    order = ["Records", "Follow-up", "Students"]                      # put the action sheets up front
+    for name in reversed(order):
+        if name in wb.sheetnames:
+            wb.move_sheet(name, offset=-wb.sheetnames.index(name))
+    writeOverview(wb, examKey, main, ign, templates, ssByTpl, alphaByTpl, filterDesc, list(wb.sheetnames))
+    wb.active = 0
+    tmp = tempfile.NamedTemporaryFile(suffix=f"_{examKey}_Detailed.xlsx", delete=False); tmp.close()
+    wb.save(tmp.name)
+    return tmp.name
